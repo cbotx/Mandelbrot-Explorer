@@ -1,0 +1,8 @@
+*.so
+*.dll
+*.exe
+.vscode
+.VSCodeCounter
+build/
+libs/
+png++/
