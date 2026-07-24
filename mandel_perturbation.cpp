@@ -353,12 +353,13 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                     if (_iter[getIndex(i, j, 0, 0)] == -2) ++nint;
             if (nint == 0) _use_interior = false;
         }
-        // Insert all pixels not yet resolved (centre + any probed interior pixels
-        // are already computed and are skipped).
+        // Insert all pixels to render. Pixels already resolved by the interior
+        // probe get recomputed (a negligible ~1/64 fraction); this avoids relying
+        // on the caller having pre-initialised _iter to EMPTYPIXEL.
         for (int i = 0; i < _h; ++i)
             for (int j = 0; j < _w; ++j)
-                if (_iter[getIndex(i, j, 0, 0)] == EMPTYPIXEL)
-                    s.insert({ i, j, 0, 0 });
+                s.insert({ i, j, 0, 0 });
+        s.erase({ _h / 2, _w / 2, 0, 0 });   // centre already computed by the first createRef
         
         while (!s.empty()) {
             if (_flag_halt) return;
