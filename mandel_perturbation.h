@@ -67,10 +67,11 @@ private:
                     int mx_ref_it, int mxit, Float* glitch_p);
 
     // AVX2 shallow (non-perturbation) Mandelbrot with lane refilling: computes a
-    // whole row of `count` pixels (c = c0re + dxf*j, cim), writing floatPointCompute-
-    // equivalent values into out[0..count).
-    void solveShallowSimdRow(double c0re, double dxf, double cim, int count,
-                             float* out, int mxit, int c_method) const;
+    // LIST of `count` pixels (arbitrary c = cre[k] + i*cim[k]), writing
+    // floatPointCompute-equivalent values into out[0..count). Used for the base row
+    // and the adaptive supersample sub-pixels.
+    void solveShallowSimdList(const double* cre, const double* cim, int count,
+                              float* out, int mxit, int c_method) const;
 
     // Bivariate Linear Approximation (Zhuoran / Fraktaler-3). A BLA skips l
     // reference iterations via dz -> A*dz + B*dc when |dz| < R. _bla[p] holds the

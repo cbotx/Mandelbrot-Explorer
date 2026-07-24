@@ -123,28 +123,28 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
 }
 
 void MandelNavigator::SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method) {
-    float rs = 0, gs = 0, bs = 0;
-    float ws = 0;
-    
+    double rs = 0, gs = 0, bs = 0;
+    double ws = 0;
+    // Average sub-samples in LINEAR light (sRGB-correct), matching getColorAA.
     for (int i = idx - _shift_idx; i <= idx + _shift_idx; i += _w * _sub) {
         for (int j = -_sub / 2; j <= _sub / 2; ++j) {
             float r, g, b;
             getColor(_iter[i + j], r, g, b, _c_method);
-            rs += r * r;
-            gs += g * g;
-            bs += b * b;
+            int ri = (int)(r + 0.5f); if (ri < 0) ri = 0; else if (ri > 255) ri = 255;
+            int gi = (int)(g + 0.5f); if (gi < 0) gi = 0; else if (gi > 255) gi = 255;
+            int bi = (int)(b + 0.5f); if (bi < 0) bi = 0; else if (bi > 255) bi = 255;
+            rs += g_srgb2lin[ri];
+            gs += g_srgb2lin[gi];
+            bs += g_srgb2lin[bi];
             ws += 1;
         }
     }
     rs /= ws;
     gs /= ws;
     bs /= ws;
-    // bitmap_pixel[0] = 255;
-    // bitmap_pixel[1] = 0;
-    // bitmap_pixel[2] = 0;
-    bitmap_pixel[0] = sqrt(rs);
-    bitmap_pixel[1] = sqrt(gs);
-    bitmap_pixel[2] = sqrt(bs);
+    bitmap_pixel[0] = (uint8_t)(srgbEncode(rs) * 255.0 + 0.5);
+    bitmap_pixel[1] = (uint8_t)(srgbEncode(gs) * 255.0 + 0.5);
+    bitmap_pixel[2] = (uint8_t)(srgbEncode(bs) * 255.0 + 0.5);
 }
 
 void MandelNavigator::SetMxit(int mxit) {

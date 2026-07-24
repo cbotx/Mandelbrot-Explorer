@@ -52,21 +52,44 @@ void getColor(float iteration, uint8_t& r, uint8_t& g, uint8_t& b, int method) {
     r = (uint8_t)fr; g = (uint8_t)fg; b = (uint8_t)fb;
 }
 
+// ---- gamma-correct (sRGB linear-light) colour averaging -------------------
+// Averaging in linear light makes a downsampled / analytically-filtered pixel
+// match the physical "view from far" (radiance averages linearly), unlike the
+// previous RMS/gamma-2 approximation.
+float g_srgb2lin[256];
+static bool g_lutReady = false;
+static void initSrgbLut() {
+    for (int i = 0; i < 256; ++i) {
+        double c = i / 255.0;
+        g_srgb2lin[i] = (float)(c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4));
+    }
+    g_lutReady = true;
+}
+static inline double srgb2linF(double v255) {           // fractional sRGB 0..255 -> linear
+    double c = v255 / 255.0; if (c < 0) c = 0; else if (c > 1) c = 1;
+    return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
+}
+float srgbEncode(double L) {                            // linear 0..1 -> sRGB 0..1
+    if (L <= 0.0) return 0.0f;
+    if (L >= 1.0) return 1.0f;
+    return (float)(L <= 0.0031308 ? 12.92 * L : 1.055 * std::pow(L, 1.0 / 2.4) - 0.055);
+}
+static inline double enc255(double L) { return srgbEncode(L) * 255.0; }
+
 // ---- analytic anti-aliasing (gradient-based palette prefiltering) ----------
-// The GUI's supersampling averages colours in squared (RMS / gamma-2 linear)
-// space, so the analytic filter integrates palette SQUARES and returns the RMS
-// to stay consistent with the supersampled path.
-static double g_palInt[3][colP + 1];   // prefix sum of color_map^2, [colP] = full sum
-static double g_palMean[3];            // RMS of the whole palette (full-cycle limit)
+// Integrates the palette in LINEAR light so the analytic average is gamma-correct
+// and consistent with the supersampled (SmoothColor) path.
+static double g_palInt[3][colP + 1];   // prefix sum of linear(color_map), [colP] = full sum
+static double g_palMean[3];            // sRGB(mean linear) of the whole palette (full-cycle limit)
 
 void prepareColorFilter() {
+    if (!g_lutReady) initSrgbLut();
     for (int c = 0; c < 3; ++c) {
         double s = 0; g_palInt[c][0] = 0;
         for (int i = 0; i < colP; ++i) {
-            double v = color_map[c][i];
-            s += v * v; g_palInt[c][i + 1] = s;
+            s += srgb2linF(color_map[c][i]); g_palInt[c][i + 1] = s;
         }
-        g_palMean[c] = std::sqrt(s / colP);
+        g_palMean[c] = enc255(s / colP);
     }
 }
 
@@ -103,18 +126,18 @@ void getColorAA(float v, float vL, float vR, float vU, float vD,
         r = (uint8_t)color_map[0][x]; g = (uint8_t)color_map[1][x]; b = (uint8_t)color_map[2][x];
         return;
     }
-    if (width >= colP) {                                 // >= a full cycle: palette RMS
+    if (width >= colP) {                                 // >= a full cycle: palette mean
         r = (uint8_t)g_palMean[0]; g = (uint8_t)g_palMean[1]; b = (uint8_t)g_palMean[2];
         return;
     }
     double a = centerU - 0.5 * width, e = centerU + 0.5 * width;
-    auto rms = [&](int c) {
-        double m = (palPrefix(c, e) - palPrefix(c, a)) / width;   // mean of squares
+    auto avg = [&](int c) {
+        double m = (palPrefix(c, e) - palPrefix(c, a)) / width;   // mean linear radiance
         if (m < 0) m = 0;                                          // guard fp cancellation
-        double s = std::sqrt(m);
+        double s = enc255(m);                                      // encode back to sRGB
         return s > 255.0 ? 255.0f : (float)s;
     };
-    r = (uint8_t)rms(0); g = (uint8_t)rms(1); b = (uint8_t)rms(2);
+    r = (uint8_t)avg(0); g = (uint8_t)avg(1); b = (uint8_t)avg(2);
 }
 
 void rgbRotate(float& r, float& g, float& b, float rad) {

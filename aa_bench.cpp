@@ -45,14 +45,25 @@ static void getColor(float it, float& r, float& g, float& b) {
     r = color_map[0][x]; g = color_map[1][x]; b = color_map[2][x];
 }
 
+// ---- sRGB linear-light averaging (matches win32_main.cpp) ------------------
+static inline double srgb2linF(double v255) {
+    double c = v255 / 255.0; if (c < 0) c = 0; else if (c > 1) c = 1;
+    return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
+}
+static inline double srgbEncode(double L) {
+    if (L <= 0.0) return 0.0; if (L >= 1.0) return 1.0;
+    return L <= 0.0031308 ? 12.92 * L : 1.055 * std::pow(L, 1.0 / 2.4) - 0.055;
+}
+static inline double enc255(double L) { return srgbEncode(L) * 255.0; }
+
 // ---- analytic AA (must mirror win32_main.cpp exactly) ----------------------
 static double g_palInt[3][colP + 1];
 static double g_palMean[3];
 static void prepareColorFilter() {
     for (int c = 0; c < 3; ++c) {
         double s = 0; g_palInt[c][0] = 0;
-        for (int i = 0; i < colP; ++i) { double v = color_map[c][i]; s += v * v; g_palInt[c][i + 1] = s; }
-        g_palMean[c] = std::sqrt(s / colP);
+        for (int i = 0; i < colP; ++i) { s += srgb2linF(color_map[c][i]); g_palInt[c][i + 1] = s; }
+        g_palMean[c] = enc255(s / colP);
     }
 }
 static double palPrefix(int c, double x) {
@@ -82,13 +93,13 @@ static void getColorAA(float v, float vL, float vR, float vU, float vD, float& r
     }
     if (width >= colP) { r = g_palMean[0]; g = g_palMean[1]; b = g_palMean[2]; return; }
     double a = centerU - 0.5 * width, e = centerU + 0.5 * width;
-    auto rms = [&](int c) {
+    auto avg = [&](int c) {
         double m = (palPrefix(c, e) - palPrefix(c, a)) / width;
         if (m < 0) m = 0;
-        double s = std::sqrt(m);
+        double s = enc255(m);
         return s > 255.0 ? 255.0f : (float)s;
     };
-    r = rms(0); g = rms(1); b = rms(2);
+    r = avg(0); g = avg(1); b = avg(2);
 }
 
 static void writeBMP(const char* path, const std::vector<uint8_t>& rgb, int W, int H) {
@@ -134,6 +145,26 @@ static bool colorBlock(const float* it, int W, int sub, int i, int j,
     int idx = (i * sub + c) * stride + (j * sub + c);
     if (it[idx] == EMPTYPIXEL) { r = g = b = 0; return false; }
     if (it[idx - (stride + 1) * c] != EMPTYPIXEL) {          // flagged
+        double rl = 0, gl = 0, bl = 0; int n = 0;
+        for (int a = -c; a <= c; ++a)
+            for (int bb = -c; bb <= c; ++bb) {
+                float rr, gg, bbb; getColor(it[idx + a * stride + bb], rr, gg, bbb);
+                rl += srgb2linF(rr); gl += srgb2linF(gg); bl += srgb2linF(bbb); n++;
+            }
+        r = (float)enc255(rl / n); g = (float)enc255(gl / n); b = (float)enc255(bl / n);
+        return true;
+    }
+    getColor(it[idx], r, g, b);                              // uniform: centre
+    return false;
+}
+
+// RMS (gamma-2) variant of colorBlock, i.e. the OLD averaging, for A/B comparison.
+static void colorBlockRMS(const float* it, int W, int sub, int i, int j,
+                          float& r, float& g, float& b) {
+    int c = sub / 2, stride = W * sub;
+    int idx = (i * sub + c) * stride + (j * sub + c);
+    if (it[idx] == EMPTYPIXEL) { r = g = b = 0; return; }
+    if (it[idx - (stride + 1) * c] != EMPTYPIXEL) {
         double r2 = 0, g2 = 0, b2 = 0; int n = 0;
         for (int a = -c; a <= c; ++a)
             for (int bb = -c; bb <= c; ++bb) {
@@ -141,10 +172,9 @@ static bool colorBlock(const float* it, int W, int sub, int i, int j,
                 r2 += rr * rr; g2 += gg * gg; b2 += bbb * bbb; n++;
             }
         r = (float)std::sqrt(r2 / n); g = (float)std::sqrt(g2 / n); b = (float)std::sqrt(b2 / n);
-        return true;
+        return;
     }
-    getColor(it[idx], r, g, b);                              // uniform: centre
-    return false;
+    getColor(it[idx], r, g, b);
 }
 
 // Like colorBlock, but each sub-sample is itself analytic-AA filtered using its
@@ -168,9 +198,9 @@ static bool colorBlockAA(const float* it, int W, int H, int sub, int i, int j,
             float vU = si > 0          ? it[sidx - stride] : EMPTYPIXEL;
             float vD = si < rowmax - 1 ? it[sidx + stride] : EMPTYPIXEL;
             float rr, gg, bbb; getColorAA(v, vL, vR, vU, vD, rr, gg, bbb);
-            r2 += rr * rr; g2 += gg * gg; b2 += bbb * bbb; n++;
+            r2 += srgb2linF(rr); g2 += srgb2linF(gg); b2 += srgb2linF(bbb); n++;
         }
-    r = (float)std::sqrt(r2 / n); g = (float)std::sqrt(g2 / n); b = (float)std::sqrt(b2 / n);
+    r = (float)enc255(r2 / n); g = (float)enc255(g2 / n); b = (float)enc255(b2 / n);
     return true;
 }
 
@@ -179,17 +209,17 @@ static bool colorBlockAA(const float* it, int W, int H, int sub, int i, int j,
 static void sampleGrid(const float* it, int W, int GTsub, int s, int i, int j,
                        float& r, float& g, float& b, double& sd) {
     int stride = W * GTsub;
-    double r2=0,g2=0,b2=0, sr=0,sg=0,sb=0; int n=0;
+    double rl=0,gl=0,bl=0, s2=0,sm=0; int n=0;
     for (int k = 0; k < s; ++k)
         for (int l = 0; l < s; ++l) {
             int rr = (int)((k + 0.5) * GTsub / s), cc = (int)((l + 0.5) * GTsub / s);
             int sidx = (i * GTsub + rr) * stride + (j * GTsub + cc);
             float R,G,B; getColor(it[sidx], R,G,B);
-            r2+=R*R; g2+=G*G; b2+=B*B; sr+=R; sg+=G; sb+=B; n++;
+            rl+=srgb2linF(R); gl+=srgb2linF(G); bl+=srgb2linF(B);
+            double lum = 0.299*R + 0.587*G + 0.114*B; s2 += lum*lum; sm += lum; n++;
         }
-    r=(float)std::sqrt(r2/n); g=(float)std::sqrt(g2/n); b=(float)std::sqrt(b2/n);
-    double vr=r2/n-sr*sr/((double)n*n), vg=g2/n-sg*sg/((double)n*n), vb=b2/n-sb*sb/((double)n*n);
-    double v=std::max(vr,std::max(vg,vb)); sd=std::sqrt(v>0?v:0);
+    r=(float)enc255(rl/n); g=(float)enc255(gl/n); b=(float)enc255(bl/n);
+    double vv = s2/n - (sm/n)*(sm/n); sd = std::sqrt(vv > 0 ? vv : 0);
 }
 
 int main(int argc, char** argv) {
@@ -226,6 +256,7 @@ int main(int argc, char** argv) {
     std::vector<float> gtF(W*H*3);
     std::vector<char> gtFlag(W*H, 0);
     double sP=0,sA=0,sF=0,sD=0,sE=0, mP=0,mA=0,mF=0,mD=0,mE=0; long cnt=0, ssPix=0, gtSS=0;
+    double sRms=0, mRms=0;   // OLD RMS/gamma-2 GT vs correct sRGB-linear GT
 
     const int cG = GTsub/2, strideG = W*GTsub;
     for (int i = 0; i < H; ++i)
@@ -235,6 +266,10 @@ int main(int argc, char** argv) {
             gtFlag[i*W+j] = gflag ? 1 : 0;
             float* gf = &gtF[(i*W+j)*3]; gf[0]=Gr; gf[1]=Gg; gf[2]=Gb;
             uint8_t* pG=&imgG[(i*W+j)*3]; pG[0]=(uint8_t)(Gr+.5f);pG[1]=(uint8_t)(Gg+.5f);pG[2]=(uint8_t)(Gb+.5f);
+            // OLD RMS/gamma-2 downsample of the same high-SS grid, for A/B accuracy.
+            float Rr,Rg,Rb; colorBlockRMS(gtIt, W, GTsub, i, j, Rr,Rg,Rb);
+            sRms += (std::fabs(Rr-Gr)+std::fabs(Rg-Gg)+std::fabs(Rb-Gb))/3.0;
+            if (std::fabs(Rr-Gr)>mRms) mRms=std::fabs(Rr-Gr);
 
             // --- point + AA, from the GT grid centre subpixel (same centring)
             int idx = (i*GTsub+cG)*strideG + (j*GTsub+cG);
@@ -295,6 +330,8 @@ int main(int argc, char** argv) {
     writeBMP("adaptive_saa.bmp", imgE, W, H);
 
     printf("GT boundary pixels supersampled: %.1f%%\n", 100.0*gtSS/cnt);
+    printf("OLD RMS/gamma-2 avg vs correct sRGB-linear avg (both %dx SS): mean=%.2f max=%.1f  <- color-accuracy gain\n",
+           GTsub, sRms/cnt, mRms);
     printf("mean |err| vs GT (0..255):\n");
     printf("   point                 = %6.2f   (max %.1f)\n", sP/cnt, mP);
     printf("   analytic AA           = %6.2f   (max %.1f)\n", sA/cnt, mA);

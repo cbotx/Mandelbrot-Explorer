@@ -26,6 +26,13 @@ void prepareColorFilter();
 void getColorAA(float v, float vL, float vR, float vU, float vD,
                 uint8_t& r, uint8_t& g, uint8_t& b, int c_method=0);
 
+// Gamma-correct (sRGB) averaging: colours are averaged in LINEAR light so a
+// downsampled pixel matches what the eye sees "from far away" (radiance averages
+// linearly). g_srgb2lin maps an 8-bit sRGB value to linear [0,1]; srgbEncode maps
+// linear [0,1] back to an sRGB [0,255] value.
+extern float g_srgb2lin[256];
+float srgbEncode(double lin);
+
 void rgbRotate(float& fr, float& fg, float& fb, float rad);
 
 #endif

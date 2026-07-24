@@ -184,14 +184,15 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method)
 
 }
 
-// AVX2 shallow Mandelbrot with lane refilling: processes a whole row of `count`
-// pixels 4-wide, and the moment a lane escapes/goes interior/hits mxit it is
-// immediately reloaded with the next pending pixel, so no SIMD lane idles on the
-// divergent boundary (the reason a naive 4-at-a-time SIMD is slower than scalar).
-// Writes floatPointCompute-equivalent values (raw EDE distance / smooth iter / -2)
-// into out[0..count).
-void Mandel::solveShallowSimdRow(double c0re, double dxf, double cim, int count,
-                                 float* out, int mxit, int c_method) const {
+// AVX2 shallow Mandelbrot with lane refilling: processes a LIST of `count` pixels
+// (arbitrary c = cre[k] + i*cim[k]) 4-wide, and the moment a lane escapes/goes
+// interior/hits mxit it is immediately reloaded with the next pending pixel, so no
+// SIMD lane idles on the divergent boundary (the reason a naive 4-at-a-time SIMD is
+// slower than scalar). Writes floatPointCompute-equivalent values (raw EDE distance
+// / smooth iter / -2) into out[0..count). Used for both the base row and the
+// adaptive supersample sub-pixels.
+void Mandel::solveShallowSimdList(const double* cre, const double* cim, int count,
+                                  float* out, int mxit, int c_method) const {
     const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
     const double ESC2 = (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS;
     const double LG2 = log(2.0);
@@ -203,7 +204,7 @@ void Mandel::solveShallowSimdRow(double c0re, double dxf, double cim, int count,
     int lanePix[4]; int next = 0, activeCount = 0;
     auto loadLane = [&](int l) {
         if (next < count) {
-            cr_[l] = c0re + dxf * next; ci_[l] = cim;
+            cr_[l] = cre[next]; ci_[l] = cim[next];
             zr_[l] = cr_[l]; zi_[l] = ci_[l];
             dr_[l] = 2; di_[l] = 0; dcr_[l] = 1; dci_[l] = 0; jv_[l] = 1;
             lanePix[l] = next++; ++activeCount;
@@ -434,8 +435,10 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             if (_flag_halt) continue;
             Float cim = c0_im_f + dy_f * i;
             if (simd0) {
+                std::vector<double> cre(_w), cimv(_w);
                 std::vector<float> row(_w);
-                solveShallowSimdRow(c0_re_f, dx_f, cim, _w, row.data(), mxit, c_method);
+                for (int j = 0; j < _w; ++j) { cre[j] = c0_re_f + dx_f * j; cimv[j] = cim; }
+                solveShallowSimdList(cre.data(), cimv.data(), _w, row.data(), mxit, c_method);
                 for (int j = 0; j < _w; ++j) {
                     double val = row[j];
                     if (ede && val >= 0) val /= dx_f;
@@ -604,18 +607,43 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         Float c0_im_f = mpf_get_ld(_c0_im);
         Float dx_f = mpf_get_ld(_dx);
         Float dy_f = mpf_get_ld(_dy);
+        static int simd0 = -1;
+        if (simd0 < 0) { const char* e = getenv("MANDEL_SIMD"); simd0 = e ? atoi(e) : 1; }
+        const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
+        const int nsub = _sub * _sub;
 #pragma omp parallel for schedule(dynamic, 1)
         for (int i = 0; i < v.size(); ++i) {
             if (_flag_halt) continue;
-            for (int xi = -_sub / 2; xi <= _sub / 2; ++xi) {
-                for (int yi = -_sub / 2; yi <= _sub / 2; ++yi) {
-                    if (xi == 0 && yi == 0) continue;
-                    std::array<int, 4> arr = { v[i][0], v[i][1], yi, xi };
-                    double iteration = floatPointCompute(c0_re_f + dx_f * v[i][1] + dx_f * xi / _sub, c0_im_f + dy_f * v[i][0] + dy_f * yi / _sub, mxit, c_method);
-                    if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
-                        if (iteration >= 0) iteration /= dx_f;
+            if (simd0 && nsub <= 128) {
+                // gather this flagged pixel's sub^2-1 subpixel c-coords, solve 4-wide
+                double cre[128], cim[128]; float out[128];
+                std::array<int, 4> arrs[128];
+                int cnt = 0;
+                for (int xi = -_sub / 2; xi <= _sub / 2; ++xi)
+                    for (int yi = -_sub / 2; yi <= _sub / 2; ++yi) {
+                        if (xi == 0 && yi == 0) continue;
+                        cre[cnt] = c0_re_f + dx_f * v[i][1] + dx_f * xi / _sub;
+                        cim[cnt] = c0_im_f + dy_f * v[i][0] + dy_f * yi / _sub;
+                        arrs[cnt] = { v[i][0], v[i][1], yi, xi };
+                        ++cnt;
                     }
-                    setPixel(arr, iteration);
+                solveShallowSimdList(cre, cim, cnt, out, mxit, c_method);
+                for (int k = 0; k < cnt; ++k) {
+                    double it = out[k];
+                    if (ede && it >= 0) it /= dx_f;
+                    setPixel(arrs[k], it);
+                }
+            } else {
+                for (int xi = -_sub / 2; xi <= _sub / 2; ++xi) {
+                    for (int yi = -_sub / 2; yi <= _sub / 2; ++yi) {
+                        if (xi == 0 && yi == 0) continue;
+                        std::array<int, 4> arr = { v[i][0], v[i][1], yi, xi };
+                        double iteration = floatPointCompute(c0_re_f + dx_f * v[i][1] + dx_f * xi / _sub, c0_im_f + dy_f * v[i][0] + dy_f * yi / _sub, mxit, c_method);
+                        if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
+                            if (iteration >= 0) iteration /= dx_f;
+                        }
+                        setPixel(arr, iteration);
+                    }
                 }
             }
         }
