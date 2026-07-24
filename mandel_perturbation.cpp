@@ -835,6 +835,9 @@ void Mandel::buildBLA(int reflen) {
         }
         _bla.push_back(std::move(nxt));   // odd leftover dropped; still available lower
     }
+    if (getenv("MANDEL_PROFILE"))
+        fprintf(stderr, "  [profile] buildBLA: reflen=%d levels=%zu dcmax=%.3e rmax=%.3e |Z1|=%.3e SA_it=%d SA_order=%d\n",
+                reflen, _bla.size(), dcmax, sqrt(_bla_rmax2), sqrt(_zfr[1] * _zfr[1] + _zfi[1] * _zfi[1]), _SA_it, _SA_order);
 }
 
 // Largest valid BLA starting at reference index s. Levels have skip 2^p and start
@@ -857,7 +860,7 @@ int Mandel::tryBLA(int s, double& dzr, double& dzi, double dcr, double dci,
         const BLAEntry& b = _bla[p][i];
         if (b.r2 <= 0 || zmag2 >= b.r2) continue;           // radius too small -> smaller skip
         int land = s + b.l;                                 // dz lands at ref index `land`
-        if (land >= mx_ref_it) continue;                    // don't overshoot the ref-end rebase
+        if (land >= mx_ref_it - 1) continue;                // leave one step of headroom before the ref-end rebase
         double nzr = b.ar * dzr - b.ai * dzi + b.br * dcr - b.bi * dci;
         double nzi = b.ar * dzi + b.ai * dzr + b.br * dci + b.bi * dcr;
         if (!g_bla_noescape) {
