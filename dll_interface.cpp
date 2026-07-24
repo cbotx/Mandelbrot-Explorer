@@ -1,4 +1,4 @@
-#include <mpir.h>
+#include <gmp.h>
 
 #include "mandel_perturbation.h"
 #include "dll_interface.h"

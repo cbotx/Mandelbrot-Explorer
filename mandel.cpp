@@ -2,7 +2,7 @@
 #include <iomanip>
 #include <math.h>
 #include <string>
-#include <mpir.h>
+#include <gmp.h>
 #include <chrono>
 #include <bitset>
 

@@ -1,6 +1,6 @@
 #include <stdint.h>
 #include <iostream>
-#include <mpir.h>
+#include <gmp.h>
 #include <thread>
 #include <mutex>
 #include <chrono>

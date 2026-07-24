@@ -2,11 +2,12 @@
 #define __MANDEL_PERTURBATION_H__
 
 #include <complex>
-#include <mpir.h>
+#include <gmp.h>
 
 #include <set>
 #include <algorithm>
 #include <array>
+#include <vector>
 
 constexpr float EMPTYPIXEL = -10;
 
@@ -23,13 +24,19 @@ enum ColoringMethod {
 
 class Mandel {
 public:
-    typedef long double Float;
+    typedef double Float;
     typedef std::complex<Float> Comp;
 public:
     Mandel(int width, int height, int max_iteration, int sub, float* iter);
     virtual ~Mandel();
 
     void Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method = 0);
+    // Verification helper: brute-force high-precision escape time into out[],
+    // reusing the grid (_c0/_dx/_dy) set by the most recent Compute() call.
+    // step>1 samples only pixels on a (step x step) grid (others left untouched)
+    // so the O(mxit) full-precision oracle stays feasible at extreme depth.
+    // Requires sub == 1.
+    void ComputeDirect(int mxit, float* out, int step = 1, int c_method = 0);
     void Output(char fname[]) const;
     void setPrecision(int precision);
     HPComp getHighIterationPoint() const;
@@ -50,6 +57,31 @@ private:
 
     void setPixel(std::array<int, 4> p, float iteration) const;
     void stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mxit, int c_method = 0);
+    // AVX2 kernel: iterate a group of up to 4 pixels (non-EDE path). Mirrors the
+    // scalar delta loop op-for-op so results are bit-identical. lanes<=4.
+    void solveSimd4(const std::array<int, 4>* v, int g, int lanes,
+                    const double* dcr, const double* dci,
+                    const double* dzr, const double* dzi,
+                    int mx_ref_it, int mxit, Float* glitch_p);
+
+    // Bivariate Linear Approximation (Zhuoran / Fraktaler-3). A BLA skips l
+    // reference iterations via dz -> A*dz + B*dc when |dz| < R. _bla[p] holds the
+    // level-p table (skip 2^p) built by pairwise merging from the reference orbit.
+    struct BLAEntry { double ar, ai, br, bi, r2; int l; };
+    std::vector<std::vector<BLAEntry>> _bla;
+    double _bla_eps = 0.0;
+    bool _use_bla = false;
+    int _bla_minlevel = 0;        // only apply BLAs with skip >= 2^_bla_minlevel
+    bool _ref_bounded = false;    // reference orbit never escapes (minibrot center)
+    bool _use_interior = false;   // periodicity-based interior detection
+    double _interior_eps2 = 0.0;  // |z_n - z_saved|^2 threshold for a detected cycle
+    int _interior_confirm = 30;   // consecutive shrinking periods required to confirm
+    void buildBLA(int reflen);
+    // Try the largest valid BLA starting at reference index s; on success updates
+    // dz and returns the skip (>0), else returns 0. Rejects skips that would land
+    // escaped or past mx_ref_it.
+    int tryBLA(int s, double& dzr, double& dzi, double dcr, double dci,
+               double ESC2, int mx_ref_it) const;
     int createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random, int c_method = 0);
     bool calCoefficient(int i, int pr_it, int c_method = 0);
     int SACheckMagnitude() const;
@@ -69,7 +101,7 @@ private:
     const int _w, _h;
     const int _mxit;
     mpf_t* _z_re, * _z_im;  // reference orbit
-    Comp* _zf, * _delta_0;
+    Comp* _zf;
 
     // Exterior DE
     mpf_t* _d_re, * _d_im;

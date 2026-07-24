@@ -2,7 +2,7 @@
 #define __MANDEL_NAVIGATOR_H__
 
 
-#include <mpir.h>
+#include <gmp.h>
 #include <future>
 
 #include "navigator.h"

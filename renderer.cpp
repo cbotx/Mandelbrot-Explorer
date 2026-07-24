@@ -27,7 +27,7 @@ void Renderer::outputImage(int w, int h, int sub, float* iter, char fname[]) {
 }
 
 void Renderer::mixColor(uint8_t* img, float* iter, std::array<int, 2> p, int w) const {
-    float rs, gs, bs;
+    float rs = 0, gs = 0, bs = 0;
     float ws = 0;
 
     for (int i = -1; i <= 1; ++i) {

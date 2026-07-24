@@ -1,4 +1,4 @@
-#include <mpir.h>
+#include <gmp.h>
 #include <future>
 
 #include "navigator.h"
@@ -108,7 +108,7 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
 }
 
 void MandelNavigator::SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method) {
-    float rs, gs, bs;
+    float rs = 0, gs = 0, bs = 0;
     float ws = 0;
     
     for (int i = idx - _shift_idx; i <= idx + _shift_idx; i += _w * _sub) {
