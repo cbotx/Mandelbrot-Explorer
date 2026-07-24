@@ -103,7 +103,8 @@ int main(int argc, char** argv) {
 
     printf("Rendering %dx%d (SS=%d -> %dx%d), scale=1e%d, mxit=%d, prec=%d ...\n",
            W, H, SS, Ws, Hs, scaleExp, mxit, precision);
-    mandel.Compute(mcx, mcy, msc, mxit, 0);
+    int cmethod = (getenv("MANDEL_EDE") && atoi(getenv("MANDEL_EDE"))) ? ColoringMethod::EXTERIOR_DIST_EST : 0;
+    mandel.Compute(mcx, mcy, msc, mxit, cmethod);
 
     // Colour hi-res, box-downsample SSxSS in linear light.
     std::vector<uint8_t> img(W * H * 3);

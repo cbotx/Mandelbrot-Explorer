@@ -41,6 +41,10 @@ public:
     void UpdateBitmap(uint8_t* bitmap);
 
     void SetMxit(int mxit);
+
+    // Zoom-adaptive iteration cap: shallow views need far fewer iterations than the
+    // flat 500k default, which is the main base-render cost. Derived from the scale.
+    int SuggestMxit();
     
     int GetCMethod();
 

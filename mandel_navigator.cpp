@@ -151,6 +151,15 @@ void MandelNavigator::SetMxit(int mxit) {
     _mxit = mxit;
 }
 
+int MandelNavigator::SuggestMxit() {
+    int bits = get_exp(_scale);            // ~log2(zoom); 0 at the full view
+    if (bits < 0) bits = -bits;
+    int m = 1000 + 150 * bits;             // e.g. zoom 7e4 -> ~3400, 1e30 -> ~16000
+    if (m < 1000) m = 1000;
+    if (m > 1000000) m = 1000000;
+    return m;
+}
+
 int MandelNavigator::GetCMethod() {
     return _c_method;
 }

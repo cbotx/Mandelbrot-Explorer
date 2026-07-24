@@ -258,6 +258,7 @@ public:
 
     // state
     int maxIter = 500000;
+    bool autoMax = true;   // zoom-adaptive iteration cap (disabled on manual edit)
     bool ssOn = false, edeOn = true;
     int presetIdx = 0; // 0 snowy, 1 sunrise
     bool navDragging = false, wasComputing = false;
@@ -350,6 +351,7 @@ public:
         startRender();
     }
     void startRender() {
+        if (autoMax) { maxIter = nav->SuggestMxit(); nav->SetMxit(maxIter); }
         renderStart = std::chrono::steady_clock::now();
         wasComputing = true;
         nav->StartCompute();
@@ -366,6 +368,7 @@ public:
     // ---- value mapping ----
     double maxToT() const { return std::clamp((log10((double)maxIter) - 2.0) / 4.0, 0.0, 1.0); }
     void setMaxFromT(double t, bool render) {
+        autoMax = false;   // slider is a manual override
         maxIter = (int)std::round(pow(10.0, 2.0 + 4.0 * std::clamp(t, 0.0, 1.0)));
         maxIter = std::clamp(maxIter, 100, 1000000);
         nav->SetMxit(maxIter);
@@ -478,9 +481,8 @@ public:
     void commitMaxEdit() {
         if (!maxEditing) return;
         maxEditing = false;
-        int v = maxBuf.empty() ? maxIter : _wtoi(maxBuf.c_str());
-        maxIter = std::clamp(v, 100, 1000000);
-        nav->SetMxit(maxIter);
+        if (maxBuf.empty()) { autoMax = true; }          // empty commit -> back to auto
+        else { autoMax = false; maxIter = std::clamp(_wtoi(maxBuf.c_str()), 100, 1000000); nav->SetMxit(maxIter); }
         startRender();
     }
 
@@ -570,7 +572,7 @@ public:
                  DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
 
         // max iterations
-        label(dc, rcMaxField.left - S(140), rcMaxField.top + S(4), L"Max iterations");
+        label(dc, rcMaxField.left - S(140), rcMaxField.top + S(4), autoMax ? L"Max iterations (auto)" : L"Max iterations");
         {
             bool hov = hover == H_MAXFIELD || maxEditing;
             fillRound(dc, rcMaxField, hov ? CLR_CARD_HOV : CLR_CARD,

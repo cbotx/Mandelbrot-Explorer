@@ -184,6 +184,90 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method)
 
 }
 
+// AVX2 shallow Mandelbrot with lane refilling: processes a whole row of `count`
+// pixels 4-wide, and the moment a lane escapes/goes interior/hits mxit it is
+// immediately reloaded with the next pending pixel, so no SIMD lane idles on the
+// divergent boundary (the reason a naive 4-at-a-time SIMD is slower than scalar).
+// Writes floatPointCompute-equivalent values (raw EDE distance / smooth iter / -2)
+// into out[0..count).
+void Mandel::solveShallowSimdRow(double c0re, double dxf, double cim, int count,
+                                 float* out, int mxit, int c_method) const {
+    const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
+    const double ESC2 = (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS;
+    const double LG2 = log(2.0);
+    const __m256d two = _mm256_set1_pd(2.0), one = _mm256_set1_pd(1.0);
+    const __m256d ESC2v = _mm256_set1_pd(ESC2), intEps = _mm256_set1_pd(1e-9);
+    const __m256d mxitv = _mm256_set1_pd((double)mxit);
+
+    alignas(32) double cr_[4], ci_[4], zr_[4], zi_[4], dr_[4], di_[4], dcr_[4], dci_[4], jv_[4];
+    int lanePix[4]; int next = 0, activeCount = 0;
+    auto loadLane = [&](int l) {
+        if (next < count) {
+            cr_[l] = c0re + dxf * next; ci_[l] = cim;
+            zr_[l] = cr_[l]; zi_[l] = ci_[l];
+            dr_[l] = 2; di_[l] = 0; dcr_[l] = 1; dci_[l] = 0; jv_[l] = 1;
+            lanePix[l] = next++; ++activeCount;
+        } else {
+            cr_[l] = ci_[l] = zr_[l] = zi_[l] = di_[l] = dci_[l] = 0;
+            dr_[l] = 2; dcr_[l] = 1; jv_[l] = 1; lanePix[l] = -1;
+        }
+    };
+    for (int l = 0; l < 4; ++l) loadLane(l);
+
+    __m256d cr = _mm256_load_pd(cr_), ci = _mm256_load_pd(ci_);
+    __m256d zr = _mm256_load_pd(zr_), zi = _mm256_load_pd(zi_);
+    __m256d dr = _mm256_load_pd(dr_), di = _mm256_load_pd(di_);
+    __m256d dcr = _mm256_load_pd(dcr_), dci = _mm256_load_pd(dci_);
+    __m256d jv = _mm256_load_pd(jv_);
+
+    while (activeCount > 0) {
+        // one iteration i = jv:  d'=2zd, dc'=2z*dc+1, z'=z^2+c   (all from old z)
+        __m256d ndr = _mm256_mul_pd(two, _mm256_sub_pd(_mm256_mul_pd(dr, zr), _mm256_mul_pd(di, zi)));
+        __m256d ndi = _mm256_mul_pd(two, _mm256_add_pd(_mm256_mul_pd(dr, zi), _mm256_mul_pd(di, zr)));
+        __m256d ndcr = _mm256_add_pd(_mm256_mul_pd(two, _mm256_sub_pd(_mm256_mul_pd(dcr, zr), _mm256_mul_pd(dci, zi))), one);
+        __m256d ndci = _mm256_mul_pd(two, _mm256_add_pd(_mm256_mul_pd(dcr, zi), _mm256_mul_pd(dci, zr)));
+        __m256d nzr = _mm256_add_pd(_mm256_sub_pd(_mm256_mul_pd(zr, zr), _mm256_mul_pd(zi, zi)), cr);
+        __m256d nzi = _mm256_add_pd(_mm256_mul_pd(two, _mm256_mul_pd(zr, zi)), ci);
+        zr = nzr; zi = nzi; dr = ndr; di = ndi; dcr = ndcr; dci = ndci;
+
+        __m256d zrad = _mm256_add_pd(_mm256_mul_pd(zr, zr), _mm256_mul_pd(zi, zi));
+        __m256d dmag = _mm256_add_pd(_mm256_mul_pd(dr, dr), _mm256_mul_pd(di, di));
+        __m256d jnext = _mm256_add_pd(jv, one);
+        int em = _mm256_movemask_pd(_mm256_cmp_pd(zrad, ESC2v, _CMP_GT_OQ));
+        int im = _mm256_movemask_pd(_mm256_cmp_pd(dmag, intEps, _CMP_LT_OQ));
+        int jm = _mm256_movemask_pd(_mm256_cmp_pd(jnext, mxitv, _CMP_GE_OQ));
+        int actmask = (lanePix[0] >= 0) | ((lanePix[1] >= 0) << 1) | ((lanePix[2] >= 0) << 2) | ((lanePix[3] >= 0) << 3);
+        int need = (em | im | jm) & actmask;
+        if (need == 0) { jv = jnext; continue; }        // fast path: advance i, no scalar work
+
+        // slow path: finish + refill the lanes that ended this iteration.
+        alignas(32) double zrad_[4], dcr2_[4], dci2_[4];
+        _mm256_store_pd(zrad_, zrad); _mm256_store_pd(dcr2_, dcr); _mm256_store_pd(dci2_, dci);
+        _mm256_store_pd(cr_, cr); _mm256_store_pd(ci_, ci);
+        _mm256_store_pd(zr_, zr); _mm256_store_pd(zi_, zi);
+        _mm256_store_pd(dr_, dr); _mm256_store_pd(di_, di);
+        _mm256_store_pd(dcr_, dcr); _mm256_store_pd(dci_, dci);
+        _mm256_store_pd(jv_, jv);
+        for (int l = 0; l < 4; ++l) {
+            if (lanePix[l] < 0) continue;
+            bool fin = false; float res = -2.0f;
+            if (em & (1 << l)) {
+                if (ede) res = (float)(sqrt(zrad_[l]) * log(zrad_[l]) / sqrt(dcr2_[l]*dcr2_[l] + dci2_[l]*dci2_[l]));
+                else     res = (float)(jv_[l] + 1 - log(log(zrad_[l]) / 2 / LG2) / LG2);
+                fin = true;
+            } else if (im & (1 << l)) { res = -2.0f; fin = true; }
+            else if (jm & (1 << l)) { res = -2.0f; fin = true; }
+            if (fin) { out[lanePix[l]] = res; --activeCount; loadLane(l); }
+            else jv_[l] += 1;
+        }
+        cr = _mm256_load_pd(cr_); ci = _mm256_load_pd(ci_);
+        zr = _mm256_load_pd(zr_); zi = _mm256_load_pd(zi_);
+        dr = _mm256_load_pd(dr_); di = _mm256_load_pd(di_);
+        dcr = _mm256_load_pd(dcr_); dci = _mm256_load_pd(dci_);
+        jv = _mm256_load_pd(jv_);
+    }
+}
+
 float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_method) const {
     mpf_t t1, t2;
     mpf_init(t1);
@@ -322,15 +406,47 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         Float c0_im_f = mpf_get_ld(_c0_im);
         Float dx_f = mpf_get_ld(_dx);
         Float dy_f = mpf_get_ld(_dy);
+        static int simd0 = -1;
+        if (simd0 < 0) { const char* e = getenv("MANDEL_SIMD"); simd0 = e ? atoi(e) : 1; }
+        const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
+        // Coarse-to-fine: a ~1/16-work strided pass paints the whole frame with a
+        // blocky preview (picked up immediately by the async display) before the
+        // full-resolution pass below sharpens it. ~instant feedback on every view.
+        static int coarse_on = -1;
+        if (coarse_on < 0) { const char* e = getenv("MANDEL_COARSE"); coarse_on = e ? atoi(e) : 1; }
+        if (coarse_on && !_flag_halt) {
+            const int C = 4;
+#pragma omp parallel for schedule(dynamic, 2)
+            for (int ci = 0; ci < _h; ci += C) {
+                if (_flag_halt) continue;
+                Float cim = c0_im_f + dy_f * ci;
+                for (int cj = 0; cj < _w; cj += C) {
+                    double val = floatPointCompute(c0_re_f + dx_f * cj, cim, mxit, c_method);
+                    if (ede && val >= 0) val /= dx_f;
+                    for (int bi = ci; bi < ci + C && bi < _h; ++bi)
+                        for (int bj = cj; bj < cj + C && bj < _w; ++bj)
+                            _iter[getIndex(bi, bj, 0, 0)] = (float)val;
+                }
+            }
+        }
 #pragma omp parallel for schedule(dynamic, 1)
         for (int i = 0; i < _h; ++i) {
             if (_flag_halt) continue;
-            for (int j = 0; j < _w; ++j) {
-                if (_flag_halt) break;
-                int idx = getIndex(i, j, 0, 0);
-                _iter[idx] = floatPointCompute(c0_re_f + dx_f * j, c0_im_f + dy_f * i, mxit, c_method);
-                if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
-                    if (_iter[idx] >= 0) _iter[idx] /= dx_f;
+            Float cim = c0_im_f + dy_f * i;
+            if (simd0) {
+                std::vector<float> row(_w);
+                solveShallowSimdRow(c0_re_f, dx_f, cim, _w, row.data(), mxit, c_method);
+                for (int j = 0; j < _w; ++j) {
+                    double val = row[j];
+                    if (ede && val >= 0) val /= dx_f;
+                    _iter[getIndex(i, j, 0, 0)] = (float)val;
+                }
+            } else {
+                for (int j = 0; j < _w; ++j) {
+                    if (_flag_halt) break;
+                    int idx = getIndex(i, j, 0, 0);
+                    _iter[idx] = floatPointCompute(c0_re_f + dx_f * j, cim, mxit, c_method);
+                    if (ede && _iter[idx] >= 0) _iter[idx] /= dx_f;
                 }
             }
         }
