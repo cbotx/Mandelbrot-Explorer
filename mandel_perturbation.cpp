@@ -799,9 +799,13 @@ void Mandel::buildBLA(int reflen) {
     std::vector<BLAEntry> lvl0;
     lvl0.reserve(reflen - 1);
     for (int s = 1; s < reflen; ++s) {
-        double ar = 2.0 * _zfr[s], ai = 2.0 * _zfi[s];   // A = 2 Z_s
-        double Amag = sqrt(ar * ar + ai * ai);
-        double R = Amag > 0 ? eps * Amag - dcmax / Amag : 0.0;  // |B|=1
+        double zr = _zfr[s], zi = _zfi[s];
+        double Zmag = sqrt(zr * zr + zi * zi);
+        double ar = 2.0 * zr, ai = 2.0 * zi;             // A = J_f(Z) = 2 Z_s, |B| = 1
+        double Amag = 2.0 * Zmag;
+        // mathr / Zhuoran single-step BLA validity radius:
+        //   r = max(0, eps * (|Z| - max|dc|) / (|J_f(Z)| + 1))
+        double R = eps * (Zmag - dcmax) / (Amag + 1.0);
         double r2 = R > 0 ? R * R : 0.0;
         if (r2 > _bla_rmax2) _bla_rmax2 = r2;
         lvl0.push_back({ ar, ai, 1.0, 0.0, r2, 1 });

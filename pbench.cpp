@@ -96,10 +96,20 @@ static BLATable buildBLA(const Ref& ref, double eps, double dcmax, int minskip) 
     if (reflen < 3) return T;
     std::vector<BLAEntry> l0;
     l0.reserve(reflen - 1);
+    bool oldr = getenv("PB_OLDR") != nullptr;
     for (int s = 1; s < reflen; ++s) {
-        double ar = 2.0 * ref.zr[s], ai = 2.0 * ref.zi[s];   // A = 2 X_s
-        double Amag = sqrt(ar * ar + ai * ai);
-        double Rv = Amag > 0 ? eps * Amag - dcmax / Amag : 0.0;   // |B| = 1
+        double zr = ref.zr[s], zi = ref.zi[s];
+        double Zmag = sqrt(zr * zr + zi * zi);
+        double ar = 2.0 * zr, ai = 2.0 * zi;   // A = 2 X_s = J_f(Z)
+        double Amag = 2.0 * Zmag;              // |A|
+        double Rv;
+        if (oldr) {
+            Rv = Amag > 0 ? eps * Amag - dcmax / Amag : 0.0;          // legacy (too aggressive)
+        } else {
+            // mathr / Zhuoran single-step BLA radius:
+            //   r = max(0, eps * (|Z| - max|c|) / (|J_f(Z)| + 1))
+            Rv = eps * (Zmag - dcmax) / (Amag + 1.0);
+        }
         double r2 = Rv > 0 ? Rv * Rv : 0.0;
         if (r2 > T.rmax2) T.rmax2 = r2;
         l0.push_back({ ar, ai, 1.0, 0.0, r2, 1 });
