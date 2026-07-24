@@ -4,6 +4,8 @@
 #include <complex>
 #include <gmp.h>
 
+#include "floatexp.h"
+
 #include <set>
 #include <algorithm>
 #include <array>
@@ -85,6 +87,11 @@ private:
                double ESC2, int mx_ref_it) const;
     int createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random, int c_method = 0);
     bool calCoefficient(int i, int pr_it, int c_method = 0);
+    // Deep-zoom rescaled perturbation (Zhuoran z = S w): the delta w stays an
+    // O(1) double while the floatexp scale S carries the deep exponent, so the
+    // inner loop is native-double yet correct far past double's ~1e320 underflow.
+    // Used when _use_floatexp; returns the pixel escape value (interior -> -2).
+    float pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit, int c_method) const;
     int SACheckMagnitude() const;
     float accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_method = 0) const;
     double floatPointCompute(Float c_re, Float c_im, int mxit, int c_method = 0) const;
@@ -118,6 +125,11 @@ private:
     int _SA_it;
 
     Float* _zfr, * _zfi;
+    // floatexp reference orbit (filled only when _use_floatexp): accurate where
+    // |Z| underflows the double shadow _zfr/_zfi, needed for deep-zoom rebasing.
+    FloatExp* _zfr_fe = nullptr, * _zfi_fe = nullptr;
+    bool _use_floatexp = false;
+    FloatExp _dxfe{ 0.0, 0 }, _dyfe{ 0.0, 0 };   // pixel spacing in floatexp
     mpf_t _c0_re, _c0_im;  // bottom left point coordinate
     mpf_t _dx;
     mpf_t _dy;

@@ -27,6 +27,13 @@
 static long long g_bla_stat[64][8];
 static int g_bla_noescape = -1;   // env MANDEL_BLA_NOESCAPE: force-skip the escape check (timing only)
 
+// GMP mpf -> floatexp (m * 2^e, 0.5 <= |m| < 1), no underflow.
+static inline FloatExp mpf_to_fe(mpf_srcptr x) {
+    if (mpf_sgn(x) == 0) return FloatExp{ 0.0, 0 };
+    long ex; double d = mpf_get_d_2exp(&ex, x);
+    return FloatExp{ d, (int64_t)ex };
+}
+
 
 Mandel::Mandel(int width, int height, int max_iteration, int sub, float* iter) : _w(width), _h(height), _mxit(max_iteration), _sub(sub), _iter(iter) {
     assert(width > 0);
@@ -38,6 +45,8 @@ Mandel::Mandel(int width, int height, int max_iteration, int sub, float* iter) :
     _zf = new Comp[_mxit + 1];
     _zfr = new Float[_mxit + 1];
     _zfi = new Float[_mxit + 1];
+    _zfr_fe = new FloatExp[_mxit + 1];
+    _zfi_fe = new FloatExp[_mxit + 1];
 
     _d_re = new mpf_t[_mxit + 1];
     _d_im = new mpf_t[_mxit + 1];
@@ -93,6 +102,8 @@ Mandel::~Mandel() {
     delete[] _df;
     delete[] _d_re;
     delete[] _d_im;
+    delete[] _zfr_fe;
+    delete[] _zfi_fe;
 }
 
 bool Mandel::attractor(double zz_re, double zz_im, const double c_re, const double c_im, int period) const {
@@ -333,6 +344,12 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         { const char* e = getenv("MANDEL_INTERIOR"); _use_interior = !e || atoi(e); }
         { const char* e = getenv("MANDEL_INT_EPS"); double ep = e ? atof(e) : 1e-13; _interior_eps2 = ep * ep; }
         { const char* e = getenv("MANDEL_INT_CONFIRM"); _interior_confirm = e ? atoi(e) : 4; }
+        // Deep-zoom: below double's ~1e320 underflow the delta must be rescaled
+        // (floatexp scale + double delta). Gate a bit before the wall so the fast
+        // double path is unchanged for shallow/moderate zoom.
+        { const char* e = getenv("MANDEL_FE");
+          _use_floatexp = e ? atoi(e) != 0 : (mpf_cmp_d(scale, 1e280) > 0); }
+        _dxfe = mpf_to_fe(_dx); _dyfe = mpf_to_fe(_dy);
         double pf_ref = 0, pf_step = 0;
         const bool profile = getenv("MANDEL_PROFILE") != nullptr;
         auto now = [] { return std::chrono::duration_cast<std::chrono::duration<double>>(
@@ -541,6 +558,32 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
     const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
     static int simd_env = -1;
     if (simd_env < 0) { const char* e = getenv("MANDEL_SIMD"); simd_env = e ? atoi(e) : 1; }
+
+    if (_use_floatexp) {
+        // ---- deep-zoom rescaled (floatexp) path: correct past ~1e320 ----
+        // Each pixel's dc is built in floatexp (dxfe/dyfe * integer offset) so it
+        // never underflows, then iterated with the rescaled delta loop.
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int i = 0; i < (int)v.size(); ++i) {
+            if (_flag_halt) continue;
+            auto arr = v[i];
+            glitch_p[i] = -1;
+            int xpix = _sub * (arr[1] - _ref[1]) + (arr[3] - _ref[3]);
+            int ypix = _sub * (arr[0] - _ref[0]) + (arr[2] - _ref[2]);
+            FloatExp dcr = fe_mul_d(_dxfe, (double)xpix);
+            FloatExp dci = fe_mul_d(_dyfe, (double)ypix);
+            if (_sub > 1) { double inv = 1.0 / _sub; dcr = fe_mul_d(dcr, inv); dci = fe_mul_d(dci, inv); }
+            setPixel(arr, pixelRescaled(dcr, dci, mx_ref_it, mxit, c_method));
+            _done[i] = true;
+        }
+        // rebasing makes the floatexp path glitch-free, so every pixel is done;
+        // drop them from the work set (matching the tail of the scalar/SIMD paths).
+        { int i = 0;
+          for (auto it = s.begin(); it != s.end(); ++i)
+              if (_done[i]) it = s.erase(it); else ++it; }
+        return;
+    }
+
     const bool use_simd = simd_env && !ede && !_use_bla && !_use_interior;   // BLA/interior paths are scalar
 
     if (use_simd) {
@@ -998,6 +1041,100 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
     }
 }
 
+// Deep-zoom rescaled (z = S w) perturbation for one pixel. See header comment:
+// w stays an O(1) double, the floatexp scale S carries the deep exponent, so the
+// inner loop is native-double yet correct far past double's ~1e320 underflow.
+float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit, int c_method) const {
+    const double ESC2 = (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS;
+    const double LG2 = log(2.0);
+    // The stored reference is _zfr[k] = X_{k+1} (X_0 = 0 is the implicit critical
+    // point). Access the orbit as X_m: X_0 = 0, X_m = _zfr[m-1]. Rebasing resets to
+    // the critical point m = 0 (X_0 = 0), matching the double path's k==0 case.
+    const int reflen = mx_ref_it + 1;
+
+    FloatExp S = fe_sqrt(fe_add(fe_mul(dcr, dcr), fe_mul(dci, dci)));   // |dc|
+    double wr, wi, dr, di;
+    if (S.m == 0.0) { S = FloatExp{ 1.0, 0 }; wr = wi = dr = di = 0.0; }
+    else {
+        wr = fe_to_double(fe_div(dcr, S)); wi = fe_to_double(fe_div(dci, S));   // unit
+        dr = wr; di = wi;                                                        // d = dc / S
+    }
+    double s = fe_to_double(S);
+    int m = 1, iter = 1;                  // dz_1 = dc at reference index m = 1
+
+    double zsr = 1e30, zsi = 1e30; int save_iter = 1, period_win = 1;
+    int conf_P = 0, conf_next = 0, conf_count = 0, conf_giveup = 0;
+    double conf_D2 = 0, conf_zr = 0, conf_zi = 0;
+
+    while (iter < mxit) {
+        if (_flag_halt) break;
+        // w' = 2 X_m w + s w^2 + d   (dz_m -> dz_{m+1}); X_0 = 0.
+        double Xr = m ? _zfr[m - 1] : 0.0, Xi = m ? _zfi[m - 1] : 0.0;
+        double w2r = wr * wr - wi * wi, w2i = 2.0 * wr * wi;
+        double nwr = 2.0 * (Xr * wr - Xi * wi) + s * w2r + dr;
+        double nwi = 2.0 * (Xr * wi + Xi * wr) + s * w2i + di;
+        wr = nwr; wi = nwi; ++m; ++iter;
+
+        Xr = m ? _zfr[m - 1] : 0.0; Xi = m ? _zfi[m - 1] : 0.0;
+        double zr = Xr + s * wr, zi = Xi + s * wi;      // z = X_m + S w
+        double zrad = zr * zr + zi * zi;
+        if (zrad > ESC2)
+            return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
+
+        if (_use_interior) {
+            if (conf_P > 0) {
+                conf_D2 *= 4.0 * zrad; if (conf_D2 > 1e18) conf_D2 = 1e18;
+                if (iter >= conf_next) {
+                    double pr = zr - conf_zr, pi = zi - conf_zi;
+                    if (pr * pr + pi * pi < _interior_eps2 * zrad && conf_D2 < 1.0) {
+                        if (++conf_count >= _interior_confirm) return -2.f;
+                        conf_zr = zr; conf_zi = zi; conf_D2 = 1; conf_next = iter + conf_P;
+                    } else { conf_P = 0; ++conf_giveup; }
+                }
+            } else if ((iter & 15) == 0 && conf_giveup < 3) {
+                double pr = zr - zsr, pi = zi - zsi;
+                if (pr * pr + pi * pi < _interior_eps2 * zrad) {
+                    conf_P = iter - save_iter; if (conf_P < 1) conf_P = 1;
+                    conf_zr = zr; conf_zi = zi; conf_D2 = 1; conf_next = iter + conf_P; conf_count = 0;
+                }
+                if (iter - save_iter >= period_win) { zsr = zr; zsi = zi; save_iter = iter; period_win += period_win; }
+            }
+        }
+
+        // periodic rescale to keep |w| ~ O(1)
+        double wmag2 = wr * wr + wi * wi;
+        if (wmag2 > 1e16 || (wmag2 < 1e-16 && wmag2 > 0.0)) {
+            FloatExp wmag = fe_sqrt(fe_from(wmag2));
+            S = fe_mul(S, wmag); s = fe_to_double(S);
+            double inv = 1.0 / fe_to_double(wmag);
+            wr *= inv; wi *= inv;
+            dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
+        }
+
+        // Zhuoran rebase to the critical point (m = 0): triggered where the
+        // reference passes near 0 (double |z| tiny) or at the reference end.
+        if (zrad < 1e-8 || m >= reflen) {
+            FloatExp Xmr = m ? _zfr_fe[m - 1] : FloatExp{ 0.0, 0 };
+            FloatExp Xmi = m ? _zfi_fe[m - 1] : FloatExp{ 0.0, 0 };
+            FloatExp Swr = fe_mul_d(S, wr), Swi = fe_mul_d(S, wi);      // S w = dz_true
+            FloatExp zrfe = fe_add(Xmr, Swr), zife = fe_add(Xmi, Swi);
+            FloatExp zradfe = fe_add(fe_mul(zrfe, zrfe), fe_mul(zife, zife));
+            FloatExp dzfe = fe_add(fe_mul(Swr, Swr), fe_mul(Swi, Swi));
+            if (m >= reflen || fe_abs_less(zradfe, dzfe)) {
+                FloatExp Snew = fe_sqrt(zradfe);
+                if (Snew.m == 0.0) { wr = wi = 0.0; }
+                else {
+                    S = Snew; s = fe_to_double(S);
+                    wr = fe_to_double(fe_div(zrfe, S)); wi = fe_to_double(fe_div(zife, S));
+                    dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
+                }
+                m = 0;
+            }
+        }
+    }
+    return -2.f;   // interior (hit maxit)
+}
+
 int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random, int c_method) {
     if (s.empty()) return false;
     ++_ref_cnt;
@@ -1051,6 +1188,7 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
     _zf[0] = _ref_z_f;
     _zfr[0] = _ref_z_f.real();
     _zfi[0] = _ref_z_f.imag();
+    if (_use_floatexp) { _zfr_fe[0] = mpf_to_fe(_ref_z_re); _zfi_fe[0] = mpf_to_fe(_ref_z_im); }
 
     mpf_set_ui(_d_re[0], 1);
     mpf_set_ui(_d_im[0], 0);
@@ -1092,6 +1230,7 @@ bool Mandel::calCoefficient(int i, int pr_it, int c_method) {
     _zf[i] = Comp{ mpf_get_ld(_z_re[i]), mpf_get_ld(_z_im[i]) };
     _zfr[i] = _zf[i].real();
     _zfi[i] = _zf[i].imag();
+    if (_use_floatexp) { _zfr_fe[i] = mpf_to_fe(_z_re[i]); _zfi_fe[i] = mpf_to_fe(_z_im[i]); }
 
     // _z_m3[i] = tmp_z.abs().get_real_imag().first / 1000; // for Pauldelbrot condition
     _z_m3[i] = { (_zfr[i] * _zfr[i] + _zfi[i] * _zfi[i]) / 1000000 };
