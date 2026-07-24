@@ -70,6 +70,7 @@ private:
     struct BLAEntry { double ar, ai, br, bi, r2; int l; };
     std::vector<std::vector<BLAEntry>> _bla;
     double _bla_eps = 0.0;
+    double _bla_rmax2 = 0.0;      // largest BLA validity radius^2 (gate for tryBLA)
     bool _use_bla = false;
     int _bla_minlevel = 0;        // only apply BLAs with skip >= 2^_bla_minlevel
     bool _ref_bounded = false;    // reference orbit never escapes (minibrot center)

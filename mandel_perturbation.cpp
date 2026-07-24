@@ -16,10 +16,16 @@
 #include <cstring>
 #include <cstdlib>
 #include <immintrin.h>
+#include <omp.h>
 
 #include "mandel_perturbation.h"
 #include "float_math.h"
 #include "dll_interface.h"
+
+// BLA profiling: per-thread padded counters (no false sharing / contention).
+// [tid][0]=iterations skipped, [1]=BLA applies, [2]=normal steps.
+static long long g_bla_stat[64][8];
+static int g_bla_noescape = -1;   // env MANDEL_BLA_NOESCAPE: force-skip the escape check (timing only)
 
 
 Mandel::Mandel(int width, int height, int max_iteration, int sub, float* iter) : _w(width), _h(height), _mxit(max_iteration), _sub(sub), _iter(iter) {
@@ -322,6 +328,8 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         { const char* e = getenv("MANDEL_BLA_EPS"); _bla_eps = e ? atof(e) : 0.0; }
         { const char* e = getenv("MANDEL_BLA_MINSKIP"); int ms = e ? atoi(e) : 8;
           _bla_minlevel = 0; while ((1 << (_bla_minlevel + 1)) <= ms) ++_bla_minlevel; }
+        if (g_bla_noescape < 0) { const char* e = getenv("MANDEL_BLA_NOESCAPE"); g_bla_noescape = e ? atoi(e) : 0; }
+        memset(g_bla_stat, 0, sizeof(g_bla_stat));
         { const char* e = getenv("MANDEL_INTERIOR"); _use_interior = !e || atoi(e); }
         { const char* e = getenv("MANDEL_INT_EPS"); double ep = e ? atof(e) : 1e-13; _interior_eps2 = ep * ep; }
         { const char* e = getenv("MANDEL_INT_CONFIRM"); _interior_confirm = e ? atoi(e) : 4; }
@@ -370,9 +378,15 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             _ref_bounded = (ref_it >= mxit);
             if (_use_bla) buildBLA(ref_it);
         }
-        if (profile)
+        if (profile) {
+            long long sk = 0, ap = 0, no = 0;
+            for (int t = 0; t < 64; ++t) { sk += g_bla_stat[t][0]; ap += g_bla_stat[t][1]; no += g_bla_stat[t][2]; }
             fprintf(stderr, "  [profile] reference-orbit (GMP): %.3f s   delta-loop (double): %.3f s   refs=%d\n",
                     pf_ref, pf_step, _ref_cnt);
+            if (_use_bla)
+                fprintf(stderr, "  [profile] BLA: applies=%lld skipped=%lld normal-steps=%lld  avg-skip=%.1f  skip-frac=%.1f%%\n",
+                        ap, sk, no, ap ? (double)sk / ap : 0.0, (sk + no) ? 100.0 * sk / (sk + no) : 0.0);
+        }
     }
     bool is_super_sampling = (_sub > 1) && (c_method & ColoringMethod::SUPER_SAMPLING);
     if (!is_super_sampling) return;
@@ -634,11 +648,18 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         Float conf_D2 = 0, conf_zr = 0, conf_zi = 0;
         while (j < mxit) {
             if (_flag_halt) break;
-            if (_use_bla) {
+            if (_use_bla && dzr * dzr + dzi * dzi < _bla_rmax2) {
+                // Only attempt BLA when dz is small enough that some level could be
+                // valid -- avoids the per-iteration lookup cost when dz is large.
                 // BLA start index s = k-1 (loop-top invariant: dz is at ref index k-1).
                 int skip = tryBLA(k - 1, dzr, dzi, dcr, dci,
                                   _ESCAPE_RADIUS * _ESCAPE_RADIUS, mx_ref_it);
-                if (skip > 0) { k += skip; j += skip; continue; }
+                if (skip > 0) {
+                    int tid = omp_get_thread_num() & 63;
+                    g_bla_stat[tid][0] += skip; ++g_bla_stat[tid][1];
+                    k += skip; j += skip; continue;
+                }
+                ++g_bla_stat[omp_get_thread_num() & 63][2];
             }
             // dd = 2 * (dd*z + dz*(d+dd))
             if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
@@ -770,6 +791,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
 // 1..reflen-1; higher levels merge neighbour pairs (skip 2^p).
 void Mandel::buildBLA(int reflen) {
     _bla.clear();
+    _bla_rmax2 = 0.0;
     if (reflen < 3) return;
     double eps = _bla_eps > 0 ? _bla_eps : ldexp(1.0, -53);   // negligible vs double rounding
     double dcmax = std::abs(_SA_delta);
@@ -781,6 +803,7 @@ void Mandel::buildBLA(int reflen) {
         double Amag = sqrt(ar * ar + ai * ai);
         double R = Amag > 0 ? eps * Amag - dcmax / Amag : 0.0;  // |B|=1
         double r2 = R > 0 ? R * R : 0.0;
+        if (r2 > _bla_rmax2) _bla_rmax2 = r2;
         lvl0.push_back({ ar, ai, 1.0, 0.0, r2, 1 });
     }
     _bla.push_back(std::move(lvl0));
@@ -833,10 +856,11 @@ int Mandel::tryBLA(int s, double& dzr, double& dzi, double dcr, double dci,
         if (land >= mx_ref_it) continue;                    // don't overshoot the ref-end rebase
         double nzr = b.ar * dzr - b.ai * dzi + b.br * dcr - b.bi * dci;
         double nzi = b.ar * dzi + b.ai * dzr + b.br * dci + b.bi * dcr;
-        if (!_ref_bounded) {
-            // If the reference can escape, make sure this skip doesn't overshoot
-            // the pixel's escape. For a bounded (minibrot) reference a valid BLA
-            // keeps the pixel near the bounded orbit, so the check is unneeded.
+        if (!g_bla_noescape) {
+            // Never let a BLA skip overshoot the pixel's escape. (Previously this
+            // was skipped for bounded references assuming dz stays negligibly
+            // small, but at a usable eps dz is not tiny and a skip can jump past
+            // an escape, producing wrong iteration counts.)
             double fr = _zfr[land] + nzr, fi = _zfi[land] + nzi;
             if (fr * fr + fi * fi > ESC2) return 0;
         }

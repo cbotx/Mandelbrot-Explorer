@@ -6,3 +6,7 @@
 build/
 libs/
 png++/
+*.obj
+*.bmp
+*.png
+__pycache__/
