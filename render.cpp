@@ -3,7 +3,8 @@
 // cubic interpolation + the color_func mapping), renders at 3x supersampling and
 // box-downsamples in linear light, writes a 24-bit BMP. No libpng/GLUT needed.
 //
-// Usage: render <out.bmp> <W> <H> <cx> <cy> <scaleExp> <mxit>
+// Usage: render [<out.bmp> <W> <H> <cx> <cy> <scaleExp> <mxit> [SS]]
+// With no arguments, renders a ready-to-view 1e1000 exterior demo.
 
 #include <gmp.h>
 #include <cstdio>
@@ -70,17 +71,23 @@ static void writeBMP(const char* path, const std::vector<uint8_t>& rgb, int W, i
 }
 
 int main(int argc, char** argv) {
-    if (argc < 8) { fprintf(stderr, "usage: render out.bmp W H cx cy scaleExp mxit\n"); return 1; }
-    const char* out = argv[1];
-    int W = atoi(argv[2]), H = atoi(argv[3]);
-    const char* cx = argv[4]; const char* cy = argv[5];
-    int scaleExp = atoi(argv[6]);
-    int mxit = atoi(argv[7]);
-    const int SS = argc > 8 ? atoi(argv[8]) : 3;   // supersample factor
+    if (argc != 1 && argc < 8) {
+        fprintf(stderr, "usage: render [out.bmp W H cx cy scaleExp mxit [SS]]\n");
+        return 1;
+    }
+    const bool demo = argc == 1;
+    const char* out = demo ? "deep_exterior_1e1000.bmp" : argv[1];
+    int W = demo ? 960 : atoi(argv[2]);
+    int H = demo ? 540 : atoi(argv[3]);
+    const char* cx = demo ? "0" : argv[4];
+    const char* cy = demo ? "1" : argv[5];
+    int scaleExp = demo ? 1000 : atoi(argv[6]);
+    int mxit = demo ? 10000 : atoi(argv[7]);
+    const int SS = demo ? 2 : (argc > 8 ? atoi(argv[8]) : 3);
     int Ws = W * SS, Hs = H * SS;
 
     std::string scale = "1"; for (int i = 0; i < scaleExp; ++i) scale += "0";
-    int precision = (int)(scale.size() * log(10) / log(2)) + 40;
+    int precision = (int)(scale.size() * log(10) / log(2)) + 64;
     mpf_set_default_prec(precision);
 
     colorMapInit();

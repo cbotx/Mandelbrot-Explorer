@@ -85,7 +85,8 @@ private:
     // escaped or past mx_ref_it.
     int tryBLA(int s, double& dzr, double& dzi, double dcr, double dci,
                double ESC2, int mx_ref_it) const;
-    int createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random, int c_method = 0);
+    int createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random,
+                  int c_method = 0, bool view_center = false);
     bool calCoefficient(int i, int pr_it, int c_method = 0);
     // Deep-zoom rescaled perturbation (Zhuoran z = S w): the delta w stays an
     // O(1) double while the floatexp scale S carries the deep exponent, so the
@@ -129,12 +130,15 @@ private:
     // |Z| underflows the double shadow _zfr/_zfi, needed for deep-zoom rebasing.
     FloatExp* _zfr_fe = nullptr, * _zfi_fe = nullptr;
     bool _use_floatexp = false;
+    bool _fe_cutoff_sensitive = false;
     FloatExp _dxfe{ 0.0, 0 }, _dyfe{ 0.0, 0 };   // pixel spacing in floatexp
     mpf_t _c0_re, _c0_im;  // bottom left point coordinate
     mpf_t _dx;
     mpf_t _dy;
     mpf_t _scale;
     std::array<int, 4> _ref;  // reference pixel index
+    double _ref_x = 0.0, _ref_y = 0.0;  // reference position in pixel coordinates
+    bool _ref_virtual = false;           // exact view center, not an actual pixel
     std::array<int, 4> _new_ref;  // new reference pixel index
     mpf_t _ref_z_re, _ref_z_im;  // reference point coordinate
     Comp _ref_z_f;

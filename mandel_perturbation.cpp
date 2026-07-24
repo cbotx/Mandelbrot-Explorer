@@ -26,6 +26,7 @@
 // [tid][0]=iterations skipped, [1]=BLA applies, [2]=normal steps.
 static long long g_bla_stat[64][8];
 static int g_bla_noescape = -1;   // env MANDEL_BLA_NOESCAPE: force-skip the escape check (timing only)
+static long long g_fe_fallback = 0;
 
 // GMP mpf -> floatexp (m * 2^e, 0.5 <= |m| < 1), no underflow.
 static inline FloatExp mpf_to_fe(mpf_srcptr x) {
@@ -349,6 +350,8 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         // double path is unchanged for shallow/moderate zoom.
         { const char* e = getenv("MANDEL_FE");
           _use_floatexp = e ? atoi(e) != 0 : (mpf_cmp_d(scale, 1e280) > 0); }
+        g_fe_fallback = 0;
+        _fe_cutoff_sensitive = false;
         _dxfe = mpf_to_fe(_dx); _dyfe = mpf_to_fe(_dy);
         double pf_ref = 0, pf_step = 0;
         const bool profile = getenv("MANDEL_PROFILE") != nullptr;
@@ -360,6 +363,16 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         floatPointCompute(c0_re_f, c0_im_f, mxit, c_method);
         s.insert({ _h / 2, _w / 2, 0, 0 });
         tk = now(); ref_it = createRef(s, mxit, mxit, true, c_method); pf_ref += now() - tk;
+        if (_use_floatexp && ref_it >= mxit - 16) {
+            bool sensitive = ref_it < mxit ||
+                accuratePointCompute(_ref_z_re, _ref_z_im, mxit + 64, c_method) >= 0;
+            if (sensitive) {
+                // Rebuild from the exact geometric center so the result cannot
+                // depend on which center pixel exists for even/odd dimensions.
+                s.insert({ _h / 2, _w / 2, 0, 0 });
+                tk = now(); ref_it = createRef(s, mxit, mxit, true, c_method, true); pf_ref += now() - tk;
+            }
+        }
         _ref_bounded = (ref_it >= mxit);
         if (_use_bla) buildBLA(ref_it);
         if (_use_interior) {
@@ -384,7 +397,8 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         for (int i = 0; i < _h; ++i)
             for (int j = 0; j < _w; ++j)
                 s.insert({ i, j, 0, 0 });
-        s.erase({ _h / 2, _w / 2, 0, 0 });   // centre already computed by the first createRef
+        if (!_ref_virtual)
+            s.erase({ _h / 2, _w / 2, 0, 0 });   // pixel reference was already computed
         
         while (!s.empty()) {
             if (_flag_halt) return;
@@ -403,6 +417,9 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             if (_use_bla)
                 fprintf(stderr, "  [profile] BLA: applies=%lld skipped=%lld normal-steps=%lld  avg-skip=%.1f  skip-frac=%.1f%%\n",
                         ap, sk, no, ap ? (double)sk / ap : 0.0, (sk + no) ? 100.0 * sk / (sk + no) : 0.0);
+            if (_use_floatexp)
+                fprintf(stderr, "  [profile] FE: cutoff-sensitive=%d GMP-fallback-pixels=%lld\n",
+                        _fe_cutoff_sensitive ? 1 : 0, g_fe_fallback);
         }
     }
     bool is_super_sampling = (_sub > 1) && (c_method & ColoringMethod::SUPER_SAMPLING);
@@ -412,8 +429,13 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
     // Oversampling pixels that differs from neighbours with (_sub x _sub) pixels
     std::vector<std::array<int, 2>> v;
     int mix_cnt = 0;
-    double mx_diff = log(mxit) / 8;
-    if (c_method & ColoringMethod::SUPER_SAMPLING) mx_diff = 1;
+    // Flag detector threshold: supersample a pixel when its iteration value differs
+    // from a neighbour by more than exp(log(mxit)/K). Larger K => lower threshold =>
+    // more pixels supersampled (catches colour-complex pixels the base AA can't
+    // resolve). Tunable via MANDEL_SS_K (default 8).
+    double ss_k = 8.0;
+    { const char* e = getenv("MANDEL_SS_K"); if (e) ss_k = atof(e); }
+    double ss_thresh = log((double)mxit) / ss_k;
     for (int i = 0; i < _h; ++i) {
         for (int j = 0; j < _w; ++j) {
             bool need_sample = false;
@@ -444,7 +466,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                         }
                     }
                 }
-                need_sample = (log(diff) > log(mxit) / 8);
+                need_sample = (log(diff) > ss_thresh);
             }
             if (need_sample) {
                 ++mix_cnt;
@@ -568,12 +590,31 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
             if (_flag_halt) continue;
             auto arr = v[i];
             glitch_p[i] = -1;
-            int xpix = _sub * (arr[1] - _ref[1]) + (arr[3] - _ref[3]);
-            int ypix = _sub * (arr[0] - _ref[0]) + (arr[2] - _ref[2]);
-            FloatExp dcr = fe_mul_d(_dxfe, (double)xpix);
-            FloatExp dci = fe_mul_d(_dyfe, (double)ypix);
-            if (_sub > 1) { double inv = 1.0 / _sub; dcr = fe_mul_d(dcr, inv); dci = fe_mul_d(dci, inv); }
-            setPixel(arr, pixelRescaled(dcr, dci, mx_ref_it, mxit, c_method));
+            double px = arr[1] + (double)arr[3] / _sub;
+            double py = arr[0] + (double)arr[2] / _sub;
+            FloatExp dcr = fe_mul_d(_dxfe, px - _ref_x);
+            FloatExp dci = fe_mul_d(_dyfe, py - _ref_y);
+            float value = pixelRescaled(dcr, dci, mx_ref_it, mxit, c_method);
+            if (_fe_cutoff_sensitive && (value < 0 || value > mxit - 16)) {
+                // This rare frame sits directly on the maxit classification
+                // boundary. Resolve only its uncertain pixels with the GMP oracle;
+                // stable deep exterior/interior views never enter this path.
+                mpf_t cre, cim, t;
+                mpf_init_set(cre, _c0_re); mpf_init_set(cim, _c0_im); mpf_init(t);
+                mpf_mul_ui(t, _dx, arr[1]); mpf_add(cre, cre, t);
+                mpf_mul_ui(t, _dx, abs(arr[3]));
+                if (arr[3] < 0) mpf_neg(t, t);
+                mpf_div_ui(t, t, _sub); mpf_add(cre, cre, t);
+                mpf_mul_ui(t, _dy, arr[0]); mpf_add(cim, cim, t);
+                mpf_mul_ui(t, _dy, abs(arr[2]));
+                if (arr[2] < 0) mpf_neg(t, t);
+                mpf_div_ui(t, t, _sub); mpf_add(cim, cim, t);
+                value = accuratePointCompute(cre, cim, mxit, c_method);
+                mpf_clears(cre, cim, t, (mpf_ptr)0);
+#pragma omp atomic
+                ++g_fe_fallback;
+            }
+            setPixel(arr, value);
             _done[i] = true;
         }
         // rebasing makes the floatexp path glitch-free, so every pixel is done;
@@ -1135,46 +1176,63 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
     return -2.f;   // interior (hit maxit)
 }
 
-int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random, int c_method) {
+int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random,
+                      int c_method, bool view_center) {
     if (s.empty()) return false;
     ++_ref_cnt;
-    std::array<int, 4> p;
-    if (random) {
-        auto r = rand() % s.size();
-        auto iter = std::begin(s);
-        std::advance(iter, r);
-        p = *iter;
-        s.erase(iter);
-    }
-    else {
-        // Glitch-guided: reuse the pixel with the smallest orbit magnitude
-        // (Pauldelbrot) chosen in stepParallel as the next reference. Fall back
-        // to a random pixel if that choice is stale / no longer pending.
-        auto it = s.find(_new_ref);
-        if (it == s.end()) {
+    std::array<int, 4> p{ _h / 2, _w / 2, 0, 0 };
+    if (view_center) {
+        _ref_virtual = true;
+        _fe_cutoff_sensitive = false;
+        _ref_x = (_w - 1) * 0.5;
+        _ref_y = (_h - 1) * 0.5;
+        // Exact geometric center = c0 + spacing*(size-1)/2. This may be a
+        // half-pixel position for even dimensions, but is independent of which
+        // actual center pixel would otherwise be selected.
+        mpf_set(_ref_z_re, _c0_re);
+        mpf_mul_ui(_t1, _dx, _w - 1); mpf_div_ui(_t1, _t1, 2);
+        mpf_add(_ref_z_re, _ref_z_re, _t1);
+        mpf_set(_ref_z_im, _c0_im);
+        mpf_mul_ui(_t1, _dy, _h - 1); mpf_div_ui(_t1, _t1, 2);
+        mpf_add(_ref_z_im, _ref_z_im, _t1);
+    } else {
+        _ref_virtual = false;
+        if (random) {
             auto r = rand() % s.size();
-            it = std::begin(s);
+            auto it = std::begin(s);
             std::advance(it, r);
+            p = *it;
+            s.erase(it);
+        } else {
+            // Glitch-guided: reuse the pixel with the smallest orbit magnitude
+            // chosen in stepParallel. Fall back to a random pending pixel.
+            auto it = s.find(_new_ref);
+            if (it == s.end()) {
+                auto r = rand() % s.size();
+                it = std::begin(s);
+                std::advance(it, r);
+            }
+            p = *it;
+            s.erase(it);
         }
-        p = *it;
-        s.erase(it);
+        _ref_x = p[1] + (double)p[3] / _sub;
+        _ref_y = p[0] + (double)p[2] / _sub;
+        // _ref_z = _c0 + pixel/sub offsets.
+        mpf_set(_ref_z_re, _c0_re);
+        mpf_set(_ref_z_im, _c0_im);
+        mpf_mul_ui(_t1, _dx, p[1]);
+        mpf_add(_ref_z_re, _ref_z_re, _t1);
+        mpf_mul_ui(_t1, _dx, abs(p[3]));
+        if (p[3] < 0) mpf_neg(_t1, _t1);
+        mpf_div_ui(_t1, _t1, _sub);
+        mpf_add(_ref_z_re, _ref_z_re, _t1);
+        mpf_mul_ui(_t1, _dy, p[0]);
+        mpf_add(_ref_z_im, _ref_z_im, _t1);
+        mpf_mul_ui(_t1, _dy, abs(p[2]));
+        if (p[2] < 0) mpf_neg(_t1, _t1);
+        mpf_div_ui(_t1, _t1, _sub);
+        mpf_add(_ref_z_im, _ref_z_im, _t1);
     }
-
-    // _ref_z = _c0 + p[0] * _dy + p[2] * _dy / _sub + p[1] * _dx + p[3] * _dx / _sub;
-    mpf_set(_ref_z_re, _c0_re);
-    mpf_set(_ref_z_im, _c0_im);
-    mpf_mul_ui(_t1, _dx, p[1]);
-    mpf_add(_ref_z_re, _ref_z_re, _t1);
-    mpf_mul_ui(_t1, _dx, abs(p[3]));
-    if (p[3] < 0) mpf_neg(_t1, _t1);
-    mpf_div_ui(_t1, _t1, _sub);
-    mpf_add(_ref_z_re, _ref_z_re, _t1);
-    mpf_mul_ui(_t1, _dy, p[0]);
-    mpf_add(_ref_z_im, _ref_z_im, _t1);
-    mpf_mul_ui(_t1, _dy, abs(p[2]));
-    if (p[2] < 0) mpf_neg(_t1, _t1);
-    mpf_div_ui(_t1, _t1, _sub);
-    mpf_add(_ref_z_im, _ref_z_im, _t1);
 
     // _ref_z_f = static_cast<Comp>(_ref_z);
     _ref_z_f = Comp{ mpf_get_ld(_ref_z_re), mpf_get_ld(_ref_z_im) };
@@ -1209,9 +1267,17 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
     for (int i = 1; i <= mxit; ++i) {
         if (_flag_halt) break;
         if (!calCoefficient(i, pr_it, c_method)) {
-            setPixel(_ref, getEscapeTime(_z_re[i], _z_im[i], i));
+            if (_ref_virtual && _use_floatexp && i >= mxit - 16)
+                _fe_cutoff_sensitive = true;
+            if (!_ref_virtual) setPixel(_ref, getEscapeTime(_z_re[i], _z_im[i], i));
             return i;
         }
+    }
+    if (_ref_virtual && _use_floatexp) {
+        // A reference that only escapes just beyond maxit makes classification
+        // exquisitely sensitive to accumulated double perturbation rounding.
+        _fe_cutoff_sensitive =
+            accuratePointCompute(_ref_z_re, _ref_z_im, mxit + 64, c_method) >= 0;
     }
     return mxit;
 }

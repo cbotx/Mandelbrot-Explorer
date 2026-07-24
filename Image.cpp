@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <vector>
 
+#include "png++/png.hpp"
 #include "image.h"
 #include "interpolate.h"
 #include "mandel_perturbation.h"

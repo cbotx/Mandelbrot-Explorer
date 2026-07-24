@@ -1,5 +1,4 @@
 @echo off
-REM Build the headless verification/benchmark harness (MSVC + static GMP).
 setlocal
 cd /d "%~dp0"
 set VCVARS="C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
@@ -10,11 +9,11 @@ call %VCVARS% >nul || goto :err
 cl /nologo /O2 /EHsc /openmp /std:c++17 /arch:AVX2 /MT ^
    /I "%VCPKG%\include" ^
    /Fo:build\ ^
-   verify.cpp mandel_perturbation.cpp float_math.cpp ^
-   /Fe:build\verify.exe ^
+   aa_bench.cpp mandel_perturbation.cpp float_math.cpp interpolate.cpp ^
+   /Fe:build\aa_bench.exe ^
    /link /LIBPATH:"%VCPKG%\lib" gmp.lib || goto :err
 
-echo Build OK: build\verify.exe
+echo Build OK: build\aa_bench.exe
 exit /b 0
 :err
 echo BUILD FAILED

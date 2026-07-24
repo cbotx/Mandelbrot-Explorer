@@ -3,7 +3,9 @@
 
 
 #include <gmp.h>
+#include <atomic>
 #include <future>
+#include <string>
 
 #include "navigator.h"
 #include "mandel_perturbation.h"
@@ -19,7 +21,7 @@ private:
     int _sub;
     int _c_method = ColoringMethod::EXTERIOR_DIST_EST;
     int _shift_idx;
-    bool _require_update;
+    std::atomic_bool _require_update{true};
 
     std::future<void> _task;
 
@@ -47,6 +49,8 @@ public:
     void SetRedisplay();
 
     bool IsComputing();
+
+    std::string GetLocationText() const;
 
 private:
     void SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method);

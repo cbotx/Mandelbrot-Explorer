@@ -1,5 +1,7 @@
 #include <gmp.h>
+#include <cassert>
 #include <future>
+#include <vector>
 
 #include "navigator.h"
 #include "mandel_perturbation.h"
@@ -22,6 +24,7 @@ MandelNavigator::MandelNavigator(int width, int height, int sub, int max_iterati
 }
 
 MandelNavigator::~MandelNavigator() {
+    InterruptCompute();
     delete[] _iter;
     delete _mandel;
     mpf_clear(_z_re);
@@ -45,7 +48,7 @@ void MandelNavigator::StartCompute() {
         this->_require_update = true;
     };
     // _task = std::async(&Mandel::Compute, _mandel, _z_re, _z_im, _scale, _mxit, _c_method);
-    _task = std::async(compute_task);
+    _task = std::async(std::launch::async, compute_task);
 }
 
 void MandelNavigator::InterruptCompute() {
@@ -58,9 +61,17 @@ void MandelNavigator::InterruptCompute() {
 
 bool MandelNavigator::IsComputing() {
     if (!_task.valid()) return false;
-    std::chrono::milliseconds span(50);
+    std::chrono::milliseconds span(0);
     if (_task.wait_for(span) == std::future_status::ready) return false;
     return true;
+}
+
+std::string MandelNavigator::GetLocationText() const {
+    int digits = std::max(18, (int)(mpf_get_prec(_z_re) * log(2.0) / log(10.0)));
+    std::vector<char> buf((size_t)digits * 2 + 256);
+    gmp_snprintf(buf.data(), buf.size(), "x: %.*Ff\r\ny: %.*Ff\r\nzoom: %.6Fe",
+                 digits, _z_re, digits, _z_im, _scale);
+    return std::string(buf.data());
 }
 
 void MandelNavigator::UpdateCoords() {
@@ -85,24 +96,28 @@ void MandelNavigator::UpdateCoords() {
 void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
     if (!_require_update && !IsComputing()) return;
     _require_update = false;
+    const int stride = _w * _sub;
+    const int c = _sub / 2;
+    prepareColorFilter();   // rebuild palette box-filter integral once per frame
+    const bool ss = (_c_method & ColoringMethod::SUPER_SAMPLING) != 0;
     for (int i = 0; i < _h; ++i) {
         for (int j = 0; j < _w; ++j) {
             int idx_bmp = (i * _w + j) * 3;
-            int idx = (i * _sub + _sub / 2) * _w * _sub + (j * _sub + _sub / 2);
-            if (_c_method & ColoringMethod::SUPER_SAMPLING) {
-                if (_iter[idx] != EMPTYPIXEL) {
-                    if (_iter[idx - (_w * _sub + 1) * (_sub / 2)] == EMPTYPIXEL) {
-                        getColor(_iter[idx], bitmap[idx_bmp], bitmap[idx_bmp + 1], bitmap[idx_bmp + 2], _c_method);
-                    } else {
-                        SmoothColor(bitmap + idx_bmp, idx, _c_method);
-                    }
-                }
+            int idx = (i * _sub + c) * stride + (j * _sub + c);
+            if (_iter[idx] == EMPTYPIXEL) continue;
+            // In SS mode a flagged pixel has its full sub-block computed (top-left
+            // corner subpixel filled): average it. Otherwise this is the 1-sample
+            // base layer -> analytic AA from the centre + its 4 pixel neighbours.
+            if (ss && _iter[idx - (stride + 1) * c] != EMPTYPIXEL) {
+                SmoothColor(bitmap + idx_bmp, idx, _c_method);
             } else {
-                if (_iter[idx] != EMPTYPIXEL) {
-                    getColor(_iter[idx], bitmap[idx_bmp], bitmap[idx_bmp + 1], bitmap[idx_bmp + 2], _c_method);
-                }
+                float vL = j > 0        ? _iter[idx - _sub]         : EMPTYPIXEL;
+                float vR = j < _w - 1   ? _iter[idx + _sub]         : EMPTYPIXEL;
+                float vU = i > 0        ? _iter[idx - stride * _sub] : EMPTYPIXEL;
+                float vD = i < _h - 1   ? _iter[idx + stride * _sub] : EMPTYPIXEL;
+                getColorAA(_iter[idx], vL, vR, vU, vD,
+                           bitmap[idx_bmp], bitmap[idx_bmp + 1], bitmap[idx_bmp + 2], _c_method);
             }
-
         }
     }
 }

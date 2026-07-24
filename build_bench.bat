@@ -2,17 +2,18 @@
 setlocal
 cd /d "%~dp0"
 set VCVARS="C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-set VCPKG=C:\Users\yuxiangchi\repo\vcpkg\installed\x64-windows
+set VCPKG=C:\Users\yuxiangchi\repo\vcpkg\installed\x64-windows-static
+if not exist build mkdir build
 call %VCVARS% >nul || goto :err
 
-cl /nologo /O2 /EHsc /std:c++17 ^
+cl /nologo /O2 /EHsc /std:c++17 /MT ^
    /I "%VCPKG%\include" ^
+   /Fo:build\ ^
    bench_bigfixed.cpp ^
-   /Fe:bench_bigfixed.exe ^
+   /Fe:build\bench_bigfixed.exe ^
    /link /LIBPATH:"%VCPKG%\lib" gmp.lib || goto :err
 
-copy /y "%VCPKG%\bin\gmp-10.dll" . >nul
-echo Build OK: bench_bigfixed.exe
+echo Build OK: build\bench_bigfixed.exe
 exit /b 0
 :err
 echo BUILD FAILED

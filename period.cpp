@@ -19,6 +19,8 @@
 #include <cmath>
 #include <string>
 
+#include "floatexp.h"
+
 struct Cmpf { mpf_t re, im; };
 static void cinit(Cmpf& z) { mpf_init(z.re); mpf_init(z.im); }
 static void cclear(Cmpf& z) { mpf_clear(z.re); mpf_clear(z.im); }
@@ -51,19 +53,30 @@ static double cabs_d(const Cmpf& z) {
     return hypot(mpf_get_d(z.re), mpf_get_d(z.im));
 }
 
+static FloatExp mpf_to_fe(mpf_srcptr x) {
+    if (mpf_sgn(x) == 0) return FloatExp{ 0.0, 0 };
+    long e;
+    return FloatExp{ mpf_get_d_2exp(&e, x), (int64_t)e };
+}
+
+static FloatExp cabs_fe(const Cmpf& z) {
+    FloatExp re = mpf_to_fe(z.re), im = mpf_to_fe(z.im);
+    return fe_sqrt(fe_add(fe_mul(re, re), fe_mul(im, im)));
+}
+
 // Ball-arithmetic period finder. Returns period (0 if none within maxp).
-static int findPeriod(const Cmpf& c0, double r, int maxp) {
+static int findPeriod(const Cmpf& c0, FloatExp r, int maxp) {
     Cmpf z; cinit(z);
     mpf_set_ui(z.re, 0); mpf_set_ui(z.im, 0);
-    double R = 0.0;
+    FloatExp R{ 0.0, 0 };
     int period = 0;
     for (int p = 1; p <= maxp; ++p) {
-        double za = cabs_d(z);
-        R = (2 * za + R) * R + r;
+        FloatExp za = cabs_fe(z);
+        R = fe_add(fe_mul(fe_add(fe_mul_d(za, 2.0), R), R), r);
         csqadd(z, c0);
-        double zb = cabs_d(z);
-        if (zb < R) { period = p; break; }
-        if (zb > 4.0) break;    // escaped: no bounded atom here
+        FloatExp zb = cabs_fe(z);
+        if (fe_abs_less(zb, R)) { period = p; break; }
+        if (cabs_d(z) > 4.0) break;    // escaped: no bounded atom here
     }
     cclear(z);
     return period;
@@ -92,16 +105,17 @@ static int newtonNucleus(Cmpf& c, int period, int maxit) {
         mpf_mul(num.im, z.im, dz.re); mpf_mul(t3, z.re, dz.im); mpf_sub(num.im, num.im, t3);
         mpf_div(num.re, num.re, t1); mpf_div(num.im, num.im, t1);
         mpf_sub(c.re, c.re, num.re); mpf_sub(c.im, c.im, num.im);
-        double step = cabs_d(num);
-        if (step < 1e-300 || (step == 0)) { ++it; break; }
-        // convergence: step tiny relative to c
-        if (step < ldexp(cabs_d(c) + 1e-300, -80)) { ++it; break; }
+        FloatExp step = cabs_fe(num);
+        if (step.m == 0.0 || step.e < -(int64_t)mpf_get_prec(c.re) + 32) { ++it; break; }
     }
     // residual |z_period(c)|
     mpf_set_ui(z.re, 0); mpf_set_ui(z.im, 0);
     for (int i = 0; i < period; ++i) csqadd(z, c);
-    double resid = cabs_d(z);
-    printf("  Newton: %d iters, residual |z_p| = %.3e\n", it, resid);
+    FloatExp resid = cabs_fe(z);
+    printf("  Newton: %d iters, residual |z_p| = %.17g * 2^%lld\n",
+           it, resid.m, (long long)resid.e);
+    printf("  nucleus re = "); mpf_out_str(stdout, 10, 0, c.re); putchar('\n');
+    printf("  nucleus im = "); mpf_out_str(stdout, 10, 0, c.im); putchar('\n');
     cclear(z); cclear(dz); cclear(num);
     return it;
 }
@@ -113,17 +127,27 @@ int main(int argc, char** argv) {
     int maxp = argc > 4 ? atoi(argv[4]) : 4000000;
 
     std::string scale = "1"; for (int i = 0; i < scaleExp; ++i) scale += "0";
-    int precision = (int)(scale.size() * log(10) / log(2)) + 40;
+    // Near a Misiurewicz point, a nucleus at parameter distance d can have a
+    // component width on the order of d^2. Keep about twice the view depth so
+    // Newton can resolve the nucleus well enough to inspect that component.
+    int precision = 2 * (int)(scale.size() * log(10) / log(2)) + 128;
     mpf_set_default_prec(precision);
     mpf_init(t1); mpf_init(t2); mpf_init(t3);
 
     Cmpf c0; cinit(c0);
     mpf_set_str(c0.re, cx, 10); mpf_set_str(c0.im, cy, 10);
-    double r = 2.0 * pow(10.0, -scaleExp);   // view radius (half-width)
+    mpf_t radius, scale_mpf;
+    mpf_init_set_ui(radius, 2);
+    mpf_init_set_str(scale_mpf, scale.c_str(), 10);
+    mpf_div(radius, radius, scale_mpf);
+    FloatExp r = mpf_to_fe(radius);           // view radius (half-width), no underflow
 
-    printf("scale=1e%d  view-radius=%.3e  prec=%d bits  maxp=%d\n", scaleExp, r, precision, maxp);
+    printf("scale=1e%d  view-radius=%.17g * 2^%lld  prec=%d bits  maxp=%d\n",
+           scaleExp, r.m, (long long)r.e, precision, maxp);
     int p = findPeriod(c0, r, maxp);
     printf("dominant period = %d\n", p);
     if (p > 0) newtonNucleus(c0, p, 200);
+    mpf_clear(radius);
+    mpf_clear(scale_mpf);
     return 0;
 }
