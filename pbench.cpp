@@ -34,6 +34,7 @@
 #include <chrono>
 
 #include "test_cases.h"
+#include "floatexp.h"
 
 using Clock = std::chrono::high_resolution_clock;
 static double secs(Clock::time_point a, Clock::time_point b) {
@@ -232,6 +233,101 @@ static double pixelBrute(mpf_t cr, mpf_t ci, int maxit) {
     return res;
 }
 
+// ===== rescaled (z = S w) deep-zoom perturbation ==========================
+// Reference stored in floatexp (accurate near 0) plus a double shadow (fast).
+struct RefFE {
+    std::vector<double> zr, zi;          // double shadow (0 where |Z| underflows)
+    std::vector<FloatExp> fr, fi;         // full-range reference
+    int len = 0;
+    bool bounded = false;
+};
+
+static FloatExp mpf_to_fe(mpf_t x) {
+    if (mpf_sgn(x) == 0) return FloatExp{ 0.0, 0 };
+    long ex; double d = mpf_get_d_2exp(&ex, x);   // x = d * 2^ex, 0.5<=|d|<1
+    return FloatExp{ d, (int64_t)ex };
+}
+
+static RefFE computeRefFE(mpf_t cr, mpf_t ci, int maxit) {
+    RefFE R;
+    R.zr.assign(maxit + 2, 0.0); R.zi.assign(maxit + 2, 0.0);
+    R.fr.assign(maxit + 2, FloatExp{ 0.0, 0 }); R.fi.assign(maxit + 2, FloatExp{ 0.0, 0 });
+    mpf_t xr, xi, xr2, xi2, t;
+    mpf_inits(xr, xi, xr2, xi2, t, (mpf_ptr)0);
+    mpf_set_ui(xr, 0); mpf_set_ui(xi, 0);
+    int n = 0;
+    for (; n < maxit; ++n) {
+        mpf_mul(xr2, xr, xr); mpf_mul(xi2, xi, xi); mpf_mul(t, xr, xi);
+        mpf_sub(xr, xr2, xi2); mpf_add(xr, xr, cr);
+        mpf_mul_2exp(xi, t, 1); mpf_add(xi, xi, ci);
+        R.fr[n + 1] = mpf_to_fe(xr); R.fi[n + 1] = mpf_to_fe(xi);
+        R.zr[n + 1] = fe_to_double(R.fr[n + 1]); R.zi[n + 1] = fe_to_double(R.fi[n + 1]);
+        double zr = R.zr[n + 1], zi = R.zi[n + 1];
+        if (zr * zr + zi * zi > ESC2) { R.len = n + 1; mpf_clears(xr, xi, xr2, xi2, t, (mpf_ptr)0); return R; }
+    }
+    R.len = n; R.bounded = true;
+    mpf_clears(xr, xi, xr2, xi2, t, (mpf_ptr)0);
+    return R;
+}
+
+// Rescaled perturbation for a single pixel; dc given in floatexp so it never
+// underflows. Returns smooth escape iteration, or -1 for interior.
+static double pixelPertRS(const RefFE& ref, FloatExp dcr, FloatExp dci, int maxit) {
+    int reflen = ref.len;
+    FloatExp dcmag = fe_sqrt(fe_add(fe_mul(dcr, dcr), fe_mul(dci, dci)));   // |dc|
+    if (dcmag.m == 0.0) return -1.0;
+    FloatExp S = dcmag;                       // scale: dz_true = S * w
+    double s = fe_to_double(S);
+    double wr = fe_to_double(fe_div(dcr, S)), wi = fe_to_double(fe_div(dci, S));   // unit
+    double dr = wr, di = wi;                  // d = dc / S
+    int m = 1, iter = 1;                      // dz_true(index 1) = dc
+    const double HI = 1e16, LO = 1e-16, REBASE = 1e-8;
+
+    while (iter < maxit) {
+        // w' = 2 X_m w + s w^2 + d   (maps dz at ref index m to index m+1)
+        double Xr = ref.zr[m], Xi = ref.zi[m];
+        double w2r = wr * wr - wi * wi, w2i = 2.0 * wr * wi;
+        double nwr = 2.0 * (Xr * wr - Xi * wi) + s * w2r + dr;
+        double nwi = 2.0 * (Xr * wi + Xi * wr) + s * w2i + di;
+        wr = nwr; wi = nwi; ++m; ++iter;
+
+        Xr = ref.zr[m]; Xi = ref.zi[m];
+        double zr = Xr + s * wr, zi = Xi + s * wi;     // z = X_m + S w  (double shadow)
+        double zrad = zr * zr + zi * zi;
+        if (zrad > ESC2) return (double)iter + 1.0 - log(log(zrad) / 2.0 / LOG2) / LOG2;
+
+        // periodic rescale to keep |w| ~ O(1)
+        double wmag2 = wr * wr + wi * wi;
+        if (wmag2 > HI || (wmag2 < LO && wmag2 > 0.0)) {
+            FloatExp wmag = fe_sqrt(fe_from(wmag2));    // |w|
+            S = fe_mul(S, wmag); s = fe_to_double(S);
+            double inv = 1.0 / fe_to_double(wmag);
+            wr *= inv; wi *= inv;
+            dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
+        }
+
+        // rebase (Zhuoran): only possible where the reference is near 0, i.e.
+        // where the double |z| is tiny -- do the exact test in floatexp there.
+        if (zrad < REBASE || m >= reflen) {
+            FloatExp Swr = fe_mul_d(S, wr), Swi = fe_mul_d(S, wi);            // S w = dz_true
+            FloatExp zrfe = fe_add(ref.fr[m], Swr), zife = fe_add(ref.fi[m], Swi);
+            FloatExp zrad_fe = fe_add(fe_mul(zrfe, zrfe), fe_mul(zife, zife));
+            FloatExp dz_fe = fe_add(fe_mul(Swr, Swr), fe_mul(Swi, Swi));
+            if (m >= reflen || fe_abs_less(zrad_fe, dz_fe)) {
+                FloatExp Snew = fe_sqrt(zrad_fe);
+                if (Snew.m == 0.0) { wr = wi = 0.0; }
+                else {
+                    S = Snew; s = fe_to_double(S);
+                    wr = fe_to_double(fe_div(zrfe, S)); wi = fe_to_double(fe_div(zife, S));
+                    dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
+                }
+                m = 0;
+            }
+        }
+    }
+    return -1.0;
+}
+
 // smooth iteration -> grayscale byte (cyclic), interior -> 0
 static int shade(double v) {
     if (v < 0) return 0;
@@ -281,6 +377,47 @@ int main(int argc, char** argv) {
 
     printf("=== pbench %s  zoom=1e%d  tile=%dx%d  maxit=%d  prec=%d bits  eps=%.3g minskip=%d\n",
            loc.c_str(), scaleExp, W, H, maxit, precision, eps, minskip);
+
+    // ---- rescaled (floatexp) deep-zoom validation vs GMP oracle -----------
+    if (getenv("PB_FE")) {
+        auto tref = Clock::now();
+        RefFE ref = computeRefFE(cr, ci, maxit);
+        double t_ref = secs(tref, Clock::now());
+        printf("    [FE] reference: len=%d %s (%.3f s)\n", ref.len, ref.bounded ? "BOUNDED" : "escaped", t_ref);
+
+        auto dcFE = [&](int i, int j, FloatExp& fr, FloatExp& fi) {
+            mpf_t off; mpf_init(off);
+            mpf_set_si(off, 2 * j - (W - 1)); mpf_mul(off, off, dx); mpf_div_ui(off, off, 2); fr = mpf_to_fe(off);
+            mpf_set_si(off, 2 * i - (H - 1)); mpf_mul(off, off, dx); mpf_div_ui(off, off, 2); fi = mpf_to_fe(off);
+            mpf_clear(off);
+        };
+        // time a full-tile render
+        std::vector<double> itF(W * H);
+        auto tr = Clock::now();
+        for (int i = 0; i < H; ++i) for (int j = 0; j < W; ++j) {
+            FloatExp fr, fi; dcFE(i, j, fr, fi);
+            itF[i * W + j] = pixelPertRS(ref, fr, fi, maxit);
+        }
+        double t_rs = secs(tr, Clock::now());
+
+        int ostep = argc > 6 ? atoi(argv[6]) : 16;
+        long samp = 0, cls = 0; double maxd = 0, sumd = 0; int wi = -1, wj = -1; double wt = 0;
+        for (int i = 0; i < H; i += ostep) for (int j = 0; j < W; j += ostep) {
+            mpf_t pcr, pci, off; mpf_inits(pcr, pci, off, (mpf_ptr)0);
+            mpf_set_si(off, 2 * j - (W - 1)); mpf_mul(off, off, dx); mpf_div_ui(off, off, 2); mpf_add(pcr, cr, off);
+            mpf_set_si(off, 2 * i - (H - 1)); mpf_mul(off, off, dx); mpf_div_ui(off, off, 2); mpf_add(pci, ci, off);
+            double truth = pixelBrute(pcr, pci, maxit), f = itF[i * W + j];
+            ++samp; bool ti = truth < 0, fi2 = f < 0;
+            if (ti != fi2) ++cls; else if (!ti) { double d = fabs(truth - f); sumd += d; if (d > maxd) { maxd = d; wi = i; wj = j; wt = truth; } }
+            mpf_clears(pcr, pci, off, (mpf_ptr)0);
+        }
+        printf("    [FE] render %dx%d in %.3f s (%.2f Mpix/s)\n", W, H, t_rs, (W * H) / t_rs / 1e6);
+        printf("    [FE] vs GMP oracle (%ld px): class-mismatch=%ld  max-iter-diff=%.4g  mean=%.4g\n",
+               samp, cls, maxd, samp - cls > 0 ? sumd / (samp - cls) : 0.0);
+        if (wi >= 0) printf("    [FE] worst @ (%d,%d): truth=%.5f FE=%.5f\n", wi, wj, wt, itF[wi * W + wj]);
+        mpf_clears(cr, ci, scale, dw, dx, half, (mpf_ptr)0);
+        return 0;
+    }
 
     // dc of the tile corner (double) to check double is adequate.
     double dx_d = mpf_get_d(dx);
