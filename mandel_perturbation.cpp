@@ -69,6 +69,8 @@ Mandel::Mandel(int width, int height, int max_iteration, int sub, float* iter) :
 
     mpf_init(_t1);
     mpf_init(_t2);
+    mpf_init(_t3);
+    mpf_init(_t4);
     for (int i = 0; i <= _mxit; ++i) {
         mpf_init(_z_re[i]);
         mpf_init(_z_im[i]);
@@ -91,6 +93,8 @@ Mandel::~Mandel() {
 
     mpf_clear(_t1);
     mpf_clear(_t2);
+    mpf_clear(_t3);
+    mpf_clear(_t4);
     for (int i = 0; i <= _mxit; ++i) {
         mpf_clear(_z_re[i]);
         mpf_clear(_z_im[i]);
@@ -726,6 +730,8 @@ void Mandel::setPrecision(int precision) {
 
     mpf_set_prec(_t1, precision);
     mpf_set_prec(_t2, precision);
+    mpf_set_prec(_t3, precision);
+    mpf_set_prec(_t4, precision);
     for (int i = 0; i <= _mxit; ++i) {
         mpf_set_prec(_z_re[i], precision);
         mpf_set_prec(_z_im[i], precision);
@@ -1112,6 +1118,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
 // 1..reflen-1; higher levels merge neighbour pairs (skip 2^p).
 void Mandel::buildBLA(int reflen, bool ede) {
     _bla.clear();
+    _blaD.clear();
     _bla_rmax2 = 0.0;
     if (reflen < 3) return;
     double eps = _bla_eps > 0 ? _bla_eps : ldexp(1.0, -53);   // negligible vs double rounding
@@ -1127,7 +1134,9 @@ void Mandel::buildBLA(int reflen, bool ede) {
     double dcmax = std::sqrt(dxf * dxf * mxx * mxx + dyf * dyf * mxy * mxy);
 
     std::vector<BLAEntry> lvl0;
+    std::vector<BLADeriv> lvl0D;
     lvl0.reserve(reflen - 1);
+    if (ede) lvl0D.reserve(reflen - 1);
     for (int s = 1; s < reflen; ++s) {
         double zr = _zfr[s], zi = _zfi[s];
         double Zmag = sqrt(zr * zr + zi * zi);
@@ -1138,16 +1147,20 @@ void Mandel::buildBLA(int reflen, bool ede) {
         double R = eps * (Zmag - dcmax) / (Amag + 1.0);
         double r2 = R > 0 ? R * R : 0.0;
         if (r2 > _bla_rmax2) _bla_rmax2 = r2;
+        lvl0.push_back({ ar, ai, 1.0, 0.0, r2, 1 });
         // Under EDE also carry the derivative-delta coupling C = 2 D_s (dd -> C dz).
-        double cr = ede ? 2.0 * _dfr[s] : 0.0, ci = ede ? 2.0 * _dfi[s] : 0.0;
-        lvl0.push_back({ ar, ai, 1.0, 0.0, cr, ci, 0.0, 0.0, r2, 1 });
+        if (ede) lvl0D.push_back({ 2.0 * _dfr[s], 2.0 * _dfi[s], 0.0, 0.0 });
     }
     _bla.push_back(std::move(lvl0));
+    if (ede) _blaD.push_back(std::move(lvl0D));
 
     while (_bla.back().size() > 1) {
         const std::vector<BLAEntry>& prev = _bla.back();
+        const std::vector<BLADeriv>* prevD = ede ? &_blaD.back() : nullptr;
         std::vector<BLAEntry> nxt;
+        std::vector<BLADeriv> nxtD;
         nxt.reserve(prev.size() / 2);
+        if (ede) nxtD.reserve(prev.size() / 2);
         for (size_t i = 0; i + 1 < prev.size(); i += 2) {
             const BLAEntry& x = prev[i];
             const BLAEntry& y = prev[i + 1];
@@ -1156,11 +1169,17 @@ void Mandel::buildBLA(int reflen, bool ede) {
             z.ai = y.ar * x.ai + y.ai * x.ar;
             z.br = y.ar * x.br - y.ai * x.bi + y.br;          // B_z = A_y B_x + B_y
             z.bi = y.ar * x.bi + y.ai * x.br + y.bi;
-            // Derivative couplings: C_z = C_y A_x + A_y C_x, E_z = C_y B_x + A_y E_x + E_y
-            z.cr = (y.cr * x.ar - y.ci * x.ai) + (y.ar * x.cr - y.ai * x.ci);
-            z.ci = (y.cr * x.ai + y.ci * x.ar) + (y.ar * x.ci + y.ai * x.cr);
-            z.er = (y.cr * x.br - y.ci * x.bi) + (y.ar * x.er - y.ai * x.ei) + y.er;
-            z.ei = (y.cr * x.bi + y.ci * x.br) + (y.ar * x.ei + y.ai * x.er) + y.ei;
+            if (ede) {
+                const BLADeriv& xd = (*prevD)[i];
+                const BLADeriv& yd = (*prevD)[i + 1];
+                BLADeriv zd;
+                // Derivative couplings: C_z = C_y A_x + A_y C_x, E_z = C_y B_x + A_y E_x + E_y
+                zd.cr = (yd.cr * x.ar - yd.ci * x.ai) + (y.ar * xd.cr - y.ai * xd.ci);
+                zd.ci = (yd.cr * x.ai + yd.ci * x.ar) + (y.ar * xd.ci + y.ai * xd.cr);
+                zd.er = (yd.cr * x.br - yd.ci * x.bi) + (y.ar * xd.er - y.ai * xd.ei) + yd.er;
+                zd.ei = (yd.cr * x.bi + yd.ci * x.br) + (y.ar * xd.ei + y.ai * xd.er) + yd.ei;
+                nxtD.push_back(zd);
+            }
             double Rx = sqrt(x.r2), Ry = sqrt(y.r2);
             double Axmag = sqrt(x.ar * x.ar + x.ai * x.ai);
             double Bxmag = sqrt(x.br * x.br + x.bi * x.bi);
@@ -1171,6 +1190,7 @@ void Mandel::buildBLA(int reflen, bool ede) {
             nxt.push_back(z);
         }
         _bla.push_back(std::move(nxt));   // odd leftover dropped; still available lower
+        if (ede) _blaD.push_back(std::move(nxtD));
     }
     if (getenv("MANDEL_PROFILE"))
         fprintf(stderr, "  [profile] buildBLA: reflen=%d levels=%zu dcmax=%.3e rmax=%.3e |Z1|=%.3e SA_it=%d SA_order=%d\n",
@@ -1210,8 +1230,9 @@ int Mandel::tryBLA(int s, double& dzr, double& dzi, double& ddr, double& ddi,
         }
         if (ede) {
             // dd -> C*dz + A*dd + E*dc  (derivative delta carried through the skip)
-            double nddr = (b.cr * dzr - b.ci * dzi) + (b.ar * ddr - b.ai * ddi) + (b.er * dcr - b.ei * dci);
-            double nddi = (b.cr * dzi + b.ci * dzr) + (b.ar * ddi + b.ai * ddr) + (b.er * dci + b.ei * dcr);
+            const BLADeriv& bd = _blaD[p][i];
+            double nddr = (bd.cr * dzr - bd.ci * dzi) + (b.ar * ddr - b.ai * ddi) + (bd.er * dcr - bd.ei * dci);
+            double nddi = (bd.cr * dzi + bd.ci * dzr) + (b.ar * ddi + b.ai * ddr) + (bd.er * dci + bd.ei * dcr);
             ddr = nddr; ddi = nddi;
         }
         dzr = nzr; dzi = nzi;
@@ -1388,6 +1409,10 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
     // The stored reference is _zfr[k] = X_{k+1} (X_0 = 0 is the implicit critical
     // point). Access the orbit as X_m: X_0 = 0, X_m = _zfr[m-1]. Rebasing resets to
     // the critical point m = 0 (X_0 = 0), matching the double path's k==0 case.
+    // Read the orbit through the interleaved _zf (re,im adjacent) so each X_m load
+    // touches one cache line instead of two separate _zfr/_zfi streams: this loop
+    // is memory-bound, so halving the reference footprint is the real lever.
+    const double* zfp = reinterpret_cast<const double*>(_zf);
     const int reflen = mx_ref_it + 1;
 
     FloatExp S = fe_sqrt(fe_add(fe_mul(dcr, dcr), fe_mul(dci, dci)));   // |dc|
@@ -1423,13 +1448,13 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
             }
         }
         // w' = 2 X_m w + s w^2 + d   (dz_m -> dz_{m+1}); X_0 = 0.
-        double Xr = m ? _zfr[m - 1] : 0.0, Xi = m ? _zfi[m - 1] : 0.0;
+        double Xr = m ? zfp[2 * (m - 1)] : 0.0, Xi = m ? zfp[2 * (m - 1) + 1] : 0.0;
         double w2r = wr * wr - wi * wi, w2i = 2.0 * wr * wi;
         double nwr = 2.0 * (Xr * wr - Xi * wi) + s * w2r + dr;
         double nwi = 2.0 * (Xr * wi + Xi * wr) + s * w2i + di;
         wr = nwr; wi = nwi; ++m; ++iter;
 
-        Xr = m ? _zfr[m - 1] : 0.0; Xi = m ? _zfi[m - 1] : 0.0;
+        Xr = m ? zfp[2 * (m - 1)] : 0.0; Xi = m ? zfp[2 * (m - 1) + 1] : 0.0;
         double zr = Xr + s * wr, zi = Xi + s * wi;      // z = X_m + S w
         double zrad = zr * zr + zi * zi;
         if (zrad > ESC2)
@@ -1728,12 +1753,13 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
 }
 
 bool Mandel::calCoefficient(int i, int pr_it, int c_method) {
-    // _z[i] = _z[i - 1] * _z[i - 1] + _ref_z;
-    mpf_mul(_z_re[i], _z_re[i - 1], _z_re[i - 1]);
-    mpf_mul(_t1, _z_im[i - 1], _z_im[i - 1]);
-    mpf_sub(_z_re[i], _z_re[i], _t1);
-    mpf_mul(_z_im[i], _z_re[i - 1], _z_im[i - 1]);
-    mpf_mul_ui(_z_im[i], _z_im[i], 2);
+    // _z[i] = _z[i - 1] * _z[i - 1] + _ref_z;  (complex square via Karatsuba:
+    // re = (a+b)(a-b), im = 2ab -> 2 big multiplies instead of 3)
+    mpf_add(_t1, _z_re[i - 1], _z_im[i - 1]);       // a + b
+    mpf_sub(_t2, _z_re[i - 1], _z_im[i - 1]);       // a - b
+    mpf_mul(_z_im[i], _z_re[i - 1], _z_im[i - 1]);  // a*b   (read a,b before _z_re[i] write)
+    mpf_mul(_z_re[i], _t1, _t2);                    // a^2 - b^2
+    mpf_mul_ui(_z_im[i], _z_im[i], 2);              // 2ab
     mpf_add(_z_re[i], _z_re[i], _ref_z_re);
     mpf_add(_z_im[i], _z_im[i], _ref_z_im);
 
@@ -1747,15 +1773,18 @@ bool Mandel::calCoefficient(int i, int pr_it, int c_method) {
     _z_m3[i] = { (_zfr[i] * _zfr[i] + _zfi[i] * _zfi[i]) / 1000000 };
 
     if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
-        // _d[i] = 2 * _d[i - 1] * _z[i - 1] + 1;
-        mpf_mul(_d_re[i], _d_re[i - 1], _z_re[i - 1]);
-        mpf_mul(_t1, _d_im[i - 1], _z_im[i - 1]);
-        mpf_sub(_d_re[i], _d_re[i], _t1);
+        // _d[i] = 2 * _d[i - 1] * _z[i - 1] + 1;  (complex product d*z via Karatsuba:
+        // k1=zr(dr+di), k2=dr(zi-zr), k3=di(zr+zi); re=k1-k3, im=k1+k2 -> 3 muls)
+        mpf_add(_t1, _d_re[i - 1], _d_im[i - 1]);   // dr + di
+        mpf_mul(_t2, _z_re[i - 1], _t1);            // k1 = zr(dr+di)
+        mpf_sub(_t1, _z_im[i - 1], _z_re[i - 1]);   // zi - zr
+        mpf_mul(_t3, _d_re[i - 1], _t1);            // k2 = dr(zi-zr)
+        mpf_add(_t1, _z_re[i - 1], _z_im[i - 1]);   // zr + zi
+        mpf_mul(_t4, _d_im[i - 1], _t1);            // k3 = di(zr+zi)
+        mpf_sub(_d_re[i], _t2, _t4);                // re = k1 - k3
         mpf_mul_ui(_d_re[i], _d_re[i], 2);
         mpf_add_ui(_d_re[i], _d_re[i], 1);
-        mpf_mul(_d_im[i], _d_re[i - 1], _z_im[i - 1]);
-        mpf_mul(_t1, _d_im[i - 1], _z_re[i - 1]);
-        mpf_add(_d_im[i], _d_im[i], _t1);
+        mpf_add(_d_im[i], _t2, _t3);                // im = k1 + k2
         mpf_mul_ui(_d_im[i], _d_im[i], 2);
 
         

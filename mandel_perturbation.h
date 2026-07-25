@@ -74,11 +74,16 @@ private:
                               float* out, int mxit, int c_method) const;
 
     // Bivariate Linear Approximation (Zhuoran / Fraktaler-3). A BLA skips l
-    // reference iterations via dz -> A*dz + B*dc when |dz| < R. Under EDE it also
-    // carries the derivative delta dd -> C*dz + A*dd + E*dc (the derivative's own
-    // linearised recurrence), so distance-estimate colouring survives the skip.
-    struct BLAEntry { double ar, ai, br, bi, cr, ci, er, ei, r2; int l; };
+    // reference iterations via dz -> A*dz + B*dc when |dz| < R. The hot entry
+    // (A, B, r2, l) is what every tryBLA/tryBLAfe lookup reads; splitting it from
+    // the EDE-only derivative couplings (C, E in a parallel _blaD) shrinks the
+    // per-entry footprint ~40% (80->48 B) so the large table streams from cache
+    // better in the memory-bound delta loop.
+    struct BLAEntry { double ar, ai, br, bi, r2; int l; };
+    // Derivative deltas carried through a skip under EDE: dd -> C*dz + A*dd + E*dc.
+    struct BLADeriv { double cr, ci, er, ei; };
     std::vector<std::vector<BLAEntry>> _bla;
+    std::vector<std::vector<BLADeriv>> _blaD;   // parallel to _bla; only built under EDE
     double _bla_eps = 0.0;
     double _bla_rmax2 = 0.0;      // largest BLA validity radius^2 (gate for tryBLA)
     bool _use_bla = false;
@@ -168,7 +173,7 @@ private:
     int _mx_coef;
 
     // temporary vavriables
-    mpf_t _t1, _t2;
+    mpf_t _t1, _t2, _t3, _t4;
 };
 
 #endif
