@@ -290,6 +290,13 @@ public:
     int dpi = 96;         // display DPI; all metrics scale by dpi/96
     std::chrono::steady_clock::time_point renderStart;
     double lastRenderMs = 0;
+    // Cached back buffer + partial-repaint state (avoids reallocating the buffer
+    // and rebuilding the whole UI panel on every drag/zoom/compute tick).
+    HDC memDC = nullptr; HBITMAP memBmp = nullptr; HGDIOBJ memOld = nullptr;
+    int memW = 0, memH = 0;
+    bool needFull = true;          // force a full redraw (buffer (re)created / first paint)
+    bool fractalOnlyTick = false;  // set by the timer for pure fractal animation frames
+    double lastPresentMs = 0;
 
     int S(int v) const { return MulDiv(v, dpi, 96); }   // scale a design px to device px
     void keepLive(int frames = 60) { liveFrames = std::max(liveFrames, frames); }
@@ -559,12 +566,23 @@ public:
     void paint() {
         PAINTSTRUCT ps; HDC wdc = BeginPaint(hwnd, &ps);
         RECT rc; GetClientRect(hwnd, &rc);
-        HDC dc = CreateCompatibleDC(wdc);
-        HBITMAP bmp = CreateCompatibleBitmap(wdc, rc.right, rc.bottom);
-        HGDIOBJ obmp = SelectObject(dc, bmp);
-        fillRect(dc, rc, CLR_BG);
+        auto _pt0 = std::chrono::steady_clock::now();
+        // Cached back buffer: recreate only when the client size changes, not per
+        // frame. Any content change forces a full redraw via needFull.
+        if (!memDC || memW != (int)rc.right || memH != (int)rc.bottom) {
+            if (memDC) { SelectObject(memDC, memOld); DeleteObject(memBmp); DeleteDC(memDC); }
+            memDC = CreateCompatibleDC(wdc);
+            memBmp = CreateCompatibleBitmap(wdc, rc.right, rc.bottom);
+            memOld = SelectObject(memDC, memBmp);
+            memW = rc.right; memH = rc.bottom; needFull = true;
+        }
+        HDC dc = memDC;
+        // Full redraw unless this is a pure fractal-animation tick from the timer.
+        bool full = needFull || !fractalOnlyTick;
+        needFull = false; fractalOnlyTick = false;
+        if (full) fillRect(dc, rc, CLR_BG);   // bg + letterbox (full paints only)
 
-        // fractal view
+        // fractal view (always -- it changes every tick)
         RECT vr = viewRect();
         BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bi.bmiHeader.biWidth = RENDER_W; bi.bmiHeader.biHeight = -RENDER_H;
@@ -573,6 +591,9 @@ public:
         StretchDIBits(dc, vr.left, vr.top, vr.right-vr.left, vr.bottom-vr.top,
                       0,0, RENDER_W, RENDER_H, display.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
 
+        // panel + all controls: only rebuilt when UI state changed. On fractal/
+        // compute/drag ticks the panel persists in the cached buffer.
+        if (full) {
         // panel
         RECT panel = { rc.right - S(PANEL_W), 0, rc.right, rc.bottom };
         fillRect(dc, panel, CLR_PANEL);
@@ -651,20 +672,24 @@ public:
             RECT tr = rcColor; tr.left += S(44);
             drawText(dc, tr, L"Edit selected stop color", CLR_TEXT, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
+        } // end panel (full paints only)
 
-        // status bar
+        // status bar (always -- text changes with compute state / timings)
         RECT status = { 0, rc.bottom - S(STATUS_H), rc.right - S(PANEL_W), rc.bottom };
         fillRect(dc, status, CLR_PANEL);
         std::wstring st = nav->IsComputing()
             ? L"  Rendering..."
-            : L"  Ready   last render " + std::to_wstring((int)lastRenderMs) +
-              L" ms    Drag pan   Wheel zoom   R reset   Space render   S save   C copy";
+            : L"  Ready   last render " + std::to_wstring((int)lastRenderMs) + L" ms";
+        st += L"   present " + std::to_wstring((int)(lastPresentMs + 0.5)) + L" ms";
+        if (!nav->IsComputing())
+            st += L"    Drag pan   Wheel zoom   R reset   Space render   S save   C copy";
         RECT str = status; str.left += S(10);
         drawText(dc, str, st, CLR_TEXT_DIM, fSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
         BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
-        SelectObject(dc, obmp); DeleteObject(bmp); DeleteDC(dc);
         EndPaint(hwnd, &ps);
+        lastPresentMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - _pt0).count();
     }
 
     Hit hitTest(int x, int y) {
@@ -707,10 +732,18 @@ public:
         wasComputing = computing;
         buildDisplay();
         if (maxEditing) ++caretTick;
+        // Pure fractal-animation frames (pan/zoom/compute) can skip the panel
+        // rebuild; UI-control interaction still gets a full paint.
+        bool uiInteract = palette.dragging || maxEditing ||
+                          pressed == H_MAXTRACK || pressed == H_DENSTRACK;
+        fractalOnlyTick = !uiInteract;
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
     LRESULT message(UINT msg, WPARAM wp, LPARAM lp) {
+        // Any non-timer/paint message may change UI state, so force the next paint
+        // to be a full redraw (the timer re-enables fractal-only ticks).
+        if (msg != WM_TIMER && msg != WM_PAINT) fractalOnlyTick = false;
         switch (msg) {
         case WM_CREATE: {
             dpi = (int)GetDpiForWindow(hwnd);
@@ -838,6 +871,7 @@ public:
         case WM_DESTROY:
             KillTimer(hwnd, TIMER_ID);
             nav.reset();
+            if (memDC) { SelectObject(memDC, memOld); DeleteObject(memBmp); DeleteDC(memDC); memDC = nullptr; }
             DeleteObject(fUi); DeleteObject(fBold); DeleteObject(fSmall); DeleteObject(fMono);
             PostQuitMessage(0);
             return 0;
