@@ -100,6 +100,7 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
     const int c = _sub / 2;
     prepareColorFilter();   // rebuild palette box-filter integral once per frame
     const bool ss = (_c_method & ColoringMethod::SUPER_SAMPLING) != 0;
+#pragma omp parallel for schedule(dynamic, 8)
     for (int i = 0; i < _h; ++i) {
         for (int j = 0; j < _w; ++j) {
             int idx_bmp = (i * _w + j) * 3;

@@ -13,6 +13,7 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <chrono>
 
 #include "mandel_perturbation.h"
 #include "interpolate.h"
@@ -125,6 +126,8 @@ int main(int argc, char** argv) {
 
     // Colour hi-res, box-downsample SSxSS in linear light.
     std::vector<uint8_t> img(W * H * 3);
+    auto _tc0 = std::chrono::high_resolution_clock::now();
+#pragma omp parallel for schedule(dynamic, 8)
     for (int i = 0; i < H; ++i)
         for (int j = 0; j < W; ++j) {
             float lr = 0, lg = 0, lb = 0;
@@ -140,6 +143,10 @@ int main(int argc, char** argv) {
             p[2] = (uint8_t)(toGam(lb / n) + 0.5f);
         }
     writeBMP(out, img, W, H);
+    if (getenv("MANDEL_PROFILE")) {
+        double _tcol = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - _tc0).count();
+        fprintf(stderr, "  [timing] coloring pass: %.4f s  (%dx%d, SS=%d)\n", _tcol, W, H, SS);
+    }
     printf("Wrote %s\n", out);
     return 0;
 }
