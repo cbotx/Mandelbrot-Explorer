@@ -107,6 +107,12 @@ private:
     // inner loop is native-double yet correct far past double's ~1e320 underflow.
     // Used when _use_floatexp; returns the pixel escape value (interior -> -2).
     float pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit, int c_method) const;
+    // AVX2 4-wide version of pixelRescaled: iterates up to 4 deep-zoom pixels in
+    // lockstep, vectorising the rescaled double step while keeping BLA / rescale /
+    // rebase as cheap per-lane scalar events. Writes smooth-iteration values into
+    // out[g..g+lanes). Mirrors pixelRescaled's math; no EDE derivative (dz-only).
+    void solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g, int lanes,
+                            int mx_ref_it, int mxit, int c_method, float* out) const;
     int SACheckMagnitude() const;
     float accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_method = 0) const;
     double floatPointCompute(Float c_re, Float c_im, int mxit, int c_method = 0) const;

@@ -782,16 +782,47 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         // ---- deep-zoom rescaled (floatexp) path: correct past ~1e320 ----
         // Each pixel's dc is built in floatexp (dxfe/dyfe * integer offset) so it
         // never underflows, then iterated with the rescaled delta loop.
-#pragma omp parallel for schedule(dynamic, 1)
+        static int fesimd = -1;
+        if (fesimd < 0) { const char* e = getenv("MANDEL_FESIMD"); fesimd = e ? atoi(e) : 1; }
+        // The rescaled step vectorises cleanly (4-wide, byte-identical output) but
+        // the deep loop is memory/latency-bound on the per-iteration reference
+        // gather, so SIMD only ~matches scalar (same as the double-path solveSimd4).
+        // BLA already skips most steps and is checked per-lane scalar every
+        // iteration, so keep the default (BLA) path scalar and use SIMD only when
+        // BLA is off (where the quadratic step is the whole cost).
+        const bool feSimdOn = fesimd && !_use_bla;
+
+        std::vector<FloatExp> Dcr(n), Dci(n);
+        std::vector<float> val(n);
+#pragma omp parallel for schedule(dynamic, 64)
         for (int i = 0; i < (int)v.size(); ++i) {
             if (_flag_halt) continue;
             auto arr = v[i];
             glitch_p[i] = -1;
             double px = arr[1] + (double)arr[3] / _sub;
             double py = arr[0] + (double)arr[2] / _sub;
-            FloatExp dcr = fe_mul_d(_dxfe, px - _ref_x);
-            FloatExp dci = fe_mul_d(_dyfe, py - _ref_y);
-            float value = pixelRescaled(dcr, dci, mx_ref_it, mxit, c_method);
+            Dcr[i] = fe_mul_d(_dxfe, px - _ref_x);
+            Dci[i] = fe_mul_d(_dyfe, py - _ref_y);
+        }
+        if (feSimdOn) {
+#pragma omp parallel for schedule(dynamic, 1)
+            for (int gg = 0; gg < n; gg += 4) {
+                if (_flag_halt) continue;
+                int lanes = n - gg < 4 ? n - gg : 4;
+                solveRescaledSimd4(Dcr.data(), Dci.data(), gg, lanes, mx_ref_it, mxit, c_method, val.data());
+            }
+        } else {
+#pragma omp parallel for schedule(dynamic, 1)
+            for (int i = 0; i < (int)v.size(); ++i) {
+                if (_flag_halt) continue;
+                val[i] = pixelRescaled(Dcr[i], Dci[i], mx_ref_it, mxit, c_method);
+            }
+        }
+#pragma omp parallel for schedule(dynamic, 64)
+        for (int i = 0; i < (int)v.size(); ++i) {
+            if (_flag_halt) continue;
+            auto arr = v[i];
+            float value = val[i];
             if (_fe_cutoff_sensitive && (value < 0 || value > mxit - 16)) {
                 // This rare frame sits directly on the maxit classification
                 // boundary. Resolve only its uncertain pixels with the GMP oracle;
@@ -1456,6 +1487,138 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         }
     }
     return -2.f;   // interior (hit maxit)
+}
+
+// AVX2 4-wide rescaled deep-zoom kernel. Each lane carries its own scale S, delta
+// (wr,wi), reference index m and iteration count, so lanes stay independent and
+// coherent adjacent pixels vectorise well. The heavy quadratic step is done in a
+// __m256d; BLA skips, |w| rescales and Zhuoran rebases are rare per-lane scalar
+// events. Mirrors pixelRescaled op-for-op (see that function for the math).
+void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g, int lanes,
+                                int mx_ref_it, int mxit, int c_method, float* out) const {
+    const double ESC2 = (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS;
+    const double LG2 = log(2.0);
+    const int reflen = mx_ref_it + 1;
+
+    alignas(32) double wr[4] = { 0,0,0,0 }, wi[4] = { 0,0,0,0 };
+    alignas(32) double sS[4] = { 1,1,1,1 }, dr[4] = { 0,0,0,0 }, di[4] = { 0,0,0,0 };
+    FloatExp S[4], dcr[4], dci[4];
+    int m[4] = { 0,0,0,0 }, iter[4] = { 0,0,0,0 };
+    bool act[4] = { false,false,false,false };
+
+    for (int l = 0; l < lanes; ++l) {
+        FloatExp DCr = Dcr[g + l], DCi = Dci[g + l];
+        dcr[l] = DCr; dci[l] = DCi;
+        FloatExp Sl = fe_sqrt(fe_add(fe_mul(DCr, DCr), fe_mul(DCi, DCi)));
+        if (Sl.m == 0.0) { S[l] = FloatExp{ 1.0, 0 }; wr[l] = wi[l] = dr[l] = di[l] = 0.0; }
+        else {
+            S[l] = Sl;
+            wr[l] = fe_to_double(fe_div(DCr, Sl)); wi[l] = fe_to_double(fe_div(DCi, Sl));
+            dr[l] = wr[l]; di[l] = wi[l];
+        }
+        sS[l] = fe_to_double(S[l]);
+        m[l] = 1; iter[l] = 1;
+        out[g + l] = -2.f;      // interior default
+        act[l] = true;
+    }
+
+    const __m256d two = _mm256_set1_pd(2.0);
+    bool anyactive = (lanes > 0);
+    while (anyactive) {
+        if (_flag_halt) return;
+
+        // Phase 1: per-lane scalar BLA. A skipping lane advances itself and sits
+        // out this round's vector step (stepMask bit clear).
+        int stepMask = 0;
+        for (int l = 0; l < lanes; ++l) {
+            if (!act[l]) continue;
+            if (iter[l] >= mxit) { out[g + l] = -2.f; act[l] = false; continue; }
+            bool skipped = false;
+            if (_use_bla && m[l] >= 2) {
+                int skip = tryBLAfe(m[l] - 1, S[l], wr[l], wi[l], dcr[l], dci[l], ESC2, reflen);
+                if (skip > 0) {
+                    m[l] += skip; iter[l] += skip;
+                    sS[l] = fe_to_double(S[l]);
+                    dr[l] = fe_to_double(fe_div(dcr[l], S[l]));
+                    di[l] = fe_to_double(fe_div(dci[l], S[l]));
+                    skipped = true;
+                }
+            }
+            if (!skipped) stepMask |= 1 << l;
+        }
+
+        // Phase 2: gather reference values and run the quadratic step for the
+        // lanes that are stepping this round (garbage lanes compute unused zeros).
+        alignas(32) double Xpr[4] = { 0,0,0,0 }, Xpi[4] = { 0,0,0,0 };
+        alignas(32) double Xqr[4] = { 0,0,0,0 }, Xqi[4] = { 0,0,0,0 };
+        for (int l = 0; l < 4; ++l) {
+            if (!(stepMask & (1 << l))) continue;
+            int mm = m[l];
+            if (mm) { Xpr[l] = _zfr[mm - 1]; Xpi[l] = _zfi[mm - 1]; }   // X_m
+            int pi = mm > mx_ref_it ? mx_ref_it : mm;                  // X_{m+1} = _zfr[mm]
+            Xqr[l] = _zfr[pi]; Xqi[l] = _zfi[pi];
+        }
+        __m256d vwr = _mm256_load_pd(wr), vwi = _mm256_load_pd(wi);
+        __m256d vs = _mm256_load_pd(sS), vdr = _mm256_load_pd(dr), vdi = _mm256_load_pd(di);
+        __m256d vXpr = _mm256_load_pd(Xpr), vXpi = _mm256_load_pd(Xpi);
+        __m256d w2r = _mm256_sub_pd(_mm256_mul_pd(vwr, vwr), _mm256_mul_pd(vwi, vwi));
+        __m256d w2i = _mm256_mul_pd(two, _mm256_mul_pd(vwr, vwi));
+        // nwr = 2*(Xpr*wr - Xpi*wi) + s*w2r + dr
+        __m256d a = _mm256_sub_pd(_mm256_mul_pd(vXpr, vwr), _mm256_mul_pd(vXpi, vwi));
+        __m256d nwr = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(two, a), _mm256_mul_pd(vs, w2r)), vdr);
+        // nwi = 2*(Xpr*wi + Xpi*wr) + s*w2i + di
+        __m256d b = _mm256_add_pd(_mm256_mul_pd(vXpr, vwi), _mm256_mul_pd(vXpi, vwr));
+        __m256d nwi = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(two, b), _mm256_mul_pd(vs, w2i)), vdi);
+        __m256d vXqr = _mm256_load_pd(Xqr), vXqi = _mm256_load_pd(Xqi);
+        __m256d zr = _mm256_add_pd(vXqr, _mm256_mul_pd(vs, nwr));
+        __m256d zi = _mm256_add_pd(vXqi, _mm256_mul_pd(vs, nwi));
+        __m256d zrad = _mm256_add_pd(_mm256_mul_pd(zr, zr), _mm256_mul_pd(zi, zi));
+        __m256d wmag2 = _mm256_add_pd(_mm256_mul_pd(nwr, nwr), _mm256_mul_pd(nwi, nwi));
+        alignas(32) double nwr_[4], nwi_[4], zrad_[4], wmag2_[4];
+        _mm256_store_pd(nwr_, nwr); _mm256_store_pd(nwi_, nwi);
+        _mm256_store_pd(zrad_, zrad); _mm256_store_pd(wmag2_, wmag2);
+
+        // Phase 3: per-lane scalar commit + rare rescale / rebase / escape events.
+        for (int l = 0; l < lanes; ++l) {
+            if (!(stepMask & (1 << l))) continue;
+            wr[l] = nwr_[l]; wi[l] = nwi_[l]; ++m[l]; ++iter[l];
+            double zrl = zrad_[l];
+            if (zrl > ESC2) {
+                out[g + l] = (float)((double)iter[l] - log(log(zrl) / 2.0 / LG2) / LG2);
+                act[l] = false; continue;
+            }
+            double wm = wmag2_[l];
+            if (wm > 1e16 || (wm < 1e-16 && wm > 0.0)) {          // keep |w| ~ O(1)
+                FloatExp wmag = fe_sqrt(fe_from(wm));
+                S[l] = fe_mul(S[l], wmag); sS[l] = fe_to_double(S[l]);
+                double inv = 1.0 / fe_to_double(wmag);
+                wr[l] *= inv; wi[l] *= inv;
+                dr[l] = fe_to_double(fe_div(dcr[l], S[l])); di[l] = fe_to_double(fe_div(dci[l], S[l]));
+            }
+            if (zrl < 1e-8 || m[l] >= reflen) {                   // Zhuoran rebase to m=0
+                int mm = m[l];
+                FloatExp Xmr = mm ? _zfr_fe[mm - 1] : FloatExp{ 0.0, 0 };
+                FloatExp Xmi = mm ? _zfi_fe[mm - 1] : FloatExp{ 0.0, 0 };
+                FloatExp Swr = fe_mul_d(S[l], wr[l]), Swi = fe_mul_d(S[l], wi[l]);
+                FloatExp zrfe = fe_add(Xmr, Swr), zife = fe_add(Xmi, Swi);
+                FloatExp zradfe = fe_add(fe_mul(zrfe, zrfe), fe_mul(zife, zife));
+                FloatExp dzfe = fe_add(fe_mul(Swr, Swr), fe_mul(Swi, Swi));
+                if (mm >= reflen || fe_abs_less(zradfe, dzfe)) {
+                    FloatExp Snew = fe_sqrt(zradfe);
+                    if (Snew.m == 0.0) { wr[l] = wi[l] = 0.0; }
+                    else {
+                        S[l] = Snew; sS[l] = fe_to_double(S[l]);
+                        wr[l] = fe_to_double(fe_div(zrfe, S[l])); wi[l] = fe_to_double(fe_div(zife, S[l]));
+                        dr[l] = fe_to_double(fe_div(dcr[l], S[l])); di[l] = fe_to_double(fe_div(dci[l], S[l]));
+                    }
+                    m[l] = 0;
+                }
+            }
+        }
+
+        anyactive = false;
+        for (int l = 0; l < lanes; ++l) if (act[l]) { anyactive = true; break; }
+    }
 }
 
 int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random,
