@@ -712,7 +712,7 @@ public:
         const auto& pr = palettePresets();
         if (idx < 0 || idx >= (int)pr.size()) return;
         paletteIdx = idx; palette.load(idx);
-        nav->SetRedisplay(); InvalidateRect(hwnd, nullptr, FALSE);
+        nav->SetRedisplay(); keepLive(); InvalidateRect(hwnd, nullptr, FALSE);
     }
 
     void paint() {
