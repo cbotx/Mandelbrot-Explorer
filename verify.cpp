@@ -65,16 +65,22 @@ static int runCase(const TestCase& tc, int W, int H) {
     Mandel mandel(W, H, tc.mxit, 1, itp);
     mandel.setPrecision(precision);
 
-    printf("=== %s  (%dx%d, scale=1e%zu, mxit=%d, prec=%d bits)\n",
-           tc.name, W, H, tc.scale.size() - 1, tc.mxit, precision);
+    // Optional EDE mode (exterior distance estimation) to benchmark the
+    // accuracy-safe render path used by the GUI. Applied to both the
+    // perturbation engine and the brute-force oracle so values stay comparable.
+    int c_method = (getenv("MANDEL_EDE") != nullptr) ? ColoringMethod::EXTERIOR_DIST_EST : 0;
+
+    printf("=== %s  (%dx%d, scale=1e%zu, mxit=%d, prec=%d bits%s)\n",
+           tc.name, W, H, tc.scale.size() - 1, tc.mxit, precision,
+           c_method ? ", EDE" : "");
 
     auto t0 = Clock::now();
-    mandel.Compute(cre, cim, scale, tc.mxit);
+    mandel.Compute(cre, cim, scale, tc.mxit, c_method);
     double t_pert = since(t0);
 
     bool run_oracle = (getenv("MANDEL_NOORACLE") == nullptr);
     t0 = Clock::now();
-    if (run_oracle) mandel.ComputeDirect(tc.mxit, itd, tc.step);
+    if (run_oracle) mandel.ComputeDirect(tc.mxit, itd, tc.step, c_method);
     double t_direct = since(t0);
 
     // Compare only pixels the (possibly sparse) oracle actually computed.

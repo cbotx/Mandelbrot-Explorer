@@ -109,7 +109,7 @@ private:
 private:
     volatile bool _flag_halt = false;
     volatile bool _sub_flag;
-    const float _ESCAPE_RADIUS = 100;
+    float _ESCAPE_RADIUS = 1e8f;
     const double _TOL = 1e12;
     static const int _SA_N = 30;
 

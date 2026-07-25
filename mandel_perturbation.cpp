@@ -41,6 +41,7 @@ Mandel::Mandel(int width, int height, int max_iteration, int sub, float* iter) :
     assert(height > 0);
     assert(max_iteration > 0);
     assert(sub % 2);
+    { const char* e = getenv("MANDEL_BAILOUT"); if (e && atof(e) > 0) _ESCAPE_RADIUS = (float)atof(e); }
     _z_re = new mpf_t[_mxit + 1];
     _z_im = new mpf_t[_mxit + 1];
     _zf = new Comp[_mxit + 1];
@@ -284,6 +285,11 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
     mpf_init(d_re);
     mpf_init(d_im);
     mpf_set_str(d_re, "2", 10);
+    // dc = 1  (derivative w.r.t. the parameter c; drives the EDE distance
+    // estimate). Iterated only when EDE is requested, mirroring floatPointCompute.
+    const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
+    mpf_t dc_re, dc_im, e1, e2;
+    mpf_init_set_ui(dc_re, 1); mpf_init(dc_im); mpf_init(e1); mpf_init(e2);
     int i = 1;
     float res = -2;
     while (i < mxit) {
@@ -296,6 +302,14 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
         mpf_mul_ui(d_re, d_re, 2);
         mpf_add(d_im, d_im, t1);
         mpf_mul_ui(d_im, d_im, 2);
+
+        // dc = 2.0 * dc * z + 1   (uses the pre-update z, like floatPointCompute)
+        if (ede) {
+            mpf_mul(e1, dc_re, z_im); mpf_mul(e2, dc_im, z_re); mpf_add(e2, e1, e2);
+            mpf_mul(e1, dc_re, z_re); mpf_mul(t2, dc_im, z_im); mpf_sub(e1, e1, t2);
+            mpf_mul_ui(dc_re, e1, 2); mpf_add_ui(dc_re, dc_re, 1);
+            mpf_mul_ui(dc_im, e2, 2);
+        }
 
         // z = z * z + c;
         mpf_mul(t1, z_re, z_im);
@@ -316,7 +330,17 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
         double rad = mpf_get_d(t1);
 
         if (rad > _ESCAPE_RADIUS * _ESCAPE_RADIUS) {
-            res = (i + 1 - log(log(rad) / 2 / log(2)) / log(2));
+            if (ede) {
+                // EDE distance estimate = |z| * log(|z|^2) / |dc|, computed via
+                // mpf to avoid overflowing double when |dc| is huge (deep zoom).
+                mpf_mul(e1, dc_re, dc_re); mpf_mul(e2, dc_im, dc_im);
+                mpf_add(e1, e1, e2); mpf_sqrt(e1, e1);
+                mpf_set_d(e2, sqrt(rad) * log(rad));
+                mpf_div(e1, e2, e1);
+                res = (float)mpf_get_d(e1);
+            } else {
+                res = (i + 1 - log(log(rad) / 2 / log(2)) / log(2));
+            }
             break;
         }
 
@@ -332,6 +356,10 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
     }
     mpf_clear(d_re);
     mpf_clear(d_im);
+    mpf_clear(dc_re);
+    mpf_clear(dc_im);
+    mpf_clear(e1);
+    mpf_clear(e2);
     mpf_clear(z_re);
     mpf_clear(z_im);
     mpf_clear(t1);
@@ -344,6 +372,10 @@ void Mandel::ComputeDirect(int mxit, float* out, int step, int c_method) {
     // Brute-force ground truth: iterate every sampled pixel in full mpf_t
     // precision. Uses _c0_re/_c0_im/_dx/_dy from the most recent Compute() call.
     if (step < 1) step = 1;
+    // EDE values are normalised by the pixel spacing, matching the engine paths
+    // (e.g. `_iter[idx] /= dx_f`), so the oracle and engine EDE are comparable.
+    const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
+    const double dxf = mpf_get_d(_dx);
 #pragma omp parallel for schedule(dynamic, 1)
     for (int i = 0; i < _h; i += step) {
         if (_flag_halt) continue;
@@ -356,7 +388,9 @@ void Mandel::ComputeDirect(int mxit, float* out, int step, int c_method) {
             mpf_add(cre, _c0_re, tmp);
             mpf_mul_ui(tmp, _dy, i);
             mpf_add(cim, _c0_im, tmp);
-            out[i * _w + j] = accuratePointCompute(cre, cim, mxit, c_method);
+            float v = accuratePointCompute(cre, cim, mxit, c_method);
+            if (ede && v >= 0) v /= dxf;
+            out[i * _w + j] = v;
         }
         mpf_clear(cre);
         mpf_clear(cim);
@@ -456,14 +490,15 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
     }
     else if (method == 1) {
         // BLA (bivariate linear approximation) skips runs of reference iterations for
-        // a big deep-zoom speedup (~6x on 1e50+ high-iteration views). Now
-        // CLASSIFICATION-safe (periodicity detector restarted after each skip -> fixes
-        // the flake@1e157 interior misclassification; verify deep/ticktock/flake PASS).
-        // Caveat: near the double-precision edge (e.g. 3.8e51 @ mxit=2M) BLA amplifies
-        // the boundary-chaos escape-time error ~5x vs no-BLA (colour of a few edge
-        // pixels shifts; interior/exterior stays correct). Kept OFF by default pending
-        // that trade-off; MANDEL_BLA=1 opts in.
-        { const char* e = getenv("MANDEL_BLA"); _use_bla = e && atoi(e); }
+        // a big deep-zoom speedup (~6x on 1e50+ high-iteration views). It is now
+        // CLASSIFICATION-safe (periodicity detector restarted after each skip) and
+        // carries the EDE derivative (BLA-with-derivative), so it is accuracy-safe
+        // under distance estimation too. Ground-truth diff at 3.8e51/mxit=2M shows
+        // BLA-on matches the GMP oracle BETTER than BLA-off (0 vs 521/12288 pixel
+        // misclassifications; equal escape-time floor) because rebasing avoids the
+        // naive-perturbation double-precision drift. Hence ON by default; set
+        // MANDEL_BLA=0 to force it off.
+        { const char* e = getenv("MANDEL_BLA"); _use_bla = e ? (atoi(e) != 0) : true; }
         { const char* e = getenv("MANDEL_BLA_EPS"); _bla_eps = e ? atof(e) : 0.0; }
         { const char* e = getenv("MANDEL_BLA_MINSKIP"); int ms = e ? atoi(e) : 8;
           _bla_minlevel = 0; while ((1 << (_bla_minlevel + 1)) <= ms) ++_bla_minlevel; }
