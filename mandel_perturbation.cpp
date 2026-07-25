@@ -1189,7 +1189,45 @@ int Mandel::tryBLA(int s, double& dzr, double& dzi, double& ddr, double& ddi,
     return 0;
 }
 
-// AVX2 delta kernel for up to 4 pixels. Every double operation mirrors the
+// Floatexp counterpart of tryBLA for the rescaled kernel. dz is carried as
+// dz = S*(wr,wi); the linear map dz -> A*dz + B*dc and the |dz|^2 < r2 test are
+// done in floatexp so they stay correct past double underflow, then the result
+// is re-rescaled back into (S,wr,wi). Reuses the same BLA table (built in double)
+// -- the coefficients A,B are O(1) and representable in double.
+int Mandel::tryBLAfe(int s, FloatExp& S, double& wr, double& wi,
+                     FloatExp dcr, FloatExp dci, double ESC2, int mx_ref_it) const {
+    if (s < 1 || _bla.empty()) return 0;
+    // |dz|^2 = S^2 (wr^2 + wi^2)
+    FloatExp dz2 = fe_mul(fe_mul(S, S), fe_from(wr * wr + wi * wi));
+    int maxp = (int)_bla.size() - 1;
+    int startp = (s == 1) ? maxp : (int)_tzcnt_u32((unsigned)(s - 1));
+    if (startp > maxp) startp = maxp;
+    if (startp < _bla_minlevel) return 0;
+    for (int p = startp; p >= _bla_minlevel; --p) {
+        int i = (s - 1) >> p;
+        if (i >= (int)_bla[p].size()) continue;
+        const BLAEntry& b = _bla[p][i];
+        if (b.r2 <= 0 || !fe_abs_less(dz2, fe_from(b.r2))) continue;   // radius too small
+        int land = s + b.l;
+        if (land >= mx_ref_it - 1) continue;
+        // dz = S*w (floatexp), nz = A*dz + B*dc
+        FloatExp dzr = fe_mul_d(S, wr), dzi = fe_mul_d(S, wi);
+        FloatExp nzr = fe_add(fe_sub(fe_mul_d(dzr, b.ar), fe_mul_d(dzi, b.ai)),
+                              fe_sub(fe_mul_d(dcr, b.br), fe_mul_d(dci, b.bi)));
+        FloatExp nzi = fe_add(fe_add(fe_mul_d(dzr, b.ai), fe_mul_d(dzi, b.ar)),
+                              fe_add(fe_mul_d(dcr, b.bi), fe_mul_d(dci, b.br)));
+        // Never skip past an escape: z = X_land + nz (near escape nz is O(1)).
+        double fr = _zfr[land] + fe_to_double(nzr), fi = _zfi[land] + fe_to_double(nzi);
+        if (fr * fr + fi * fi > ESC2) return 0;
+        // Accept: re-rescale dz = nz -> (S, wr, wi).
+        FloatExp Snew = fe_sqrt(fe_add(fe_mul(nzr, nzr), fe_mul(nzi, nzi)));
+        if (Snew.m == 0.0) { S = FloatExp{ 1.0, 0 }; wr = wi = 0.0; }
+        else { S = Snew; wr = fe_to_double(fe_div(nzr, S)); wi = fe_to_double(fe_div(nzi, S)); }
+        return b.l;
+    }
+    return 0;
+}
+
 // scalar loop in the same order (no FMA contraction), so the per-pixel result
 // is bit-identical to the scalar path. The reference orbit is read per lane via
 // gather; escape / rebase / glitch decisions are done in a short scalar pass
@@ -1337,6 +1375,22 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
 
     while (iter < mxit) {
         if (_flag_halt) break;
+        // BLA: skip a run of reference iterations when the rescaled dz is small
+        // enough (deep zoom -> almost always). dz is at reference index m (double
+        // path convention: table index s = m-1). On a skip, dz/S/wr/wi are
+        // advanced; recompute the scalar scale s and unit d = dc/S, and restart
+        // the periodicity detector (a multi-iter skip leaves its state stale).
+        if (_use_bla && m >= 2) {
+            int skip = tryBLAfe(m - 1, S, wr, wi, dcr, dci, ESC2, reflen);
+            if (skip > 0) {
+                m += skip; iter += skip;
+                s = fe_to_double(S);
+                dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
+                zsr = 1e30; zsi = 1e30; save_iter = iter; period_win = 1;
+                conf_P = 0; conf_giveup = 0;
+                continue;
+            }
+        }
         // w' = 2 X_m w + s w^2 + d   (dz_m -> dz_{m+1}); X_0 = 0.
         double Xr = m ? _zfr[m - 1] : 0.0, Xi = m ? _zfi[m - 1] : 0.0;
         double w2r = wr * wr - wi * wi, w2i = 2.0 * wr * wi;
