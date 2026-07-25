@@ -185,24 +185,37 @@ enum Hit {
     H_NONE, H_VIEW, H_GRADIENT,
     H_RESET, H_RENDER, H_SAVE, H_COPY, H_PASTE,
     H_MAXFIELD, H_MAXTRACK, H_DENSTRACK,
-    H_SS, H_EDE, H_PRESET_SNOWY, H_PRESET_SUNRISE, H_COLOR
+    H_SS, H_EDE, H_PALETTE_DD, H_COLOR
 };
 
 struct Stop { float pos, r, g, b; };
+
+struct NamedPal { const wchar_t* name; std::vector<Stop> stops; };
+
+// Finalized palette presets (natural / gemstone; saturated hues bridged by
+// white or near-black). Index 0 is the default.
+static const std::vector<NamedPal>& palettePresets() {
+    static const std::vector<NamedPal> p = {
+        { L"Sunrise",  { {0,0,70,100},{0.16f,32,107,203},{0.42f,237,255,255},{0.6425f,255,170,0},{0.8575f,0,2,0} } },
+        { L"Snowy",    { {0,255,255,255},{0.12f,32,107,203},{0.34f,214,223,255} } },
+        { L"Reef",     { {0,0,45,65},{0.15f,25,155,195},{0.40f,240,255,255},{0.60f,255,190,45},{0.78f,220,60,40},{0.90f,12,3,10} } },
+        { L"Emerald",  { {0,6,45,30},{0.16f,40,160,90},{0.42f,235,255,235},{0.6425f,225,205,120},{0.8575f,6,18,12} } },
+        { L"Amethyst", { {0,32,12,60},{0.18f,120,70,180},{0.40f,200,175,230},{0.58f,245,242,252},{0.8575f,18,8,30} } },
+        { L"Topaz",    { {0,35,20,8},{0.18f,170,95,30},{0.40f,235,175,70},{0.60f,250,235,200},{0.85f,20,12,6} } },
+        { L"Gems",     { {0.05f,30,90,200},{0.17f,242,248,255},{0.30f,25,155,95},{0.42f,10,12,20},{0.55f,125,70,185},{0.67f,250,244,252},{0.80f,240,180,55},{0.92f,18,12,8} } },
+    };
+    return p;
+}
 
 struct PaletteEditor {
     std::vector<Stop> stops;
     int selected = 0;
     bool dragging = false;
 
-    void sunrise() {
-        stops = { {0.0f,0,70,100}, {0.16f,32,107,203}, {0.42f,237,255,255},
-                  {0.6425f,255,170,0}, {0.8575f,0,2,0} };
-        selected = 0; rebuild();
-    }
-    void snowy() {
-        stops = { {0.0f,255,255,255}, {0.12f,32,107,203}, {0.34f,214,223,255} };
-        selected = 0; rebuild();
+    void load(int idx) {
+        const auto& pr = palettePresets();
+        if (idx < 0 || idx >= (int)pr.size()) return;
+        stops = pr[idx].stops; selected = 0; rebuild();
     }
     void rebuild() {
         if (stops.empty()) return;
@@ -321,12 +334,14 @@ public:
     // widget rects (computed in layout())
     RECT rcReset{}, rcRender{}, rcSave{}, rcCopy{}, rcPaste{};
     RECT rcLocation{}, rcMaxField{}, rcMaxTrack{}, rcDensTrack{};
-    RECT rcSS{}, rcEDE{}, rcSnowy{}, rcSunrise{}, rcColor{}, rcGradient{};
+    RECT rcSS{}, rcEDE{}, rcPaletteDD{}, rcColor{}, rcGradient{};
 
     // state
     int maxIter = 500000;
     bool ssOn = false, edeOn = false;
-    int presetIdx = 1; // 0 snowy, 1 sunrise
+    int paletteIdx = 0;                    // index into palettePresets()
+    bool paletteOpen = false;              // dropdown expanded
+    int paletteHover = -1;                 // hovered item while open (-1 none)
     bool navDragging = false, wasComputing = false;
     Hit hover = H_NONE, pressed = H_NONE;
     bool maxEditing = false; std::wstring maxBuf; int caretTick = 0;
@@ -366,15 +381,13 @@ public:
         rcCopy    = { px + 3*(bw+g),   y, px + 4*bw + 3*g,  y + bh };
         rcPaste   = { px + 4*(bw+g),   y, px + 5*bw + 4*g,  y + bh };
         y += bh + S(14);
-        rcLocation = { px, y, px + w, y + S(84) }; y += S(84) + S(20);
+        rcLocation = { px, y, px + w, y + S(100) }; y += S(100) + S(16);
         rcMaxField = { px + w - S(96), y - S(2), px + w, y + S(24) };
         rcMaxTrack = { px, y + S(32), px + w, y + S(46) }; y += S(60);
         rcDensTrack = { px, y + S(26), px + w, y + S(40) }; y += S(54);
         rcSS  = { px, y, px + w, y + bh }; y += S(38);
         rcEDE = { px, y, px + w, y + bh }; y += S(46);
-        int half = (w - g) / 2;
-        rcSnowy   = { px, y, px + half, y + bh };
-        rcSunrise = { px + half + g, y, px + w, y + bh }; y += S(44);
+        rcPaletteDD = { px, y, px + w, y + bh }; y += S(44);
         rcGradient = { px, y + S(22), px + w, y + S(62) }; y += S(84);
         rcColor = { px, y, px + w, y + bh };
     }
@@ -634,6 +647,74 @@ public:
         drawText(dc, r, s, CLR_TEXT_DIM, fSmall, DT_LEFT | DT_TOP | DT_SINGLELINE);
     }
 
+    // ---- palette dropdown ----
+    static std::array<int,3> sampleStops(const std::vector<Stop>& st, float t) {
+        if (st.empty()) return { 0,0,0 };
+        if (t <= st.front().pos) return { (int)st.front().r,(int)st.front().g,(int)st.front().b };
+        if (t >= st.back().pos)  return { (int)st.back().r,(int)st.back().g,(int)st.back().b };
+        for (size_t i = 0; i + 1 < st.size(); ++i)
+            if (t >= st[i].pos && t <= st[i+1].pos) {
+                float f = (t - st[i].pos) / (st[i+1].pos - st[i].pos + 1e-6f);
+                return { (int)(st[i].r + (st[i+1].r - st[i].r)*f),
+                         (int)(st[i].g + (st[i+1].g - st[i].g)*f),
+                         (int)(st[i].b + (st[i+1].b - st[i].b)*f) };
+            }
+        return { (int)st.back().r,(int)st.back().g,(int)st.back().b };
+    }
+    void drawSwatch(HDC dc, RECT r, const std::vector<Stop>& st) {
+        auto cl = [](int v){ return v < 0 ? 0 : (v > 255 ? 255 : v); };
+        int w = r.right - r.left;
+        for (int x = 0; x < w; ++x) {
+            auto c = sampleStops(st, (float)x / (w > 1 ? w - 1 : 1));
+            RECT col = { r.left + x, r.top, r.left + x + 1, r.bottom };
+            HBRUSH b = CreateSolidBrush(RGB(cl(c[0]), cl(c[1]), cl(c[2])));
+            FillRect(dc, &col, b); DeleteObject(b);
+        }
+    }
+    int paletteItemH() const { return S(28); }
+    RECT paletteListRect() const {
+        int n = (int)palettePresets().size();
+        return { rcPaletteDD.left, rcPaletteDD.bottom + S(2), rcPaletteDD.right,
+                 rcPaletteDD.bottom + S(2) + n * paletteItemH() };
+    }
+    int paletteItemAt(int x, int y) const {
+        RECT lr = paletteListRect();
+        if (!inRect(lr, x, y)) return -1;
+        int i = (y - lr.top) / paletteItemH();
+        return (i >= 0 && i < (int)palettePresets().size()) ? i : -1;
+    }
+    void drawPaletteDD(HDC dc) {
+        bool hov = hover == H_PALETTE_DD;
+        fillRound(dc, rcPaletteDD, hov ? CLR_CARD_HOV : CLR_CARD,
+                  paletteOpen ? CLR_ACCENT : CLR_BORDER, S(8));
+        RECT sw = { rcPaletteDD.left + S(8), rcPaletteDD.top + S(6), rcPaletteDD.left + S(52), rcPaletteDD.bottom - S(6) };
+        drawSwatch(dc, sw, palette.stops);
+        RECT tr = rcPaletteDD; tr.left += S(62); tr.right -= S(28);
+        drawText(dc, tr, palettePresets()[paletteIdx].name, CLR_TEXT, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT cr = rcPaletteDD; cr.right -= S(12);
+        drawText(dc, cr, paletteOpen ? L"\u25B2" : L"\u25BC", CLR_TEXT_DIM, fSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+    void drawPaletteList(HDC dc) {
+        RECT lr = paletteListRect();
+        fillRound(dc, lr, CLR_CARD, CLR_ACCENT, S(8));
+        const auto& pr = palettePresets();
+        int ih = paletteItemH();
+        for (int i = 0; i < (int)pr.size(); ++i) {
+            RECT ir = { lr.left, lr.top + i * ih, lr.right, lr.top + (i + 1) * ih };
+            if (i == paletteHover) fillRect(dc, { ir.left + S(3), ir.top, ir.right - S(3), ir.bottom }, CLR_CARD_HOV);
+            RECT sw = { ir.left + S(10), ir.top + S(5), ir.left + S(46), ir.bottom - S(5) };
+            drawSwatch(dc, sw, pr[i].stops);
+            RECT tr = ir; tr.left += S(56);
+            drawText(dc, tr, pr[i].name, i == paletteIdx ? CLR_ACCENT : CLR_TEXT, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
+    void selectPalette(int idx) {
+        const auto& pr = palettePresets();
+        if (idx < 0 || idx >= (int)pr.size()) return;
+        paletteIdx = idx; palette.load(idx);
+        nav->SetRedisplay(); InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
     void paint() {
         PAINTSTRUCT ps; HDC wdc = BeginPaint(hwnd, &ps);
         RECT rc; GetClientRect(hwnd, &rc);
@@ -688,7 +769,7 @@ public:
             SelectObject(dc, ofm);
             int cpl = cs.cx > 0 ? (int)((lt.right - lt.left) / cs.cx) : 40;
             drawText(dc, lt, truncLocation(nav->GetLocationText(), cpl), CLR_TEXT, fMono,
-                     DT_LEFT | DT_TOP | DT_NOPREFIX | DT_EDITCONTROL);
+                     DT_LEFT | DT_TOP | DT_NOPREFIX);
         }
 
         // max iterations
@@ -712,9 +793,8 @@ public:
         drawToggle(dc, rcSS, L"5x supersampling", ssOn, H_SS);
         drawToggle(dc, rcEDE, L"Exterior distance estimation", edeOn, H_EDE);
 
-        label(dc, rcSnowy.left, rcSnowy.top - S(20), L"Palette");
-        drawSeg(dc, rcSnowy, L"Snowy", presetIdx == 0, H_PRESET_SNOWY);
-        drawSeg(dc, rcSunrise, L"Sunrise", presetIdx == 1, H_PRESET_SUNRISE);
+        label(dc, rcPaletteDD.left, rcPaletteDD.top - S(20), L"Palette");
+        drawPaletteDD(dc);
 
         // gradient bar
         label(dc, rcGradient.left, rcGradient.top - S(20), L"Gradient  (drag / right-click / dbl-click)");
@@ -750,6 +830,8 @@ public:
             RECT tr = rcColor; tr.left += S(44);
             drawText(dc, tr, L"Edit selected stop color", CLR_TEXT, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
+        // palette dropdown list -- drawn last so it overlays the widgets below it
+        if (paletteOpen) drawPaletteList(dc);
         } // end panel (full paints only)
 
         // status bar (always -- text changes with compute state / timings)
@@ -781,20 +863,12 @@ public:
         RECT dt = rcDensTrack; dt.top -= S(8); dt.bottom += S(8); if (inRect(dt,x,y)) return H_DENSTRACK;
         if (inRect(rcSS,x,y)) return H_SS;
         if (inRect(rcEDE,x,y)) return H_EDE;
-        if (inRect(rcSnowy,x,y)) return H_PRESET_SNOWY;
-        if (inRect(rcSunrise,x,y)) return H_PRESET_SUNRISE;
+        if (inRect(rcPaletteDD,x,y)) return H_PALETTE_DD;
         if (inRect(rcColor,x,y)) return H_COLOR;
         RECT gr = rcGradient; gr.left -= S(8); gr.right += S(8); gr.top -= S(6); gr.bottom += S(14);
         if (inRect(gr,x,y)) return H_GRADIENT;
         RECT vr = viewRect(); if (inRect(vr,x,y)) return H_VIEW;
         return H_NONE;
-    }
-
-    void applyPreset(int idx) {
-        presetIdx = idx;
-        if (idx == 0) palette.snowy(); else palette.sunrise();
-        nav->SetRedisplay();
-        InvalidateRect(hwnd, nullptr, FALSE);
     }
 
     void timer() {
@@ -828,7 +902,7 @@ public:
             dpi = (int)GetDpiForWindow(hwnd);
             if (dpi <= 0) dpi = 96;
             createFonts();
-            palette.sunrise();
+            palette.load(paletteIdx);
             nav = std::make_unique<MandelNavigator>(RENDER_W, RENDER_H, 5, 1000000, 1.0, 220.0);
             nav->SetMxit(maxIter);
             nav->SetCMethod(edeOn ? ColoringMethod::EXTERIOR_DIST_EST : 0);
@@ -857,13 +931,22 @@ public:
             if (pressed == H_MAXTRACK) { setMaxFromT((double)(x - rcMaxTrack.left)/(rcMaxTrack.right-rcMaxTrack.left), false); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (pressed == H_DENSTRACK) { color_density = (float)std::clamp(10.0 + 190.0*(x-rcDensTrack.left)/(rcDensTrack.right-rcDensTrack.left),10.0,200.0); nav->SetRedisplay(); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (navDragging) { POINT p = mapToRender(x,y); nav->Drag(p.x,p.y); return 0; }
+            if (paletteOpen) { int it = paletteItemAt(x,y); if (it != paletteHover) { paletteHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
             Hit h = hitTest(x,y);
             if (h != hover) { hover = h; InvalidateRect(hwnd, nullptr, FALSE); }
             return 0;
         }
         case WM_LBUTTONDOWN: {
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+            if (paletteOpen) {   // a click while the list is open selects or dismisses it
+                int it = paletteItemAt(x,y);
+                if (it >= 0) selectPalette(it);
+                paletteOpen = false; paletteHover = -1; pressed = H_NONE;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             Hit h = hitTest(x,y);
+            if (h == H_PALETTE_DD) { paletteOpen = true; paletteHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
             if (maxEditing && h != H_MAXFIELD) commitMaxEdit();
             pressed = h;
             if (h == H_GRADIENT) { gradientDown(x); return 0; }
@@ -890,9 +973,7 @@ public:
                 case H_COPY: copyLocation(); break;
                 case H_PASTE: pasteLocation(); break;
                 case H_SS: ssOn = !ssOn; setMethodFlag(ColoringMethod::SUPER_SAMPLING, ssOn); break;
-                case H_EDE: edeOn = !edeOn; applyPreset(edeOn ? 0 : 1); setMethodFlag(ColoringMethod::EXTERIOR_DIST_EST, edeOn); break;
-                case H_PRESET_SNOWY: applyPreset(0); break;
-                case H_PRESET_SUNRISE: applyPreset(1); break;
+                case H_EDE: edeOn = !edeOn; setMethodFlag(ColoringMethod::EXTERIOR_DIST_EST, edeOn); break;
                 case H_COLOR: chooseSelectedColor(); break;
                 default: break;
                 }
