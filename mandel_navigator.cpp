@@ -2,6 +2,8 @@
 #include <cassert>
 #include <future>
 #include <vector>
+#include <string>
+#include <algorithm>
 
 #include "navigator.h"
 #include "mandel_perturbation.h"
@@ -72,6 +74,19 @@ std::string MandelNavigator::GetLocationText() const {
     gmp_snprintf(buf.data(), buf.size(), "x: %.*Ff\r\ny: %.*Ff\r\nzoom: %.6Fe",
                  digits, _z_re, digits, _z_im, _scale);
     return std::string(buf.data());
+}
+
+bool MandelNavigator::SetLocation(const std::string& xs, const std::string& ys, const std::string& ss) {
+    int prec = (int)(std::max(xs.size(), ys.size()) * 3.3219) + 40;
+    if (prec < 64) prec = 64;
+    mpf_set_prec(_scale, prec); mpf_set_prec(_z_re, prec);
+    mpf_set_prec(_z_im, prec); mpf_set_prec(_t, prec);
+    _mandel->setPrecision(prec);
+    if (mpf_set_str(_scale, ss.c_str(), 10) != 0 || mpf_sgn(_scale) <= 0) return false;
+    if (mpf_set_str(_z_re, xs.c_str(), 10) != 0) return false;
+    if (mpf_set_str(_z_im, ys.c_str(), 10) != 0) return false;
+    JumpReset();
+    return true;
 }
 
 void MandelNavigator::UpdateCoords() {

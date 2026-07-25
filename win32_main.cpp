@@ -183,7 +183,7 @@ const COLORREF CLR_BORDER    = RGB(58, 64, 80);
 // hit-test ids for self-drawn widgets
 enum Hit {
     H_NONE, H_VIEW, H_GRADIENT,
-    H_RESET, H_RENDER, H_SAVE, H_COPY,
+    H_RESET, H_RENDER, H_SAVE, H_COPY, H_PASTE,
     H_MAXFIELD, H_MAXTRACK, H_DENSTRACK,
     H_SS, H_EDE, H_PRESET_SNOWY, H_PRESET_SUNRISE, H_COLOR
 };
@@ -240,6 +240,50 @@ static std::wstring widen(const std::string& s) {
     return w;
 }
 
+// Cap the x:/y: lines of the location text to at most 2 mono lines each (cpl
+// chars/line), truncating with "..." so the zoom line is always visible.
+static std::wstring truncLocation(const std::string& raw, int cpl) {
+    if (cpl < 8) cpl = 8;
+    std::wstring out; std::string acc;
+    auto flush = [&](bool last) {
+        std::string L = acc; acc.clear();
+        if ((L.rfind("x:", 0) == 0 || L.rfind("y:", 0) == 0) && (int)L.size() > cpl) {
+            std::string l1 = L.substr(0, cpl), rest = L.substr(cpl);
+            if ((int)rest.size() > cpl) rest = rest.substr(0, std::max(0, cpl - 3)) + "...";
+            L = l1 + "\n" + rest;
+        }
+        for (char c : L) out.push_back(c == '\n' ? L'\n' : (wchar_t)(unsigned char)c);
+        if (!last) out.push_back(L'\n');
+    };
+    for (char c : raw) { if (c == '\r') continue; if (c == '\n') flush(false); else acc.push_back(c); }
+    flush(true);
+    return out;
+}
+
+// Expand a scientific-notation number ("4.361669e+03") to a plain decimal string
+// ("4361.669") so GMP mpf_set_str (base 10, no exponent) can parse it.
+static std::string expandSci(const std::string& in) {
+    std::string s = in;
+    size_t ep = s.find_first_of("eE");
+    std::string mant = (ep == std::string::npos) ? s : s.substr(0, ep);
+    long e10 = (ep == std::string::npos) ? 0 : atol(s.substr(ep + 1).c_str());
+    std::string sign;
+    if (!mant.empty() && (mant[0] == '+' || mant[0] == '-')) { if (mant[0] == '-') sign = "-"; mant.erase(0, 1); }
+    size_t dp = mant.find('.');
+    int frac = (dp == std::string::npos) ? 0 : (int)(mant.size() - dp - 1);
+    if (dp != std::string::npos) mant.erase(dp, 1);
+    if (mant.empty()) return "";
+    long shift = e10 - frac;                 // value = mant (integer) * 10^shift
+    std::string out;
+    if (shift >= 0) { out = mant; out.append((size_t)shift, '0'); }
+    else {
+        long point = (long)mant.size() + shift;   // decimal point position from the left
+        if (point <= 0) out = "0." + std::string((size_t)(-point), '0') + mant;
+        else out = mant.substr(0, (size_t)point) + "." + mant.substr((size_t)point);
+    }
+    return sign + out;
+}
+
 static bool inRect(const RECT& r, int x, int y) {
     return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
 }
@@ -275,14 +319,14 @@ public:
     PaletteEditor palette;
 
     // widget rects (computed in layout())
-    RECT rcReset{}, rcRender{}, rcSave{}, rcCopy{};
+    RECT rcReset{}, rcRender{}, rcSave{}, rcCopy{}, rcPaste{};
     RECT rcLocation{}, rcMaxField{}, rcMaxTrack{}, rcDensTrack{};
     RECT rcSS{}, rcEDE{}, rcSnowy{}, rcSunrise{}, rcColor{}, rcGradient{};
 
     // state
     int maxIter = 500000;
-    bool ssOn = false, edeOn = true;
-    int presetIdx = 0; // 0 snowy, 1 sunrise
+    bool ssOn = false, edeOn = false;
+    int presetIdx = 1; // 0 snowy, 1 sunrise
     bool navDragging = false, wasComputing = false;
     Hit hover = H_NONE, pressed = H_NONE;
     bool maxEditing = false; std::wstring maxBuf; int caretTick = 0;
@@ -315,11 +359,12 @@ public:
         RECT rc; GetClientRect(hwnd, &rc);
         int px = rc.right - S(PANEL_W) + S(18), w = S(PANEL_W) - S(36), y = S(18);
         int g = S(8), bh = S(30);
-        int bw = (w - 3 * g) / 4;
+        int bw = (w - 4 * g) / 5;
         rcReset   = { px,              y, px + bw,          y + bh };
         rcRender  = { px + bw + g,     y, px + 2*bw + g,    y + bh };
         rcSave    = { px + 2*(bw+g),   y, px + 3*bw + 2*g,  y + bh };
         rcCopy    = { px + 3*(bw+g),   y, px + 4*bw + 3*g,  y + bh };
+        rcPaste   = { px + 4*(bw+g),   y, px + 5*bw + 4*g,  y + bh };
         y += bh + S(14);
         rcLocation = { px, y, px + w, y + S(84) }; y += S(84) + S(20);
         rcMaxField = { px + w - S(96), y - S(2), px + w, y + S(24) };
@@ -478,6 +523,32 @@ public:
         memcpy(GlobalLock(h), t.c_str(), bytes); GlobalUnlock(h);
         SetClipboardData(CF_UNICODETEXT, h); CloseClipboard();
     }
+    void pasteLocation() {
+        if (!OpenClipboard(hwnd)) return;
+        std::string txt;
+        if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+            if (wchar_t* p = (wchar_t*)GlobalLock(h)) {
+                for (wchar_t* q = p; *q; ++q) txt.push_back(*q < 128 ? (char)*q : ' ');
+                GlobalUnlock(h);
+            }
+        }
+        CloseClipboard();
+        if (txt.empty()) return;
+        auto val = [&](const char* key) -> std::string {
+            size_t p = txt.find(key); if (p == std::string::npos) return "";
+            p += strlen(key);
+            while (p < txt.size() && (txt[p] == ' ' || txt[p] == '\t')) ++p;
+            size_t e = p; while (e < txt.size() && txt[e] != '\r' && txt[e] != '\n') ++e;
+            std::string v = txt.substr(p, e - p);
+            while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
+            return v;
+        };
+        std::string xs = val("x:"), ys = val("y:"), zs = val("zoom:");
+        if (xs.empty() || ys.empty() || zs.empty()) return;
+        std::string scale = expandSci(zs);
+        if (scale.empty()) return;
+        if (nav->SetLocation(xs, ys, scale)) startRender();
+    }
     static bool writeBMP(const wchar_t* path, const std::vector<uint8_t>& bgr) {
         FILE* f = nullptr;
         if (_wfopen_s(&f, path, L"wb") || !f) return false;
@@ -606,12 +677,19 @@ public:
         drawButton(dc, rcRender, L"Render", H_RENDER, true);
         drawButton(dc, rcSave, L"Save", H_SAVE, false);
         drawButton(dc, rcCopy, L"Copy", H_COPY, false);
+        drawButton(dc, rcPaste, L"Paste", H_PASTE, false);
 
-        // location card
+        // location card -- cap x/y to 2 lines each so the zoom line always shows
         fillRound(dc, rcLocation, CLR_CARD, CLR_BORDER, S(8));
         RECT lt = rcLocation; lt.left += S(10); lt.top += S(6); lt.right -= S(10); lt.bottom -= S(6);
-        drawText(dc, lt, widen(nav->GetLocationText()), CLR_TEXT, fMono,
-                 DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
+        {
+            HGDIOBJ ofm = SelectObject(dc, fMono);
+            SIZE cs{}; GetTextExtentPoint32W(dc, L"0", 1, &cs);
+            SelectObject(dc, ofm);
+            int cpl = cs.cx > 0 ? (int)((lt.right - lt.left) / cs.cx) : 40;
+            drawText(dc, lt, truncLocation(nav->GetLocationText(), cpl), CLR_TEXT, fMono,
+                     DT_LEFT | DT_TOP | DT_NOPREFIX | DT_EDITCONTROL);
+        }
 
         // max iterations
         label(dc, rcMaxField.left - S(140), rcMaxField.top + S(4), L"Max iterations");
@@ -697,6 +775,7 @@ public:
         if (inRect(rcRender,x,y)) return H_RENDER;
         if (inRect(rcSave,x,y)) return H_SAVE;
         if (inRect(rcCopy,x,y)) return H_COPY;
+        if (inRect(rcPaste,x,y)) return H_PASTE;
         if (inRect(rcMaxField,x,y)) return H_MAXFIELD;
         RECT mt = rcMaxTrack; mt.top -= S(8); mt.bottom += S(8); if (inRect(mt,x,y)) return H_MAXTRACK;
         RECT dt = rcDensTrack; dt.top -= S(8); dt.bottom += S(8); if (inRect(dt,x,y)) return H_DENSTRACK;
@@ -749,9 +828,10 @@ public:
             dpi = (int)GetDpiForWindow(hwnd);
             if (dpi <= 0) dpi = 96;
             createFonts();
-            palette.snowy();
+            palette.sunrise();
             nav = std::make_unique<MandelNavigator>(RENDER_W, RENDER_H, 5, 1000000, 1.0, 220.0);
             nav->SetMxit(maxIter);
+            nav->SetCMethod(edeOn ? ColoringMethod::EXTERIOR_DIST_EST : 0);
             nav->BindFixImageCallback(fixCallback);
             layout(); startRender();
             SetTimer(hwnd, TIMER_ID, 16, nullptr);
@@ -808,6 +888,7 @@ public:
                 case H_RENDER: startRender(); break;
                 case H_SAVE: saveImage(); break;
                 case H_COPY: copyLocation(); break;
+                case H_PASTE: pasteLocation(); break;
                 case H_SS: ssOn = !ssOn; setMethodFlag(ColoringMethod::SUPER_SAMPLING, ssOn); break;
                 case H_EDE: edeOn = !edeOn; applyPreset(edeOn ? 0 : 1); setMethodFlag(ColoringMethod::EXTERIOR_DIST_EST, edeOn); break;
                 case H_PRESET_SNOWY: applyPreset(0); break;
@@ -860,6 +941,7 @@ public:
             else if (wp == VK_SPACE) startRender();
             else if (wp == 'S') saveImage();
             else if (wp == 'C') copyLocation();
+            else if (wp == 'V') pasteLocation();
             else if (wp == VK_ADD || wp == VK_OEM_PLUS) { nav->ZoomIn(RENDER_W/2, RENDER_H/2); keepLive(); }
             else if (wp == VK_SUBTRACT || wp == VK_OEM_MINUS) { nav->ZoomOut(RENDER_W/2, RENDER_H/2); keepLive(); }
             return 0;

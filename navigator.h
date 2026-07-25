@@ -51,6 +51,10 @@ public:
 
     std::array<std::array<double, 2>, 4> GetBoundary();
 
+    // Reset the pan/zoom preview transform to identity WITHOUT firing the commit
+    // callback -- used to jump directly to an absolute pasted location.
+    void JumpReset();
+
 private:
     void init();
 };

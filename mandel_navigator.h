@@ -52,6 +52,11 @@ public:
 
     std::string GetLocationText() const;
 
+    // Jump to an absolute location: x/y as decimal strings, scale as a plain
+    // decimal string (scientific already expanded). Sets precision from the digit
+    // count, resets the preview transform. Returns false on a parse error.
+    bool SetLocation(const std::string& x, const std::string& y, const std::string& scale);
+
 private:
     void SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method);
 };

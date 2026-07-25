@@ -104,6 +104,16 @@ void Navigator::init() {
     _dragging = false;
 }
 
+void Navigator::JumpReset() {
+    _dx = _dy = _display_dx = _display_dy = 0;
+    _drag_unprocessed_dx = _drag_unprocessed_dy = 0;
+    _zoom_start = _zoom_end = 0;
+    _zoom_x = _zoom_y = 0;
+    _k = 1;
+    _zoom_progress = 1;
+    _dragging = false;
+}
+
 
 void Navigator::BindFixImageCallback(void (*func)(void)) {
     _fix_image_cb = func;
