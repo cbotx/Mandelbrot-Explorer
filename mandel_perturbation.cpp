@@ -455,6 +455,11 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         }
     }
     else if (method == 1) {
+        // BLA (bivariate linear approximation) can skip runs of reference iterations
+        // for a big deep-zoom speedup (~8x on 1e50+ high-iteration views), BUT it can
+        // skip *over* a transient escape and misclassify boundary pixels (verified:
+        // flake @1e157 -> 39.7% class mismatch even at eps=0). Left OFF by default to
+        // preserve accuracy; MANDEL_BLA=1 opts in where the view is known-safe.
         { const char* e = getenv("MANDEL_BLA"); _use_bla = e && atoi(e); }
         { const char* e = getenv("MANDEL_BLA_EPS"); _bla_eps = e ? atof(e) : 0.0; }
         { const char* e = getenv("MANDEL_BLA_MINSKIP"); int ms = e ? atoi(e) : 8;
