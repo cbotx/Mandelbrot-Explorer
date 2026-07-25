@@ -159,7 +159,8 @@ int main(int argc, char** argv) {
     // step=1: brute-force the whole image. step>1: sparse oracle (feasible when
     // the location needs a high mxit and deep precision).
     TestCase shallow{ "shallow (whole set)", "-0.5", "0", pow10(0), 5000, 1 };
-    TestCase deep{ "deep (1e30 into deep1)", testcases::deep1_x, testcases::deep1_y, pow10(30), 30000, 1 };
+    std::string deep51_scale = "3831277"; deep51_scale.append(45, '0');   // 3.831277e51
+    TestCase deep{ "deep51 (3.8e51 stress, maxit 2M)", testcases::deep51_x, testcases::deep51_y, deep51_scale, 2000000, 32 };
     TestCase ticktock{ "ticktock (1e141, glitch stress)", testcases::ticktock_x, testcases::ticktock_y, pow10(141), 200000, 12 };
     TestCase flake{ "flake (1e157, glitch stress)", testcases::flake_x, testcases::flake_y, pow10(157), 200000, 12 };
     // Exact Misiurewicz parameter c=i. Its critical orbit enters a repelling

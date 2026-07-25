@@ -455,11 +455,14 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         }
     }
     else if (method == 1) {
-        // BLA (bivariate linear approximation) can skip runs of reference iterations
-        // for a big deep-zoom speedup (~8x on 1e50+ high-iteration views), BUT it can
-        // skip *over* a transient escape and misclassify boundary pixels (verified:
-        // flake @1e157 -> 39.7% class mismatch even at eps=0). Left OFF by default to
-        // preserve accuracy; MANDEL_BLA=1 opts in where the view is known-safe.
+        // BLA (bivariate linear approximation) skips runs of reference iterations for
+        // a big deep-zoom speedup (~6x on 1e50+ high-iteration views). Now
+        // CLASSIFICATION-safe (periodicity detector restarted after each skip -> fixes
+        // the flake@1e157 interior misclassification; verify deep/ticktock/flake PASS).
+        // Caveat: near the double-precision edge (e.g. 3.8e51 @ mxit=2M) BLA amplifies
+        // the boundary-chaos escape-time error ~5x vs no-BLA (colour of a few edge
+        // pixels shifts; interior/exterior stays correct). Kept OFF by default pending
+        // that trade-off; MANDEL_BLA=1 opts in.
         { const char* e = getenv("MANDEL_BLA"); _use_bla = e && atoi(e); }
         { const char* e = getenv("MANDEL_BLA_EPS"); _bla_eps = e ? atof(e) : 0.0; }
         { const char* e = getenv("MANDEL_BLA_MINSKIP"); int ms = e ? atoi(e) : 8;
@@ -890,7 +893,16 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                 if (skip > 0) {
                     int tid = omp_get_thread_num() & 63;
                     g_bla_stat[tid][0] += skip; ++g_bla_stat[tid][1];
-                    k += skip; j += skip; continue;
+                    k += skip; j += skip;
+                    // A BLA skip jumps j forward without visiting the skipped orbit
+                    // points, so the periodicity (interior) detector's tortoise/hare
+                    // and any in-progress cycle confirmation are now stale -- using
+                    // them would falsely flag exterior pixels as interior. Restart the
+                    // detector from here (interior pixels still reach mxit quickly via
+                    // further skips).
+                    zsr = 1e30; zsi = 1e30; save_j = j; period_win = 1;
+                    conf_P = 0; conf_giveup = 0;
+                    continue;
                 }
                 ++g_bla_stat[omp_get_thread_num() & 63][2];
             }
@@ -1027,7 +1039,16 @@ void Mandel::buildBLA(int reflen) {
     _bla_rmax2 = 0.0;
     if (reflen < 3) return;
     double eps = _bla_eps > 0 ? _bla_eps : ldexp(1.0, -53);   // negligible vs double rounding
-    double dcmax = std::abs(_SA_delta);
+    // Max |dc| over ALL pixels relative to the ACTUAL reference position. The old
+    // bound |_SA_delta| assumes a centre reference; after glitch re-referencing the
+    // reference is off-centre, so edge pixels have larger |dc| and a centre-based
+    // bound makes the radii too loose -> BLA skips over an escape (flake@1e157
+    // misclassified corner pixels). Farthest image corner from (_ref_x,_ref_y),
+    // +0.5 px for the sub-pixel grid extent.
+    double dxf = std::fabs(mpf_get_ld(_dx)), dyf = std::fabs(mpf_get_ld(_dy));
+    double mxx = std::max(_ref_x, (double)(_w - 1) - _ref_x) + 0.5;
+    double mxy = std::max(_ref_y, (double)(_h - 1) - _ref_y) + 0.5;
+    double dcmax = std::sqrt(dxf * dxf * mxx * mxx + dyf * dyf * mxy * mxy);
 
     std::vector<BLAEntry> lvl0;
     lvl0.reserve(reflen - 1);
