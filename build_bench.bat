@@ -1,10 +1,9 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-set VCVARS="C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
 set VCPKG=C:\Users\yuxiangchi\repo\vcpkg\installed\x64-windows-static
 if not exist build mkdir build
-call %VCVARS% >nul || goto :err
+call "%~dp0msvcenv.bat" || goto :err
 
 cl /nologo /O2 /EHsc /std:c++17 /MT ^
    /I "%VCPKG%\include" ^
