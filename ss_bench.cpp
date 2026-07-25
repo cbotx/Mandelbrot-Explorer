@@ -39,6 +39,33 @@ int main(int argc, char** argv) {
     size_t N = (size_t)W * H * sub * sub;
     float* iter = new float[N];
 
+    // Correctness self-check: compute the SS buffer with BLA off (trusted, no
+    // stale-table risk) vs on, and report interior/exterior class mismatches and
+    // exterior value diffs. BLA on must match BLA off closely.
+    if (getenv("MANDEL_SSCHECK")) {
+        float* a = new float[N];
+        _putenv_s("MANDEL_BLA", "0");
+        { for (size_t i = 0; i < N; ++i) iter[i] = EMPTYPIXEL;
+          Mandel m(W, H, mxit, sub, iter); m.setPrecision(precision);
+          m.Compute(mcx, mcy, msc, mxit, cmethod); }
+        for (size_t i = 0; i < N; ++i) a[i] = iter[i];
+        _putenv_s("MANDEL_BLA", "1");
+        { for (size_t i = 0; i < N; ++i) iter[i] = EMPTYPIXEL;
+          Mandel m(W, H, mxit, sub, iter); m.setPrecision(precision);
+          m.Compute(mcx, mcy, msc, mxit, cmethod); }
+        long cls = 0, extboth = 0, sampled = 0; double maxd = 0, sumd = 0;
+        for (size_t i = 0; i < N; ++i) {
+            if (a[i] == EMPTYPIXEL || iter[i] == EMPTYPIXEL) continue;
+            ++sampled;
+            bool ai = a[i] < 0, bi = iter[i] < 0;
+            if (ai != bi) { ++cls; continue; }
+            if (!ai) { double d = fabs((double)a[i] - iter[i]); sumd += d; if (d > maxd) maxd = d; ++extboth; }
+        }
+        printf("SSCHECK sub=%d: sampled=%ld class-mismatch(on vs off)=%ld  ext maxdiff=%.6g meandiff=%.6g\n",
+               sub, sampled, cls, maxd, extboth ? sumd / extboth : 0.0);
+        delete[] a; delete[] iter; return 0;
+    }
+
     double best = 1e30;
     for (int t = 0; t < trials; ++t) {
         for (size_t i = 0; i < N; ++i) iter[i] = EMPTYPIXEL;

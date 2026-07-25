@@ -692,14 +692,24 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         }
     }
     else if (method == 1) {
+        // The first stepParallel uses the base reference's BLA table, which is
+        // still valid (its dcmax covers the whole image incl. subpixels). But once
+        // a glitched subpixel is re-referenced by createRef, that table is stale
+        // (coefficients belong to the base reference) and rebuilding it per
+        // re-reference costs more than the skips save. So keep BLA for the first
+        // pass and disable it for the (few) refinement passes -- correct by
+        // construction. BLA stays on for the base pass regardless.
+        bool saved_bla = _use_bla;
         while (!s.empty()) {
             // std::cout << ref_it << " === " << _SA_it << ' ' << _SA_order << ' ';
-            if (_flag_halt) return;
+            if (_flag_halt) { _use_bla = saved_bla; return; }
             stepParallel(s, ref_it, mxit, c_method);
-            if (_flag_halt) return;
+            if (_flag_halt) { _use_bla = saved_bla; return; }
             if (s.empty()) break;
             ref_it = createRef(s, mxit, mxit, false, c_method);
+            _use_bla = false;   // base BLA table is now stale for the new reference
         }
+        _use_bla = saved_bla;
     }
 
 }
