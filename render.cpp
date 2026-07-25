@@ -81,12 +81,29 @@ int main(int argc, char** argv) {
     int H = demo ? 540 : atoi(argv[3]);
     const char* cx = demo ? "0" : argv[4];
     const char* cy = demo ? "1" : argv[5];
-    int scaleExp = demo ? 1000 : atoi(argv[6]);
+    const char* scaleArg = demo ? "1000" : argv[6];
     int mxit = demo ? 10000 : atoi(argv[7]);
     const int SS = demo ? 2 : (argc > 8 ? atoi(argv[8]) : 3);
     int Ws = W * SS, Hs = H * SS;
 
-    std::string scale = "1"; for (int i = 0; i < scaleExp; ++i) scale += "0";
+    // scaleArg is either a power-of-10 exponent ("51") or a decimal magnitude
+    // ("3.831277e51"); expand either to an integer digit string for GMP.
+    std::string sa = scaleArg, scale;
+    if (sa.find('e') != std::string::npos || sa.find('E') != std::string::npos || sa.find('.') != std::string::npos) {
+        size_t ep = sa.find_first_of("eE");
+        std::string mant = (ep == std::string::npos) ? sa : sa.substr(0, ep);
+        int e10 = (ep == std::string::npos) ? 0 : atoi(sa.substr(ep + 1).c_str());
+        std::string sign;
+        if (!mant.empty() && (mant[0] == '-' || mant[0] == '+')) { sign = (mant[0] == '-') ? "-" : ""; mant.erase(0, 1); }
+        size_t dp = mant.find('.');
+        int frac = (dp == std::string::npos) ? 0 : (int)(mant.size() - dp - 1);
+        if (dp != std::string::npos) mant.erase(dp, 1);
+        int zeros = e10 - frac;
+        scale = sign + mant; if (zeros > 0) scale.append(zeros, '0');
+    } else {
+        int scaleExp = atoi(sa.c_str());
+        scale = "1"; for (int i = 0; i < scaleExp; ++i) scale += "0";
+    }
     int precision = (int)(scale.size() * log(10) / log(2)) + 64;
     mpf_set_default_prec(precision);
 
@@ -101,8 +118,8 @@ int main(int argc, char** argv) {
     mpf_init_set_str(mcy, cy, 10);
     mpf_init_set_str(msc, scale.c_str(), 10);
 
-    printf("Rendering %dx%d (SS=%d -> %dx%d), scale=1e%d, mxit=%d, prec=%d ...\n",
-           W, H, SS, Ws, Hs, scaleExp, mxit, precision);
+    printf("Rendering %dx%d (SS=%d -> %dx%d), scale=%s (%zu digits), mxit=%d, prec=%d ...\n",
+           W, H, SS, Ws, Hs, scaleArg, scale.size(), mxit, precision);
     int cmethod = (getenv("MANDEL_EDE") && atoi(getenv("MANDEL_EDE"))) ? ColoringMethod::EXTERIOR_DIST_EST : 0;
     mandel.Compute(mcx, mcy, msc, mxit, cmethod);
 

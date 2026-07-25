@@ -74,9 +74,10 @@ private:
                               float* out, int mxit, int c_method) const;
 
     // Bivariate Linear Approximation (Zhuoran / Fraktaler-3). A BLA skips l
-    // reference iterations via dz -> A*dz + B*dc when |dz| < R. _bla[p] holds the
-    // level-p table (skip 2^p) built by pairwise merging from the reference orbit.
-    struct BLAEntry { double ar, ai, br, bi, r2; int l; };
+    // reference iterations via dz -> A*dz + B*dc when |dz| < R. Under EDE it also
+    // carries the derivative delta dd -> C*dz + A*dd + E*dc (the derivative's own
+    // linearised recurrence), so distance-estimate colouring survives the skip.
+    struct BLAEntry { double ar, ai, br, bi, cr, ci, er, ei, r2; int l; };
     std::vector<std::vector<BLAEntry>> _bla;
     double _bla_eps = 0.0;
     double _bla_rmax2 = 0.0;      // largest BLA validity radius^2 (gate for tryBLA)
@@ -86,12 +87,12 @@ private:
     bool _use_interior = false;   // periodicity-based interior detection
     double _interior_eps2 = 0.0;  // |z_n - z_saved|^2 threshold for a detected cycle
     int _interior_confirm = 30;   // consecutive shrinking periods required to confirm
-    void buildBLA(int reflen);
+    void buildBLA(int reflen, bool ede);
     // Try the largest valid BLA starting at reference index s; on success updates
-    // dz and returns the skip (>0), else returns 0. Rejects skips that would land
-    // escaped or past mx_ref_it.
-    int tryBLA(int s, double& dzr, double& dzi, double dcr, double dci,
-               double ESC2, int mx_ref_it) const;
+    // dz (and, under ede, dd) and returns the skip (>0), else returns 0. Rejects
+    // skips that would land escaped or past mx_ref_it.
+    int tryBLA(int s, double& dzr, double& dzi, double& ddr, double& ddi,
+               double dcr, double dci, bool ede, double ESC2, int mx_ref_it) const;
     int createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random,
                   int c_method = 0, bool view_center = false);
     bool calCoefficient(int i, int pr_it, int c_method = 0);

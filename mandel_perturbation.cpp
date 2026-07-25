@@ -501,7 +501,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             }
         }
         _ref_bounded = (ref_it >= mxit);
-        if (_use_bla) buildBLA(ref_it);
+        if (_use_bla) buildBLA(ref_it, (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0);
         if (_use_interior) {
             // Auto-gate: probe a coarse grid (reusing the centre reference, so no
             // rebuild) to see whether this frame contains any interior. If not,
@@ -534,7 +534,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             if (s.empty()) break;
             tk = now(); ref_it = createRef(s, mxit, mxit, false, c_method); pf_ref += now() - tk;
             _ref_bounded = (ref_it >= mxit);
-            if (_use_bla) buildBLA(ref_it);
+            if (_use_bla) buildBLA(ref_it, (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0);
         }
         if (profile) {
             long long sk = 0, ap = 0, no = 0;
@@ -888,7 +888,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                 // Only attempt BLA when dz is small enough that some level could be
                 // valid -- avoids the per-iteration lookup cost when dz is large.
                 // BLA start index s = k-1 (loop-top invariant: dz is at ref index k-1).
-                int skip = tryBLA(k - 1, dzr, dzi, dcr, dci,
+                int skip = tryBLA(k - 1, dzr, dzi, ddr, ddi, dcr, dci, ede,
                                   _ESCAPE_RADIUS * _ESCAPE_RADIUS, mx_ref_it);
                 if (skip > 0) {
                     int tid = omp_get_thread_num() & 63;
@@ -1034,7 +1034,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
 // dc-independent: uses the largest pixel offset |_SA_delta| as the |Δc| bound so
 // the radii are valid for every pixel. Level 0 = single steps at ref index
 // 1..reflen-1; higher levels merge neighbour pairs (skip 2^p).
-void Mandel::buildBLA(int reflen) {
+void Mandel::buildBLA(int reflen, bool ede) {
     _bla.clear();
     _bla_rmax2 = 0.0;
     if (reflen < 3) return;
@@ -1062,7 +1062,9 @@ void Mandel::buildBLA(int reflen) {
         double R = eps * (Zmag - dcmax) / (Amag + 1.0);
         double r2 = R > 0 ? R * R : 0.0;
         if (r2 > _bla_rmax2) _bla_rmax2 = r2;
-        lvl0.push_back({ ar, ai, 1.0, 0.0, r2, 1 });
+        // Under EDE also carry the derivative-delta coupling C = 2 D_s (dd -> C dz).
+        double cr = ede ? 2.0 * _dfr[s] : 0.0, ci = ede ? 2.0 * _dfi[s] : 0.0;
+        lvl0.push_back({ ar, ai, 1.0, 0.0, cr, ci, 0.0, 0.0, r2, 1 });
     }
     _bla.push_back(std::move(lvl0));
 
@@ -1078,6 +1080,11 @@ void Mandel::buildBLA(int reflen) {
             z.ai = y.ar * x.ai + y.ai * x.ar;
             z.br = y.ar * x.br - y.ai * x.bi + y.br;          // B_z = A_y B_x + B_y
             z.bi = y.ar * x.bi + y.ai * x.br + y.bi;
+            // Derivative couplings: C_z = C_y A_x + A_y C_x, E_z = C_y B_x + A_y E_x + E_y
+            z.cr = (y.cr * x.ar - y.ci * x.ai) + (y.ar * x.cr - y.ai * x.ci);
+            z.ci = (y.cr * x.ai + y.ci * x.ar) + (y.ar * x.ci + y.ai * x.cr);
+            z.er = (y.cr * x.br - y.ci * x.bi) + (y.ar * x.er - y.ai * x.ei) + y.er;
+            z.ei = (y.cr * x.bi + y.ci * x.br) + (y.ar * x.ei + y.ai * x.er) + y.ei;
             double Rx = sqrt(x.r2), Ry = sqrt(y.r2);
             double Axmag = sqrt(x.ar * x.ar + x.ai * x.ai);
             double Bxmag = sqrt(x.br * x.br + x.bi * x.bi);
@@ -1097,8 +1104,8 @@ void Mandel::buildBLA(int reflen) {
 // Largest valid BLA starting at reference index s. Levels have skip 2^p and start
 // at ref index 1 + i*2^p, so s is a valid start at level p iff (s-1) is a multiple
 // of 2^p. Returns skip applied (0 if none), updating dz on success.
-int Mandel::tryBLA(int s, double& dzr, double& dzi, double dcr, double dci,
-                   double ESC2, int mx_ref_it) const {
+int Mandel::tryBLA(int s, double& dzr, double& dzi, double& ddr, double& ddi,
+                   double dcr, double dci, bool ede, double ESC2, int mx_ref_it) const {
     if (s < 1 || _bla.empty()) return 0;
     double zmag2 = dzr * dzr + dzi * dzi;
     int maxp = (int)_bla.size() - 1;
@@ -1124,6 +1131,12 @@ int Mandel::tryBLA(int s, double& dzr, double& dzi, double dcr, double dci,
             // an escape, producing wrong iteration counts.)
             double fr = _zfr[land] + nzr, fi = _zfi[land] + nzi;
             if (fr * fr + fi * fi > ESC2) return 0;
+        }
+        if (ede) {
+            // dd -> C*dz + A*dd + E*dc  (derivative delta carried through the skip)
+            double nddr = (b.cr * dzr - b.ci * dzi) + (b.ar * ddr - b.ai * ddi) + (b.er * dcr - b.ei * dci);
+            double nddi = (b.cr * dzi + b.ci * dzr) + (b.ar * ddi + b.ai * ddr) + (b.er * dci + b.ei * dcr);
+            ddr = nddr; ddi = nddi;
         }
         dzr = nzr; dzi = nzi;
         return b.l;
