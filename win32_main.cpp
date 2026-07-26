@@ -186,7 +186,7 @@ const COLORREF CLR_BORDER    = RGB(58, 64, 80);
 enum Hit {
     H_NONE, H_VIEW, H_GRADIENT,
     H_RESET, H_RENDER, H_SAVE, H_COPY, H_PASTE,
-    H_MAXFIELD, H_MAXTRACK, H_DENSTRACK,
+    H_MAXTRACK, H_DENSTRACK,
     H_SS, H_EDE, H_PALETTE_DD, H_COLOR, H_GALLERY_DD
 };
 
@@ -360,7 +360,7 @@ public:
 
     // widget rects (computed in layout())
     RECT rcReset{}, rcRender{}, rcSave{}, rcCopy{}, rcPaste{};
-    RECT rcLocation{}, rcMaxField{}, rcMaxTrack{}, rcDensTrack{};
+    RECT rcLocation{}, rcMaxTrack{}, rcDensTrack{};
     RECT rcSS{}, rcColoringDD{}, rcPaletteDD{}, rcColor{}, rcGradient{};
     RECT rcGalleryDD{};
 
@@ -377,7 +377,6 @@ public:
     int galleryHover = -1;                 // hovered gallery item (-1 none)
     bool navDragging = false, wasComputing = false;
     Hit hover = H_NONE, pressed = H_NONE;
-    bool maxEditing = false; std::wstring maxBuf; int caretTick = 0;
     int liveFrames = 0;   // frames still needing per-tick repaint (animation/compute)
     int dpi = 96;         // display DPI; all metrics scale by dpi/96
     std::chrono::steady_clock::time_point renderStart;
@@ -415,9 +414,8 @@ public:
         rcPaste   = { px + 4*(bw+g),   y, px + 5*bw + 4*g,  y + bh };
         y += bh + S(14);
         rcLocation = { px, y, px + w, y + S(100) }; y += S(100) + S(16);
-        rcMaxField = { px + w - S(96), y - S(2), px + w, y + S(24) };
-        rcMaxTrack = { px, y + S(32), px + w, y + S(46) }; y += S(60);
-        rcDensTrack = { px, y + S(26), px + w, y + S(40) }; y += S(54);
+        rcMaxTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
+        rcDensTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         rcSS  = { px, y, px + w, y + bh }; y += S(56);
         rcColoringDD = { px, y, px + w, y + bh }; y += S(56);
         rcPaletteDD = { px, y, px + w, y + bh }; y += S(44);
@@ -625,15 +623,6 @@ public:
         if (GetSaveFileNameW(&ofn)) { buildDisplay(); writeBMP(file, display); }
     }
 
-    void commitMaxEdit() {
-        if (!maxEditing) return;
-        maxEditing = false;
-        int v = maxBuf.empty() ? maxIter : _wtoi(maxBuf.c_str());
-        maxIter = std::clamp(v, 100, 5000000);
-        nav->SetMxit(maxIter);
-        startRender();
-    }
-
     // ---- widget drawing ----
     void drawButton(HDC dc, RECT r, const std::wstring& s, Hit id, bool accent) {
         bool hov = hover == id, prs = pressed == id;
@@ -681,6 +670,13 @@ public:
     void label(HDC dc, int x, int y, const std::wstring& s) {
         RECT r = { x, y, x + S(300), y + S(18) };
         drawText(dc, r, s, CLR_TEXT_DIM, fSmall, DT_LEFT | DT_TOP | DT_SINGLELINE);
+    }
+    // A slider caption: dim label on the left, brighter value right-aligned, on
+    // the line just above the track (used by Max iterations + Color density).
+    void labelRow(HDC dc, const RECT& track, const std::wstring& lab, const std::wstring& val) {
+        RECT r = { track.left, track.top - S(22), track.right, track.top - S(4) };
+        drawText(dc, r, lab, CLR_TEXT_DIM, fSmall, DT_LEFT | DT_TOP | DT_SINGLELINE);
+        drawText(dc, r, val, CLR_TEXT, fSmall, DT_RIGHT | DT_TOP | DT_SINGLELINE);
     }
 
     // ---- palette dropdown ----
@@ -916,22 +912,13 @@ public:
                      DT_LEFT | DT_TOP | DT_NOPREFIX);
         }
 
-        // max iterations
-        label(dc, rcMaxField.left - S(140), rcMaxField.top + S(4), L"Max iterations");
-        {
-            bool hov = hover == H_MAXFIELD || maxEditing;
-            fillRound(dc, rcMaxField, hov ? CLR_CARD_HOV : CLR_CARD,
-                      maxEditing ? CLR_ACCENT : CLR_BORDER, S(6));
-            std::wstring t = maxEditing ? maxBuf : std::to_wstring(maxIter);
-            if (maxEditing && (caretTick / 15) % 2 == 0) t += L"|";
-            RECT tr = rcMaxField; tr.right -= S(10);
-            drawText(dc, tr, t, CLR_TEXT, fUi, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-        }
+        // max iterations (read-only value; drag slider + mouse-wheel to change)
+        labelRow(dc, rcMaxTrack, L"Max iterations", std::to_wstring(maxIter));
         drawSlider(dc, rcMaxTrack, maxToT(), H_MAXTRACK);
 
-        // density (read-only value; drag slider = integer, mouse-wheel = 0.1 steps)
-        wchar_t db[48]; swprintf_s(db, L"Color density: %.1f", color_density);
-        label(dc, rcDensTrack.left, rcDensTrack.top - S(22), db);
+        // color density (read-only; drag slider = integer, mouse-wheel = 0.1)
+        wchar_t db[32]; swprintf_s(db, L"%.1f", color_density);
+        labelRow(dc, rcDensTrack, L"Color density", db);
         drawSlider(dc, rcDensTrack, std::clamp((color_density - 10.0) / 190.0, 0.0, 1.0), H_DENSTRACK);
 
         drawToggle(dc, rcSS, L"5x supersampling", ssOn, H_SS);
@@ -1006,7 +993,6 @@ public:
         if (inRect(rcCopy,x,y)) return H_COPY;
         if (inRect(rcPaste,x,y)) return H_PASTE;
         if (inRect(rcGalleryDD,x,y)) return H_GALLERY_DD;
-        if (inRect(rcMaxField,x,y)) return H_MAXFIELD;
         RECT mt = rcMaxTrack; mt.top -= S(8); mt.bottom += S(8); if (inRect(mt,x,y)) return H_MAXTRACK;
         RECT dt = rcDensTrack; dt.top -= S(8); dt.bottom += S(8); if (inRect(dt,x,y)) return H_DENSTRACK;
         if (inRect(rcSS,x,y)) return H_SS;
@@ -1021,7 +1007,7 @@ public:
 
     void timer() {
         bool computing = nav->IsComputing();
-        bool active = computing || wasComputing || navDragging || palette.dragging || maxEditing ||
+        bool active = computing || wasComputing || navDragging || palette.dragging ||
                       pressed == H_MAXTRACK || pressed == H_DENSTRACK || liveFrames > 0;
         if (!active) return;                 // idle: no repaint, no flicker, no CPU spin
         if (liveFrames > 0) --liveFrames;
@@ -1032,10 +1018,9 @@ public:
                 std::chrono::steady_clock::now() - renderStart).count();
         wasComputing = computing;
         buildDisplay();
-        if (maxEditing) ++caretTick;
         // Pure fractal-animation frames (pan/zoom/compute) can skip the panel
         // rebuild; UI-control interaction still gets a full paint.
-        bool uiInteract = palette.dragging || maxEditing ||
+        bool uiInteract = palette.dragging ||
                           pressed == H_MAXTRACK || pressed == H_DENSTRACK;
         fractalOnlyTick = !uiInteract;
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -1114,12 +1099,10 @@ public:
             if (h == H_PALETTE_DD) { paletteOpen = true; paletteHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
             if (h == H_EDE) { coloringOpen = true; coloringHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
             if (h == H_GALLERY_DD) { galleryOpen = true; galleryHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-            if (maxEditing && h != H_MAXFIELD) commitMaxEdit();
             pressed = h;
             if (h == H_GRADIENT) { gradientDown(x); return 0; }
             if (h == H_MAXTRACK) { SetCapture(hwnd); setMaxFromT((double)(x-rcMaxTrack.left)/(rcMaxTrack.right-rcMaxTrack.left), false); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (h == H_DENSTRACK) { SetCapture(hwnd); color_density=(float)std::round(std::clamp(10.0+190.0*(x-rcDensTrack.left)/(rcDensTrack.right-rcDensTrack.left),10.0,200.0)); nav->SetRedisplay(); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
-            if (h == H_MAXFIELD) { maxEditing = true; maxBuf.clear(); caretTick = 0; InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (h == H_VIEW) { POINT p = mapToRender(x,y); navDragging = true; SetCapture(hwnd); nav->DragStart(p.x,p.y); }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -1165,12 +1148,21 @@ public:
         case WM_MOUSEWHEEL: {
             POINT q{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; ScreenToClient(hwnd, &q);
             int wd = GET_WHEEL_DELTA_WPARAM(wp);
-            // Mouse-wheel over the density slider nudges it by 0.1 (fine control).
+            // Mouse-wheel over a slider fine-tunes it (color density in 0.1 steps,
+            // max iterations ~2% per notch on its log scale).
             RECT dt = rcDensTrack; dt.top -= S(10); dt.bottom += S(10);
             if (inRect(dt, q.x, q.y)) {
                 double v = color_density + (wd > 0 ? 0.1 : -0.1);
                 color_density = (float)(std::round(std::clamp(v, 10.0, 200.0) * 10.0) / 10.0);
                 nav->SetRedisplay(); keepLive(); InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            RECT mt = rcMaxTrack; mt.top -= S(10); mt.bottom += S(10);
+            if (inRect(mt, q.x, q.y)) {
+                int nv = (int)std::round(maxIter * (wd > 0 ? 1.02 : 1.0 / 1.02));
+                if (nv == maxIter) nv += (wd > 0 ? 1 : -1);   // always move at small values
+                maxIter = std::clamp(nv, 100, 5000000);
+                nav->SetMxit(maxIter); startRender();
                 return 0;
             }
             if (inRect(viewRect(), q.x, q.y)) {
@@ -1180,19 +1172,7 @@ public:
             }
             return 0;
         }
-        case WM_CHAR:
-            if (maxEditing) {
-                wchar_t c = (wchar_t)wp;
-                if (c >= '0' && c <= '9') { if (maxBuf.size() < 7) maxBuf += c; }
-                else if (c == 8 && !maxBuf.empty()) maxBuf.pop_back();
-                else if (c == '\r') commitMaxEdit();
-                else if (c == 27) maxEditing = false;
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
-            return 0;
         case WM_KEYDOWN:
-            if (maxEditing) return 0;
             if (wp == 'R') { nav->Reset(); renderStart = std::chrono::steady_clock::now(); wasComputing = true; keepLive(); }
             else if (wp == VK_SPACE) startRender();
             else if (wp == 'S') saveImage();
