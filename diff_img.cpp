@@ -150,6 +150,27 @@ int main(int argc, char** argv) {
     colorMapInit();
     system("if not exist diffs mkdir diffs");
 
+    // Custom case from env: MANDEL_CX / MANDEL_CY / MANDEL_SCALE (e.g. 3.131699e286).
+    // Expands e-notation/decimal scale to an integer digit string like render.cpp.
+    if (const char* cxs = getenv("MANDEL_CX")) {
+        std::string sa = getenv("MANDEL_SCALE") ? getenv("MANDEL_SCALE") : "1", scl;
+        if (sa.find_first_of("eE.") != std::string::npos) {
+            size_t ep = sa.find_first_of("eE");
+            std::string mant = (ep == std::string::npos) ? sa : sa.substr(0, ep);
+            int e10 = (ep == std::string::npos) ? 0 : atoi(sa.substr(ep + 1).c_str());
+            std::string sign;
+            if (!mant.empty() && (mant[0] == '-' || mant[0] == '+')) { sign = (mant[0] == '-') ? "-" : ""; mant.erase(0, 1); }
+            size_t dp = mant.find('.');
+            int frac = (dp == std::string::npos) ? 0 : (int)(mant.size() - dp - 1);
+            if (dp != std::string::npos) mant.erase(dp, 1);
+            int zeros = e10 - frac; scl = sign + mant; if (zeros > 0) scl.append(zeros, '0');
+        } else { int se = atoi(sa.c_str()); scl = "1"; for (int i = 0; i < se; ++i) scl += "0"; }
+        cases.clear();
+        cases.push_back({ "custom", cxs, getenv("MANDEL_CY"), scl,
+                          mxarg ? mxarg : 100000, Warg ? Warg : 160, Harg ? Harg : 120 });
+        which = "custom";
+    }
+
     printf("mode: %s\n", c_method ? "EDE" : "raw-iter");
     printf("%-10s %6s %8s  %-18s %-18s\n", "case", "WxH", "mxit",
            "BLA-off vs GT", "BLA-on vs GT");
