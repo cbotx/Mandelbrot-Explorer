@@ -187,8 +187,31 @@ enum Hit {
     H_NONE, H_VIEW, H_GRADIENT,
     H_RESET, H_RENDER, H_SAVE, H_COPY, H_PASTE,
     H_MAXFIELD, H_MAXTRACK, H_DENSTRACK,
-    H_SS, H_EDE, H_PALETTE_DD, H_COLOR
+    H_SS, H_EDE, H_PALETTE_DD, H_COLOR, H_GALLERY_DD
 };
+
+// Gallery demo presets: a saved location plus the exact render settings used to
+// produce it, so selecting one reproduces the image. zoom is scientific notation
+// (expanded by expandSci); palette is looked up by name in palettePresets().
+struct Preset {
+    const wchar_t* name;
+    const char* x; const char* y; const char* zoom;
+    float density; bool ss; int coloring;   // 0 Smooth, 1 Distance(EDE), 2 Feather
+    const wchar_t* palette; int maxIter;
+};
+static const std::vector<Preset>& galleryPresets() {
+    static const std::vector<Preset> p = {
+        { L"Feather spiral  (5.1e292)",
+          "-1.74961551043225917132558762203092997406776582824486737043789087410512096670138841060878237427473435515004168931589322189249239986606828774155860523237102635565490176581179889267432026148118400022509532606522827603302653557653285809596137929818429125986636205433675211119215873019002373733544536685782529789935",
+          "0.00000033552806488437213922924936314667758682179580368291347248996372066040948346974233057158256293565061238343085946164873110399056182528356343156076648247679264617131919657718521028825787075233133790754370605292961104472660681262156196225123453401177034629580032892768133871611413536923738263673919333840137",
+          "5.119695e292", 169.0f, true, 2, L"Sunrise", 500000 },
+        { L"Smooth valley  (1.7e40)",
+          "-1.768628917759850520844734198472848718821423994141176532908",
+          "0.001395534274228826510747662517373603005419245032078944176",
+          "1.691960e40", 43.0f, true, 0, L"Sunrise", 500000 },
+    };
+    return p;
+}
 
 struct Stop { float pos, r, g, b; };
 
@@ -339,6 +362,7 @@ public:
     RECT rcReset{}, rcRender{}, rcSave{}, rcCopy{}, rcPaste{};
     RECT rcLocation{}, rcMaxField{}, rcMaxTrack{}, rcDensTrack{};
     RECT rcSS{}, rcColoringDD{}, rcPaletteDD{}, rcColor{}, rcGradient{};
+    RECT rcGalleryDD{};
 
     // state
     int maxIter = 500000;
@@ -349,6 +373,8 @@ public:
     int paletteIdx = 0;                    // index into palettePresets()
     bool paletteOpen = false;              // dropdown expanded
     int paletteHover = -1;                 // hovered item while open (-1 none)
+    bool galleryOpen = false;              // gallery dropdown expanded
+    int galleryHover = -1;                 // hovered gallery item (-1 none)
     bool navDragging = false, wasComputing = false;
     Hit hover = H_NONE, pressed = H_NONE;
     bool maxEditing = false; std::wstring maxBuf; int caretTick = 0;
@@ -388,6 +414,7 @@ public:
         rcCopy    = { px + 3*(bw+g),   y, px + 4*bw + 3*g,  y + bh };
         rcPaste   = { px + 4*(bw+g),   y, px + 5*bw + 4*g,  y + bh };
         y += bh + S(14);
+        rcGalleryDD = { px, y, px + w, y + bh }; y += bh + S(14);
         rcLocation = { px, y, px + w, y + S(100) }; y += S(100) + S(16);
         rcMaxField = { px + w - S(96), y - S(2), px + w, y + S(24) };
         rcMaxTrack = { px, y + S(32), px + w, y + S(46) }; y += S(60);
@@ -738,6 +765,63 @@ public:
         startRender();
     }
 
+    // ---- gallery (demo presets) ----
+    int galleryItemH() const { return S(28); }
+    RECT galleryListRect() const {
+        int n = (int)galleryPresets().size();
+        return { rcGalleryDD.left, rcGalleryDD.bottom + S(2), rcGalleryDD.right,
+                 rcGalleryDD.bottom + S(2) + n * galleryItemH() };
+    }
+    int galleryItemAt(int x, int y) const {
+        RECT lr = galleryListRect();
+        if (x < lr.left || x > lr.right || y < lr.top || y > lr.bottom) return -1;
+        int i = (y - lr.top) / galleryItemH();
+        return (i >= 0 && i < (int)galleryPresets().size()) ? i : -1;
+    }
+    void drawGalleryDD(HDC dc) {
+        bool hov = hover == H_GALLERY_DD;
+        fillRound(dc, rcGalleryDD, hov ? CLR_CARD_HOV : CLR_CARD,
+                  galleryOpen ? CLR_ACCENT : CLR_BORDER, S(8));
+        RECT tr = rcGalleryDD; tr.left += S(12); tr.right -= S(28);
+        drawText(dc, tr, L"Gallery \u2014 load a demo", CLR_TEXT, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT cr = rcGalleryDD; cr.right -= S(12);
+        drawText(dc, cr, galleryOpen ? L"\u25B2" : L"\u25BC", CLR_TEXT_DIM, fSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+    void drawGalleryList(HDC dc) {
+        RECT lr = galleryListRect();
+        fillRound(dc, lr, CLR_CARD, CLR_ACCENT, S(8));
+        const auto& gp = galleryPresets();
+        int ih = galleryItemH();
+        for (int i = 0; i < (int)gp.size(); ++i) {
+            RECT ir = { lr.left, lr.top + i * ih, lr.right, lr.top + (i + 1) * ih };
+            if (i == galleryHover) fillRect(dc, { ir.left + S(3), ir.top, ir.right - S(3), ir.bottom }, CLR_CARD_HOV);
+            RECT tr = ir; tr.left += S(14);
+            drawText(dc, tr, gp[i].name, CLR_TEXT, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
+    void applyPreset(int idx) {
+        const auto& gp = galleryPresets();
+        if (idx < 0 || idx >= (int)gp.size()) return;
+        const Preset& p = gp[idx];
+        // render settings first, then the location (which kicks off the render)
+        maxIter = std::clamp(p.maxIter, 100, 1000000); nav->SetMxit(maxIter);
+        color_density = std::clamp(p.density, 10.0f, 200.0f);
+        ssOn = p.ss;
+        coloringIdx = p.coloring;
+        int m = 0;
+        if (ssOn) m |= ColoringMethod::SUPER_SAMPLING;
+        if (coloringIdx == 1) m |= ColoringMethod::EXTERIOR_DIST_EST;
+        else if (coloringIdx == 2) m |= ColoringMethod::STRIPE_AVERAGE;
+        nav->SetCMethod(m);
+        // palette by name
+        const auto& pr = palettePresets();
+        for (int i = 0; i < (int)pr.size(); ++i)
+            if (wcscmp(pr[i].name, p.palette) == 0) { paletteIdx = i; palette.load(i); break; }
+        std::string scale = expandSci(p.zoom);
+        if (!scale.empty() && nav->SetLocation(p.x, p.y, scale)) startRender();
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
     void drawPaletteDD(HDC dc) {
         bool hov = hover == H_PALETTE_DD;
         fillRound(dc, rcPaletteDD, hov ? CLR_CARD_HOV : CLR_CARD,
@@ -815,6 +899,8 @@ public:
         drawButton(dc, rcCopy, L"Copy", H_COPY, false);
         drawButton(dc, rcPaste, L"Paste", H_PASTE, false);
 
+        drawGalleryDD(dc);
+
         // location card -- cap x/y to 2 lines each so the zoom line always shows
         fillRound(dc, rcLocation, CLR_CARD, CLR_BORDER, S(8));
         RECT lt = rcLocation; lt.left += S(10); lt.top += S(6); lt.right -= S(10); lt.bottom -= S(6);
@@ -889,6 +975,7 @@ public:
         // palette dropdown list -- drawn last so it overlays the widgets below it
         if (paletteOpen) drawPaletteList(dc);
         if (coloringOpen) drawColoringList(dc);
+        if (galleryOpen) drawGalleryList(dc);
         } // end panel (full paints only)
 
         // status bar (always -- text changes with compute state / timings)
@@ -915,6 +1002,7 @@ public:
         if (inRect(rcSave,x,y)) return H_SAVE;
         if (inRect(rcCopy,x,y)) return H_COPY;
         if (inRect(rcPaste,x,y)) return H_PASTE;
+        if (inRect(rcGalleryDD,x,y)) return H_GALLERY_DD;
         if (inRect(rcMaxField,x,y)) return H_MAXFIELD;
         RECT mt = rcMaxTrack; mt.top -= S(8); mt.bottom += S(8); if (inRect(mt,x,y)) return H_MAXTRACK;
         RECT dt = rcDensTrack; dt.top -= S(8); dt.bottom += S(8); if (inRect(dt,x,y)) return H_DENSTRACK;
@@ -991,6 +1079,7 @@ public:
             if (navDragging) { POINT p = mapToRender(x,y); nav->Drag(p.x,p.y); return 0; }
             if (paletteOpen) { int it = paletteItemAt(x,y); if (it != paletteHover) { paletteHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
             if (coloringOpen) { int it = coloringItemAt(x,y); if (it != coloringHover) { coloringHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
+            if (galleryOpen) { int it = galleryItemAt(x,y); if (it != galleryHover) { galleryHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
             Hit h = hitTest(x,y);
             if (h != hover) { hover = h; InvalidateRect(hwnd, nullptr, FALSE); }
             return 0;
@@ -1011,9 +1100,17 @@ public:
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
+            if (galleryOpen) {
+                int it = galleryItemAt(x,y);
+                if (it >= 0) applyPreset(it);
+                galleryOpen = false; galleryHover = -1; pressed = H_NONE;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             Hit h = hitTest(x,y);
             if (h == H_PALETTE_DD) { paletteOpen = true; paletteHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
             if (h == H_EDE) { coloringOpen = true; coloringHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+            if (h == H_GALLERY_DD) { galleryOpen = true; galleryHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
             if (maxEditing && h != H_MAXFIELD) commitMaxEdit();
             pressed = h;
             if (h == H_GRADIENT) { gradientDown(x); return 0; }
