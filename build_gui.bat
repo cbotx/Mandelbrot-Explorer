@@ -14,7 +14,7 @@ cl /nologo /O2 /EHsc /openmp /std:c++17 /arch:AVX2 /MT ^
    mandel_perturbation.cpp float_math.cpp interpolate.cpp color.cpp ^
    /Fe:build\mandel_gui.exe ^
    /link /SUBSYSTEM:WINDOWS /LIBPATH:"%VCPKG%\lib" ^
-   gmp.lib user32.lib gdi32.lib comctl32.lib comdlg32.lib || goto :err
+   gmp.lib user32.lib gdi32.lib comctl32.lib comdlg32.lib windowscodecs.lib ole32.lib || goto :err
 
 REM Ship the OpenMP runtime next to the exe so build\ is copy-and-run portable.
 for /f "delims=" %%D in ('dir /b /s "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Redist\*\x64\*\vcomp140.dll" 2^>nul') do copy /y "%%D" build\ >nul
