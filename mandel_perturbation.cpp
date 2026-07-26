@@ -29,6 +29,41 @@ static int g_bla_noescape = -1;   // env MANDEL_BLA_NOESCAPE: force-skip the esc
 static long long g_fe_fallback = 0;
 static long long g_fe_stat[64][3];   // [tid] 0=BLA skip-iters 1=BLA applies 2=normal steps (MANDEL_PROFILE)
 
+// Stripe Average Coloring window. Averaging the stripe term over the whole orbit
+// washes out at deep zoom (orbits are long and nearly identical, so Feather goes
+// flat); the per-pixel structure lives in the escaping tail. Averaging only the
+// last W iterations recovers it, and since it is a pure function of the orbit it
+// stays pan-invariant (no reference halo). W<=0 restores the classic full average.
+static int g_sac_win = -2;   // -2 = unread
+static inline int sacWindow() {
+    if (g_sac_win == -2) { const char* e = getenv("MANDEL_SACWIN"); g_sac_win = e ? atoi(e) : 256; }
+    return g_sac_win;
+}
+namespace {
+struct SacAccum {
+    static const int MAXW = 1024;
+    double ring[MAXW];
+    double wsum = 0.0, full = 0.0, last = 0.0;
+    int W = 0, pos = 0, fill = 0, cnt = 0;
+    void init(int w) { W = w > MAXW ? MAXW : (w < 0 ? 0 : w); wsum = full = last = 0.0; pos = fill = cnt = 0; }
+    inline void push(double zr, double zi) {
+        double t = 0.5 + 0.5 * sin(7.0 * atan2(zi, zr));
+        full += t; last = t; ++cnt;
+        if (W > 0) { if (fill == W) wsum -= ring[pos]; else ++fill; ring[pos] = t; wsum += t; pos = (pos + 1) % W; }
+    }
+    inline void reset_window() { wsum = 0.0; pos = fill = 0; }   // a BLA skip breaks the tail
+    inline void add_full(double stripeSum, int n) { full += stripeSum; cnt += n; }  // W==0 skip restore
+    inline float value(double zrad, double R) const {
+        double frac = 1.0 - log(log(zrad) * 0.5 / log(R)) / log(2.0);
+        frac -= floor(frac);
+        double S = W > 0 ? wsum : full; int C = W > 0 ? fill : cnt;
+        double a1 = C > 0 ? S / C : 0.0;
+        double a2 = C > 1 ? (S - last) / (C - 1) : a1;
+        return (float)(a2 + (a1 - a2) * frac);
+    }
+};
+}
+
 // GMP mpf -> floatexp (m * 2^e, 0.5 <= |m| < 1), no underflow.
 static inline FloatExp mpf_to_fe(mpf_srcptr x) {
     if (mpf_sgn(x) == 0) return FloatExp{ 0.0, 0 };
@@ -150,8 +185,7 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method)
     Float dc_im = 0;
     Float tmp;
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
-    const double sac_freq = 7.0;
-    double sac_sum = 0.0, sac_last = 0.0; int sac_cnt = 0;
+    SacAccum sacc; if (sac) sacc.init(sacWindow());
     int i = 1;
     while (i < mxit) {
         tmp = 2.0 * (d_re * z_re - d_im * z_im);
@@ -168,19 +202,14 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method)
         z_im = 2.0 * z_re * z_im + c_im;
         z_re = tmp;
 
-        if (sac) { double t = 0.5 + 0.5 * sin(sac_freq * atan2(z_im, z_re)); sac_sum += t; sac_last = t; ++sac_cnt; }
+        if (sac) sacc.push((double)z_re, (double)z_im);
 
         tmp = z_re * z_re + z_im * z_im;
         if (tmp > _ESCAPE_RADIUS * _ESCAPE_RADIUS) {
             if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
                 return sqrt(tmp) * log(tmp) / sqrt(dc_re * dc_re + dc_im * dc_im);
             } else if (sac) {
-                double logR = log((double)_ESCAPE_RADIUS);
-                double frac = 1.0 - log(log(tmp) * 0.5 / logR) / log(2.0);
-                frac = frac - floor(frac);
-                double avg1 = sac_cnt > 0 ? sac_sum / sac_cnt : 0.0;
-                double avg2 = sac_cnt > 1 ? (sac_sum - sac_last) / (sac_cnt - 1) : avg1;
-                return avg2 + (avg1 - avg2) * frac;
+                return sacc.value((double)tmp, (double)_ESCAPE_RADIUS);
             } else {
                 return (i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
             }
@@ -298,8 +327,7 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
     // estimate). Iterated only when EDE is requested, mirroring floatPointCompute.
     const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
-    const double sac_freq = 7.0;
-    double sac_sum = 0.0, sac_last = 0.0; int sac_cnt = 0;
+    SacAccum sacc; if (sac) sacc.init(sacWindow());
     mpf_t dc_re, dc_im, e1, e2;
     mpf_init_set_ui(dc_re, 1); mpf_init(dc_im); mpf_init(e1); mpf_init(e2);
     int i = 1;
@@ -332,11 +360,7 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
         mpf_mul_ui(z_im, t1, 2);
         mpf_add(z_im, z_im, c_im);
 
-        if (sac) {   // full-precision stripe average (ground-truth reference)
-            double zrd = mpf_get_d(z_re), zid = mpf_get_d(z_im);
-            double t = 0.5 + 0.5 * sin(sac_freq * atan2(zid, zrd));
-            sac_sum += t; sac_last = t; ++sac_cnt;
-        }
+        if (sac) sacc.push(mpf_get_d(z_re), mpf_get_d(z_im));   // ground-truth stripe average
 
         // auto re_im = z.get_real_imag();
         // if (re_im.first * re_im.first + re_im.second * re_im.second > _ESCAPE_RADIUS) return (i + 1 - log(log(static_cast<float>(re_im.first * re_im.first + re_im.second * re_im.second))) / log(2));
@@ -357,12 +381,7 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
                 mpf_div(e1, e2, e1);
                 res = (float)mpf_get_d(e1);
             } else if (sac) {
-                double logR = log((double)_ESCAPE_RADIUS);
-                double frac = 1.0 - log(log(rad) * 0.5 / logR) / log(2.0);
-                frac = frac - floor(frac);
-                double avg1 = sac_cnt > 0 ? sac_sum / sac_cnt : 0.0;
-                double avg2 = sac_cnt > 1 ? (sac_sum - sac_last) / (sac_cnt - 1) : avg1;
-                res = (float)(avg2 + (avg1 - avg2) * frac);
+                res = sacc.value(rad, (double)_ESCAPE_RADIUS);
             } else {
                 res = (i + 1 - log(log(rad) / 2 / log(2)) / log(2));
             }
@@ -568,7 +587,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         // stripe-average contributions (z ~ X during a valid skip) instead of
         // dropping them -- otherwise the dropped fraction grows with distance from
         // the reference, giving Feather a pan-dependent radial halo.
-        if (_use_bla && _use_floatexp && (c_method & ColoringMethod::STRIPE_AVERAGE)) {
+        if (_use_bla && _use_floatexp && (c_method & ColoringMethod::STRIPE_AVERAGE) && sacWindow() <= 0) {
             const double* zfp = reinterpret_cast<const double*>(_zf);
             int N = ref_it + 1;
             _sacRefPre.assign((size_t)N + 1, 0.0);
@@ -1007,12 +1026,10 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         // convergence confirmation state (0 = searching for a candidate cycle)
         int conf_P = 0, conf_next = 0, conf_count = 0, conf_giveup = 0;
         Float conf_D2 = 0, conf_zr = 0, conf_zi = 0;
-        // Stripe Average Coloring: running mean of 0.5+0.5*sin(freq*arg(z)) over the
-        // orbit. A BLA skip advances the orbit without visiting the intermediate
-        // points, so their stripe terms are omitted (the sum is over non-skipped
-        // iterations only) -- see the on-vs-off comparison for the approximation.
-        const double sac_freq = 7.0;
-        double sac_sum = 0.0, sac_last = 0.0; int sac_cnt = 0;
+        // Stripe Average Coloring, averaged over the last sacWindow() iterations
+        // (the escaping tail) so it stays rich at deep zoom and pan-invariant. A
+        // BLA skip breaks the tail, so it resets the window.
+        SacAccum sacc; if (sac) sacc.init(sacWindow());
         while (j < mxit) {
             if (_flag_halt) break;
             if (_use_bla && dzr * dzr + dzi * dzi < _bla_rmax2) {
@@ -1025,6 +1042,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                     int tid = omp_get_thread_num() & 63;
                     g_bla_stat[tid][0] += skip; ++g_bla_stat[tid][1];
                     k += skip; j += skip;
+                    if (sac) sacc.reset_window();   // the jump breaks the tail window
                     // A BLA skip jumps j forward without visiting the skipped orbit
                     // points, so the periodicity (interior) detector's tortoise/hare
                     // and any in-progress cycle confirmation are now stale -- using
@@ -1066,7 +1084,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
             zi = dzi + _zfi[k];
             zrad = zr * zr + zi * zi;
 
-            if (sac) { double t = 0.5 + 0.5 * sin(sac_freq * atan2(zi, zr)); sac_sum += t; sac_last = t; ++sac_cnt; }
+            if (sac) sacc.push(zr, zi);
 
             ++k;
             if (zrad > _ESCAPE_RADIUS * _ESCAPE_RADIUS) {
@@ -1074,15 +1092,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                 if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
                     setPixel(arr, sqrt(zrad) / dxf * log(zrad) / sqrt(dr * dr + di * di));
                 } else if (sac) {
-                    // Smoothly interpolate the average with / without the last term
-                    // by the fractional escape (normalised by the bailout radius R,
-                    // so the stripe field is continuous across iteration bands).
-                    double logR = log((double)_ESCAPE_RADIUS);
-                    double frac = 1.0 - log(log((double)zrad) * 0.5 / logR) / log(2.0);
-                    frac = frac - floor(frac);
-                    double avg1 = sac_cnt > 0 ? sac_sum / sac_cnt : 0.0;
-                    double avg2 = sac_cnt > 1 ? (sac_sum - sac_last) / (sac_cnt - 1) : avg1;
-                    setPixel(arr, (float)(avg2 + (avg1 - avg2) * frac));
+                    setPixel(arr, sacc.value((double)zrad, (double)_ESCAPE_RADIUS));
                 } else {
                     setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
                 }
@@ -1498,11 +1508,12 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
     double zsr = 1e30, zsi = 1e30; int save_iter = 1, period_win = 1;
     int conf_P = 0, conf_next = 0, conf_count = 0, conf_giveup = 0;
     double conf_D2 = 0, conf_zr = 0, conf_zi = 0;
-    // Stripe Average Coloring (see the double path). BLA skips omit their orbit
-    // points from the sum; the residual approximation is small (<~3%).
+    // Stripe Average Coloring. Averaged over the last sacWindow() iterations (the
+    // escaping tail) so Feather keeps its structure at deep zoom; a BLA skip breaks
+    // the tail, so it resets the window. W<=0 uses the classic full average, and
+    // then restores a skip's omitted points via the reference-orbit prefix sum.
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
-    const double sac_freq = 7.0;
-    double sac_sum = 0.0, sac_last = 0.0; int sac_cnt = 0;
+    SacAccum sacc; if (sac) sacc.init(sacWindow());
 
     // Exterior distance estimation. The double path tracks the derivative in
     // double, but at deep zoom the true derivative |dz/dc| ~ 1/dx overflows it,
@@ -1526,12 +1537,10 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
             double ab[4];
             int skip = tryBLAfe(m - 1, S, S2, wr, wi, dcr, dci, ESC2, reflen, ede ? ab : nullptr);
             if (skip > 0) {
-                if (sac && !_sacRefPre.empty() && m + skip < (int)_sacRefPre.size()) {
-                    // Restore the omitted stripe contributions via the reference
-                    // orbit (z ~ X_k during a valid skip). Keeps Feather reference-
-                    // independent so it has no pan-dependent radial halo.
-                    sac_sum += _sacRefPre[m + skip] - _sacRefPre[m];
-                    sac_cnt += skip;
+                if (sac) {
+                    if (sacc.W > 0) sacc.reset_window();      // tail broken by the jump
+                    else if (!_sacRefPre.empty() && m + skip < (int)_sacRefPre.size())
+                        sacc.add_full(_sacRefPre[m + skip] - _sacRefPre[m], skip);   // full-avg restore
                 }
                 if (ede) {
                     // J -> A*J + B, carried in floatexp (A can be large over a run).
@@ -1575,7 +1584,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         Xr = m ? zfp[2 * (m - 1)] : 0.0; Xi = m ? zfp[2 * (m - 1) + 1] : 0.0;
         double zr = Xr + s * wr, zi = Xi + s * wi;      // z = X_m + S w
         double zrad = zr * zr + zi * zi;
-        if (sac) { double t = 0.5 + 0.5 * sin(sac_freq * atan2(zi, zr)); sac_sum += t; sac_last = t; ++sac_cnt; }
+        if (sac) sacc.push(zr, zi);
         if (zrad > ESC2) {
             if (ede) {
                 // dist = |z| log|z|^2 / (dx * |z'|); |z'| = SJ * |j| in floatexp.
@@ -1585,12 +1594,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
             }
             if (!sac)
                 return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
-            double logR = log((double)_ESCAPE_RADIUS);
-            double frac = 1.0 - log(log(zrad) * 0.5 / logR) / LG2;
-            frac = frac - floor(frac);
-            double avg1 = sac_cnt > 0 ? sac_sum / sac_cnt : 0.0;
-            double avg2 = sac_cnt > 1 ? (sac_sum - sac_last) / (sac_cnt - 1) : avg1;
-            return (float)(avg2 + (avg1 - avg2) * frac);
+            return sacc.value(zrad, (double)_ESCAPE_RADIUS);
         }
 
         if (_use_interior) {
