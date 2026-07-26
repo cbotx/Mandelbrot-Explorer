@@ -187,7 +187,7 @@ enum Hit {
     H_NONE, H_VIEW, H_GRADIENT,
     H_RESET, H_RENDER, H_SAVE, H_COPY, H_PASTE,
     H_MAXFIELD, H_MAXTRACK, H_DENSTRACK,
-    H_SS, H_EDE, H_PALETTE_DD, H_COLOR, H_GALLERY_DD
+    H_SS, H_EDE, H_PALETTE_DD, H_COLOR, H_GALLERY_DD, H_DENSFIELD
 };
 
 // Gallery demo presets: a saved location plus the exact render settings used to
@@ -204,7 +204,7 @@ static const std::vector<Preset>& galleryPresets() {
         { L"Night City  (1.7e40)",
           "-1.768628917759850520844734198472848718821423994141176532908",
           "0.001395534274228826510747662517373603005419245032078944176",
-          "1.691960e40", 83.0f, true, 0, L"Sunrise", 500000 },
+          "1.691960e40", 83.7f, true, 0, L"Sunrise", 500000 },
         { L"Golden Phoenix  (5.1e292)",
           "-1.74961551043225917132558762203092997406776582824486737043789087410512096670138841060878237427473435515004168931589322189249239986606828774155860523237102635565490176581179889267432026148118400022509532606522827603302653557653285809596137929818429125986636205433675211119215873019002373733544536685782529789935",
           "0.00000033552806488437213922924936314667758682179580368291347248996372066040948346974233057158256293565061238343085946164873110399056182528356343156076648247679264617131919657718521028825787075233133790754370605292961104472660681262156196225123453401177034629580032892768133871611413536923738263673919333840137",
@@ -360,7 +360,7 @@ public:
 
     // widget rects (computed in layout())
     RECT rcReset{}, rcRender{}, rcSave{}, rcCopy{}, rcPaste{};
-    RECT rcLocation{}, rcMaxField{}, rcMaxTrack{}, rcDensTrack{};
+    RECT rcLocation{}, rcMaxField{}, rcMaxTrack{}, rcDensTrack{}, rcDensField{};
     RECT rcSS{}, rcColoringDD{}, rcPaletteDD{}, rcColor{}, rcGradient{};
     RECT rcGalleryDD{};
 
@@ -378,6 +378,7 @@ public:
     bool navDragging = false, wasComputing = false;
     Hit hover = H_NONE, pressed = H_NONE;
     bool maxEditing = false; std::wstring maxBuf; int caretTick = 0;
+    bool densEditing = false; std::wstring densBuf;
     int liveFrames = 0;   // frames still needing per-tick repaint (animation/compute)
     int dpi = 96;         // display DPI; all metrics scale by dpi/96
     std::chrono::steady_clock::time_point renderStart;
@@ -417,7 +418,9 @@ public:
         rcLocation = { px, y, px + w, y + S(100) }; y += S(100) + S(16);
         rcMaxField = { px + w - S(96), y - S(2), px + w, y + S(24) };
         rcMaxTrack = { px, y + S(32), px + w, y + S(46) }; y += S(60);
-        rcDensTrack = { px, y + S(26), px + w, y + S(40) }; y += S(54);
+        rcDensTrack = { px, y + S(26), px + w, y + S(40) };
+        rcDensField = { px + w - S(72), y + S(2), px + w, y + S(24) };   // editable density value
+        y += S(54);
         rcSS  = { px, y, px + w, y + bh }; y += S(56);
         rcColoringDD = { px, y, px + w, y + bh }; y += S(56);
         rcPaletteDD = { px, y, px + w, y + bh }; y += S(44);
@@ -632,6 +635,16 @@ public:
         maxIter = std::clamp(v, 100, 5000000);
         nav->SetMxit(maxIter);
         startRender();
+    }
+    void commitDensEdit() {
+        if (!densEditing) return;
+        densEditing = false;
+        if (!densBuf.empty()) {
+            double v = _wtof(densBuf.c_str());
+            v = std::round(v * 10.0) / 10.0;                 // keep one decimal
+            color_density = (float)std::clamp(v, 10.0, 200.0);
+            nav->SetRedisplay(); keepLive();
+        }
     }
 
     // ---- widget drawing ----
@@ -929,9 +942,18 @@ public:
         }
         drawSlider(dc, rcMaxTrack, maxToT(), H_MAXTRACK);
 
-        // density
-        wchar_t db[48]; swprintf_s(db, L"Color density: %.0f", color_density);
-        label(dc, rcDensTrack.left, rcDensTrack.top - S(22), db);
+        // density (label + click-to-edit field that accepts one decimal)
+        label(dc, rcDensTrack.left, rcDensTrack.top - S(22), L"Color density");
+        {
+            bool hov = hover == H_DENSFIELD || densEditing;
+            fillRound(dc, rcDensField, hov ? CLR_CARD_HOV : CLR_CARD,
+                      densEditing ? CLR_ACCENT : CLR_BORDER, S(6));
+            wchar_t db[32]; swprintf_s(db, L"%.1f", color_density);
+            std::wstring t = densEditing ? densBuf : db;
+            if (densEditing && (caretTick / 15) % 2 == 0) t += L"|";
+            RECT tr = rcDensField; tr.right -= S(10);
+            drawText(dc, tr, t, CLR_TEXT, fUi, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        }
         drawSlider(dc, rcDensTrack, std::clamp((color_density - 10.0) / 190.0, 0.0, 1.0), H_DENSTRACK);
 
         drawToggle(dc, rcSS, L"5x supersampling", ssOn, H_SS);
@@ -1007,6 +1029,7 @@ public:
         if (inRect(rcPaste,x,y)) return H_PASTE;
         if (inRect(rcGalleryDD,x,y)) return H_GALLERY_DD;
         if (inRect(rcMaxField,x,y)) return H_MAXFIELD;
+        if (inRect(rcDensField,x,y)) return H_DENSFIELD;
         RECT mt = rcMaxTrack; mt.top -= S(8); mt.bottom += S(8); if (inRect(mt,x,y)) return H_MAXTRACK;
         RECT dt = rcDensTrack; dt.top -= S(8); dt.bottom += S(8); if (inRect(dt,x,y)) return H_DENSTRACK;
         if (inRect(rcSS,x,y)) return H_SS;
@@ -1021,7 +1044,7 @@ public:
 
     void timer() {
         bool computing = nav->IsComputing();
-        bool active = computing || navDragging || palette.dragging || maxEditing ||
+        bool active = computing || wasComputing || navDragging || palette.dragging || maxEditing || densEditing ||
                       pressed == H_MAXTRACK || pressed == H_DENSTRACK || liveFrames > 0;
         if (!active) return;                 // idle: no repaint, no flicker, no CPU spin
         if (liveFrames > 0) --liveFrames;
@@ -1032,10 +1055,10 @@ public:
                 std::chrono::steady_clock::now() - renderStart).count();
         wasComputing = computing;
         buildDisplay();
-        if (maxEditing) ++caretTick;
+        if (maxEditing || densEditing) ++caretTick;
         // Pure fractal-animation frames (pan/zoom/compute) can skip the panel
         // rebuild; UI-control interaction still gets a full paint.
-        bool uiInteract = palette.dragging || maxEditing ||
+        bool uiInteract = palette.dragging || maxEditing || densEditing ||
                           pressed == H_MAXTRACK || pressed == H_DENSTRACK;
         fractalOnlyTick = !uiInteract;
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -1078,7 +1101,7 @@ public:
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
             if (palette.dragging) { gradientMove(x); return 0; }
             if (pressed == H_MAXTRACK) { setMaxFromT((double)(x - rcMaxTrack.left)/(rcMaxTrack.right-rcMaxTrack.left), false); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
-            if (pressed == H_DENSTRACK) { color_density = (float)std::clamp(10.0 + 190.0*(x-rcDensTrack.left)/(rcDensTrack.right-rcDensTrack.left),10.0,200.0); nav->SetRedisplay(); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
+            if (pressed == H_DENSTRACK) { color_density = (float)std::round(std::clamp(10.0 + 190.0*(x-rcDensTrack.left)/(rcDensTrack.right-rcDensTrack.left),10.0,200.0)); nav->SetRedisplay(); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (navDragging) { POINT p = mapToRender(x,y); nav->Drag(p.x,p.y); return 0; }
             if (paletteOpen) { int it = paletteItemAt(x,y); if (it != paletteHover) { paletteHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
             if (coloringOpen) { int it = coloringItemAt(x,y); if (it != coloringHover) { coloringHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
@@ -1115,11 +1138,13 @@ public:
             if (h == H_EDE) { coloringOpen = true; coloringHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
             if (h == H_GALLERY_DD) { galleryOpen = true; galleryHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
             if (maxEditing && h != H_MAXFIELD) commitMaxEdit();
+            if (densEditing && h != H_DENSFIELD) commitDensEdit();
             pressed = h;
             if (h == H_GRADIENT) { gradientDown(x); return 0; }
             if (h == H_MAXTRACK) { SetCapture(hwnd); setMaxFromT((double)(x-rcMaxTrack.left)/(rcMaxTrack.right-rcMaxTrack.left), false); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
-            if (h == H_DENSTRACK) { SetCapture(hwnd); color_density=(float)std::clamp(10.0+190.0*(x-rcDensTrack.left)/(rcDensTrack.right-rcDensTrack.left),10.0,200.0); nav->SetRedisplay(); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
+            if (h == H_DENSTRACK) { SetCapture(hwnd); color_density=(float)std::round(std::clamp(10.0+190.0*(x-rcDensTrack.left)/(rcDensTrack.right-rcDensTrack.left),10.0,200.0)); nav->SetRedisplay(); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (h == H_MAXFIELD) { maxEditing = true; maxBuf.clear(); caretTick = 0; InvalidateRect(hwnd,nullptr,FALSE); return 0; }
+            if (h == H_DENSFIELD) { densEditing = true; densBuf.clear(); caretTick = 0; InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (h == H_VIEW) { POINT p = mapToRender(x,y); navDragging = true; SetCapture(hwnd); nav->DragStart(p.x,p.y); }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -1181,9 +1206,19 @@ public:
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
+            if (densEditing) {
+                wchar_t c = (wchar_t)wp;
+                if (c >= '0' && c <= '9') { if (densBuf.size() < 6) densBuf += c; }
+                else if (c == '.' && densBuf.find('.') == std::wstring::npos && densBuf.size() < 6) densBuf += c;
+                else if (c == 8 && !densBuf.empty()) densBuf.pop_back();
+                else if (c == '\r') commitDensEdit();
+                else if (c == 27) densEditing = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             return 0;
         case WM_KEYDOWN:
-            if (maxEditing) return 0;
+            if (maxEditing || densEditing) return 0;
             if (wp == 'R') { nav->Reset(); renderStart = std::chrono::steady_clock::now(); wasComputing = true; keepLive(); }
             else if (wp == VK_SPACE) startRender();
             else if (wp == 'S') saveImage();
