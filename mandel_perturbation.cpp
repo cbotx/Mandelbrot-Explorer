@@ -807,29 +807,13 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
             Dcr[i] = fe_mul_d(_dxfe, px - _ref_x);
             Dci[i] = fe_mul_d(_dyfe, py - _ref_y);
         }
-        if (feSimdOn) {
-#pragma omp parallel for schedule(dynamic, 1)
-            for (int gg = 0; gg < n; gg += 4) {
-                if (_flag_halt) continue;
-                int lanes = n - gg < 4 ? n - gg : 4;
-                solveRescaledSimd4(Dcr.data(), Dci.data(), gg, lanes, mx_ref_it, mxit, c_method, val.data());
-            }
-        } else {
-#pragma omp parallel for schedule(dynamic, 1)
-            for (int i = 0; i < (int)v.size(); ++i) {
-                if (_flag_halt) continue;
-                val[i] = pixelRescaled(Dcr[i], Dci[i], mx_ref_it, mxit, c_method);
-            }
-        }
-#pragma omp parallel for schedule(dynamic, 64)
-        for (int i = 0; i < (int)v.size(); ++i) {
-            if (_flag_halt) continue;
+        // Write each finished pixel to _iter as soon as it is computed (not in a
+        // separate pass) so the GUI shows the deep render filling in progressively.
+        // Rare cutoff-sensitive frames resolve uncertain pixels with the GMP oracle.
+        auto finalize = [&](int i) {
             auto arr = v[i];
             float value = val[i];
             if (_fe_cutoff_sensitive && (value < 0 || value > mxit - 16)) {
-                // This rare frame sits directly on the maxit classification
-                // boundary. Resolve only its uncertain pixels with the GMP oracle;
-                // stable deep exterior/interior views never enter this path.
                 mpf_t cre, cim, t;
                 mpf_init_set(cre, _c0_re); mpf_init_set(cim, _c0_im); mpf_init(t);
                 mpf_mul_ui(t, _dx, arr[1]); mpf_add(cre, cre, t);
@@ -847,9 +831,25 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
             }
             setPixel(arr, value);
             _done[i] = true;
+        };
+        if (feSimdOn) {
+#pragma omp parallel for schedule(dynamic, 1)
+            for (int gg = 0; gg < n; gg += 4) {
+                if (_flag_halt) continue;
+                int lanes = n - gg < 4 ? n - gg : 4;
+                solveRescaledSimd4(Dcr.data(), Dci.data(), gg, lanes, mx_ref_it, mxit, c_method, val.data());
+                for (int l = 0; l < lanes; ++l) finalize(gg + l);
+            }
+        } else {
+#pragma omp parallel for schedule(dynamic, 1)
+            for (int i = 0; i < (int)v.size(); ++i) {
+                if (_flag_halt) continue;
+                val[i] = pixelRescaled(Dcr[i], Dci[i], mx_ref_it, mxit, c_method);
+                finalize(i);
+            }
         }
-        // rebasing makes the floatexp path glitch-free, so every pixel is done;
-        // drop them from the work set (matching the tail of the scalar/SIMD paths).
+        // Zhuoran rebasing (rebase whenever |z| < |dz|) keeps the floatexp path
+        // glitch-free, so every pixel is resolved in one pass; drop them all.
         { int i = 0;
           for (auto it = s.begin(); it != s.end(); ++i)
               if (_done[i]) it = s.erase(it); else ++it; }
@@ -1493,9 +1493,15 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
             dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
         }
 
-        // Zhuoran rebase to the critical point (m = 0): triggered where the
-        // reference passes near 0 (double |z| tiny) or at the reference end.
-        if (zrad < 1e-8 || m >= reflen) {
+        // Zhuoran rebase to the critical point (m = 0). Rebase whenever the pixel
+        // orbit is smaller than the delta (|z|^2 < |dz|^2), matching the double
+        // path -- NOT only when |z| is tiny in double. Far-from-reference pixels
+        // have a large delta (dz ~ O(1)); gating rebasing behind zrad<1e-8 misses
+        // their |z|<|dz| rebases, so the delta grows and its 53-bit mantissa drifts
+        // -> large-area glitch. dzmag2 = |S w|^2 in double (0 if S underflows deep,
+        // where the zrad<1e-8 branch still handles the near-zero reference passes).
+        double dzmag2 = s * s * (wr * wr + wi * wi);
+        if (zrad < 1e-8 || zrad < dzmag2 || m >= reflen) {
             FloatExp Xmr = m ? _zfr_fe[m - 1] : FloatExp{ 0.0, 0 };
             FloatExp Xmi = m ? _zfi_fe[m - 1] : FloatExp{ 0.0, 0 };
             FloatExp Swr = fe_mul_d(S, wr), Swi = fe_mul_d(S, wi);      // S w = dz_true
@@ -1623,7 +1629,8 @@ void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g,
                 wr[l] *= inv; wi[l] *= inv;
                 dr[l] = fe_to_double(fe_div(dcr[l], S[l])); di[l] = fe_to_double(fe_div(dci[l], S[l]));
             }
-            if (zrl < 1e-8 || m[l] >= reflen) {                   // Zhuoran rebase to m=0
+            double dzmag2 = sS[l] * sS[l] * (wr[l] * wr[l] + wi[l] * wi[l]);   // |S w|^2
+            if (zrl < 1e-8 || zrl < dzmag2 || m[l] >= reflen) {   // Zhuoran rebase (|z|<|dz|)
                 int mm = m[l];
                 FloatExp Xmr = mm ? _zfr_fe[mm - 1] : FloatExp{ 0.0, 0 };
                 FloatExp Xmi = mm ? _zfi_fe[mm - 1] : FloatExp{ 0.0, 0 };
