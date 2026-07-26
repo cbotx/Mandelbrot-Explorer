@@ -201,14 +201,14 @@ struct Preset {
 };
 static const std::vector<Preset>& galleryPresets() {
     static const std::vector<Preset> p = {
-        { L"Feather spiral  (5.1e292)",
+        { L"Night City  (1.7e40)",
+          "-1.768628917759850520844734198472848718821423994141176532908",
+          "0.001395534274228826510747662517373603005419245032078944176",
+          "1.691960e40", 83.0f, true, 0, L"Sunrise", 500000 },
+        { L"Golden Phoenix  (5.1e292)",
           "-1.74961551043225917132558762203092997406776582824486737043789087410512096670138841060878237427473435515004168931589322189249239986606828774155860523237102635565490176581179889267432026148118400022509532606522827603302653557653285809596137929818429125986636205433675211119215873019002373733544536685782529789935",
           "0.00000033552806488437213922924936314667758682179580368291347248996372066040948346974233057158256293565061238343085946164873110399056182528356343156076648247679264617131919657718521028825787075233133790754370605292961104472660681262156196225123453401177034629580032892768133871611413536923738263673919333840137",
           "5.119695e292", 169.0f, true, 2, L"Sunrise", 500000 },
-        { L"Smooth valley  (1.7e40)",
-          "-1.768628917759850520844734198472848718821423994141176532908",
-          "0.001395534274228826510747662517373603005419245032078944176",
-          "1.691960e40", 43.0f, true, 0, L"Sunrise", 500000 },
     };
     return p;
 }
@@ -414,7 +414,6 @@ public:
         rcCopy    = { px + 3*(bw+g),   y, px + 4*bw + 3*g,  y + bh };
         rcPaste   = { px + 4*(bw+g),   y, px + 5*bw + 4*g,  y + bh };
         y += bh + S(14);
-        rcGalleryDD = { px, y, px + w, y + bh }; y += bh + S(14);
         rcLocation = { px, y, px + w, y + S(100) }; y += S(100) + S(16);
         rcMaxField = { px + w - S(96), y - S(2), px + w, y + S(24) };
         rcMaxTrack = { px, y + S(32), px + w, y + S(46) }; y += S(60);
@@ -423,7 +422,8 @@ public:
         rcColoringDD = { px, y, px + w, y + bh }; y += S(56);
         rcPaletteDD = { px, y, px + w, y + bh }; y += S(44);
         rcGradient = { px, y + S(22), px + w, y + S(62) }; y += S(84);
-        rcColor = { px, y, px + w, y + bh };
+        rcColor = { px, y, px + w, y + bh }; y += bh + S(16);
+        rcGalleryDD = { px, y, px + w, y + bh };
     }
 
     void createFonts() {
@@ -486,10 +486,12 @@ public:
     }
 
     // ---- value mapping ----
-    double maxToT() const { return std::clamp((log10((double)maxIter) - 2.0) / 4.0, 0.0, 1.0); }
+    // Max-iteration slider: log scale from 100 (10^2) to 5,000,000.
+    static double maxItExpSpan() { return log10(5000000.0) - 2.0; }   // ~4.699
+    double maxToT() const { return std::clamp((log10((double)maxIter) - 2.0) / maxItExpSpan(), 0.0, 1.0); }
     void setMaxFromT(double t, bool render) {
-        maxIter = (int)std::round(pow(10.0, 2.0 + 4.0 * std::clamp(t, 0.0, 1.0)));
-        maxIter = std::clamp(maxIter, 100, 1000000);
+        maxIter = (int)std::round(pow(10.0, 2.0 + maxItExpSpan() * std::clamp(t, 0.0, 1.0)));
+        maxIter = std::clamp(maxIter, 100, 5000000);
         nav->SetMxit(maxIter);
         if (render) startRender();
     }
@@ -627,7 +629,7 @@ public:
         if (!maxEditing) return;
         maxEditing = false;
         int v = maxBuf.empty() ? maxIter : _wtoi(maxBuf.c_str());
-        maxIter = std::clamp(v, 100, 1000000);
+        maxIter = std::clamp(v, 100, 5000000);
         nav->SetMxit(maxIter);
         startRender();
     }
@@ -769,8 +771,9 @@ public:
     int galleryItemH() const { return S(28); }
     RECT galleryListRect() const {
         int n = (int)galleryPresets().size();
-        return { rcGalleryDD.left, rcGalleryDD.bottom + S(2), rcGalleryDD.right,
-                 rcGalleryDD.bottom + S(2) + n * galleryItemH() };
+        int h = n * galleryItemH();
+        // Gallery sits at the panel bottom, so the list opens upward.
+        return { rcGalleryDD.left, rcGalleryDD.top - S(2) - h, rcGalleryDD.right, rcGalleryDD.top - S(2) };
     }
     int galleryItemAt(int x, int y) const {
         RECT lr = galleryListRect();
@@ -783,7 +786,7 @@ public:
         fillRound(dc, rcGalleryDD, hov ? CLR_CARD_HOV : CLR_CARD,
                   galleryOpen ? CLR_ACCENT : CLR_BORDER, S(8));
         RECT tr = rcGalleryDD; tr.left += S(12); tr.right -= S(28);
-        drawText(dc, tr, L"Gallery \u2014 load a demo", CLR_TEXT, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        drawText(dc, tr, L"Gallery", CLR_TEXT, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         RECT cr = rcGalleryDD; cr.right -= S(12);
         drawText(dc, cr, galleryOpen ? L"\u25B2" : L"\u25BC", CLR_TEXT_DIM, fSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
@@ -804,7 +807,7 @@ public:
         if (idx < 0 || idx >= (int)gp.size()) return;
         const Preset& p = gp[idx];
         // render settings first, then the location (which kicks off the render)
-        maxIter = std::clamp(p.maxIter, 100, 1000000); nav->SetMxit(maxIter);
+        maxIter = std::clamp(p.maxIter, 100, 5000000); nav->SetMxit(maxIter);
         color_density = std::clamp(p.density, 10.0f, 200.0f);
         ssOn = p.ss;
         coloringIdx = p.coloring;
@@ -1048,7 +1051,7 @@ public:
             if (dpi <= 0) dpi = 96;
             createFonts();
             palette.load(paletteIdx);
-            nav = std::make_unique<MandelNavigator>(RENDER_W, RENDER_H, 5, 1000000, 1.0, 220.0);
+            nav = std::make_unique<MandelNavigator>(RENDER_W, RENDER_H, 5, 5000000, 1.0, 220.0);
             nav->SetMxit(maxIter);
             nav->SetCMethod(coloringIdx == 1 ? ColoringMethod::EXTERIOR_DIST_EST
                           : coloringIdx == 2 ? ColoringMethod::STRIPE_AVERAGE : 0);
