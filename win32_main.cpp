@@ -33,6 +33,8 @@ float color_map[3][colP];
 float color_density = 60.0f;
 
 static float colorFunction(float it, int method) {
+    if (method & ColoringMethod::STRIPE_AVERAGE)
+        return it * (color_density / 20.0f);   // SAC value in [0,1] -> banded palette
     if (method & ColoringMethod::EXTERIOR_DIST_EST)
         return tanhf(it / color_density * 5.0f);
     float l = logf(it + 2.0f);
@@ -336,11 +338,14 @@ public:
     // widget rects (computed in layout())
     RECT rcReset{}, rcRender{}, rcSave{}, rcCopy{}, rcPaste{};
     RECT rcLocation{}, rcMaxField{}, rcMaxTrack{}, rcDensTrack{};
-    RECT rcSS{}, rcEDE{}, rcPaletteDD{}, rcColor{}, rcGradient{};
+    RECT rcSS{}, rcColoringDD{}, rcPaletteDD{}, rcColor{}, rcGradient{};
 
     // state
     int maxIter = 500000;
-    bool ssOn = false, edeOn = false;
+    bool ssOn = false;
+    int coloringIdx = 0;                    // 0 Smooth, 1 Distance (EDE), 2 Feather (SAC)
+    bool coloringOpen = false;              // coloring dropdown expanded
+    int coloringHover = -1;                 // hovered item while open (-1 none)
     int paletteIdx = 0;                    // index into palettePresets()
     bool paletteOpen = false;              // dropdown expanded
     int paletteHover = -1;                 // hovered item while open (-1 none)
@@ -388,7 +393,7 @@ public:
         rcMaxTrack = { px, y + S(32), px + w, y + S(46) }; y += S(60);
         rcDensTrack = { px, y + S(26), px + w, y + S(40) }; y += S(54);
         rcSS  = { px, y, px + w, y + bh }; y += S(38);
-        rcEDE = { px, y, px + w, y + bh }; y += S(46);
+        rcColoringDD = { px, y, px + w, y + bh }; y += S(46);
         rcPaletteDD = { px, y, px + w, y + bh }; y += S(44);
         rcGradient = { px, y + S(22), px + w, y + S(62) }; y += S(84);
         rcColor = { px, y, px + w, y + bh };
@@ -685,6 +690,54 @@ public:
         int i = (y - lr.top) / paletteItemH();
         return (i >= 0 && i < (int)palettePresets().size()) ? i : -1;
     }
+    // ---- coloring-mode dropdown (Smooth / Distance / Feather) ----
+    static const wchar_t* coloringName(int i) {
+        static const wchar_t* n[3] = { L"Smooth", L"Distance (EDE)", L"Feather (stripe)" };
+        return n[i < 0 ? 0 : (i > 2 ? 2 : i)];
+    }
+    int coloringItemH() const { return S(28); }
+    RECT coloringListRect() const {
+        int n = 3;
+        return { rcColoringDD.left, rcColoringDD.bottom + S(2), rcColoringDD.right,
+                 rcColoringDD.bottom + S(2) + n * coloringItemH() };
+    }
+    int coloringItemAt(int x, int y) const {
+        RECT lr = coloringListRect();
+        if (x < lr.left || x > lr.right || y < lr.top || y > lr.bottom) return -1;
+        int i = (y - lr.top) / coloringItemH();
+        return (i < 0 || i > 2) ? -1 : i;
+    }
+    void drawColoringDD(HDC dc) {
+        bool hov = hover == H_EDE;
+        fillRound(dc, rcColoringDD, hov ? CLR_CARD_HOV : CLR_CARD,
+                  coloringOpen ? CLR_ACCENT : CLR_BORDER, S(8));
+        RECT tr = rcColoringDD; tr.left += S(12); tr.right -= S(28);
+        drawText(dc, tr, coloringName(coloringIdx), CLR_TEXT, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT cr = rcColoringDD; cr.right -= S(12);
+        drawText(dc, cr, coloringOpen ? L"\u25B2" : L"\u25BC", CLR_TEXT_DIM, fSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+    void drawColoringList(HDC dc) {
+        RECT lr = coloringListRect();
+        fillRound(dc, lr, CLR_CARD, CLR_ACCENT, S(8));
+        int ih = coloringItemH();
+        for (int i = 0; i < 3; ++i) {
+            RECT ir = { lr.left, lr.top + i * ih, lr.right, lr.top + (i + 1) * ih };
+            if (i == coloringHover) fillRect(dc, { ir.left + S(3), ir.top, ir.right - S(3), ir.bottom }, CLR_CARD_HOV);
+            RECT tr = ir; tr.left += S(14);
+            drawText(dc, tr, coloringName(i), i == coloringIdx ? CLR_ACCENT : CLR_TEXT, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
+    void selectColoring(int idx) {
+        if (idx < 0 || idx > 2) return;
+        coloringIdx = idx;
+        int m = nav->GetCMethod();
+        m &= ~(ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::STRIPE_AVERAGE);
+        if (idx == 1) m |= ColoringMethod::EXTERIOR_DIST_EST;
+        else if (idx == 2) m |= ColoringMethod::STRIPE_AVERAGE;
+        nav->SetCMethod(m);
+        startRender();
+    }
+
     void drawPaletteDD(HDC dc) {
         bool hov = hover == H_PALETTE_DD;
         fillRound(dc, rcPaletteDD, hov ? CLR_CARD_HOV : CLR_CARD,
@@ -793,7 +846,8 @@ public:
         drawSlider(dc, rcDensTrack, std::clamp((color_density - 10.0) / 190.0, 0.0, 1.0), H_DENSTRACK);
 
         drawToggle(dc, rcSS, L"5x supersampling", ssOn, H_SS);
-        drawToggle(dc, rcEDE, L"Exterior distance estimation", edeOn, H_EDE);
+        label(dc, rcColoringDD.left, rcColoringDD.top - S(20), L"Coloring");
+        drawColoringDD(dc);
 
         label(dc, rcPaletteDD.left, rcPaletteDD.top - S(20), L"Palette");
         drawPaletteDD(dc);
@@ -834,6 +888,7 @@ public:
         }
         // palette dropdown list -- drawn last so it overlays the widgets below it
         if (paletteOpen) drawPaletteList(dc);
+        if (coloringOpen) drawColoringList(dc);
         } // end panel (full paints only)
 
         // status bar (always -- text changes with compute state / timings)
@@ -864,7 +919,7 @@ public:
         RECT mt = rcMaxTrack; mt.top -= S(8); mt.bottom += S(8); if (inRect(mt,x,y)) return H_MAXTRACK;
         RECT dt = rcDensTrack; dt.top -= S(8); dt.bottom += S(8); if (inRect(dt,x,y)) return H_DENSTRACK;
         if (inRect(rcSS,x,y)) return H_SS;
-        if (inRect(rcEDE,x,y)) return H_EDE;
+        if (inRect(rcColoringDD,x,y)) return H_EDE;
         if (inRect(rcPaletteDD,x,y)) return H_PALETTE_DD;
         if (inRect(rcColor,x,y)) return H_COLOR;
         RECT gr = rcGradient; gr.left -= S(8); gr.right += S(8); gr.top -= S(6); gr.bottom += S(14);
@@ -907,7 +962,8 @@ public:
             palette.load(paletteIdx);
             nav = std::make_unique<MandelNavigator>(RENDER_W, RENDER_H, 5, 1000000, 1.0, 220.0);
             nav->SetMxit(maxIter);
-            nav->SetCMethod(edeOn ? ColoringMethod::EXTERIOR_DIST_EST : 0);
+            nav->SetCMethod(coloringIdx == 1 ? ColoringMethod::EXTERIOR_DIST_EST
+                          : coloringIdx == 2 ? ColoringMethod::STRIPE_AVERAGE : 0);
             nav->BindFixImageCallback(fixCallback);
             layout(); startRender();
             SetTimer(hwnd, TIMER_ID, 16, nullptr);
@@ -934,6 +990,7 @@ public:
             if (pressed == H_DENSTRACK) { color_density = (float)std::clamp(10.0 + 190.0*(x-rcDensTrack.left)/(rcDensTrack.right-rcDensTrack.left),10.0,200.0); nav->SetRedisplay(); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (navDragging) { POINT p = mapToRender(x,y); nav->Drag(p.x,p.y); return 0; }
             if (paletteOpen) { int it = paletteItemAt(x,y); if (it != paletteHover) { paletteHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
+            if (coloringOpen) { int it = coloringItemAt(x,y); if (it != coloringHover) { coloringHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
             Hit h = hitTest(x,y);
             if (h != hover) { hover = h; InvalidateRect(hwnd, nullptr, FALSE); }
             return 0;
@@ -947,8 +1004,16 @@ public:
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
+            if (coloringOpen) {
+                int it = coloringItemAt(x,y);
+                if (it >= 0) selectColoring(it);
+                coloringOpen = false; coloringHover = -1; pressed = H_NONE;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             Hit h = hitTest(x,y);
             if (h == H_PALETTE_DD) { paletteOpen = true; paletteHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+            if (h == H_EDE) { coloringOpen = true; coloringHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
             if (maxEditing && h != H_MAXFIELD) commitMaxEdit();
             pressed = h;
             if (h == H_GRADIENT) { gradientDown(x); return 0; }
@@ -975,7 +1040,6 @@ public:
                 case H_COPY: copyLocation(); break;
                 case H_PASTE: pasteLocation(); break;
                 case H_SS: ssOn = !ssOn; setMethodFlag(ColoringMethod::SUPER_SAMPLING, ssOn); break;
-                case H_EDE: edeOn = !edeOn; setMethodFlag(ColoringMethod::EXTERIOR_DIST_EST, edeOn); break;
                 case H_COLOR: chooseSelectedColor(); break;
                 default: break;
                 }

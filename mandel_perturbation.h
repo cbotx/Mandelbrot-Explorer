@@ -21,7 +21,8 @@ struct HPComp {
 enum ColoringMethod {
     SUPER_SAMPLING = 1,
     EXTERIOR_DIST_EST = 2,
-    INTERIOR_DIST_EST = 4
+    INTERIOR_DIST_EST = 4,
+    STRIPE_AVERAGE = 8
 };
 
 class Mandel {

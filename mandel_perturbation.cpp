@@ -778,6 +778,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
     auto glitch_p = std::unique_ptr<Float[]>(new Float[n]);
 
     const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
+    const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
     static int simd_env = -1;
     if (simd_env < 0) { const char* e = getenv("MANDEL_SIMD"); simd_env = e ? atoi(e) : 1; }
 
@@ -793,7 +794,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         // BLA already skips most steps and is checked per-lane scalar every
         // iteration, so keep the default (BLA) path scalar and use SIMD only when
         // BLA is off (where the quadratic step is the whole cost).
-        const bool feSimdOn = fesimd && !_use_bla;
+        const bool feSimdOn = fesimd && !_use_bla && !sac;
 
         std::vector<FloatExp> Dcr(n), Dci(n);
         std::vector<float> val(n);
@@ -856,7 +857,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         return;
     }
 
-    const bool use_simd = simd_env && !ede && !_use_bla && !_use_interior;   // BLA/interior paths are scalar
+    const bool use_simd = simd_env && !ede && !sac && !_use_bla && !_use_interior;   // BLA/interior/EDE/SAC paths are scalar
 
     if (use_simd) {
         // ---- setup: per-pixel dc + series-approximation initial delta ----
@@ -961,6 +962,12 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         // convergence confirmation state (0 = searching for a candidate cycle)
         int conf_P = 0, conf_next = 0, conf_count = 0, conf_giveup = 0;
         Float conf_D2 = 0, conf_zr = 0, conf_zi = 0;
+        // Stripe Average Coloring: running mean of 0.5+0.5*sin(freq*arg(z)) over the
+        // orbit. A BLA skip advances the orbit without visiting the intermediate
+        // points, so their stripe terms are omitted (the sum is over non-skipped
+        // iterations only) -- see the on-vs-off comparison for the approximation.
+        const double sac_freq = 7.0;
+        double sac_sum = 0.0, sac_last = 0.0; int sac_cnt = 0;
         while (j < mxit) {
             if (_flag_halt) break;
             if (_use_bla && dzr * dzr + dzi * dzi < _bla_rmax2) {
@@ -1014,12 +1021,23 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
             zi = dzi + _zfi[k];
             zrad = zr * zr + zi * zi;
 
+            if (sac) { double t = 0.5 + 0.5 * sin(sac_freq * atan2(zi, zr)); sac_sum += t; sac_last = t; ++sac_cnt; }
 
             ++k;
             if (zrad > _ESCAPE_RADIUS * _ESCAPE_RADIUS) {
                 
                 if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
                     setPixel(arr, sqrt(zrad) / dxf * log(zrad) / sqrt(dr * dr + di * di));
+                } else if (sac) {
+                    // Smoothly interpolate the average with / without the last term
+                    // by the fractional escape (normalised by the bailout radius R,
+                    // so the stripe field is continuous across iteration bands).
+                    double logR = log((double)_ESCAPE_RADIUS);
+                    double frac = 1.0 - log(log((double)zrad) * 0.5 / logR) / log(2.0);
+                    frac = frac - floor(frac);
+                    double avg1 = sac_cnt > 0 ? sac_sum / sac_cnt : 0.0;
+                    double avg2 = sac_cnt > 1 ? (sac_sum - sac_last) / (sac_cnt - 1) : avg1;
+                    setPixel(arr, (float)(avg2 + (avg1 - avg2) * frac));
                 } else {
                     setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
                 }
@@ -1431,6 +1449,11 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
     double zsr = 1e30, zsi = 1e30; int save_iter = 1, period_win = 1;
     int conf_P = 0, conf_next = 0, conf_count = 0, conf_giveup = 0;
     double conf_D2 = 0, conf_zr = 0, conf_zi = 0;
+    // Stripe Average Coloring (see the double path). BLA skips omit their orbit
+    // points from the sum; the residual approximation is small (<~3%).
+    const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
+    const double sac_freq = 7.0;
+    double sac_sum = 0.0, sac_last = 0.0; int sac_cnt = 0;
 
     while (iter < mxit) {
         if (_flag_halt) break;
@@ -1460,8 +1483,17 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         Xr = m ? zfp[2 * (m - 1)] : 0.0; Xi = m ? zfp[2 * (m - 1) + 1] : 0.0;
         double zr = Xr + s * wr, zi = Xi + s * wi;      // z = X_m + S w
         double zrad = zr * zr + zi * zi;
-        if (zrad > ESC2)
-            return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
+        if (sac) { double t = 0.5 + 0.5 * sin(sac_freq * atan2(zi, zr)); sac_sum += t; sac_last = t; ++sac_cnt; }
+        if (zrad > ESC2) {
+            if (!sac)
+                return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
+            double logR = log((double)_ESCAPE_RADIUS);
+            double frac = 1.0 - log(log(zrad) * 0.5 / logR) / LG2;
+            frac = frac - floor(frac);
+            double avg1 = sac_cnt > 0 ? sac_sum / sac_cnt : 0.0;
+            double avg2 = sac_cnt > 1 ? (sac_sum - sac_last) / (sac_cnt - 1) : avg1;
+            return (float)(avg2 + (avg1 - avg2) * frac);
+        }
 
         if (_use_interior) {
             if (conf_P > 0) {
