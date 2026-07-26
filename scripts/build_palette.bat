@@ -1,14 +1,13 @@
 @echo off
 setlocal
-cd /d "%~dp0"
-set VCPKG=C:\Users\yuxiangchi\repo\vcpkg\installed\x64-windows-static
+cd /d "%~dp0.."
 if not exist build mkdir build
 call "%~dp0msvcenv.bat" || goto :err
 
 cl /nologo /O2 /EHsc /openmp /std:c++17 /arch:AVX2 /MT ^
-   /I "%VCPKG%\include" ^
+   /I "%VCPKG%\include" /I src\engine ^
    /Fo:build\ ^
-   palette_preview.cpp mandel_perturbation.cpp float_math.cpp interpolate.cpp color.cpp ^
+   src\bench\palette_preview.cpp src\engine\mandel_perturbation.cpp src\engine\float_math.cpp src\engine\interpolate.cpp src\engine\color.cpp ^
    /Fe:build\palette_preview.exe ^
    /link /LIBPATH:"%VCPKG%\lib" gmp.lib || goto :err
 
