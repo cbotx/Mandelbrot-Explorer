@@ -149,6 +149,9 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method)
     Float dc_re = 1;
     Float dc_im = 0;
     Float tmp;
+    const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
+    const double sac_freq = 7.0;
+    double sac_sum = 0.0, sac_last = 0.0; int sac_cnt = 0;
     int i = 1;
     while (i < mxit) {
         tmp = 2.0 * (d_re * z_re - d_im * z_im);
@@ -165,10 +168,19 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method)
         z_im = 2.0 * z_re * z_im + c_im;
         z_re = tmp;
 
+        if (sac) { double t = 0.5 + 0.5 * sin(sac_freq * atan2(z_im, z_re)); sac_sum += t; sac_last = t; ++sac_cnt; }
+
         tmp = z_re * z_re + z_im * z_im;
         if (tmp > _ESCAPE_RADIUS * _ESCAPE_RADIUS) {
             if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
                 return sqrt(tmp) * log(tmp) / sqrt(dc_re * dc_re + dc_im * dc_im);
+            } else if (sac) {
+                double logR = log((double)_ESCAPE_RADIUS);
+                double frac = 1.0 - log(log(tmp) * 0.5 / logR) / log(2.0);
+                frac = frac - floor(frac);
+                double avg1 = sac_cnt > 0 ? sac_sum / sac_cnt : 0.0;
+                double avg2 = sac_cnt > 1 ? (sac_sum - sac_last) / (sac_cnt - 1) : avg1;
+                return avg2 + (avg1 - avg2) * frac;
             } else {
                 return (i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
             }
@@ -441,6 +453,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         static int simd0 = -1;
         if (simd0 < 0) { const char* e = getenv("MANDEL_SIMD"); simd0 = e ? atoi(e) : 1; }
         const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
+        const bool simd0on = simd0 && !(c_method & ColoringMethod::STRIPE_AVERAGE);   // shallow SIMD has no SAC
         // Coarse-to-fine: a ~1/16-work strided pass paints the whole frame with a
         // blocky preview (picked up immediately by the async display) before the
         // full-resolution pass below sharpens it. ~instant feedback on every view.
@@ -465,7 +478,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         for (int i = 0; i < _h; ++i) {
             if (_flag_halt) continue;
             Float cim = c0_im_f + dy_f * i;
-            if (simd0) {
+            if (simd0on) {
                 std::vector<double> cre(_w), cimv(_w);
                 std::vector<float> row(_w);
                 for (int j = 0; j < _w; ++j) { cre[j] = c0_re_f + dx_f * j; cimv[j] = cim; }
@@ -656,11 +669,12 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         static int simd0 = -1;
         if (simd0 < 0) { const char* e = getenv("MANDEL_SIMD"); simd0 = e ? atoi(e) : 1; }
         const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
+        const bool simd0on = simd0 && !(c_method & ColoringMethod::STRIPE_AVERAGE);   // shallow SIMD has no SAC
         const int nsub = _sub * _sub;
 #pragma omp parallel for schedule(dynamic, 1)
         for (int i = 0; i < v.size(); ++i) {
             if (_flag_halt) continue;
-            if (simd0 && nsub <= 128) {
+            if (simd0on && nsub <= 128) {
                 // gather this flagged pixel's sub^2-1 subpixel c-coords, solve 4-wide
                 double cre[128], cim[128]; float out[128];
                 std::array<int, 4> arrs[128];

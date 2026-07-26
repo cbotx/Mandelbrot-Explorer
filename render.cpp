@@ -20,7 +20,7 @@
 
 static const int colP = 2048;
 static float color_map[3][colP];
-static const float color_density = 60.0f;
+static float color_density = 60.0f;   // MANDEL_DENS overrides (comparison tooling)
 
 static void colorMapInit() {
     static const int N = 6;
@@ -113,6 +113,7 @@ int main(int argc, char** argv) {
     mpf_set_default_prec(precision);
 
     colorMapInit();
+    if (getenv("MANDEL_DENS")) color_density = (float)atof(getenv("MANDEL_DENS"));
 
     float* iter = new float[Ws * Hs];
     for (int i = 0; i < Ws * Hs; ++i) iter[i] = EMPTYPIXEL;
