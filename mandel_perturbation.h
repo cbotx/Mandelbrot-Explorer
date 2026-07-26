@@ -162,6 +162,12 @@ private:
     // floatexp reference orbit (filled only when _use_floatexp): accurate where
     // |Z| underflows the double shadow _zfr/_zfi, needed for deep-zoom rebasing.
     FloatExp* _zfr_fe = nullptr, * _zfi_fe = nullptr;
+    // Prefix sum of the reference orbit's stripe values (freq-7 SAC), P[m] =
+    // sum_{k=1..m} stripe(X_k). Lets pixelRescaled add a BLA skip's omitted
+    // stripe contributions back (z ~ X during a valid skip), so Feather stays
+    // reference-independent (no pan-dependent radial halo). Built only for the
+    // floatexp+BLA+SAC path.
+    std::vector<double> _sacRefPre;
     bool _use_floatexp = false;
     bool _fe_cutoff_sensitive = false;
     FloatExp _dxfe{ 0.0, 0 }, _dyfe{ 0.0, 0 };   // pixel spacing in floatexp

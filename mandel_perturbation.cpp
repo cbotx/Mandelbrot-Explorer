@@ -297,6 +297,9 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
     // dc = 1  (derivative w.r.t. the parameter c; drives the EDE distance
     // estimate). Iterated only when EDE is requested, mirroring floatPointCompute.
     const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
+    const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
+    const double sac_freq = 7.0;
+    double sac_sum = 0.0, sac_last = 0.0; int sac_cnt = 0;
     mpf_t dc_re, dc_im, e1, e2;
     mpf_init_set_ui(dc_re, 1); mpf_init(dc_im); mpf_init(e1); mpf_init(e2);
     int i = 1;
@@ -329,6 +332,12 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
         mpf_mul_ui(z_im, t1, 2);
         mpf_add(z_im, z_im, c_im);
 
+        if (sac) {   // full-precision stripe average (ground-truth reference)
+            double zrd = mpf_get_d(z_re), zid = mpf_get_d(z_im);
+            double t = 0.5 + 0.5 * sin(sac_freq * atan2(zid, zrd));
+            sac_sum += t; sac_last = t; ++sac_cnt;
+        }
+
         // auto re_im = z.get_real_imag();
         // if (re_im.first * re_im.first + re_im.second * re_im.second > _ESCAPE_RADIUS) return (i + 1 - log(log(static_cast<float>(re_im.first * re_im.first + re_im.second * re_im.second))) / log(2));
         mpf_mul(t1, z_re, z_re);
@@ -347,6 +356,13 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
                 mpf_set_d(e2, sqrt(rad) * log(rad));
                 mpf_div(e1, e2, e1);
                 res = (float)mpf_get_d(e1);
+            } else if (sac) {
+                double logR = log((double)_ESCAPE_RADIUS);
+                double frac = 1.0 - log(log(rad) * 0.5 / logR) / log(2.0);
+                frac = frac - floor(frac);
+                double avg1 = sac_cnt > 0 ? sac_sum / sac_cnt : 0.0;
+                double avg2 = sac_cnt > 1 ? (sac_sum - sac_last) / (sac_cnt - 1) : avg1;
+                res = (float)(avg2 + (avg1 - avg2) * frac);
             } else {
                 res = (i + 1 - log(log(rad) / 2 / log(2)) / log(2));
             }
@@ -548,6 +564,21 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         }
         _ref_bounded = (ref_it >= mxit);
         if (_use_bla) { tk = now(); buildBLA(ref_it, (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0); pf_bla += now() - tk; }
+        // Reference-orbit stripe prefix sum, so a BLA skip can restore its omitted
+        // stripe-average contributions (z ~ X during a valid skip) instead of
+        // dropping them -- otherwise the dropped fraction grows with distance from
+        // the reference, giving Feather a pan-dependent radial halo.
+        if (_use_bla && _use_floatexp && (c_method & ColoringMethod::STRIPE_AVERAGE)) {
+            const double* zfp = reinterpret_cast<const double*>(_zf);
+            int N = ref_it + 1;
+            _sacRefPre.assign((size_t)N + 1, 0.0);
+            for (int m = 1; m <= N; ++m) {
+                double xr = zfp[2 * (m - 1)], xi = zfp[2 * (m - 1) + 1];
+                _sacRefPre[m] = _sacRefPre[m - 1] + (0.5 + 0.5 * sin(7.0 * atan2(xi, xr)));
+            }
+        } else {
+            _sacRefPre.clear();
+        }
         if (_use_interior) {
             // Auto-gate: probe a coarse grid (reusing the centre reference, so no
             // rebuild) to see whether this frame contains any interior. If not,
@@ -1495,6 +1526,13 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
             double ab[4];
             int skip = tryBLAfe(m - 1, S, S2, wr, wi, dcr, dci, ESC2, reflen, ede ? ab : nullptr);
             if (skip > 0) {
+                if (sac && !_sacRefPre.empty() && m + skip < (int)_sacRefPre.size()) {
+                    // Restore the omitted stripe contributions via the reference
+                    // orbit (z ~ X_k during a valid skip). Keeps Feather reference-
+                    // independent so it has no pan-dependent radial halo.
+                    sac_sum += _sacRefPre[m + skip] - _sacRefPre[m];
+                    sac_cnt += skip;
+                }
                 if (ede) {
                     // J -> A*J + B, carried in floatexp (A can be large over a run).
                     FloatExp Jr = fe_mul_d(SJ, jr), Ji = fe_mul_d(SJ, ji);

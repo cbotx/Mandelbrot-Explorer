@@ -133,6 +133,7 @@ int main(int argc, char** argv) {
     if (cmethod & ColoringMethod::EXTERIOR_DIST_EST) g_ede = 1;
     if (getenv("MANDEL_SAC") && atoi(getenv("MANDEL_SAC"))) { cmethod |= ColoringMethod::STRIPE_AVERAGE; g_sac = 1; }
     mandel.Compute(mcx, mcy, msc, mxit, cmethod);
+    if (getenv("MANDEL_ORACLE")) mandel.ComputeDirect(mxit, iter, 1, cmethod);   // brute-force GMP ground truth
 
     if (getenv("MANDEL_DUMPRAW")) {   // raw per-pixel value (float) for exact diffs
         std::string rp = std::string(out) + ".raw";
