@@ -1281,7 +1281,8 @@ int Mandel::tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi,
         FloatExp nzi = fe_add(fe_add(fe_mul_d(dzr, b.ai), fe_mul_d(dzi, b.ar)),
                               fe_add(fe_mul_d(dcr, b.bi), fe_mul_d(dci, b.br)));
         // Never skip past an escape: z = X_land + nz (near escape nz is O(1)).
-        double fr = _zfr[land] + fe_to_double(nzr), fi = _zfi[land] + fe_to_double(nzi);
+        const double* zfp = reinterpret_cast<const double*>(_zf);
+        double fr = zfp[2 * land] + fe_to_double(nzr), fi = zfp[2 * land + 1] + fe_to_double(nzi);
         if (fr * fr + fi * fi > ESC2) return 0;
         // Accept: re-rescale dz = nz -> (S, wr, wi).
         FloatExp Snew = fe_sqrt(fe_add(fe_mul(nzr, nzr), fe_mul(nzi, nzi)));
