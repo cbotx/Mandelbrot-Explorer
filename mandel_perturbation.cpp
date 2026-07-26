@@ -31,9 +31,15 @@ static long long g_fe_stat[64][3];   // [tid] 0=BLA skip-iters 1=BLA applies 2=n
 
 // Stripe Average Coloring window. Averaging the stripe term over the whole orbit
 // washes out at deep zoom (orbits are long and nearly identical, so Feather goes
-// flat); the per-pixel structure lives in the escaping tail. Averaging only the
-// last W iterations recovers it, and since it is a pure function of the orbit it
-// stays pan-invariant (no reference halo). W<=0 restores the classic full average.
+// flat); the per-pixel structure lives in the escaping tail. Weighting recent
+// iterations recovers it, and since it is a pure function of the orbit it stays
+// pan-invariant (no reference halo). A rectangular "last W" window steps sharply
+// when the escape count shifts a feature past its hard far edge (a visible
+// brightness line); an exponential window has infinite support so a BLA-skip
+// reset leaks a decayed tail (a faint halo). A triangular (Bartlett) window fixes
+// both: its weight fades linearly to 0 at age W, so there is no far-edge cliff
+// AND its support is finite (age>=W has weight 0), so it stays reference-clean.
+// MANDEL_SACWIN<=0 restores the classic full average.
 static int g_sac_win = -2;   // -2 = unread
 static inline int sacWindow() {
     if (g_sac_win == -2) { const char* e = getenv("MANDEL_SACWIN"); g_sac_win = e ? atoi(e) : 256; }
@@ -43,22 +49,30 @@ namespace {
 struct SacAccum {
     static const int MAXW = 1024;
     double ring[MAXW];
-    double wsum = 0.0, full = 0.0, last = 0.0;
+    double RS = 0.0, TS = 0.0, full = 0.0, last = 0.0;   // rect sum, triangular-weighted sum
     int W = 0, pos = 0, fill = 0, cnt = 0;
-    void init(int w) { W = w > MAXW ? MAXW : (w < 0 ? 0 : w); wsum = full = last = 0.0; pos = fill = cnt = 0; }
+    void init(int w) { W = w > MAXW ? MAXW : (w < 0 ? 0 : w); RS = TS = full = last = 0.0; pos = fill = cnt = 0; }
     inline void push(double zr, double zi) {
         double t = 0.5 + 0.5 * sin(7.0 * atan2(zi, zr));
         full += t; last = t; ++cnt;
-        if (W > 0) { if (fill == W) wsum -= ring[pos]; else ++fill; ring[pos] = t; wsum += t; pos = (pos + 1) % W; }
+        if (W > 0) {
+            double evicted = (fill == W) ? ring[pos] : (++fill, 0.0);
+            TS += (double)W * t - RS;         // newest gets weight W; every other weight -1
+            RS += t - evicted;
+            ring[pos] = t; pos = (pos + 1) % W;
+        }
     }
-    inline void reset_window() { wsum = 0.0; pos = fill = 0; }   // a BLA skip breaks the tail
+    inline void reset_window() { RS = TS = 0.0; pos = fill = 0; }   // a BLA skip breaks the tail
     inline void add_full(double stripeSum, int n) { full += stripeSum; cnt += n; }  // W==0 skip restore
     inline float value(double zrad, double R) const {
         double frac = 1.0 - log(log(zrad) * 0.5 / log(R)) / log(2.0);
         frac -= floor(frac);
-        double S = W > 0 ? wsum : full; int C = W > 0 ? fill : cnt;
-        double a1 = C > 0 ? S / C : 0.0;
-        double a2 = C > 1 ? (S - last) / (C - 1) : a1;
+        double S, WS;   // weighted stripe sum and total weight
+        if (W > 0) { S = TS; WS = (double)fill * W - (double)fill * (fill - 1) / 2.0; }   // triangular weights
+        else       { S = full; WS = cnt; }
+        double a1 = WS > 0 ? S / WS : 0.0;
+        double lw = W > 0 ? (double)W : 1.0;                       // the last term's weight
+        double a2 = WS > lw ? (S - lw * last) / (WS - lw) : a1;    // average without the newest term
         return (float)(a2 + (a1 - a2) * frac);
     }
 };
