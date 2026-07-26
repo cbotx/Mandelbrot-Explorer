@@ -9,21 +9,27 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commdlg.h>
+#include <commctrl.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "Image.h"
 #include "color.h"
 #include "interpolate.h"
 #include "mandel_navigator.h"
+#include "mandel_perturbation.h"
 
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -168,6 +174,354 @@ constexpr int RENDER_H = 600;
 constexpr int PANEL_W = 330;
 constexpr int STATUS_H = 30;
 constexpr UINT TIMER_ID = 1;
+
+// ---- high-resolution export (strip renderer) -----------------------------
+// Renders the current view at an arbitrary W x H with ss x ss supersampling,
+// in horizontal strips so peak memory is ~one strip + the reference orbit (a
+// few hundred MB) regardless of output size. Colours with the live palette /
+// density / method and box-downsamples in linear light. Reports progress and
+// honours a cancel flag; meant to run on a background thread.
+struct ExportState {
+    std::atomic<float> progress{ 0.0f };
+    std::atomic<bool> cancel{ false };
+    std::atomic<bool> done{ false };
+    std::atomic<bool> ok{ false };
+    std::atomic<Mandel*> cur{ nullptr };   // current strip's engine, for cancel
+    std::mutex curMx;                       // guards cur while the UI calls SetHalt
+};
+
+// Match the on-screen coordinate rectangle: identical if the export aspect
+// equals the view's (RENDER_W:RENDER_H), otherwise keep the centre and expand
+// the short side outward. scale_out = scale_view / max(1, aspect / (W0/H0)).
+static void exportScale(mpf_t scale_view, int W, int H, mpf_t scale_out) {
+    double a = (double)W / (double)H;
+    double factor = a / ((double)RENDER_W / (double)RENDER_H);
+    if (factor < 1.0) factor = 1.0;
+    mpf_set_prec(scale_out, mpf_get_prec(scale_view));
+    if (factor <= 1.0) { mpf_set(scale_out, scale_view); return; }
+    mpf_t f; mpf_init_set_d(f, factor);
+    mpf_div(scale_out, scale_view, f);
+    mpf_clear(f);
+}
+
+static void exportRender(mpf_t cx, mpf_t cy, mpf_t scale_view,
+                         int W, int H, int ss, int mxit, int cmethod,
+                         std::vector<uint8_t>& out, ExportState* st) {
+    if (!g_lutReady) initSrgbLut();
+    out.assign((size_t)W * H * 3, 0);
+    unsigned long prec = mpf_get_prec(scale_view);
+    mpf_t scale_e; mpf_init2(scale_e, prec);
+    exportScale(scale_view, W, H, scale_e);
+
+    const int Wss = W * ss, Hss = H * ss;
+    // strip height (output rows), bounded so the strip buffer stays ~<=200 MB.
+    long budget = 200L * 1024 * 1024;
+    int sh = (int)std::max<long>(1, budget / ((long)Wss * ss * 5));
+    sh = std::clamp(sh, 1, H);
+    const int nstrips = (H + sh - 1) / sh;
+
+    std::vector<float> ibuf((size_t)Wss * sh * ss, EMPTYPIXEL);
+    Mandel mandel(Wss, sh * ss, mxit, 1, ibuf.data());
+    mandel.setPrecision(prec);
+    st->cur = &mandel;
+
+    for (int s = 0; s < nstrips && !st->cancel; ++s) {
+        int obase = s * sh;
+        int oh = std::min(sh, H - obase);
+        std::fill(ibuf.begin(), ibuf.end(), (float)EMPTYPIXEL);
+        mandel.SetHalt(false);
+        mandel.Compute(cx, cy, scale_e, mxit, cmethod, Hss, obase * ss);
+        if (st->cancel) break;
+#pragma omp parallel for schedule(dynamic, 4)
+        for (int oi = 0; oi < oh; ++oi) {
+            for (int oj = 0; oj < W; ++oj) {
+                double lr = 0, lg = 0, lb = 0; int n = ss * ss;
+                for (int a = 0; a < ss; ++a)
+                    for (int b = 0; b < ss; ++b) {
+                        float v = ibuf[(size_t)(oi * ss + a) * Wss + (oj * ss + b)];
+                        uint8_t r, g, bl; getColor(v, r, g, bl, cmethod);
+                        lr += g_srgb2lin[r]; lg += g_srgb2lin[g]; lb += g_srgb2lin[bl];
+                    }
+                uint8_t* p = &out[((size_t)(obase + oi) * W + oj) * 3];
+                p[0] = (uint8_t)(srgbEncode(lr / n) * 255.0 + 0.5);
+                p[1] = (uint8_t)(srgbEncode(lg / n) * 255.0 + 0.5);
+                p[2] = (uint8_t)(srgbEncode(lb / n) * 255.0 + 0.5);
+            }
+        }
+        st->progress = (float)(s + 1) / nstrips;
+    }
+    { std::lock_guard<std::mutex> lk(st->curMx); st->cur = nullptr; }
+    mpf_clear(scale_e);
+    st->ok = !st->cancel;
+    st->done = true;
+}
+
+// Write W x H top-down RGB to a 24-bit BMP (stored bottom-up, BGR).
+static bool writeExportBMP(const wchar_t* path, const std::vector<uint8_t>& rgb, int W, int H) {
+    int row = (W * 3 + 3) & ~3, dataSize = row * H;
+    uint8_t fh[14] = { 'B','M' }; uint32_t v;
+    v = 14 + 40 + dataSize; memcpy(fh + 2, &v, 4);
+    v = 54; memcpy(fh + 10, &v, 4);
+    uint8_t ih[40] = { 0 };
+    v = 40; memcpy(ih + 0, &v, 4);
+    v = (uint32_t)W; memcpy(ih + 4, &v, 4);
+    v = (uint32_t)H; memcpy(ih + 8, &v, 4);
+    uint16_t planes = 1, bpp = 24; memcpy(ih + 12, &planes, 2); memcpy(ih + 14, &bpp, 2);
+    v = (uint32_t)dataSize; memcpy(ih + 20, &v, 4);
+    FILE* f = _wfopen(path, L"wb"); if (!f) return false;
+    fwrite(fh, 1, 14, f); fwrite(ih, 1, 40, f);
+    std::vector<uint8_t> line(row, 0);
+    for (int y = H - 1; y >= 0; --y) {
+        const uint8_t* src = &rgb[(size_t)y * W * 3];
+        for (int x = 0; x < W; ++x) { line[x*3+0]=src[x*3+2]; line[x*3+1]=src[x*3+1]; line[x*3+2]=src[x*3+0]; }
+        fwrite(line.data(), 1, row, f);
+    }
+    fclose(f);
+    return true;
+}
+
+// ---- Export dialog (native controls popup) -------------------------------
+enum {
+    IDC_RES = 2001, IDC_SS, IDC_WEDIT, IDC_HEDIT, IDC_EXPORT, IDC_CANCEL, IDC_PROG
+};
+struct ResPreset { const wchar_t* name; int w, h; };
+
+struct ExportDlg {
+    HWND hwnd = nullptr, owner = nullptr;
+    MandelNavigator* nav = nullptr;
+    int cmethod = 0, mxit = 0;
+    mpf_t cx, cy, scale;
+    HWND resCombo = 0, ssCombo = 0, wEdit = 0, hEdit = 0, exportBtn = 0, cancelBtn = 0, prog = 0;
+    std::vector<ResPreset> presets;               // last entry is Custom (w=h=0)
+    RECT pvRect{};                                 // preview area (client coords)
+    std::vector<uint8_t> preview; int pvW = 0, pvH = 0;   // BGR top-down for StretchDIBits
+    std::thread pvThread; ExportState pvState; std::atomic<int> pvGen{ 0 };
+    std::thread exThread; ExportState exState; std::vector<uint8_t> exImg;
+    bool exporting = false; int outW = 1920, outH = 1280, ss = 2;
+    ExportDlg() { mpf_init(cx); mpf_init(cy); mpf_init(scale); }
+    ~ExportDlg() {
+        { std::lock_guard<std::mutex> lk(pvState.curMx); pvState.cancel = true; Mandel* mm = pvState.cur.load(); if (mm) mm->SetHalt(true); }
+        if (pvThread.joinable()) pvThread.join();
+        { std::lock_guard<std::mutex> lk(exState.curMx); exState.cancel = true; Mandel* mm = exState.cur.load(); if (mm) mm->SetHalt(true); }
+        if (exThread.joinable()) exThread.join();
+        mpf_clear(cx); mpf_clear(cy); mpf_clear(scale);
+    }
+};
+
+// Standard sizes; only those fitting the monitor are offered (plus Custom).
+static void buildResPresets(ExportDlg* d) {
+    static const ResPreset all[] = {
+        { L"1350 x 900  (view 3:2)", 1350, 900 },
+        { L"1920 x 1080  (1080p)", 1920, 1080 },
+        { L"2560 x 1440  (1440p)", 2560, 1440 },
+        { L"2700 x 1800  (3:2)", 2700, 1800 },
+        { L"3840 x 2160  (4K)", 3840, 2160 },
+        { L"5120 x 2880  (5K)", 5120, 2880 },
+        { L"7680 x 4320  (8K)", 7680, 4320 },
+    };
+    int mw = GetSystemMetrics(SM_CXSCREEN), mh = GetSystemMetrics(SM_CYSCREEN);
+    d->presets.clear();
+    for (const auto& r : all) if (r.w <= mw && r.h <= mh) d->presets.push_back(r);
+    if (d->presets.empty()) d->presets.push_back({ L"1350 x 900  (view 3:2)", 1350, 900 });
+    d->presets.push_back({ L"Custom\u2026", 0, 0 });
+}
+
+static void exportGetSize(ExportDlg* d) {
+    int sel = (int)SendMessageW(d->resCombo, CB_GETCURSEL, 0, 0);
+    if (sel < 0) sel = 0;
+    if (d->presets[sel].w > 0) { d->outW = d->presets[sel].w; d->outH = d->presets[sel].h; }
+    else {
+        wchar_t buf[16];
+        GetWindowTextW(d->wEdit, buf, 16); d->outW = std::clamp(_wtoi(buf), 16, 30000);
+        GetWindowTextW(d->hEdit, buf, 16); d->outH = std::clamp(_wtoi(buf), 16, 30000);
+    }
+    int sssel = (int)SendMessageW(d->ssCombo, CB_GETCURSEL, 0, 0);
+    d->ss = std::clamp(sssel + 1, 1, 4);
+}
+
+// Kick off a small preview render on a background thread (cancels any prior one).
+static void startPreview(ExportDlg* d) {
+    { std::lock_guard<std::mutex> lk(d->pvState.curMx); d->pvState.cancel = true; Mandel* mm = d->pvState.cur.load(); if (mm) mm->SetHalt(true); }
+    if (d->pvThread.joinable()) d->pvThread.join();
+    exportGetSize(d);
+    int pw = 300, ph = std::max(1, (int)std::lround(300.0 * d->outH / d->outW));
+    int gen = ++d->pvGen;
+    d->pvState.cancel = false;
+    HWND hw = d->hwnd;
+    d->pvThread = std::thread([d, pw, ph, gen, hw]() {
+        std::vector<uint8_t> rgb;
+        exportRender(d->cx, d->cy, d->scale, pw, ph, 1, d->mxit, d->cmethod, rgb, &d->pvState);
+        if (gen != d->pvGen || d->pvState.cancel) return;
+        // to BGR top-down for StretchDIBits
+        std::vector<uint8_t> bgr((size_t)pw * ph * 3);
+        for (size_t i = 0; i < (size_t)pw * ph; ++i) { bgr[i*3]=rgb[i*3+2]; bgr[i*3+1]=rgb[i*3+1]; bgr[i*3+2]=rgb[i*3]; }
+        d->preview.swap(bgr); d->pvW = pw; d->pvH = ph;
+        InvalidateRect(hw, nullptr, FALSE);
+    });
+}
+
+LRESULT CALLBACK ExportWndProc(HWND h, UINT m, WPARAM wp, LPARAM lp);
+
+static void showExportDialog(HWND owner, MandelNavigator* nav) {
+    static bool registered = false;
+    HINSTANCE inst = (HINSTANCE)GetWindowLongPtrW(owner, GWLP_HINSTANCE);
+    if (!registered) {
+        INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES };
+        InitCommonControlsEx(&icc);
+        WNDCLASSW wc{}; wc.lpfnWndProc = ExportWndProc; wc.hInstance = inst;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"MandelExportDlg";
+        RegisterClassW(&wc); registered = true;
+    }
+    ExportDlg* d = new ExportDlg();
+    d->owner = owner; d->nav = nav;
+    d->cmethod = nav->GetCMethod(); d->mxit = nav->GetMxit();
+    nav->GetView(d->cx, d->cy, d->scale);
+    buildResPresets(d);
+    UINT dpi = GetDpiForWindow(owner); if (!dpi) dpi = 96;
+    int W = MulDiv(560, dpi, 96), H = MulDiv(470, dpi, 96);
+    RECT orc; GetWindowRect(owner, &orc);
+    int x = orc.left + 80, y = orc.top + 80;
+    HWND hw = CreateWindowExW(0, L"MandelExportDlg", L"Export image",
+        WS_POPUPWINDOW | WS_CAPTION | WS_VISIBLE, x, y, W, H, owner, nullptr, inst, d);
+    EnableWindow(owner, FALSE);
+    d->hwnd = hw;
+}
+
+static void exportDoSave(ExportDlg* d) {
+    wchar_t path[MAX_PATH] = L"mandelbrot.bmp";
+    OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = d->hwnd;
+    ofn.lpstrFilter = L"Bitmap (*.bmp)\0*.bmp\0"; ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrDefExt = L"bmp"; ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!GetSaveFileNameW(&ofn)) return;
+    exportGetSize(d);
+    d->exState.cancel = false; d->exState.done = false; d->exState.progress = 0;
+    d->exporting = true;
+    EnableWindow(d->exportBtn, FALSE); EnableWindow(d->resCombo, FALSE);
+    EnableWindow(d->ssCombo, FALSE); EnableWindow(d->wEdit, FALSE); EnableWindow(d->hEdit, FALSE);
+    SetWindowTextW(d->cancelBtn, L"Cancel");
+    std::wstring save = path;
+    int W = d->outW, H = d->outH, ss = d->ss;
+    if (d->exThread.joinable()) d->exThread.join();
+    d->exThread = std::thread([d, W, H, ss, save]() {
+        exportRender(d->cx, d->cy, d->scale, W, H, ss, d->mxit, d->cmethod, d->exImg, &d->exState);
+        if (d->exState.ok) writeExportBMP(save.c_str(), d->exImg, W, H);
+    });
+}
+
+LRESULT CALLBACK ExportWndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    ExportDlg* d = (ExportDlg*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (m) {
+    case WM_CREATE: {
+        CREATESTRUCTW* cs = (CREATESTRUCTW*)lp;
+        d = (ExportDlg*)cs->lpCreateParams;
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)d);
+        HINSTANCE inst = cs->hInstance;
+        UINT dpi = GetDpiForWindow(h); if (!dpi) dpi = 96;
+        auto S = [dpi](int v) { return MulDiv(v, dpi, 96); };
+        HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        auto mk = [&](const wchar_t* cls, const wchar_t* txt, DWORD style, int x, int y, int w, int hh, int id) -> HWND {
+            HWND c = CreateWindowExW(0, cls, txt, WS_CHILD | WS_VISIBLE | style,
+                S(x), S(y), S(w), S(hh), h, (HMENU)(INT_PTR)id, inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE); return c;
+        };
+        mk(L"STATIC", L"Resolution", 0, 16, 14, 100, 18, 0);
+        d->resCombo = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 16, 34, 220, 240, IDC_RES);
+        for (auto& p : d->presets) SendMessageW(d->resCombo, CB_ADDSTRING, 0, (LPARAM)p.name);
+        SendMessageW(d->resCombo, CB_SETCURSEL, 0, 0);
+        mk(L"STATIC", L"Custom  W x H", 0, 250, 14, 120, 18, 0);
+        d->wEdit = mk(L"EDIT", L"1920", WS_BORDER | ES_NUMBER | ES_RIGHT, 250, 34, 64, 22, IDC_WEDIT);
+        mk(L"STATIC", L"x", SS_CENTER, 316, 36, 12, 18, 0);
+        d->hEdit = mk(L"EDIT", L"1280", WS_BORDER | ES_NUMBER | ES_RIGHT, 330, 34, 64, 22, IDC_HEDIT);
+        mk(L"STATIC", L"Supersampling", 0, 410, 14, 110, 18, 0);
+        d->ssCombo = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST, 410, 34, 116, 160, IDC_SS);
+        for (const wchar_t* s : { L"1x (fast)", L"2x", L"3x", L"4x (best)" })
+            SendMessageW(d->ssCombo, CB_ADDSTRING, 0, (LPARAM)s);
+        SendMessageW(d->ssCombo, CB_SETCURSEL, 1, 0);
+        d->pvRect = { S(16), S(74), S(544), S(360) };
+        d->prog = mk(L"msctls_progress32", L"", 0, 16, 372, 528, 16, IDC_PROG);
+        d->exportBtn = mk(L"BUTTON", L"Export\u2026", BS_DEFPUSHBUTTON, 344, 398, 92, 30, IDC_EXPORT);
+        d->cancelBtn = mk(L"BUTTON", L"Close", 0, 444, 398, 92, 30, IDC_CANCEL);
+        EnableWindow(d->wEdit, FALSE); EnableWindow(d->hEdit, FALSE);
+        SetTimer(h, 1, 100, nullptr);
+        startPreview(d);
+        return 0;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wp), code = HIWORD(wp);
+        if (id == IDC_RES && code == CBN_SELCHANGE) {
+            int sel = (int)SendMessageW(d->resCombo, CB_GETCURSEL, 0, 0);
+            bool custom = (sel >= 0 && d->presets[sel].w == 0);
+            EnableWindow(d->wEdit, custom); EnableWindow(d->hEdit, custom);
+            startPreview(d);
+        } else if ((id == IDC_WEDIT || id == IDC_HEDIT) && code == EN_KILLFOCUS) {
+            startPreview(d);
+        } else if (id == IDC_EXPORT && code == BN_CLICKED) {
+            if (!d->exporting) exportDoSave(d);
+        } else if (id == IDC_CANCEL && code == BN_CLICKED) {
+            if (d->exporting) { d->exState.cancel = true; std::lock_guard<std::mutex> lk(d->exState.curMx); Mandel* mm = d->exState.cur.load(); if (mm) mm->SetHalt(true); }
+            else DestroyWindow(h);
+        }
+        return 0;
+    }
+    case WM_TIMER: {
+        if (d->exporting) {
+            SendMessageW(d->prog, PBM_SETPOS, (int)(d->exState.progress * 100.0f + 0.5f), 0);
+            if (d->exState.done) {
+                if (d->exThread.joinable()) d->exThread.join();
+                d->exporting = false;
+                SendMessageW(d->prog, PBM_SETPOS, d->exState.ok ? 100 : 0, 0);
+                EnableWindow(d->exportBtn, TRUE); EnableWindow(d->resCombo, TRUE);
+                EnableWindow(d->ssCombo, TRUE);
+                int sel = (int)SendMessageW(d->resCombo, CB_GETCURSEL, 0, 0);
+                bool custom = (sel >= 0 && d->presets[sel].w == 0);
+                EnableWindow(d->wEdit, custom); EnableWindow(d->hEdit, custom);
+                SetWindowTextW(d->cancelBtn, L"Close");
+                if (d->exState.ok) MessageBoxW(h, L"Saved.", L"Export", MB_OK | MB_ICONINFORMATION);
+            }
+        }
+        return 0;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT r = d->pvRect;
+        FrameRect(dc, &r, (HBRUSH)GetStockObject(GRAY_BRUSH));
+        wchar_t info[64]; swprintf_s(info, L"%d x %d,  %dx SS", d->outW, d->outH, d->ss);
+        RECT tr = { r.left, r.bottom + 4, r.right, r.bottom + 24 };
+        SetBkMode(dc, TRANSPARENT); DrawTextW(dc, info, -1, &tr, DT_CENTER | DT_TOP);
+        if (d->pvW > 0 && !d->preview.empty()) {
+            // aspect-fit the preview inside pvRect
+            int bw = r.right - r.left - 4, bh = r.bottom - r.top - 4;
+            double s = std::min((double)bw / d->pvW, (double)bh / d->pvH);
+            int dw = (int)(d->pvW * s), dh = (int)(d->pvH * s);
+            int dx = r.left + 2 + (bw - dw) / 2, dy = r.top + 2 + (bh - dh) / 2;
+            BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth = d->pvW; bi.bmiHeader.biHeight = -d->pvH;
+            bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 24; bi.bmiHeader.biCompression = BI_RGB;
+            SetStretchBltMode(dc, HALFTONE);
+            StretchDIBits(dc, dx, dy, dw, dh, 0, 0, d->pvW, d->pvH, d->preview.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+        } else {
+            RECT cr = r; DrawTextW(dc, L"Rendering preview\u2026", -1, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_CLOSE:
+        if (d && d->exporting) { d->exState.cancel = true; std::lock_guard<std::mutex> lk(d->exState.curMx); Mandel* mm = d->exState.cur.load(); if (mm) mm->SetHalt(true); }
+        DestroyWindow(h);
+        return 0;
+    case WM_DESTROY:
+        if (d) {
+            KillTimer(h, 1);
+            EnableWindow(d->owner, TRUE); SetForegroundWindow(d->owner);
+            delete d;
+            SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+        }
+        return 0;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
 
 // --- theme -----------------------------------------------------------------
 const COLORREF CLR_BG        = RGB(18, 20, 26);
@@ -894,7 +1248,7 @@ public:
 
         drawButton(dc, rcReset, L"Reset", H_RESET, false);
         drawButton(dc, rcRender, L"Render", H_RENDER, true);
-        drawButton(dc, rcSave, L"Save", H_SAVE, false);
+        drawButton(dc, rcSave, L"Export", H_SAVE, false);
         drawButton(dc, rcCopy, L"Copy", H_COPY, false);
         drawButton(dc, rcPaste, L"Paste", H_PASTE, false);
 
@@ -1119,7 +1473,7 @@ public:
                 switch (h) {
                 case H_RESET: nav->Reset(); renderStart = std::chrono::steady_clock::now(); wasComputing = true; keepLive(); break;
                 case H_RENDER: startRender(); break;
-                case H_SAVE: saveImage(); break;
+                case H_SAVE: showExportDialog(hwnd, nav.get()); break;
                 case H_COPY: copyLocation(); break;
                 case H_PASTE: pasteLocation(); break;
                 case H_SS: ssOn = !ssOn; setMethodFlag(ColoringMethod::SUPER_SAMPLING, ssOn); break;
