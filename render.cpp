@@ -35,12 +35,15 @@ static inline float color_func(float it) {
 }
 
 static int g_sac = 0;
+static int g_ede = 0;
 
 static void getColor(float it, float& r, float& g, float& b) {
     if (it < 0) { r = g = b = 0; return; }   // interior -> black
     // SAC value is already in [0,1]; map it around the palette a few times for
     // banded feather texture. Iteration counts use the log-power curve.
-    float f = g_sac ? it * (color_density / 20.0f) : color_func(it);
+    float f = g_sac ? it * (color_density / 20.0f)
+            : g_ede ? tanhf(it * color_density / 3600.0f * 5.0f)
+            : color_func(it);
     int x = (int)(f * colP) % colP;
     if (x < 0) x += colP;
     r = color_map[0][x]; g = color_map[1][x]; b = color_map[2][x];
@@ -127,6 +130,7 @@ int main(int argc, char** argv) {
     printf("Rendering %dx%d (SS=%d -> %dx%d), scale=%s (%zu digits), mxit=%d, prec=%d ...\n",
            W, H, SS, Ws, Hs, scaleArg, scale.size(), mxit, precision);
     int cmethod = (getenv("MANDEL_EDE") && atoi(getenv("MANDEL_EDE"))) ? ColoringMethod::EXTERIOR_DIST_EST : 0;
+    if (cmethod & ColoringMethod::EXTERIOR_DIST_EST) g_ede = 1;
     if (getenv("MANDEL_SAC") && atoi(getenv("MANDEL_SAC"))) { cmethod |= ColoringMethod::STRIPE_AVERAGE; g_sac = 1; }
     mandel.Compute(mcx, mcy, msc, mxit, cmethod);
 

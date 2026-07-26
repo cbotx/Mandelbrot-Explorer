@@ -808,7 +808,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         // BLA already skips most steps and is checked per-lane scalar every
         // iteration, so keep the default (BLA) path scalar and use SIMD only when
         // BLA is off (where the quadratic step is the whole cost).
-        const bool feSimdOn = fesimd && !_use_bla && !sac;
+        const bool feSimdOn = fesimd && !_use_bla && !sac && !ede;
 
         std::vector<FloatExp> Dcr(n), Dci(n);
         std::vector<float> val(n);
@@ -1276,7 +1276,8 @@ int Mandel::tryBLA(int s, double& dzr, double& dzi, double& ddr, double& ddi,
 // is re-rescaled back into (S,wr,wi). Reuses the same BLA table (built in double)
 // -- the coefficients A,B are O(1) and representable in double.
 int Mandel::tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi,
-                     FloatExp dcr, FloatExp dci, double ESC2, int mx_ref_it) const {
+                     FloatExp dcr, FloatExp dci, double ESC2, int mx_ref_it,
+                     double* outAB) const {
     if (s < 1 || _bla.empty()) return 0;
     int maxp = (int)_bla.size() - 1;
     int startp = (s == 1) ? maxp : (int)_tzcnt_u32((unsigned)(s - 1));
@@ -1306,6 +1307,9 @@ int Mandel::tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi,
         FloatExp Snew = fe_sqrt(fe_add(fe_mul(nzr, nzr), fe_mul(nzi, nzi)));
         if (Snew.m == 0.0) { S = FloatExp{ 1.0, 0 }; wr = wi = 0.0; }
         else { S = Snew; wr = fe_to_double(fe_div(nzr, S)); wi = fe_to_double(fe_div(nzi, S)); }
+        // Export the linear map (A, B) so the caller can carry the EDE total
+        // derivative through the same skip: J -> A*J + B (see pixelRescaled).
+        if (outAB) { outAB[0] = b.ar; outAB[1] = b.ai; outAB[2] = b.br; outAB[3] = b.bi; }
         return b.l;
     }
     return 0;
@@ -1469,6 +1473,17 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
     const double sac_freq = 7.0;
     double sac_sum = 0.0, sac_last = 0.0; int sac_cnt = 0;
 
+    // Exterior distance estimation. The double path tracks the derivative in
+    // double, but at deep zoom the true derivative |dz/dc| ~ 1/dx overflows it,
+    // so carry the total derivative J = dz/dc in its own rescaled floatexp
+    // (scale SJ, unit (jr,ji)) exactly like the delta w. J is rebase-invariant
+    // (it is defined on the reconstructed z), advances as J' = 2 z J + 1 per
+    // step, and as J -> A J + B through a BLA skip (A,B are the same linear-map
+    // coefficients tryBLAfe uses for dz -- the derivative of dz = A dz + B dc).
+    const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
+    FloatExp SJ{ 1.0, 0 };            // |J| scale; J_1 = d(dc)/dc = 1
+    double jr = 1.0, ji = 0.0, invSJd = 1.0;   // invSJd = 1/SJ carries the "+1" seed
+
     while (iter < mxit) {
         if (_flag_halt) break;
         // BLA: skip a run of reference iterations when the rescaled dz is small
@@ -1477,8 +1492,18 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         // advanced; recompute the scalar scale s and unit d = dc/S, and restart
         // the periodicity detector (a multi-iter skip leaves its state stale).
         if (_use_bla && m >= 2) {
-            int skip = tryBLAfe(m - 1, S, S2, wr, wi, dcr, dci, ESC2, reflen);
+            double ab[4];
+            int skip = tryBLAfe(m - 1, S, S2, wr, wi, dcr, dci, ESC2, reflen, ede ? ab : nullptr);
             if (skip > 0) {
+                if (ede) {
+                    // J -> A*J + B, carried in floatexp (A can be large over a run).
+                    FloatExp Jr = fe_mul_d(SJ, jr), Ji = fe_mul_d(SJ, ji);
+                    FloatExp nJr = fe_add(fe_sub(fe_mul_d(Jr, ab[0]), fe_mul_d(Ji, ab[1])), fe_from(ab[2]));
+                    FloatExp nJi = fe_add(fe_add(fe_mul_d(Jr, ab[1]), fe_mul_d(Ji, ab[0])), fe_from(ab[3]));
+                    SJ = fe_sqrt(fe_add(fe_mul(nJr, nJr), fe_mul(nJi, nJi)));
+                    if (SJ.m == 0.0) { SJ = FloatExp{ 1.0, 0 }; jr = ji = 0.0; invSJd = 1.0; }
+                    else { jr = fe_to_double(fe_div(nJr, SJ)); ji = fe_to_double(fe_div(nJi, SJ)); invSJd = 1.0 / fe_to_double(SJ); }
+                }
                 m += skip; iter += skip; g.sk++; g.skl += skip;
                 s = fe_to_double(S); S2 = fe_mul(S, S);
                 dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
@@ -1489,16 +1514,37 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         }
         // w' = 2 X_m w + s w^2 + d   (dz_m -> dz_{m+1}); X_0 = 0.
         double Xr = m ? zfp[2 * (m - 1)] : 0.0, Xi = m ? zfp[2 * (m - 1) + 1] : 0.0;
+        double zmr = Xr + s * wr, zmi = Xi + s * wi;   // z at index m (pre-step), for J' = 2 z J + 1
         double w2r = wr * wr - wi * wi, w2i = 2.0 * wr * wi;
         double nwr = 2.0 * (Xr * wr - Xi * wi) + s * w2r + dr;
         double nwi = 2.0 * (Xr * wi + Xi * wr) + s * w2i + di;
         wr = nwr; wi = nwi; ++m; ++iter; g.st++;
+        if (ede) {
+            // J_{m+1} = 2 z_m J_m + 1 (exact; z_m is the reconstructed value).
+            double a = 2.0 * (zmr * jr - zmi * ji) + invSJd;   // "+1" is invSJd in the SJ scale
+            double b = 2.0 * (zmr * ji + zmi * jr);
+            jr = a; ji = b;
+            double jm2 = jr * jr + ji * ji;
+            if (jm2 > 1e16 || (jm2 > 0.0 && jm2 < 1e-16)) {   // keep |j| ~ O(1)
+                FloatExp jmag = fe_sqrt(fe_from(jm2));
+                SJ = fe_mul(SJ, jmag);
+                double inv = 1.0 / fe_to_double(jmag);
+                jr *= inv; ji *= inv;
+                invSJd = 1.0 / fe_to_double(SJ);
+            }
+        }
 
         Xr = m ? zfp[2 * (m - 1)] : 0.0; Xi = m ? zfp[2 * (m - 1) + 1] : 0.0;
         double zr = Xr + s * wr, zi = Xi + s * wi;      // z = X_m + S w
         double zrad = zr * zr + zi * zi;
         if (sac) { double t = 0.5 + 0.5 * sin(sac_freq * atan2(zi, zr)); sac_sum += t; sac_last = t; ++sac_cnt; }
         if (zrad > ESC2) {
+            if (ede) {
+                // dist = |z| log|z|^2 / (dx * |z'|); |z'| = SJ * |j| in floatexp.
+                double num = sqrt(zrad) * log(zrad);
+                FloatExp Jmag = fe_mul_d(SJ, sqrt(jr * jr + ji * ji));
+                return (float)fe_to_double(fe_div(fe_from(num), fe_mul(_dxfe, Jmag)));
+            }
             if (!sac)
                 return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
             double logR = log((double)_ESCAPE_RADIUS);

@@ -104,7 +104,8 @@ private:
     // (updating S/wr/wi) and returns the skip (>0), else 0. dz-only (the rescaled
     // kernel returns smooth iteration, so no EDE derivative is carried).
     int tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi,
-                 FloatExp dcr, FloatExp dci, double ESC2, int mx_ref_it) const;
+                 FloatExp dcr, FloatExp dci, double ESC2, int mx_ref_it,
+                 double* outAB = nullptr) const;
     int createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random,
                   int c_method = 0, bool view_center = false);
     bool calCoefficient(int i, int pr_it, int c_method = 0);
