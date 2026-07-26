@@ -31,7 +31,7 @@ static void colorMapInit() {
 }
 
 static inline float color_func(float it) {
-    return powf(logf(it + 2), logf(it + 2) * logf(it + 2) / color_density);
+    return powf(logf(it + 2), logf(it + 2) * logf(it + 2) * color_density / 3600.0f);
 }
 
 static int g_sac = 0;
@@ -40,7 +40,7 @@ static void getColor(float it, float& r, float& g, float& b) {
     if (it < 0) { r = g = b = 0; return; }   // interior -> black
     // SAC value is already in [0,1]; map it around the palette a few times for
     // banded feather texture. Iteration counts use the log-power curve.
-    float f = g_sac ? it * 3.0f : color_func(it);
+    float f = g_sac ? it * (color_density / 20.0f) : color_func(it);
     int x = (int)(f * colP) % colP;
     if (x < 0) x += colP;
     r = color_map[0][x]; g = color_map[1][x]; b = color_map[2][x];

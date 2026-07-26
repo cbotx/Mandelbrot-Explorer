@@ -36,9 +36,9 @@ static float colorFunction(float it, int method) {
     if (method & ColoringMethod::STRIPE_AVERAGE)
         return it * (color_density / 20.0f);   // SAC value in [0,1] -> banded palette
     if (method & ColoringMethod::EXTERIOR_DIST_EST)
-        return tanhf(it / color_density * 5.0f);
+        return tanhf(it * color_density / 3600.0f * 5.0f);
     float l = logf(it + 2.0f);
-    return powf(l, l * l / color_density);
+    return powf(l, l * l * color_density / 3600.0f);
 }
 
 void getColor(float iteration, float& r, float& g, float& b, int method) {
@@ -199,7 +199,6 @@ struct NamedPal { const wchar_t* name; std::vector<Stop> stops; };
 static const std::vector<NamedPal>& palettePresets() {
     static const std::vector<NamedPal> p = {
         { L"Sunrise",  { {0,0,70,100},{0.16f,32,107,203},{0.42f,237,255,255},{0.6425f,255,170,0},{0.8575f,0,2,0} } },
-        { L"Snowy",    { {0,255,255,255},{0.12f,32,107,203},{0.34f,214,223,255} } },
         { L"Reef",     { {0,0,45,65},{0.15f,25,155,195},{0.40f,240,255,255},{0.60f,255,190,45},{0.78f,220,60,40},{0.90f,12,3,10} } },
         { L"Emerald",  { {0,6,45,30},{0.16f,40,160,90},{0.42f,235,255,235},{0.6425f,225,205,120},{0.8575f,6,18,12} } },
         { L"Amethyst", { {0,32,12,60},{0.18f,120,70,180},{0.40f,200,175,230},{0.58f,245,242,252},{0.8575f,18,8,30} } },
@@ -207,6 +206,7 @@ static const std::vector<NamedPal>& palettePresets() {
         { L"Gems",     { {0.05f,30,90,200},{0.17f,242,248,255},{0.30f,25,155,95},{0.42f,10,12,20},{0.55f,125,70,185},{0.67f,250,244,252},{0.80f,240,180,55},{0.92f,18,12,8} } },
         { L"Ocean",    { {0,4,12,38},{0.22f,10,64,120},{0.46f,36,150,190},{0.66f,150,220,230},{0.85f,244,252,255} } },
         { L"Lava",     { {0,10,8,20},{0.16f,140,25,30},{0.36f,240,110,30},{0.56f,250,215,120},{0.72f,180,210,230},{0.88f,50,70,140} } },
+        { L"Snowy",    { {0,255,255,255},{0.12f,32,107,203},{0.34f,214,223,255} } },
     };
     return p;
 }
@@ -392,8 +392,8 @@ public:
         rcMaxField = { px + w - S(96), y - S(2), px + w, y + S(24) };
         rcMaxTrack = { px, y + S(32), px + w, y + S(46) }; y += S(60);
         rcDensTrack = { px, y + S(26), px + w, y + S(40) }; y += S(54);
-        rcSS  = { px, y, px + w, y + bh }; y += S(38);
-        rcColoringDD = { px, y, px + w, y + bh }; y += S(46);
+        rcSS  = { px, y, px + w, y + bh }; y += S(56);
+        rcColoringDD = { px, y, px + w, y + bh }; y += S(56);
         rcPaletteDD = { px, y, px + w, y + bh }; y += S(44);
         rcGradient = { px, y + S(22), px + w, y + S(62) }; y += S(84);
         rcColor = { px, y, px + w, y + bh };
