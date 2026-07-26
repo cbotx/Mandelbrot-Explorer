@@ -138,7 +138,6 @@ private:
     Comp* _zf;
 
     // Exterior DE
-    mpf_t* _d_re, * _d_im;
     Comp* _df;
     Float* _dfr, * _dfi;
     // Reference derivative D = dZ/dc carried in the reference build. It only feeds
@@ -180,7 +179,7 @@ private:
     int _mx_coef;
 
     // temporary vavriables
-    mpf_t _t1, _t2, _t3, _t4;
+    mpf_t _t1, _t2;
 };
 
 #endif

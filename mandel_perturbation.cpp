@@ -55,8 +55,6 @@ Mandel::Mandel(int width, int height, int max_iteration, int sub, float* iter) :
     _zfr_fe = new FloatExp[_mxit + 1];
     _zfi_fe = new FloatExp[_mxit + 1];
 
-    _d_re = new mpf_t[2];
-    _d_im = new mpf_t[2];
     _df = new Comp[_mxit + 1];
     _dfr = new Float[_mxit + 1];
     _dfi = new Float[_mxit + 1];
@@ -74,13 +72,9 @@ Mandel::Mandel(int width, int height, int max_iteration, int sub, float* iter) :
 
     mpf_init(_t1);
     mpf_init(_t2);
-    mpf_init(_t3);
-    mpf_init(_t4);
     for (int i = 0; i < 2; ++i) {
         mpf_init(_z_re[i]);
         mpf_init(_z_im[i]);
-        mpf_init(_d_re[i]);
-        mpf_init(_d_im[i]);
     }
 }
 
@@ -98,21 +92,15 @@ Mandel::~Mandel() {
 
     mpf_clear(_t1);
     mpf_clear(_t2);
-    mpf_clear(_t3);
-    mpf_clear(_t4);
     for (int i = 0; i < 2; ++i) {
         mpf_clear(_z_re[i]);
         mpf_clear(_z_im[i]);
-        mpf_clear(_d_re[i]);
-        mpf_clear(_d_im[i]);
     }
     delete[] _zf;
     delete[] _z_re;
     delete[] _z_im;
 
     delete[] _df;
-    delete[] _d_re;
-    delete[] _d_im;
     delete[] _zfr_fe;
     delete[] _zfi_fe;
 }
@@ -741,8 +729,6 @@ void Mandel::setPrecision(int precision) {
 
     mpf_set_prec(_t1, precision);
     mpf_set_prec(_t2, precision);
-    mpf_set_prec(_t3, precision);
-    mpf_set_prec(_t4, precision);
     for (int i = 0; i < 2; ++i) {
         mpf_set_prec(_z_re[i], precision);
         mpf_set_prec(_z_im[i], precision);
@@ -1735,8 +1721,6 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
     _zfi[0] = _ref_z_f.imag();
     if (_use_floatexp) { _zfr_fe[0] = mpf_to_fe(_ref_z_re); _zfi_fe[0] = mpf_to_fe(_ref_z_im); }
 
-    mpf_set_ui(_d_re[0], 1);
-    mpf_set_ui(_d_im[0], 0);
     _df[0] = Comp{ 1 };
     _dfr[0] = 1.0; _dfi[0] = 0.0;
     _dfe_r = FloatExp{ 1.0, 0 }; _dfe_i = FloatExp{ 0.0, 0 };   // D_0 = 1
