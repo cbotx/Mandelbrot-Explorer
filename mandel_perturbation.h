@@ -141,6 +141,13 @@ private:
     mpf_t* _d_re, * _d_im;
     Comp* _df;
     Float* _dfr, * _dfi;
+    // Reference derivative D = dZ/dc carried in the reference build. It only feeds
+    // the double shadow _dfr/_dfi (the delta loop + BLA never read the full-
+    // precision mpf derivative), so it is iterated directly here instead of in
+    // mpf: floatexp for the deep path (Z underflows the double shadow at a
+    // minibrot's near-zero passes) and plain double otherwise. Saves 3 mpf muls
+    // per reference iteration.
+    FloatExp _dfe_r{ 1.0, 0 }, _dfe_i{ 0.0, 0 };
 
     // Series approximation context
     Comp _Adf_old[_SA_N], _Adf_new[_SA_N];

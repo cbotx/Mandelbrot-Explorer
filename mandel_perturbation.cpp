@@ -1738,6 +1738,8 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
     mpf_set_ui(_d_re[0], 1);
     mpf_set_ui(_d_im[0], 0);
     _df[0] = Comp{ 1 };
+    _dfr[0] = 1.0; _dfi[0] = 0.0;
+    _dfe_r = FloatExp{ 1.0, 0 }; _dfe_i = FloatExp{ 0.0, 0 };   // D_0 = 1
 
     // _SA_delta = static_cast<Comp>(_dx * _w / 2 + _dy * _h / 2);
     mpf_mul_ui(_t1, _dx, _w);
@@ -1793,24 +1795,22 @@ bool Mandel::calCoefficient(int i, int pr_it, int c_method) {
     _z_m3[i] = { (_zfr[i] * _zfr[i] + _zfi[i] * _zfi[i]) / 1000000 };
 
     if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
-        // _d[i] = 2 * _d[i - 1] * _z[i - 1] + 1;  (complex product d*z via Karatsuba:
-        // k1=zr(dr+di), k2=dr(zi-zr), k3=di(zr+zi); re=k1-k3, im=k1+k2 -> 3 muls)
-        mpf_add(_t1, _d_re[p], _d_im[p]);   // dr + di
-        mpf_mul(_t2, _z_re[p], _t1);        // k1 = zr(dr+di)
-        mpf_sub(_t1, _z_im[p], _z_re[p]);   // zi - zr
-        mpf_mul(_t3, _d_re[p], _t1);        // k2 = dr(zi-zr)
-        mpf_add(_t1, _z_re[p], _z_im[p]);   // zr + zi
-        mpf_mul(_t4, _d_im[p], _t1);        // k3 = di(zr+zi)
-        mpf_sub(_d_re[c], _t2, _t4);        // re = k1 - k3
-        mpf_mul_ui(_d_re[c], _d_re[c], 2);
-        mpf_add_ui(_d_re[c], _d_re[c], 1);
-        mpf_add(_d_im[c], _t2, _t3);        // im = k1 + k2
-        mpf_mul_ui(_d_im[c], _d_im[c], 2);
-
-        
-        _df[i] = Comp{ mpf_get_ld(_d_re[c]), mpf_get_ld(_d_im[c]) };
-        _dfr[i] = _df[i].real();
-        _dfi[i] = _df[i].imag();
+        // D[i] = 2 * D[i-1] * Z[i-1] + 1  (only feeds the double shadow _dfr/_dfi).
+        // Iterate directly, no mpf: floatexp on the deep path (Z[i-1] underflows the
+        // double shadow near a minibrot's zero passes), plain double otherwise.
+        if (_use_floatexp) {
+            FloatExp a = _dfe_r, b = _dfe_i;
+            FloatExp zr = _zfr_fe[i - 1], zi = _zfi_fe[i - 1];
+            FloatExp re = fe_add(fe_scale2(fe_sub(fe_mul(a, zr), fe_mul(b, zi)), 1), FloatExp{ 1.0, 0 });
+            FloatExp im = fe_scale2(fe_add(fe_mul(a, zi), fe_mul(b, zr)), 1);
+            _dfe_r = re; _dfe_i = im;
+            _dfr[i] = fe_to_double(re); _dfi[i] = fe_to_double(im);
+        } else {
+            double a = _dfr[i - 1], b = _dfi[i - 1], zr = _zfr[i - 1], zi = _zfi[i - 1];
+            _dfr[i] = 2.0 * (a * zr - b * zi) + 1.0;
+            _dfi[i] = 2.0 * (a * zi + b * zr);
+        }
+        _df[i] = Comp{ _dfr[i], _dfi[i] };
     }
 
     if (escape(_zf[i])) return false;
