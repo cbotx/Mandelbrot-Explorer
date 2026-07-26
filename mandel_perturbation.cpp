@@ -27,6 +27,7 @@
 static long long g_bla_stat[64][8];
 static int g_bla_noescape = -1;   // env MANDEL_BLA_NOESCAPE: force-skip the escape check (timing only)
 static long long g_fe_fallback = 0;
+static long long g_fe_stat[64][3];   // [tid] 0=BLA skip-iters 1=BLA applies 2=normal steps (MANDEL_PROFILE)
 
 // GMP mpf -> floatexp (m * 2^e, 0.5 <= |m| < 1), no underflow.
 static inline FloatExp mpf_to_fe(mpf_srcptr x) {
@@ -512,6 +513,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
           _bla_minlevel = 0; while ((1 << (_bla_minlevel + 1)) <= ms) ++_bla_minlevel; }
         if (g_bla_noescape < 0) { const char* e = getenv("MANDEL_BLA_NOESCAPE"); g_bla_noescape = e ? atoi(e) : 0; }
         memset(g_bla_stat, 0, sizeof(g_bla_stat));
+        memset(g_fe_stat, 0, sizeof(g_fe_stat));
         { const char* e = getenv("MANDEL_INTERIOR"); _use_interior = !e || atoi(e); }
         { const char* e = getenv("MANDEL_INT_EPS"); double ep = e ? atof(e) : 1e-13; _interior_eps2 = ep * ep; }
         { const char* e = getenv("MANDEL_INT_CONFIRM"); _interior_confirm = e ? atoi(e) : 4; }
@@ -587,9 +589,14 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             if (_use_bla)
                 fprintf(stderr, "  [profile] BLA: applies=%lld skipped=%lld normal-steps=%lld  avg-skip=%.1f  skip-frac=%.1f%%\n",
                         ap, sk, no, ap ? (double)sk / ap : 0.0, (sk + no) ? 100.0 * sk / (sk + no) : 0.0);
-            if (_use_floatexp)
+            if (_use_floatexp) {
+                long long fsk = 0, fap = 0, fst = 0;
+                for (int t = 0; t < 64; ++t) { fsk += g_fe_stat[t][0]; fap += g_fe_stat[t][1]; fst += g_fe_stat[t][2]; }
+                fprintf(stderr, "  [profile] FE-BLA: applies=%lld skip-iters=%lld normal-steps=%lld  avg-skip=%.1f  skip-frac=%.1f%%\n",
+                        fap, fsk, fst, fap ? (double)fsk / fap : 0.0, (fsk + fst) ? 100.0 * fsk / (fsk + fst) : 0.0);
                 fprintf(stderr, "  [profile] FE: cutoff-sensitive=%d GMP-fallback-pixels=%lld\n",
                         _fe_cutoff_sensitive ? 1 : 0, g_fe_fallback);
+            }
         }
     }
     bool is_super_sampling = (_sub > 1) && (c_method & ColoringMethod::SUPER_SAMPLING);
@@ -1250,15 +1257,16 @@ int Mandel::tryBLA(int s, double& dzr, double& dzi, double& ddr, double& ddi,
 // done in floatexp so they stay correct past double underflow, then the result
 // is re-rescaled back into (S,wr,wi). Reuses the same BLA table (built in double)
 // -- the coefficients A,B are O(1) and representable in double.
-int Mandel::tryBLAfe(int s, FloatExp& S, double& wr, double& wi,
+int Mandel::tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi,
                      FloatExp dcr, FloatExp dci, double ESC2, int mx_ref_it) const {
     if (s < 1 || _bla.empty()) return 0;
-    // |dz|^2 = S^2 (wr^2 + wi^2)
-    FloatExp dz2 = fe_mul(fe_mul(S, S), fe_from(wr * wr + wi * wi));
     int maxp = (int)_bla.size() - 1;
     int startp = (s == 1) ? maxp : (int)_tzcnt_u32((unsigned)(s - 1));
     if (startp > maxp) startp = maxp;
-    if (startp < _bla_minlevel) return 0;
+    if (startp < _bla_minlevel) return 0;   // alignment too low: cheap out before dz2
+    // |dz|^2 = S^2 (wr^2 + wi^2); S2 = S*S is cached by the caller (constant
+    // between rescales/rebases, so ~1 fe_mul saved per call).
+    FloatExp dz2 = fe_mul(S2, fe_from(wr * wr + wi * wi));
     for (int p = startp; p >= _bla_minlevel; --p) {
         int i = (s - 1) >> p;
         if (i >= (int)_bla[p].size()) continue;
@@ -1410,6 +1418,9 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
 float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit, int c_method) const {
     const double ESC2 = (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS;
     const double LG2 = log(2.0);
+    struct FeStat { long long* s; long long sk = 0, skl = 0, st = 0;
+        FeStat(long long* p) : s(p) {} ~FeStat() { s[0] += skl; s[1] += sk; s[2] += st; } }
+        g(g_fe_stat[omp_get_thread_num() & 63]);
     // The stored reference is _zfr[k] = X_{k+1} (X_0 = 0 is the implicit critical
     // point). Access the orbit as X_m: X_0 = 0, X_m = _zfr[m-1]. Rebasing resets to
     // the critical point m = 0 (X_0 = 0), matching the double path's k==0 case.
@@ -1427,6 +1438,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         dr = wr; di = wi;                                                        // d = dc / S
     }
     double s = fe_to_double(S);
+    FloatExp S2 = fe_mul(S, S);            // cached |S|^2 for tryBLAfe's radius test
     int m = 1, iter = 1;                  // dz_1 = dc at reference index m = 1
 
     double zsr = 1e30, zsi = 1e30; int save_iter = 1, period_win = 1;
@@ -1441,10 +1453,10 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         // advanced; recompute the scalar scale s and unit d = dc/S, and restart
         // the periodicity detector (a multi-iter skip leaves its state stale).
         if (_use_bla && m >= 2) {
-            int skip = tryBLAfe(m - 1, S, wr, wi, dcr, dci, ESC2, reflen);
+            int skip = tryBLAfe(m - 1, S, S2, wr, wi, dcr, dci, ESC2, reflen);
             if (skip > 0) {
-                m += skip; iter += skip;
-                s = fe_to_double(S);
+                m += skip; iter += skip; g.sk++; g.skl += skip;
+                s = fe_to_double(S); S2 = fe_mul(S, S);
                 dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
                 zsr = 1e30; zsi = 1e30; save_iter = iter; period_win = 1;
                 conf_P = 0; conf_giveup = 0;
@@ -1456,7 +1468,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         double w2r = wr * wr - wi * wi, w2i = 2.0 * wr * wi;
         double nwr = 2.0 * (Xr * wr - Xi * wi) + s * w2r + dr;
         double nwi = 2.0 * (Xr * wi + Xi * wr) + s * w2i + di;
-        wr = nwr; wi = nwi; ++m; ++iter;
+        wr = nwr; wi = nwi; ++m; ++iter; g.st++;
 
         Xr = m ? zfp[2 * (m - 1)] : 0.0; Xi = m ? zfp[2 * (m - 1) + 1] : 0.0;
         double zr = Xr + s * wr, zi = Xi + s * wi;      // z = X_m + S w
@@ -1488,7 +1500,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         double wmag2 = wr * wr + wi * wi;
         if (wmag2 > 1e16 || (wmag2 < 1e-16 && wmag2 > 0.0)) {
             FloatExp wmag = fe_sqrt(fe_from(wmag2));
-            S = fe_mul(S, wmag); s = fe_to_double(S);
+            S = fe_mul(S, wmag); s = fe_to_double(S); S2 = fe_mul(S, S);
             double inv = 1.0 / fe_to_double(wmag);
             wr *= inv; wi *= inv;
             dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
@@ -1507,7 +1519,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
                 FloatExp Snew = fe_sqrt(zradfe);
                 if (Snew.m == 0.0) { wr = wi = 0.0; }
                 else {
-                    S = Snew; s = fe_to_double(S);
+                    S = Snew; s = fe_to_double(S); S2 = fe_mul(S, S);
                     wr = fe_to_double(fe_div(zrfe, S)); wi = fe_to_double(fe_div(zife, S));
                     dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
                 }
@@ -1564,7 +1576,7 @@ void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g,
             if (iter[l] >= mxit) { out[g + l] = -2.f; act[l] = false; continue; }
             bool skipped = false;
             if (_use_bla && m[l] >= 2) {
-                int skip = tryBLAfe(m[l] - 1, S[l], wr[l], wi[l], dcr[l], dci[l], ESC2, reflen);
+                int skip = tryBLAfe(m[l] - 1, S[l], fe_mul(S[l], S[l]), wr[l], wi[l], dcr[l], dci[l], ESC2, reflen);
                 if (skip > 0) {
                     m[l] += skip; iter[l] += skip;
                     sS[l] = fe_to_double(S[l]);
