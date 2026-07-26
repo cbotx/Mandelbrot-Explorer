@@ -457,7 +457,8 @@ void Mandel::ComputeDirect(int mxit, float* out, int step, int c_method) {
 }
 
 
-void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method) {
+void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method,
+                     int full_h, int row_base) {
     std::cout << "mxit: " << mxit << '\n';
     _mx_coef = -1;
     _ref_cnt = 0;
@@ -466,19 +467,31 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
     // _scale = scale;
     mpf_set(_scale, scale);
 
+    // Strip export: this Mandel is only `_h` rows tall but represents rows
+    // [row_base, row_base+_h) of a taller `full_h`-row image, so derive the grid
+    // from full_h and shift the origin down by row_base rows. full_h==0 => the
+    // Mandel is the whole image (interactive path, unchanged).
+    int rows = (full_h > 0) ? full_h : _h;
     mpf_t dw, dh;
     mpf_init_set_ui(dw, 2);
     mpf_div(dw, dw, scale);
     mpf_init_set(dh, dw);
     mpf_div_ui(dh, dh, _w);
-    mpf_mul_ui(dh, dh, _h);
+    mpf_mul_ui(dh, dh, rows);
     mpf_sub(_c0_re, c_re, dw);
     mpf_sub(_c0_im, c_im, dh);
 
     mpf_div_ui(_dx, dw, _w - 1);
     mpf_mul_ui(_dx, _dx, 2);
-    mpf_div_ui(_dy, dh, _h - 1);
+    mpf_div_ui(_dy, dh, rows - 1);
     mpf_mul_ui(_dy, _dy, 2);
+
+    if (row_base > 0) {                 // move origin to this strip's first row
+        mpf_t off; mpf_init(off);
+        mpf_mul_ui(off, _dy, row_base);
+        mpf_add(_c0_im, _c0_im, off);
+        mpf_clear(off);
+    }
 
     mpf_clear(dw);
     mpf_clear(dh);

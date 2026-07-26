@@ -41,6 +41,9 @@ public:
     void UpdateBitmap(uint8_t* bitmap);
 
     void SetMxit(int mxit);
+    int GetMxit() const { return _mxit; }
+    // Copy the current view: center (re/im) and scale into caller-owned mpf_t.
+    void GetView(mpf_t re, mpf_t im, mpf_t scale) const;
     
     int GetCMethod();
 

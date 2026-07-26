@@ -167,6 +167,12 @@ void MandelNavigator::SetMxit(int mxit) {
     _mxit = mxit;
 }
 
+void MandelNavigator::GetView(mpf_t re, mpf_t im, mpf_t scale) const {
+    mpf_set_prec(re, mpf_get_prec(_z_re)); mpf_set(re, _z_re);
+    mpf_set_prec(im, mpf_get_prec(_z_im)); mpf_set(im, _z_im);
+    mpf_set_prec(scale, mpf_get_prec(_scale)); mpf_set(scale, _scale);
+}
+
 int MandelNavigator::GetCMethod() {
     return _c_method;
 }

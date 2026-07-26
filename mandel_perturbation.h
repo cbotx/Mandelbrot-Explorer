@@ -33,7 +33,8 @@ public:
     Mandel(int width, int height, int max_iteration, int sub, float* iter);
     virtual ~Mandel();
 
-    void Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method = 0);
+    void Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method = 0,
+                 int full_h = 0, int row_base = 0);
     // Verification helper: brute-force high-precision escape time into out[],
     // reusing the grid (_c0/_dx/_dy) set by the most recent Compute() call.
     // step>1 samples only pixels on a (step x step) grid (others left untouched)

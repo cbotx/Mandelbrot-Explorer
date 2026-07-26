@@ -133,6 +133,22 @@ int main(int argc, char** argv) {
     if (cmethod & ColoringMethod::EXTERIOR_DIST_EST) g_ede = 1;
     if (getenv("MANDEL_SAC") && atoi(getenv("MANDEL_SAC"))) { cmethod |= ColoringMethod::STRIPE_AVERAGE; g_sac = 1; }
     mandel.Compute(mcx, mcy, msc, mxit, cmethod);
+    if (getenv("MANDEL_STRIPS") && atoi(getenv("MANDEL_STRIPS")) > 0) {
+        // Validation: re-render in horizontal strips (each a strip-sized Mandel
+        // covering rows [base,base+sh) of the full Hs-row image) and overwrite
+        // iter. Should match the single Compute above.
+        int nstrips = atoi(getenv("MANDEL_STRIPS"));
+        int sh = (Hs + nstrips - 1) / nstrips;
+        for (int base = 0; base < Hs; base += sh) {
+            int h = std::min(sh, Hs - base);
+            std::vector<float> sbuf((size_t)Ws * h, EMPTYPIXEL);
+            Mandel strip(Ws, h, mxit, 1, sbuf.data());
+            strip.setPrecision(precision);
+            strip.Compute(mcx, mcy, msc, mxit, cmethod, Hs, base);
+            for (int r = 0; r < h; ++r)
+                for (int c = 0; c < Ws; ++c) iter[(size_t)(base + r) * Ws + c] = sbuf[(size_t)r * Ws + c];
+        }
+    }
     if (getenv("MANDEL_ORACLE")) mandel.ComputeDirect(mxit, iter, 1, cmethod);   // brute-force GMP ground truth
 
     if (getenv("MANDEL_DUMPRAW")) {   // raw per-pixel value (float) for exact diffs
