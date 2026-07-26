@@ -42,16 +42,20 @@ Mandel::Mandel(int width, int height, int max_iteration, int sub, float* iter) :
     assert(max_iteration > 0);
     assert(sub % 2);
     { const char* e = getenv("MANDEL_BAILOUT"); if (e && atof(e) > 0) _ESCAPE_RADIUS = (float)atof(e); }
-    _z_re = new mpf_t[_mxit + 1];
-    _z_im = new mpf_t[_mxit + 1];
+    // The full-precision reference/derivative orbits are only ever read at the
+    // current and previous index during the build (the delta loop uses the double
+    // and floatexp shadows below), so two rotating buffers replace mxit+1 mpf_t
+    // each -- saving the whole serial O(mxit) alloc/init and hundreds of MB.
+    _z_re = new mpf_t[2];
+    _z_im = new mpf_t[2];
     _zf = new Comp[_mxit + 1];
     _zfr = new Float[_mxit + 1];
     _zfi = new Float[_mxit + 1];
     _zfr_fe = new FloatExp[_mxit + 1];
     _zfi_fe = new FloatExp[_mxit + 1];
 
-    _d_re = new mpf_t[_mxit + 1];
-    _d_im = new mpf_t[_mxit + 1];
+    _d_re = new mpf_t[2];
+    _d_im = new mpf_t[2];
     _df = new Comp[_mxit + 1];
     _dfr = new Float[_mxit + 1];
     _dfi = new Float[_mxit + 1];
@@ -71,7 +75,7 @@ Mandel::Mandel(int width, int height, int max_iteration, int sub, float* iter) :
     mpf_init(_t2);
     mpf_init(_t3);
     mpf_init(_t4);
-    for (int i = 0; i <= _mxit; ++i) {
+    for (int i = 0; i < 2; ++i) {
         mpf_init(_z_re[i]);
         mpf_init(_z_im[i]);
         mpf_init(_d_re[i]);
@@ -95,7 +99,7 @@ Mandel::~Mandel() {
     mpf_clear(_t2);
     mpf_clear(_t3);
     mpf_clear(_t4);
-    for (int i = 0; i <= _mxit; ++i) {
+    for (int i = 0; i < 2; ++i) {
         mpf_clear(_z_re[i]);
         mpf_clear(_z_im[i]);
         mpf_clear(_d_re[i]);
@@ -519,7 +523,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         g_fe_fallback = 0;
         _fe_cutoff_sensitive = false;
         _dxfe = mpf_to_fe(_dx); _dyfe = mpf_to_fe(_dy);
-        double pf_ref = 0, pf_step = 0;
+        double pf_ref = 0, pf_step = 0, pf_bla = 0;
         const bool profile = getenv("MANDEL_PROFILE") != nullptr;
         auto now = [] { return std::chrono::duration_cast<std::chrono::duration<double>>(
                             std::chrono::high_resolution_clock::now().time_since_epoch()).count(); };
@@ -540,7 +544,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             }
         }
         _ref_bounded = (ref_it >= mxit);
-        if (_use_bla) buildBLA(ref_it, (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0);
+        if (_use_bla) { tk = now(); buildBLA(ref_it, (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0); pf_bla += now() - tk; }
         if (_use_interior) {
             // Auto-gate: probe a coarse grid (reusing the centre reference, so no
             // rebuild) to see whether this frame contains any interior. If not,
@@ -573,13 +577,13 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             if (s.empty()) break;
             tk = now(); ref_it = createRef(s, mxit, mxit, false, c_method); pf_ref += now() - tk;
             _ref_bounded = (ref_it >= mxit);
-            if (_use_bla) buildBLA(ref_it, (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0);
+            if (_use_bla) { tk = now(); buildBLA(ref_it, (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0); pf_bla += now() - tk; }
         }
         if (profile) {
             long long sk = 0, ap = 0, no = 0;
             for (int t = 0; t < 64; ++t) { sk += g_bla_stat[t][0]; ap += g_bla_stat[t][1]; no += g_bla_stat[t][2]; }
-            fprintf(stderr, "  [profile] reference-orbit (GMP): %.3f s   delta-loop (double): %.3f s   refs=%d\n",
-                    pf_ref, pf_step, _ref_cnt);
+            fprintf(stderr, "  [profile] reference-orbit (GMP): %.3f s   delta-loop (double): %.3f s   buildBLA: %.3f s   refs=%d\n",
+                    pf_ref, pf_step, pf_bla, _ref_cnt);
             if (_use_bla)
                 fprintf(stderr, "  [profile] BLA: applies=%lld skipped=%lld normal-steps=%lld  avg-skip=%.1f  skip-frac=%.1f%%\n",
                         ap, sk, no, ap ? (double)sk / ap : 0.0, (sk + no) ? 100.0 * sk / (sk + no) : 0.0);
@@ -732,7 +736,7 @@ void Mandel::setPrecision(int precision) {
     mpf_set_prec(_t2, precision);
     mpf_set_prec(_t3, precision);
     mpf_set_prec(_t4, precision);
-    for (int i = 0; i <= _mxit; ++i) {
+    for (int i = 0; i < 2; ++i) {
         mpf_set_prec(_z_re[i], precision);
         mpf_set_prec(_z_im[i], precision);
     }
@@ -1739,7 +1743,7 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
         if (!calCoefficient(i, pr_it, c_method)) {
             if (_ref_virtual && _use_floatexp && i >= mxit - 16)
                 _fe_cutoff_sensitive = true;
-            if (!_ref_virtual) setPixel(_ref, getEscapeTime(_z_re[i], _z_im[i], i));
+            if (!_ref_virtual) setPixel(_ref, getEscapeTime(_z_re[i & 1], _z_im[i & 1], i));
             return i;
         }
     }
@@ -1753,21 +1757,24 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
 }
 
 bool Mandel::calCoefficient(int i, int pr_it, int c_method) {
+    // The full-precision orbit uses two rotating buffers: c = current (i), p =
+    // previous (i-1). Opposite parity, so the two are always distinct.
+    const int c = i & 1, p = (i - 1) & 1;
     // _z[i] = _z[i - 1] * _z[i - 1] + _ref_z;  (complex square via Karatsuba:
     // re = (a+b)(a-b), im = 2ab -> 2 big multiplies instead of 3)
-    mpf_add(_t1, _z_re[i - 1], _z_im[i - 1]);       // a + b
-    mpf_sub(_t2, _z_re[i - 1], _z_im[i - 1]);       // a - b
-    mpf_mul(_z_im[i], _z_re[i - 1], _z_im[i - 1]);  // a*b   (read a,b before _z_re[i] write)
-    mpf_mul(_z_re[i], _t1, _t2);                    // a^2 - b^2
-    mpf_mul_ui(_z_im[i], _z_im[i], 2);              // 2ab
-    mpf_add(_z_re[i], _z_re[i], _ref_z_re);
-    mpf_add(_z_im[i], _z_im[i], _ref_z_im);
+    mpf_add(_t1, _z_re[p], _z_im[p]);       // a + b
+    mpf_sub(_t2, _z_re[p], _z_im[p]);       // a - b
+    mpf_mul(_z_im[c], _z_re[p], _z_im[p]);  // a*b   (read a,b before _z_re[c] write)
+    mpf_mul(_z_re[c], _t1, _t2);            // a^2 - b^2
+    mpf_mul_ui(_z_im[c], _z_im[c], 2);      // 2ab
+    mpf_add(_z_re[c], _z_re[c], _ref_z_re);
+    mpf_add(_z_im[c], _z_im[c], _ref_z_im);
 
     // _zf[i] = static_cast<Comp>(_z[i]);
-    _zf[i] = Comp{ mpf_get_ld(_z_re[i]), mpf_get_ld(_z_im[i]) };
+    _zf[i] = Comp{ mpf_get_ld(_z_re[c]), mpf_get_ld(_z_im[c]) };
     _zfr[i] = _zf[i].real();
     _zfi[i] = _zf[i].imag();
-    if (_use_floatexp) { _zfr_fe[i] = mpf_to_fe(_z_re[i]); _zfi_fe[i] = mpf_to_fe(_z_im[i]); }
+    if (_use_floatexp) { _zfr_fe[i] = mpf_to_fe(_z_re[c]); _zfi_fe[i] = mpf_to_fe(_z_im[c]); }
 
     // _z_m3[i] = tmp_z.abs().get_real_imag().first / 1000; // for Pauldelbrot condition
     _z_m3[i] = { (_zfr[i] * _zfr[i] + _zfi[i] * _zfi[i]) / 1000000 };
@@ -1775,20 +1782,20 @@ bool Mandel::calCoefficient(int i, int pr_it, int c_method) {
     if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
         // _d[i] = 2 * _d[i - 1] * _z[i - 1] + 1;  (complex product d*z via Karatsuba:
         // k1=zr(dr+di), k2=dr(zi-zr), k3=di(zr+zi); re=k1-k3, im=k1+k2 -> 3 muls)
-        mpf_add(_t1, _d_re[i - 1], _d_im[i - 1]);   // dr + di
-        mpf_mul(_t2, _z_re[i - 1], _t1);            // k1 = zr(dr+di)
-        mpf_sub(_t1, _z_im[i - 1], _z_re[i - 1]);   // zi - zr
-        mpf_mul(_t3, _d_re[i - 1], _t1);            // k2 = dr(zi-zr)
-        mpf_add(_t1, _z_re[i - 1], _z_im[i - 1]);   // zr + zi
-        mpf_mul(_t4, _d_im[i - 1], _t1);            // k3 = di(zr+zi)
-        mpf_sub(_d_re[i], _t2, _t4);                // re = k1 - k3
-        mpf_mul_ui(_d_re[i], _d_re[i], 2);
-        mpf_add_ui(_d_re[i], _d_re[i], 1);
-        mpf_add(_d_im[i], _t2, _t3);                // im = k1 + k2
-        mpf_mul_ui(_d_im[i], _d_im[i], 2);
+        mpf_add(_t1, _d_re[p], _d_im[p]);   // dr + di
+        mpf_mul(_t2, _z_re[p], _t1);        // k1 = zr(dr+di)
+        mpf_sub(_t1, _z_im[p], _z_re[p]);   // zi - zr
+        mpf_mul(_t3, _d_re[p], _t1);        // k2 = dr(zi-zr)
+        mpf_add(_t1, _z_re[p], _z_im[p]);   // zr + zi
+        mpf_mul(_t4, _d_im[p], _t1);        // k3 = di(zr+zi)
+        mpf_sub(_d_re[c], _t2, _t4);        // re = k1 - k3
+        mpf_mul_ui(_d_re[c], _d_re[c], 2);
+        mpf_add_ui(_d_re[c], _d_re[c], 1);
+        mpf_add(_d_im[c], _t2, _t3);        // im = k1 + k2
+        mpf_mul_ui(_d_im[c], _d_im[c], 2);
 
         
-        _df[i] = Comp{ mpf_get_ld(_d_re[i]), mpf_get_ld(_d_im[i]) };
+        _df[i] = Comp{ mpf_get_ld(_d_re[c]), mpf_get_ld(_d_im[c]) };
         _dfr[i] = _df[i].real();
         _dfi[i] = _df[i].imag();
     }
