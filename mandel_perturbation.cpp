@@ -1883,7 +1883,19 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
         if (!calCoefficient(i, pr_it, c_method)) {
             if (_ref_virtual && _use_floatexp && i >= mxit - 16)
                 _fe_cutoff_sensitive = true;
-            if (!_ref_virtual) setPixel(_ref, getEscapeTime(_z_re[i & 1], _z_im[i & 1], i));
+            if (!_ref_virtual) {
+                // The reference (centre) pixel is coloured here, not in the pixel
+                // loop. getEscapeTime only gives the smooth iteration count, so for
+                // Feather/EDE compute the reference's own value (one GMP pixel) or
+                // it shows a stray dot in the wrong colour space at the view centre.
+                if (c_method) {
+                    float rv = accuratePointCompute(_ref_z_re, _ref_z_im, mxit, c_method);
+                    if ((c_method & ColoringMethod::EXTERIOR_DIST_EST) && rv >= 0) rv /= (float)mpf_get_d(_dx);
+                    setPixel(_ref, rv);
+                } else {
+                    setPixel(_ref, getEscapeTime(_z_re[i & 1], _z_im[i & 1], i));
+                }
+            }
             return i;
         }
     }
