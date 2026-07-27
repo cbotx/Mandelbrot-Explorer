@@ -404,6 +404,141 @@ static BenchmarkTimes benchmark_references(const Cmpf& view_center, const Cmpf& 
     return best;
 }
 
+// ---------------------------------------------------------------------------
+// Correctness gate: does a periodic (modulo-p) nucleus reference reproduce the
+// same perturbation pixels as a full mxit-long reference, and do both match a
+// GMP brute-force oracle?  All three use the standard z_0=0 convention and the
+// same smooth escape-time formula so any constant offset cancels.
+// ---------------------------------------------------------------------------
+static float smooth_escape(double zrad, long n) {
+    return (float)((double)n + 1.0 -
+                   std::log(std::log(zrad) / 2.0 / std::log(2.0)) / std::log(2.0));
+}
+
+// Perturbation with Zhuoran rebasing against a stored reference orbit. The
+// shadow ss holds z_1..z_len (z_0 = 0 implicit). periodic => index mod 'period'
+// (the nucleus orbit is exactly periodic); otherwise index up to len, force-
+// rebasing to the critical point when the reference is exhausted. Returns the
+// smooth escape time, or -1 for interior (reached mxit).
+static float perturb_escape(const ShadowStorage& ss, bool periodic, size_t period,
+                            double dcr, double dci, size_t mxit, double R2) {
+    const size_t reflen = ss.size();
+    auto getZ = [&](size_t n) -> std::complex<double> {
+        if (n == 0) return std::complex<double>(0.0, 0.0);
+        size_t idx = periodic ? (n - 1) % period : (n - 1);
+        return ss.value(idx);
+    };
+    std::complex<double> dz(0.0, 0.0);
+    const std::complex<double> dc(dcr, dci);
+    size_t m = 0, iter = 0;
+    while (iter < mxit) {
+        std::complex<double> Zm = getZ(m);
+        dz = 2.0 * Zm * dz + dz * dz + dc;      // dz_{m+1} = 2 Z_m dz + dz^2 + dc
+        ++m; ++iter;
+        std::complex<double> z = getZ(m) + dz;  // z_iter = Z_m + dz
+        double zrad = z.real() * z.real() + z.imag() * z.imag();
+        if (zrad > R2) return smooth_escape(zrad, (long)iter);
+        double dz2 = dz.real() * dz.real() + dz.imag() * dz.imag();
+        if (zrad < dz2 || (!periodic && m >= reflen)) { dz = z; m = 0; }  // rebase
+    }
+    return -1.0f;
+}
+
+// GMP brute-force ground truth at c = nucleus + dc.
+static float oracle_escape(const Cmpf& c_nucleus, double dcr, double dci,
+                           size_t mxit, double R2, Scratch& s) {
+    Cmpf c, z;
+    mpf_set_d(s.a.v, dcr); mpf_add(c.re, c_nucleus.re, s.a.v);
+    mpf_set_d(s.a.v, dci); mpf_add(c.im, c_nucleus.im, s.a.v);
+    complex_zero(z);
+    for (size_t n = 1; n <= mxit; ++n) {
+        complex_square_add(z, c, s);
+        double zr = mpf_get_d(z.re), zi = mpf_get_d(z.im);
+        double zrad = zr * zr + zi * zi;
+        if (zrad > R2) return smooth_escape(zrad, (long)n);
+    }
+    return -1.0f;
+}
+
+static int run_verify(const Cmpf& center, const Cmpf& nucleus, uint64_t period,
+                      size_t mxit, int W, int H, double zoom_double, int oracle_step) {
+    const double R2 = 1e16;                 // escape radius 1e8 (production semantics)
+    Scratch s;
+    // delta_center = center - nucleus (tiny, fits double without cancellation).
+    Cmpf dcen;
+    mpf_sub(dcen.re, center.re, nucleus.re);
+    mpf_sub(dcen.im, center.im, nucleus.im);
+    const double dcx0 = mpf_get_d(dcen.re), dcy0 = mpf_get_d(dcen.im);
+    const double half = 2.0 / zoom_double;  // view half-width in c-units
+    const double aspect = (double)H / (double)W;
+
+    // Build both references at the nucleus (z_1.. into a double shadow).
+    ShadowStorage full_ss(mxit, false);
+    ShadowStorage per_ss((size_t)period, false);
+    { Cmpf z2[2]; Scratch sc;
+      build_reference(mxit, nucleus, z2, sc, &full_ss);
+      build_reference((size_t)period, nucleus, z2, sc, &per_ss); }
+
+    long fp_class = 0, fp_ext = 0, fp_big = 0; double fp_sum = 0, fp_max = 0;
+    long fo_class = 0, fo_ext = 0; double fo_sum = 0, fo_max = 0;
+    long po_class = 0, po_ext = 0; double po_sum = 0, po_max = 0;
+    long interior_full = 0, interior_per = 0, total = 0, o_cnt = 0;
+    const double t0 = now_seconds();
+
+    for (int i = 0; i < H; ++i) {
+        for (int j = 0; j < W; ++j) {
+            double px = ((j + 0.5) / W) * 2.0 - 1.0;
+            double py = ((i + 0.5) / H) * 2.0 - 1.0;
+            double dcr = dcx0 + px * half;
+            double dci = dcy0 - py * half * aspect;
+            float vf = perturb_escape(full_ss, false, (size_t)period, dcr, dci, mxit, R2);
+            float vp = perturb_escape(per_ss, true, (size_t)period, dcr, dci, mxit, R2);
+            ++total;
+            if (vf < 0) ++interior_full;
+            if (vp < 0) ++interior_per;
+            if ((vf < 0) != (vp < 0)) ++fp_class;
+            else if (vf >= 0) { double d = std::fabs(vf - vp); fp_sum += d; ++fp_ext;
+                                if (d > fp_max) fp_max = d; if (d > 0.01) ++fp_big; }
+            if (oracle_step > 0 && (i % oracle_step == 0) && (j % oracle_step == 0)) {
+                float vo = oracle_escape(nucleus, dcr, dci, mxit, R2, s);
+                ++o_cnt;
+                if ((vf < 0) != (vo < 0)) { ++fo_class;
+                    if (fo_class <= 10)
+                        std::printf("    [oracle class-mismatch] pixel(%d,%d) full=%.4f periodic=%.4f oracle=%.4f\n",
+                                    i, j, vf, vp, vo);
+                }
+                else if (vo >= 0) { double d = std::fabs(vf - vo); fo_sum += d; ++fo_ext; if (d > fo_max) fo_max = d; }
+                if ((vp < 0) != (vo < 0)) ++po_class;
+                else if (vo >= 0) { double d = std::fabs(vp - vo); po_sum += d; ++po_ext; if (d > po_max) po_max = d; }
+            }
+        }
+    }
+    const double secs = now_seconds() - t0;
+    std::printf("\nverify grid %dx%d  mxit=%zu  period=%llu  zoom=%.6e  R=1e8  (%.3f s)\n",
+                W, H, mxit, (unsigned long long)period, zoom_double, secs);
+    std::printf("  interior pixels: full=%ld periodic=%ld / %ld\n",
+                interior_full, interior_per, total);
+    std::printf("  FULL vs PERIODIC (dense, %ld ext): class-mismatch=%ld  big(>0.01)=%ld  meanDiff=%.3e  maxDiff=%.3e\n",
+                fp_ext, fp_class, fp_big, fp_ext ? fp_sum / fp_ext : 0.0, fp_max);
+    std::printf("  FULL     vs ORACLE (sparse %ld px, %ld ext): class-mismatch=%ld  meanDiff=%.3e  maxDiff=%.3e\n",
+                o_cnt, fo_ext, fo_class, fo_ext ? fo_sum / fo_ext : 0.0, fo_max);
+    std::printf("  PERIODIC vs ORACLE (sparse %ld px, %ld ext): class-mismatch=%ld  meanDiff=%.3e  maxDiff=%.3e\n",
+                o_cnt, po_ext, po_class, po_ext ? po_sum / po_ext : 0.0, po_max);
+    const bool periodic_matches_full = (fp_class == 0 && fp_max < 1e-6);
+    const bool periodic_no_worse =
+        (po_class == fo_class && po_ext == fo_ext && po_max <= fo_max + 1e-6);
+    const bool pass = periodic_matches_full && periodic_no_worse;
+    std::printf("  note: this bench uses a SINGLE reference with no Pauldelbrot glitch\n"
+                "        re-referencing, so far-from-nucleus / late-escape pixels diverge from the\n"
+                "        oracle -- but IDENTICALLY for full and periodic (same reference orbit ->\n"
+                "        same glitches). The periodic reference adds no error of its own; it would\n"
+                "        inherit production's existing glitch machinery unchanged.\n");
+    std::printf("  => %s\n", pass
+        ? "PASS (periodic reference reproduces the full reference EXACTLY and is no worse vs oracle)"
+        : "CHECK (see mismatches above)");
+    return pass ? 0 : 3;
+}
+
 static bool parse_u64(const char* text, uint64_t& value) {
     if (text == nullptr || *text == '\0' || *text == '-') return false;
     char* end = nullptr;
@@ -425,9 +560,10 @@ static mp_bitcnt_t default_precision(uint64_t scale_exp) {
 static void print_usage(const char* exe) {
     std::fprintf(stderr,
         "usage:\n"
-        "  %s find  cx cy scaleExp [maxPeriod] [precisionBits]\n"
-        "  %s bench cx cy scaleExp mxit [maxPeriod] [reps] [precisionBits]\n",
-        exe, exe);
+        "  %s find   cx cy scaleExp [maxPeriod] [precisionBits]\n"
+        "  %s bench  cx cy scaleExp mxit [maxPeriod] [reps] [precisionBits]\n"
+        "  %s verify cx cy scaleExp mxit W H [zoom] [oracleStep] [maxPeriod] [precisionBits]\n",
+        exe, exe, exe);
 }
 
 static void print_scientific(const char* label, mpf_srcptr value) {
@@ -437,13 +573,19 @@ static void print_scientific(const char* label, mpf_srcptr value) {
 
 int main(int argc, char** argv) {
     if (argc < 5 || (std::strcmp(argv[1], "find") != 0 &&
-                     std::strcmp(argv[1], "bench") != 0)) {
+                     std::strcmp(argv[1], "bench") != 0 &&
+                     std::strcmp(argv[1], "verify") != 0)) {
         print_usage(argv[0]);
         return 1;
     }
 
     const bool bench_mode = std::strcmp(argv[1], "bench") == 0;
+    const bool verify_mode = std::strcmp(argv[1], "verify") == 0;
     if (bench_mode && argc < 6) {
+        print_usage(argv[0]);
+        return 1;
+    }
+    if (verify_mode && argc < 8) {
         print_usage(argv[0]);
         return 1;
     }
@@ -458,6 +600,8 @@ int main(int argc, char** argv) {
     uint64_t max_period = 4000000;
     uint64_t repetitions_u64 = 1;
     uint64_t precision_u64 = default_precision(scale_exp);
+    int verify_w = 0, verify_h = 0, oracle_step = 4;
+    double verify_zoom = 0.0;
     if (bench_mode) {
         uint64_t mxit_u64 = 0;
         if (!parse_u64(argv[5], mxit_u64) || mxit_u64 == 0 ||
@@ -469,6 +613,26 @@ int main(int argc, char** argv) {
         if (argc > 6 && !parse_u64(argv[6], max_period)) return 1;
         if (argc > 7 && !parse_u64(argv[7], repetitions_u64)) return 1;
         if (argc > 8 && !parse_u64(argv[8], precision_u64)) return 1;
+    } else if (verify_mode) {
+        uint64_t v = 0;
+        if (!parse_u64(argv[5], v) || v == 0 ||
+            v > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            std::fprintf(stderr, "invalid mxit: %s\n", argv[5]); return 1;
+        }
+        mxit = static_cast<size_t>(v);
+        if (!parse_u64(argv[6], v) || v == 0 || v > 4096) {
+            std::fprintf(stderr, "invalid W (1..4096): %s\n", argv[6]); return 1;
+        }
+        verify_w = static_cast<int>(v);
+        if (!parse_u64(argv[7], v) || v == 0 || v > 4096) {
+            std::fprintf(stderr, "invalid H (1..4096): %s\n", argv[7]); return 1;
+        }
+        verify_h = static_cast<int>(v);
+        verify_zoom = (argc > 8) ? std::atof(argv[8]) : std::pow(10.0, (double)scale_exp);
+        if (!(verify_zoom > 0.0)) { std::fprintf(stderr, "invalid zoom: %s\n", argv[8]); return 1; }
+        if (argc > 9) oracle_step = std::atoi(argv[9]);
+        if (argc > 10 && !parse_u64(argv[10], max_period)) return 1;
+        if (argc > 11 && !parse_u64(argv[11], precision_u64)) return 1;
     } else {
         if (argc > 5 && !parse_u64(argv[5], max_period)) return 1;
         if (argc > 6 && !parse_u64(argv[6], precision_u64)) return 1;
@@ -554,7 +718,7 @@ int main(int argc, char** argv) {
         gmp_printf("nucleus re = %.40Fe\n", nucleus.re);
         gmp_printf("nucleus im = %.40Fe\n", nucleus.im);
 
-        if (!bench_mode) return newton.converged && inside_view ? 0 : 2;
+        if (!bench_mode && !verify_mode) return newton.converged && inside_view ? 0 : 2;
         if (!newton.converged || newton.singular || !inside_view) {
             std::printf("benchmark skipped: Newton did not produce a usable in-view nucleus\n");
             return 2;
@@ -563,6 +727,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "period does not fit this platform's size_t\n");
             return 2;
         }
+
+        if (verify_mode)
+            return run_verify(center, nucleus, search.period, mxit,
+                              verify_w, verify_h, verify_zoom, oracle_step);
 
         const bool deep_shadows = scale_exp > 280;
         const long double shallow_sample_bytes = sizeof(std::complex<double>);
