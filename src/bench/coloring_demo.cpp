@@ -1,14 +1,16 @@
 // Coloring-method demo (brute-force double, shallow views only) to compare
-// visual styles: smooth-iteration vs Stripe Average Coloring (SAC). Reuses the
-// GUI's LAB palette rebuild. Not for deep zoom -- just to eyeball the styles.
+// visual styles without touching the production renderer. Reuses the GUI's LAB
+// palette rebuild. Not for deep zoom -- this is an experiment/eyeballing tool.
 //
 // Usage: coloring_demo out.bmp W H cx cy scale mxit palIdx mode [SS]
-//   mode: 0 = smooth iteration, 1 = stripe average coloring
+//   mode: 0 smooth, 1 stripe average, 2 analytical normal lighting,
+//         3 point trap, 4 cross trap, 5 circle trap, 6 composite trap
 
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <chrono>
 #include <string>
 #include <vector>
 #include <array>
@@ -25,13 +27,13 @@ static std::vector<std::vector<Stop>> pals = {
 };
 static void rebuild(const std::vector<Stop>& st) {
     int n = (int)st.size();
-    std::vector<float> xs(n+2), ys(n+2), out(CP);
+    int m = 3 * n;
+    std::vector<float> xs(m), out(CP);
     std::vector<std::array<float,3>> lab(n);
     for (int i=0;i<n;++i) rgb2lab(st[i].r, st[i].g, st[i].b, lab[i][0], lab[i][1], lab[i][2]);
-    xs[0]=st.back().pos-1; xs[n+1]=st.front().pos+1;
-    for (int i=0;i<n;++i) xs[i+1]=st[i].pos;
-    for (int c=0;c<3;++c){ ys[0]=lab[n-1][c]; ys[n+1]=lab[0][c]; for(int i=0;i<n;++i) ys[i+1]=lab[i][c];
-        mono_cubic_interpolate(xs.data(), ys.data(), n+2, out.data(), CP); for(int i=0;i<CP;++i) color_map[c][i]=out[i]; }
+    for (int p=-1;p<=1;++p) for (int i=0;i<n;++i) xs[(p+1)*n+i]=st[i].pos+p;
+    for (int c=0;c<3;++c){ std::vector<float> ys(m); for(int p=0;p<3;++p) for(int i=0;i<n;++i) ys[p*n+i]=lab[i][c];
+        mono_cubic_interpolate(xs.data(), ys.data(), m, out.data(), CP); for(int i=0;i<CP;++i) color_map[c][i]=out[i]; }
     for (int i=0;i<CP;++i){ float r,g,b; lab2rgb(color_map[0][i],color_map[1][i],color_map[2][i],r,g,b); color_map[0][i]=r;color_map[1][i]=g;color_map[2][i]=b; }
 }
 static void palColor(float t, float& r, float& g, float& b) {   // t in [0,1)
@@ -41,28 +43,75 @@ static void palColor(float t, float& r, float& g, float& b) {   // t in [0,1)
 static inline float toLin(float c){ return powf(c/255.f, 2.2f); }
 static inline float toGam(float l){ return 255.f*powf(l<0?0:l, 1/2.2f); }
 
-// mode 0: smooth iteration -> palette via log-power. mode 1: stripe average.
+static void smoothPalette(double mu, float& R, float& G, float& B) {
+    float l=logf((float)std::max(mu, 0.0)+2); float t=powf(l, l*l/60.f);
+    palColor(t - floorf(t), R,G,B);
+}
+
 static void pixel(double cr, double ci, int mxit, int mode, float& R, float& G, float& B) {
-    double zr=0, zi=0, sum=0, lastAdd=0; int cnt=0;
+    double zr=0, zi=0, dr=0, di=0, sum=0, lastAdd=0; int cnt=0;
+    double minPoint=1e300, minCross=1e300, minCircle=1e300;
+    double trapAngle=0;
+    const bool doStripe=mode==1, doNormal=mode==2, doTrap=mode>=3;
     const double freq = 7.0;
     const double R2 = 1e20, logR = log(sqrt(R2));
     for (int i=0;i<mxit;++i){
+        double ndr=0, ndi=0;
+        if(doNormal) {
+            // d(z^2+c)/dc = 2*z*dz/dc + 1 (analytical normal lighting).
+            ndr=2*(zr*dr-zi*di)+1; ndi=2*(zr*di+zi*dr);
+        }
         double zr2=zr*zr, zi2=zi*zi;
         double nzr=zr2-zi2+cr, nzi=2*zr*zi+ci; zr=nzr; zi=nzi;
-        double add = 0.5 + 0.5*sin(freq*atan2(zi,zr)); lastAdd=add; sum+=add; ++cnt;
+        if(doNormal){dr=ndr;di=ndi;}
         double m2=zr*zr+zi*zi;
+        if(doTrap) {
+            double point=m2, cross=std::min(std::fabs(zr),std::fabs(zi));
+            double circle=std::fabs(std::sqrt(m2)-0.5);
+            if(point<minPoint){minPoint=point;trapAngle=atan2(zi,zr);}
+            minCross=std::min(minCross,cross); minCircle=std::min(minCircle,circle);
+        }
+        if(doStripe) {
+            double add=0.5+0.5*sin(freq*atan2(zi,zr));
+            lastAdd=add;sum+=add;++cnt;
+        }
         if (m2 > R2){
+            double mu = i + 1 - log(log(m2)/2/log(2))/log(2);
             if (mode==1){
                 double aw=sum/cnt, awo=cnt>1?(sum-lastAdd)/(cnt-1):aw;
                 double frac = 1.0 - log(log(sqrt(m2))/logR)/log(2.0);
                 if (frac<0)frac=0; if(frac>1)frac=1;
                 double avg = awo + (aw-awo)*frac;
                 palColor((float)fmod(avg,1.0), R,G,B); return;
-            } else {
-                double it = i + 1 - log(log(m2)/2/log(2))/log(2);
-                float l=logf((float)it+2); float t=powf(l, l*l/60.f);
-                palColor(t - floorf(t), R,G,B); return;
             }
+            if (mode==2) {
+                smoothPalette(mu,R,G,B);
+                // Complex u=z/(dz/dc) points along the exterior-potential normal.
+                double den=dr*dr+di*di;
+                if(den>0){
+                    double ux=(zr*dr+zi*di)/den, uy=(zi*dr-zr*di)/den;
+                    double un=hypot(ux,uy); if(un>0){ux/=un;uy/=un;}
+                    const double nz=1.0, lx=-0.45, ly=-0.35, lz=0.82;
+                    double nn=sqrt(1+nz*nz), ln=sqrt(lx*lx+ly*ly+lz*lz);
+                    double diffuse=std::max(0.0,(ux*lx+uy*ly+nz*lz)/(nn*ln));
+                    double shade=0.35+0.75*diffuse;
+                    R=(float)std::min(255.0,R*shade); G=(float)std::min(255.0,G*shade); B=(float)std::min(255.0,B*shade);
+                }
+                return;
+            }
+            if (mode>=3) {
+                double d = mode==3 ? sqrt(minPoint) : mode==4 ? minCross : mode==5 ? minCircle
+                         : std::min({sqrt(minPoint),minCross*1.5,minCircle});
+                // Log distance exposes nested trap contours; mix a little smooth
+                // dwell and the angle at closest approach to avoid flat plateaus.
+                double trap=-log10(std::max(d,1e-14));
+                double t=0.17*trap+0.025*mu+(mode==6?0.10*trapAngle:0.0);
+                palColor((float)(t-floor(t)),R,G,B);
+                double glow=0.38+0.62*exp(-3.0*std::min(d,1.0));
+                R=(float)(R*glow);G=(float)(G*glow);B=(float)(B*glow);
+                return;
+            }
+            smoothPalette(mu,R,G,B); return;
         }
     }
     R=G=B=0;
@@ -82,9 +131,12 @@ int main(int argc, char** argv){
     int palIdx=atoi(argv[8]), mode=atoi(argv[9]); int SS=argc>10?atoi(argv[10]):3;
     if (palIdx<0||palIdx>=(int)pals.size()) palIdx=0;
     rebuild(pals[palIdx]);
+    const char* names[]={"smooth","stripe-average","normal-light","point-trap","cross-trap","circle-trap","composite-trap"};
+    if(mode<0||mode>6){fprintf(stderr,"mode must be 0..6\n");return 1;}
     int Ws=W*SS, Hs=H*SS;
     double half = 2.0/scale;          // view half-width in complex units (approx)
     std::vector<uint8_t> img(W*H*3);
+    auto t0=std::chrono::steady_clock::now();
     #pragma omp parallel for schedule(dynamic,1)
     for (int i=0;i<H;++i) for (int j=0;j<W;++j){
         float lr=0,lg=0,lb=0;
@@ -97,7 +149,8 @@ int main(int argc, char** argv){
         int n=SS*SS; uint8_t* p=&img[(i*W+j)*3];
         p[0]=(uint8_t)(toGam(lr/n)+0.5f); p[1]=(uint8_t)(toGam(lg/n)+0.5f); p[2]=(uint8_t)(toGam(lb/n)+0.5f);
     }
+    double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
     writeBMP(out, img, W, H);
-    printf("wrote %s mode=%s\n", out, mode?"stripe-average":"smooth-iter");
+    printf("wrote %s mode=%s compute+color=%.3f ms\n",out,names[mode],ms);
     return 0;
 }
