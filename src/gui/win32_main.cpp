@@ -38,19 +38,30 @@
 
 float color_map[3][colP];
 float color_density = 60.0f;
+float color_phase = 0.0f;
+
+// The engine marks set-interior pixels with the exact sentinel -2.0f; every
+// exterior (escaped) pixel carries a smooth iteration count. That count can be
+// slightly NEGATIVE for far-field points that escape almost immediately (large
+// |c|, escape iteration < ~5: mu = i+1 - log2(log2|z|) < 0), so "interior" must
+// be tested against the exact sentinel, not "< 0", or the whole outer region of
+// a zoomed-out view goes black. colorFunction clamps such counts to 0.
+static constexpr float INTERIOR_SENTINEL = -2.0f;
+static inline bool isInterior(float it) { return it == INTERIOR_SENTINEL; }
 
 static float colorFunction(float it, int method) {
     if (method & ColoringMethod::STRIPE_AVERAGE)
         return it * (color_density / 20.0f);   // SAC value in [0,1] -> banded palette
     if (method & ColoringMethod::EXTERIOR_DIST_EST)
         return tanhf(it * color_density / 3600.0f * 5.0f);
+    if (it < 0.0f) it = 0.0f;                  // far-field fast escapes: small negative count
     float l = logf(it + 2.0f);
     return powf(l, l * l * color_density / 3600.0f);
 }
 
 void getColor(float iteration, float& r, float& g, float& b, int method) {
-    if (iteration < 0) { r = g = b = 0; return; }
-    int x = (int)(colorFunction(iteration, method) * colP) % colP;
+    if (isInterior(iteration)) { r = g = b = 0; return; }
+    int x = (int)(colorFunction(iteration, method) * colP + color_phase) % colP;
     if (x < 0) x += colP;
     r = color_map[0][x]; g = color_map[1][x]; b = color_map[2][x];
 }
@@ -112,10 +123,16 @@ static double palPrefix(int c, double x) {
     return q * g_palInt[c][colP] + part;
 }
 
-void getColorAA(float v, float vL, float vR, float vU, float vD,
-                uint8_t& r, uint8_t& g, uint8_t& b, int method) {
-    if (v < 0) { r = g = b = 0; return; }    // interior
-    auto ext = [](float x) { return x != EMPTYPIXEL && x >= 0.0f; };
+// Phase-independent analysis: the palette-index centre (baseU) and the palette
+// footprint width. Neither depends on color_phase, so both can be cached and
+// re-shaded cheaply as the phase animates. baseU < 0 marks interior/empty.
+void colorAnalyzeAA(float v, float vL, float vR, float vU, float vD, int method,
+                    float& baseU, float& width) {
+    if (isInterior(v)) { baseU = -1.0f; width = 0.0f; return; }   // interior
+    // A neighbour counts for the gradient if it is a real exterior sample (not
+    // empty, not the interior sentinel). Far-field escapes have a small negative
+    // smooth count but are still exterior, so test against the sentinel, not < 0.
+    auto ext = [](float x) { return x != EMPTYPIXEL && x != INTERIOR_SENTINEL; };
     float f = colorFunction(v, method);
     auto cf = [&](float nv) { return colorFunction(nv, method); };
     // screen-space gradient of the (monotonic) colour value f, from neighbours
@@ -127,11 +144,17 @@ void getColorAA(float v, float vL, float vR, float vU, float vD,
     else if (ext(vD)) fy = cf(vD) - f;
     else if (ext(vU)) fy = f - cf(vU);
     float gradf = std::sqrt(fx * fx + fy * fy);          // colour cycles per pixel
-    double width = (double)gradf * colP;                 // palette entries spanned
-    double centerU = (double)f * colP;
+    width = (float)((double)gradf * colP);               // palette entries spanned
+    baseU = (float)((double)f * colP);
+}
 
+// Phase-dependent shading of an analysed (baseU, width) pixel. Cheap: no
+// colorFunction / gradient, just a palette-integral average shifted by phase.
+void colorShadeAA(float baseU, float width, float phase, uint8_t& r, uint8_t& g, uint8_t& b) {
+    if (baseU < 0) { r = g = b = 0; return; }            // interior
+    double centerU = (double)baseU + phase;
     if (width < 1.0) {                                   // sub-cycle: point sample
-        int x = (int)centerU % colP; if (x < 0) x += colP;
+        int x = ((int)centerU) % colP; if (x < 0) x += colP;
         r = (uint8_t)color_map[0][x]; g = (uint8_t)color_map[1][x]; b = (uint8_t)color_map[2][x];
         return;
     }
@@ -148,6 +171,19 @@ void getColorAA(float v, float vL, float vR, float vU, float vD,
     };
     r = (uint8_t)avg(0); g = (uint8_t)avg(1); b = (uint8_t)avg(2);
 }
+
+float colorBaseIndex(float iteration, int method) {
+    if (isInterior(iteration)) return -1.0f;
+    return (float)((double)colorFunction(iteration, method) * colP);
+}
+
+void getColorAA(float v, float vL, float vR, float vU, float vD,
+                uint8_t& r, uint8_t& g, uint8_t& b, int method) {
+    float baseU, width;
+    colorAnalyzeAA(v, vL, vR, vU, vD, method, baseU, width);
+    colorShadeAA(baseU, width, color_phase, r, g, b);
+}
+
 
 void rgbRotate(float& r, float& g, float& b, float rad) {
     float c = cosf(rad), s = sinf(rad), t = 1.0f / 3.0f, q = sqrtf(t);
@@ -814,7 +850,7 @@ LRESULT CALLBACK ExportWndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 enum Hit {
     H_NONE, H_VIEW, H_GRADIENT,
     H_RESET, H_RENDER, H_SAVE, H_COPY, H_PASTE,
-    H_MAXTRACK, H_DENSTRACK,
+    H_MAXTRACK, H_DENSTRACK, H_PHASETRACK, H_SPEEDTRACK,
     H_SS, H_EDE, H_PALETTE_DD, H_COLOR, H_GALLERY_DD
 };
 
@@ -976,7 +1012,7 @@ public:
 
     // widget rects (computed in layout())
     RECT rcReset{}, rcRender{}, rcSave{}, rcCopy{}, rcPaste{};
-    RECT rcLocation{}, rcMaxTrack{}, rcDensTrack{};
+    RECT rcLocation{}, rcMaxTrack{}, rcDensTrack{}, rcPhaseTrack{}, rcSpeedTrack{};
     RECT rcSS{}, rcColoringDD{}, rcPaletteDD{}, rcColor{}, rcGradient{};
     RECT rcGalleryDD{};
 
@@ -1005,8 +1041,38 @@ public:
     bool fractalOnlyTick = false;  // set by the timer for pure fractal animation frames
     double lastPresentMs = 0;
 
+    // ---- palette-phase animation --------------------------------------------
+    // animSpeed is the signed cycle rate in [-1, 1]; 0 (slider centre) = paused.
+    // At |1| the palette cycles once every PHASE_SECONDS_AT_MAX seconds. Phase is
+    // advanced by wall-clock time so the speed is frame-rate independent.
+    float animSpeed = 0.0f;
+    static constexpr double PHASE_SECONDS_AT_MAX = 2.0;
+    std::chrono::steady_clock::time_point lastAnimTick = std::chrono::steady_clock::now();
+
     int S(int v) const { return MulDiv(v, dpi, 96); }   // scale a design px to device px
     void keepLive(int frames = 60) { liveFrames = std::max(liveFrames, frames); }
+
+    // Set the palette phase from a phase-slider x (0..colP over the track).
+    void setPhaseFromX(int x) {
+        double t = (double)(x - rcPhaseTrack.left) / std::max(1L, rcPhaseTrack.right - rcPhaseTrack.left);
+        color_phase = (float)(std::clamp(t, 0.0, 1.0) * colP);
+        recolorPhaseNow();
+    }
+    // Set the animation speed from a speed-slider x; snaps to the centre (0).
+    void setSpeedFromX(int x) {
+        double t = (double)(x - rcSpeedTrack.left) / std::max(1L, rcSpeedTrack.right - rcSpeedTrack.left);
+        t = std::clamp(t, 0.0, 1.0);
+        const double snaps[] = { 0.5 };
+        t = snapT(t, snaps, 1, (double)(rcSpeedTrack.right - rcSpeedTrack.left));
+        animSpeed = (float)((t - 0.5) * 2.0);
+        lastAnimTick = std::chrono::steady_clock::now();   // avoid a phase jump on (re)start
+    }
+    // Immediate cheap re-colour + present for the current phase (paused-drag feedback).
+    void recolorPhaseNow() {
+        color_phase = std::fmod(color_phase, (float)colP); if (color_phase < 0) color_phase += colP;
+        if (nav) { nav->RecolorPhase(bitmap.data()); buildDisplay(); }
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
 
     // ---- geometry ----
     RECT viewRect() const {
@@ -1032,6 +1098,8 @@ public:
         rcLocation = { px, y, px + w, y + S(100) }; y += S(100) + S(16);
         rcMaxTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         rcDensTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
+        rcPhaseTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
+        rcSpeedTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         rcSS  = { px, y, px + w, y + bh }; y += S(56);
         rcColoringDD = { px, y, px + w, y + bh }; y += S(56);
         rcPaletteDD = { px, y, px + w, y + bh }; y += S(44);
@@ -1054,7 +1122,9 @@ public:
         double lx = b[0][0], ly = b[0][1], rx = b[2][0], ry = b[2][1];
         // The reference/bitmap is y-up (row 0 = smallest imaginary = bottom) while
         // the display DIB is top-down; flip vertically so the image is upright and
-        // pan/zoom track the cursor consistently on the y axis.
+        // pan/zoom track the cursor consistently on the y axis. Parallelised: this
+        // runs every animation/pan frame, so it must stay well under the 16 ms budget.
+#pragma omp parallel for schedule(static)
         for (int y = 0; y < RENDER_H; ++y) {
             double fy = ly + (ry - ly) * ((RENDER_H - 1 - y) + 0.5) / RENDER_H;
             int sy = (int)(fy * RENDER_H);
@@ -1237,19 +1307,49 @@ public:
         drawText(dc, r, s, accent ? RGB(255,255,255) : CLR_TEXT, fUi,
                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
-    void drawSlider(HDC dc, RECT track, double t, Hit id) {
+    void drawSlider(HDC dc, RECT track, double t, Hit id,
+                    const double* snaps = nullptr, int nsnaps = 0) {
         int cy = (track.top + track.bottom) / 2, hb = S(3);
         RECT bar = { track.left, cy - hb, track.right, cy + hb };
         fillRound(dc, bar, CLR_TRACK, CLR_BG, S(6));
         int kx = track.left + (int)(t * (track.right - track.left));
         RECT fill = { track.left, cy - hb, kx, cy + hb };
         fillRound(dc, fill, CLR_ACCENT, CLR_BG, S(6));
+        // Snap detent marker lines: a thin tick straddling the track at each snap.
+        if (snaps && nsnaps > 0) {
+            HPEN dp = CreatePen(PS_SOLID, S(1), CLR_TEXT_DIM);
+            HGDIOBJ odp = SelectObject(dc, dp);
+            for (int i = 0; i < nsnaps; ++i) {
+                int sx = track.left + (int)(snaps[i] * (track.right - track.left));
+                MoveToEx(dc, sx, cy - S(9), nullptr); LineTo(dc, sx, cy + S(9));
+            }
+            SelectObject(dc, odp); DeleteObject(dp);
+        }
         int kr = hover == id || pressed == id ? S(9) : S(7);
         HBRUSH kb = CreateSolidBrush(RGB(238,242,250));
         HPEN kp = CreatePen(PS_SOLID, S(2), CLR_ACCENT);
         HGDIOBJ ob = SelectObject(dc, kb), op = SelectObject(dc, kp);
         Ellipse(dc, kx - kr, cy - kr, kx + kr, cy + kr);
         SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(kb); DeleteObject(kp);
+    }
+    // Snap a normalized slider value t to the nearest snap point within a
+    // distance-aware radius: the radius at each snap is a fraction of the gap to
+    // its nearest neighbour (or the track edge), clamped to a comfortable pixel
+    // range. Returns the (possibly snapped) value. trackPx = track pixel width.
+    double snapT(double t, const double* snaps, int nsnaps, double trackPx) {
+        double best = t, bestDpx = 1e18;
+        for (int i = 0; i < nsnaps; ++i) {
+            double s = snaps[i];
+            double lo = s, hi = 1.0 - s;                 // gaps to the track edges
+            for (int k = 0; k < nsnaps; ++k) if (k != i) {
+                double d = s - snaps[k];
+                if (d > 0) lo = std::min(lo, d); else hi = std::min(hi, -d);
+            }
+            double radiusPx = std::clamp(std::min(lo, hi) * 0.18 * trackPx, 6.0, 28.0);
+            double dpx = std::fabs(t - s) * trackPx;
+            if (dpx <= radiusPx && dpx < bestDpx) { bestDpx = dpx; best = s; }
+        }
+        return best;
     }
     void drawToggle(HDC dc, RECT r, const std::wstring& label, bool on, Hit id) {
         bool hov = hover == id;
@@ -1526,6 +1626,19 @@ public:
         labelRow(dc, rcDensTrack, L"Color density", db);
         drawSlider(dc, rcDensTrack, std::clamp((color_density - 10.0) / 190.0, 0.0, 1.0), H_DENSTRACK);
 
+        // palette-cycle phase (0..1 = one full cycle) and animation speed
+        wchar_t pb[32]; swprintf_s(pb, L"%.2f", color_phase / (float)colP);
+        labelRow(dc, rcPhaseTrack, L"Gradient phase", pb);
+        drawSlider(dc, rcPhaseTrack, std::clamp(color_phase / (double)colP, 0.0, 1.0), H_PHASETRACK);
+
+        wchar_t sb[32];
+        if (std::fabs(animSpeed) < 1e-3f) swprintf_s(sb, L"paused");
+        else swprintf_s(sb, L"%+.2f", animSpeed);
+        labelRow(dc, rcSpeedTrack, L"Cycle speed", sb);
+        const double speedSnaps[] = { 0.5 };
+        drawSlider(dc, rcSpeedTrack, std::clamp((animSpeed + 1.0) / 2.0, 0.0, 1.0), H_SPEEDTRACK,
+                   speedSnaps, 1);
+
         drawToggle(dc, rcSS, L"5x supersampling", ssOn, H_SS);
         label(dc, rcColoringDD.left, rcColoringDD.top - S(20), L"Coloring");
         drawColoringDD(dc);
@@ -1600,6 +1713,8 @@ public:
         if (inRect(rcGalleryDD,x,y)) return H_GALLERY_DD;
         RECT mt = rcMaxTrack; mt.top -= S(8); mt.bottom += S(8); if (inRect(mt,x,y)) return H_MAXTRACK;
         RECT dt = rcDensTrack; dt.top -= S(8); dt.bottom += S(8); if (inRect(dt,x,y)) return H_DENSTRACK;
+        RECT pt = rcPhaseTrack; pt.top -= S(8); pt.bottom += S(8); if (inRect(pt,x,y)) return H_PHASETRACK;
+        RECT sp = rcSpeedTrack; sp.top -= S(8); sp.bottom += S(8); if (inRect(sp,x,y)) return H_SPEEDTRACK;
         if (inRect(rcSS,x,y)) return H_SS;
         if (inRect(rcColoringDD,x,y)) return H_EDE;
         if (inRect(rcPaletteDD,x,y)) return H_PALETTE_DD;
@@ -1612,21 +1727,42 @@ public:
 
     void timer() {
         bool computing = nav->IsComputing();
+        bool anim = std::fabs(animSpeed) > 1e-4f;
         bool active = computing || wasComputing || navDragging || palette.dragging ||
-                      pressed == H_MAXTRACK || pressed == H_DENSTRACK || liveFrames > 0;
-        if (!active) return;                 // idle: no repaint, no flicker, no CPU spin
+                      pressed == H_MAXTRACK || pressed == H_DENSTRACK ||
+                      pressed == H_PHASETRACK || pressed == H_SPEEDTRACK ||
+                      liveFrames > 0 || anim;
+        auto now = std::chrono::steady_clock::now();
+        if (!active) { lastAnimTick = now; return; }   // idle: no repaint, no CPU spin
         if (liveFrames > 0) --liveFrames;
         nav->Update();
-        nav->UpdateBitmap(bitmap.data());
+        // Advance the palette phase by elapsed wall-clock time so the cycle speed
+        // is identical at 30 or 60 fps. animSpeed==1 => one cycle / PHASE_SECONDS_AT_MAX.
+        double dt = std::chrono::duration<double>(now - lastAnimTick).count();
+        lastAnimTick = now;
+        if (anim) {
+            double rate = (double)animSpeed / PHASE_SECONDS_AT_MAX * colP;   // index units / s
+            color_phase = (float)std::fmod((double)color_phase + rate * dt, (double)colP);
+            if (color_phase < 0) color_phase += colP;
+        }
+        // Cheap cached phase re-colour when we are only cycling the palette on a
+        // settled frame; full re-colour while computing / after settle / on other
+        // control drags (which also (re)builds the phase cache).
+        bool phaseOnly = !computing && !wasComputing && !navDragging &&
+                         pressed != H_MAXTRACK && pressed != H_DENSTRACK &&
+                         (anim || pressed == H_PHASETRACK || pressed == H_SPEEDTRACK);
+        if (phaseOnly) nav->RecolorPhase(bitmap.data());
+        else nav->UpdateBitmap(bitmap.data());
         if (wasComputing && !computing)
             lastRenderMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - renderStart).count();
         wasComputing = computing;
         buildDisplay();
-        // Pure fractal-animation frames (pan/zoom/compute) can skip the panel
-        // rebuild; UI-control interaction still gets a full paint.
+        // Pure fractal/phase-animation frames (pan/zoom/compute/cycle) can skip the
+        // panel rebuild; UI-control interaction still gets a full paint.
         bool uiInteract = palette.dragging ||
-                          pressed == H_MAXTRACK || pressed == H_DENSTRACK;
+                          pressed == H_MAXTRACK || pressed == H_DENSTRACK ||
+                          pressed == H_PHASETRACK || pressed == H_SPEEDTRACK;
         fractalOnlyTick = !uiInteract;
         InvalidateRect(hwnd, nullptr, FALSE);
     }
@@ -1669,6 +1805,8 @@ public:
             if (palette.dragging) { gradientMove(x); return 0; }
             if (pressed == H_MAXTRACK) { setMaxFromT((double)(x - rcMaxTrack.left)/(rcMaxTrack.right-rcMaxTrack.left), false); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (pressed == H_DENSTRACK) { color_density = (float)std::round(std::clamp(10.0 + 190.0*(x-rcDensTrack.left)/(rcDensTrack.right-rcDensTrack.left),10.0,200.0)); nav->SetRedisplay(); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
+            if (pressed == H_PHASETRACK) { setPhaseFromX(x); return 0; }
+            if (pressed == H_SPEEDTRACK) { setSpeedFromX(x); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (navDragging) { POINT p = mapToRender(x,y); nav->Drag(p.x,p.y); return 0; }
             if (paletteOpen) { int it = paletteItemAt(x,y); if (it != paletteHover) { paletteHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
             if (coloringOpen) { int it = coloringItemAt(x,y); if (it != coloringHover) { coloringHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
@@ -1708,6 +1846,8 @@ public:
             if (h == H_GRADIENT) { gradientDown(x); return 0; }
             if (h == H_MAXTRACK) { SetCapture(hwnd); setMaxFromT((double)(x-rcMaxTrack.left)/(rcMaxTrack.right-rcMaxTrack.left), false); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (h == H_DENSTRACK) { SetCapture(hwnd); color_density=(float)std::round(std::clamp(10.0+190.0*(x-rcDensTrack.left)/(rcDensTrack.right-rcDensTrack.left),10.0,200.0)); nav->SetRedisplay(); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
+            if (h == H_PHASETRACK) { SetCapture(hwnd); setPhaseFromX(x); return 0; }
+            if (h == H_SPEEDTRACK) { SetCapture(hwnd); setSpeedFromX(x); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (h == H_VIEW) { POINT p = mapToRender(x,y); navDragging = true; SetCapture(hwnd); nav->DragStart(p.x,p.y); }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -1720,6 +1860,8 @@ public:
             else if (pressed == H_MAXTRACK || pressed == H_DENSTRACK) {
                 ReleaseCapture();
                 if (pressed == H_MAXTRACK) startRender(); else startRender();
+            } else if (pressed == H_PHASETRACK || pressed == H_SPEEDTRACK) {
+                ReleaseCapture();   // phase/speed re-colour only; no fractal recompute
             } else if (h == pressed && h != H_NONE) {
                 switch (h) {
                 case H_RESET: nav->Reset(); renderStart = std::chrono::steady_clock::now(); wasComputing = true; keepLive(); break;
@@ -1768,6 +1910,22 @@ public:
                 if (nv == maxIter) nv += (wd > 0 ? 1 : -1);   // always move at small values
                 maxIter = std::clamp(nv, 100, 5000000);
                 nav->SetMxit(maxIter); startRender();
+                return 0;
+            }
+            // Phase wheel: nudge the palette phase (~1/256 cycle per notch), no snap.
+            RECT pt = rcPhaseTrack; pt.top -= S(10); pt.bottom += S(10);
+            if (inRect(pt, q.x, q.y)) {
+                color_phase += (wd > 0 ? 1.0f : -1.0f) * (colP / 256.0f);
+                recolorPhaseNow();
+                return 0;
+            }
+            // Speed wheel: fine-tune the cycle speed (bypasses the centre snap so a
+            // tiny non-zero speed is reachable); clamped to [-1, 1].
+            RECT sp = rcSpeedTrack; sp.top -= S(10); sp.bottom += S(10);
+            if (inRect(sp, q.x, q.y)) {
+                animSpeed = (float)std::clamp(animSpeed + (wd > 0 ? 0.02 : -0.02), -1.0, 1.0);
+                lastAnimTick = std::chrono::steady_clock::now();
+                InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
             if (inRect(viewRect(), q.x, q.y)) {

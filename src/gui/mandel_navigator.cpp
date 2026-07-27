@@ -60,11 +60,13 @@ void MandelNavigator::ConfigureSampling() {
         _mandel = new Mandel(_w, _h, _mxit, _sub, _iter);
     _mandel->setPrecision((int)mpf_get_prec(_scale));
     _shift_idx = (_w * _sub) * (_sub / 2);
+    _cache_valid = false;                       // sampling mode changed -> cache stale
 }
 
 void MandelNavigator::StartCompute() {
     InterruptCompute();
     ConfigureSampling();
+    _cache_valid = false;                       // fractal changing -> phase cache stale
     for (int i = 0; i < _w * _h * _sub * _sub; ++i) _iter[i] = EMPTYPIXEL;
     auto compute_task = [this]() {
         this->_mandel->setDensity(color_density);   // for the SAC adaptive-SS detector
@@ -148,12 +150,16 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
     prepareColorFilter();   // also initializes the linear-light LUT
     if (_uniform_feather) {
         const int stride = _w * _sub;
+        if (settled) _baseUsub.assign((size_t)_w * _h * _sub * _sub, EMPTYPIXEL);
 #pragma omp parallel for schedule(dynamic, 8)
         for (int i = 0; i < _h; ++i) {
             for (int j = 0; j < _w; ++j) {
                 double rs = 0, gs = 0, bs = 0; int n = 0;
                 for (int a = 0; a < _sub; ++a) for (int b = 0; b < _sub; ++b) {
-                    float v = _iter[(i * _sub + a) * stride + j * _sub + b];
+                    int sidx = (i * _sub + a) * stride + j * _sub + b;
+                    float v = _iter[sidx];
+                    if (settled) _baseUsub[sidx] = (v == EMPTYPIXEL) ? EMPTYPIXEL
+                                                                     : colorBaseIndex(v, _c_method);
                     if (v == EMPTYPIXEL) continue;
                     float r, g, bl; getColor(v, r, g, bl, _c_method);
                     int ri = std::clamp((int)(r + 0.5f), 0, 255);
@@ -168,11 +174,17 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
                 p[2] = (uint8_t)(srgbEncode(bs / n) * 255.0 + 0.5);
             }
         }
+        if (settled) { _cache_valid = true; _cache_density = color_density; _cache_method = _c_method; }
         return;
     }
     const int stride = _w * _sub;
     const int c = _sub / 2;
     const bool ss = (_c_method & ColoringMethod::SUPER_SAMPLING) != 0;
+    // The phase cache is only usable when every pixel took the analytic-AA path
+    // (SS off): SS-flagged pixels are averaged sub-blocks that this cache does
+    // not store, so those modes fall back to a full re-colour during animation.
+    const bool cacheable = !ss && settled;
+    if (cacheable) { _baseU.assign((size_t)_w * _h, -1.0f); _widthC.assign((size_t)_w * _h, 0.0f); }
 #pragma omp parallel for schedule(dynamic, 8)
     for (int i = 0; i < _h; ++i) {
         for (int j = 0; j < _w; ++j) {
@@ -190,14 +202,72 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
                 float vR = j < _w - 1   ? _iter[idx + _sub]         : EMPTYPIXEL;
                 float vU = i > 0        ? _iter[idx - stride * _sub] : EMPTYPIXEL;
                 float vD = i < _h - 1   ? _iter[idx + stride * _sub] : EMPTYPIXEL;
-                getColorAA(_iter[idx], vL, vR, vU, vD,
-                           bitmap[idx_bmp], bitmap[idx_bmp + 1], bitmap[idx_bmp + 2], _c_method);
+                float baseU, width;
+                colorAnalyzeAA(_iter[idx], vL, vR, vU, vD, _c_method, baseU, width);
+                colorShadeAA(baseU, width, color_phase,
+                             bitmap[idx_bmp], bitmap[idx_bmp + 1], bitmap[idx_bmp + 2]);
+                if (cacheable) { _baseU[(size_t)i * _w + j] = baseU; _widthC[(size_t)i * _w + j] = width; }
             } else {
                 float r, g, b; getColor(_iter[idx], r, g, b, _c_method);
                 bitmap[idx_bmp]     = (uint8_t)std::clamp((int)(r + 0.5f), 0, 255);
                 bitmap[idx_bmp + 1] = (uint8_t)std::clamp((int)(g + 0.5f), 0, 255);
                 bitmap[idx_bmp + 2] = (uint8_t)std::clamp((int)(b + 0.5f), 0, 255);
             }
+        }
+    }
+    if (cacheable) { _cache_valid = true; _cache_density = color_density; _cache_method = _c_method; }
+}
+
+void MandelNavigator::RecolorPhase(uint8_t* bitmap) {
+    // Fast animation re-colour: re-shade the cached settled frame with the live
+    // color_phase. If the cache is stale (density/method changed) or unusable
+    // (SS-averaged mode, or a render in progress), fall back to a full re-colour.
+    bool computing = IsComputing();
+    if (!_cache_valid || computing ||
+        _cache_density != color_density || _cache_method != _c_method) {
+        _require_update = true;
+        UpdateBitmap(bitmap);
+        return;
+    }
+    // The palette (and thus its box-filter integral) may have been edited since
+    // the cache was built; refresh it so an animated phase uses current colours.
+    // Cheap (colP*3) relative to the per-pixel re-colour. The per-pixel analysis
+    // (baseU/width) is palette-independent, so it stays cached.
+    prepareColorFilter();
+    if (_uniform_feather) {
+        const int stride = _w * _sub;
+#pragma omp parallel for schedule(dynamic, 8)
+        for (int i = 0; i < _h; ++i) {
+            for (int j = 0; j < _w; ++j) {
+                double rs = 0, gs = 0, bs = 0; int n = 0;
+                for (int a = 0; a < _sub; ++a) for (int b = 0; b < _sub; ++b) {
+                    float bu = _baseUsub[(size_t)(i * _sub + a) * stride + j * _sub + b];
+                    if (bu == EMPTYPIXEL) continue;
+                    int ri, gi, bi;
+                    if (bu < 0) { ri = gi = bi = 0; }
+                    else {
+                        int x = ((int)(bu + color_phase)) % colP; if (x < 0) x += colP;
+                        ri = std::clamp((int)(color_map[0][x] + 0.5f), 0, 255);
+                        gi = std::clamp((int)(color_map[1][x] + 0.5f), 0, 255);
+                        bi = std::clamp((int)(color_map[2][x] + 0.5f), 0, 255);
+                    }
+                    rs += g_srgb2lin[ri]; gs += g_srgb2lin[gi]; bs += g_srgb2lin[bi]; ++n;
+                }
+                if (!n) continue;
+                uint8_t* p = bitmap + ((size_t)i * _w + j) * 3;
+                p[0] = (uint8_t)(srgbEncode(rs / n) * 255.0 + 0.5);
+                p[1] = (uint8_t)(srgbEncode(gs / n) * 255.0 + 0.5);
+                p[2] = (uint8_t)(srgbEncode(bs / n) * 255.0 + 0.5);
+            }
+        }
+        return;
+    }
+#pragma omp parallel for schedule(dynamic, 8)
+    for (int i = 0; i < _h; ++i) {
+        for (int j = 0; j < _w; ++j) {
+            size_t p = (size_t)i * _w + j;
+            uint8_t* q = bitmap + p * 3;
+            colorShadeAA(_baseU[p], _widthC[p], color_phase, q[0], q[1], q[2]);
         }
     }
 }

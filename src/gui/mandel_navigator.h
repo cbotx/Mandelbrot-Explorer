@@ -6,6 +6,7 @@
 #include <atomic>
 #include <future>
 #include <string>
+#include <vector>
 
 #include "navigator.h"
 #include "mandel_perturbation.h"
@@ -26,6 +27,17 @@ private:
     std::atomic_bool _require_update{true};
     bool _need_settle = false;   // a computing frame was point-sampled; force one AA pass once settled
 
+    // ---- palette-phase animation cache -------------------------------------
+    // Phase-independent per-pixel colouring analysis, rebuilt whenever the frame
+    // settles. RecolorPhase re-shades these with the live color_phase each frame
+    // without re-running colorFunction / the neighbourhood gradient.
+    std::vector<float> _baseU;      // AA path: palette-index centre (_w*_h)
+    std::vector<float> _widthC;     // AA path: palette footprint width (_w*_h)
+    std::vector<float> _baseUsub;   // Feather path: per-subpixel base index (sub grid)
+    bool _cache_valid = false;
+    float _cache_density = -1.0f;   // color_density the cache was built with
+    int _cache_method = -1;         // _c_method the cache was built with
+
     std::future<void> _task;
 
 public:
@@ -42,6 +54,12 @@ public:
     void UpdateCoords();
 
     void UpdateBitmap(uint8_t* bitmap);
+
+    // Cheap palette-phase re-colour for animation: re-shades the cached settled
+    // frame with the live color_phase (no fractal recompute, no colorFunction).
+    // Falls back to a full UpdateBitmap while a render is in progress or if the
+    // cache is stale (density/method changed).
+    void RecolorPhase(uint8_t* bitmap);
 
     void SetMxit(int mxit);
     int GetMxit() const { return _mxit; }
