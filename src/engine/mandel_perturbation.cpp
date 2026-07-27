@@ -584,9 +584,10 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         { const char* e = getenv("MANDEL_INTERIOR"); _use_interior = !e || atoi(e); }
         { const char* e = getenv("MANDEL_INT_EPS"); double ep = e ? atof(e) : 1e-13; _interior_eps2 = ep * ep; }
         { const char* e = getenv("MANDEL_INT_CONFIRM"); _interior_confirm = e ? atoi(e) : 4; }
-        // Deep-zoom: below double's ~1e320 underflow the delta must be rescaled
-        // (floatexp scale + double delta). Gate a bit before the wall so the fast
-        // double path is unchanged for shallow/moderate zoom.
+        // Deep-zoom: below double's ~1e300 representability wall the delta must be
+        // rescaled (floatexp scale + double delta). This hard gate catches the
+        // representability limit; a finer precision gate is applied after the
+        // reference is built (see the escalation below).
         { const char* e = getenv("MANDEL_FE");
           _use_floatexp = e ? atoi(e) != 0 : (mpf_cmp_d(scale, 1e280) > 0); }
         g_fe_fallback = 0;
@@ -602,6 +603,32 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         floatPointCompute(c0_re_f, c0_im_f, mxit, c_method);
         s.insert({ _h / 2, _w / 2, 0, 0 });
         tk = now(); ref_it = createRef(s, mxit, mxit, true, c_method); pf_ref += now() - tk;
+        // Content-aware floatexp escalation. Even below the hard 1e280 gate the
+        // plain-double delta loop loses precision when the reference orbit passes
+        // close to zero: near that pass the update term 2*Z*dz falls into the
+        // denormal range (< ~1e-308) for far-from-reference pixels, since
+        // |Z_min| * max|dc| can be tiny (e.g. 6e-108 * 2e-215 ~ 1e-322 at
+        // 4.86e215). The resulting ~1e-4 error is invisible at low colour density
+        // but the steep high-density palette mapping amplifies it into wrong
+        // colours / muddy blocks (reported at 4.86e215, density>=100). The floatexp
+        // path is exact there (matches the GMP oracle). Detect it from the just-
+        // built reference's closest approach to zero and redo it in floatexp when
+        // needed; references that stay clear of zero (e.g. flake@1e157) keep the
+        // fast double path. Only meaningful once dz^2 can underflow (scale>~1e150).
+        if (!_use_floatexp && mpf_cmp_d(scale, 1e150) > 0) {
+            double refmin2 = 1e300; bool underflowed = false;
+            for (int q = 1; q <= ref_it; ++q) {
+                double m2 = _z_m3[q] * 1e6;                 // |Z_q|^2 (double shadow)
+                if (m2 <= 0.0) { underflowed = true; break; }   // |Z| below ~1.5e-154
+                if (m2 < refmin2) refmin2 = m2;
+            }
+            double dcmax = 2.0 / mpf_get_d(scale);          // ~max pixel |dc|
+            if (underflowed || std::sqrt(refmin2) * dcmax < 1e-300) {
+                _use_floatexp = true;
+                s.insert({ _h / 2, _w / 2, 0, 0 });
+                tk = now(); ref_it = createRef(s, mxit, mxit, true, c_method, true); pf_ref += now() - tk;
+            }
+        }
         if (_use_floatexp && ref_it >= mxit - 16) {
             bool sensitive = ref_it < mxit ||
                 accuratePointCompute(_ref_z_re, _ref_z_im, mxit + 64, c_method) >= 0;
@@ -683,14 +710,31 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             s.erase({ _h / 2, _w / 2, 0, 0 });   // pixel reference was already computed
         progressBegin((int)s.size(), 0.08, 0.92);
         
+        int ref_pass = 0;
         while (!s.empty()) {
             if (_flag_halt) return;
-            tk = now(); stepParallel(s, ref_it, mxit, c_method); pf_step += now() - tk;
+            size_t pending_before = s.size();
+            tk = now(); stepParallel(s, ref_it, mxit, c_method);
+            double pass_time = now() - tk; pf_step += pass_time;
+            if (profile)
+                fprintf(stderr, "  [profile] ref-pass=%d ref-it=%d pending=%zu resolved=%zu remaining=%zu delta=%.3f s\n",
+                        ref_pass, ref_it, pending_before, pending_before - s.size(), s.size(), pass_time);
+            ++ref_pass;
             if (_flag_halt) return;
             if (s.empty()) break;
             tk = now(); ref_it = createRef(s, mxit, mxit, false, c_method); pf_ref += now() - tk;
             _ref_bounded = (ref_it >= mxit);
-            if (_use_bla) { tk = now(); buildBLA(ref_it, (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0); pf_bla += now() - tk; }
+            // createRef removes the chosen reference pixel from s. If it was the
+            // final unresolved base pixel AND no adaptive-SS pass follows, there is
+            // no next delta pass, so building a potentially mxit-long BLA table is
+            // pure waste. With SS enabled, subpixels may still need this new
+            // reference; its previous BLA is stale and must be rebuilt.
+            const bool ss_follows =
+                (_sub > 1) && (c_method & ColoringMethod::SUPER_SAMPLING);
+            if ((!s.empty() || ss_follows) && _use_bla) {
+                tk = now(); buildBLA(ref_it, (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0);
+                pf_bla += now() - tk;
+            }
         }
         if (profile) {
             long long sk = 0, ap = 0, no = 0;
