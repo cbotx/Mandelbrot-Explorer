@@ -1,7 +1,7 @@
 // Minimal COMPUTE-ONLY timing harness (no coloring / no BMP overhead) so speed
 // comparisons reflect the engine only. Times Mandel::Compute for one location.
 //
-// Usage: ss_bench <cx> <cy> <scale> <mxit> <W> <H> <sub> [ede] [trials]
+// Usage: ss_bench <cx> <cy> <scale> <mxit> <W> <H> <sub> [ede] [trials] [sac]
 //   sub=1 -> base 1spp pass; sub>1 -> base + adaptive supersample (SUPER_SAMPLING).
 //   ede=1 adds EXTERIOR_DIST_EST. Prints the best (min) Compute time in seconds.
 //   MANDEL_SIMD / MANDEL_SS_K / MANDEL_COARSE env vars apply as usual.
@@ -17,11 +17,12 @@
 using Clock = std::chrono::high_resolution_clock;
 
 int main(int argc, char** argv) {
-    if (argc < 8) { fprintf(stderr, "usage: ss_bench cx cy scale mxit W H sub [ede] [trials]\n"); return 1; }
+    if (argc < 8) { fprintf(stderr, "usage: ss_bench cx cy scale mxit W H sub [ede] [trials] [sac]\n"); return 1; }
     const char* cx = argv[1]; const char* cy = argv[2]; const char* scaleStr = argv[3];
     int mxit = atoi(argv[4]); int W = atoi(argv[5]); int H = atoi(argv[6]); int sub = atoi(argv[7]);
     int ede = argc > 8 ? atoi(argv[8]) : 0;
     int trials = argc > 9 ? atoi(argv[9]) : 3;
+    int sac = argc > 10 ? atoi(argv[10]) : 0;
     if (sub < 1) sub = 1;
 
     double sd = atof(scaleStr);
@@ -32,6 +33,7 @@ int main(int argc, char** argv) {
     int cmethod = 0;
     if (sub > 1) cmethod |= ColoringMethod::SUPER_SAMPLING;
     if (ede)     cmethod |= ColoringMethod::EXTERIOR_DIST_EST;
+    if (sac)     cmethod |= ColoringMethod::STRIPE_AVERAGE;
 
     mpf_t mcx, mcy, msc;
     mpf_init_set_str(mcx, cx, 10); mpf_init_set_str(mcy, cy, 10); mpf_init_set_str(msc, scaleStr, 10);
