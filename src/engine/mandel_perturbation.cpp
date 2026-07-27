@@ -460,6 +460,8 @@ void Mandel::ComputeDirect(int mxit, float* out, int step, int c_method) {
 void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method,
                      int full_h, int row_base) {
     std::cout << "mxit: " << mxit << '\n';
+    _progress_total = 0;
+    progressSet(0.0);
     _mx_coef = -1;
     _ref_cnt = 0;
     int iteration = 0;
@@ -536,6 +538,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                 }
             }
         }
+        progressBegin(_h, coarse_on ? 0.05 : 0.0, coarse_on ? 0.95 : 1.0);
 #pragma omp parallel for schedule(dynamic, 1)
         for (int i = 0; i < _h; ++i) {
             if (_flag_halt) continue;
@@ -558,6 +561,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                     if (ede && _iter[idx] >= 0) _iter[idx] /= dx_f;
                 }
             }
+            progressAdvance();
         }
     }
     else if (method == 1) {
@@ -625,21 +629,49 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         } else {
             _sacRefPre.clear();
         }
-        if (_use_interior) {
-            // Auto-gate: probe a coarse grid (reusing the centre reference, so no
-            // rebuild) to see whether this frame contains any interior. If not,
-            // disable detection so exterior-only frames pay ~zero overhead.
+        // Coarse strided grid computed once and reused for two purposes:
+        //   (a) interior auto-gate: if no probed pixel is interior, disable the
+        //       (costly) periodicity detection so exterior-only frames pay ~zero.
+        //   (b) blocky preview: paint each computed grid point across its C x C
+        //       block so the deep path shows a preview that SHARPENS in place
+        //       instead of scattered single points ("measles") -- the same
+        //       coarse-to-fine feedback the shallow path already gives.
+        static int coarse_on = -1;
+        if (coarse_on < 0) { const char* e = getenv("MANDEL_COARSE"); coarse_on = e ? atoi(e) : 1; }
+        if ((_use_interior || coarse_on) && !_flag_halt) {
+            const int C = 8;
             std::set<std::array<int, 4>> probe;
-            for (int i = 0; i < _h; i += 8)
-                for (int j = 0; j < _w; j += 8)
+            for (int i = 0; i < _h; i += C)
+                for (int j = 0; j < _w; j += C)
                     probe.insert({ i, j, 0, 0 });
-            probe.erase({ _h / 2, _w / 2, 0, 0 });
             if (!probe.empty() && !_flag_halt) stepParallel(probe, ref_it, mxit, c_method);
-            int nint = 0;
-            for (int i = 0; i < _h; i += 8)
-                for (int j = 0; j < _w; j += 8)
-                    if (_iter[getIndex(i, j, 0, 0)] == -2) ++nint;
-            if (nint == 0) _use_interior = false;
+            if (_use_interior) {
+                int nint = 0;
+                for (int i = 0; i < _h; i += C)
+                    for (int j = 0; j < _w; j += C)
+                        if (_iter[getIndex(i, j, 0, 0)] == -2) ++nint;
+                if (nint == 0) _use_interior = false;
+            }
+            if (coarse_on && !_flag_halt) {
+                // Replicate each grid sample across its block (centre subpixels).
+                // Glitched grid points stay EMPTYPIXEL -> a few holes, filled by the
+                // full pass below; far better than a field of isolated dots. The
+                // image-centre pixel is the reference and is NOT recomputed by the
+                // full pass (it is erased from the set below), so preserve it.
+                int cidx = getIndex(_h / 2, _w / 2, 0, 0);
+                float saveCenter = _iter[cidx];
+                for (int i = 0; i < _h; i += C) {
+                    for (int j = 0; j < _w; j += C) {
+                        float v = _iter[getIndex(i, j, 0, 0)];
+                        if (v == EMPTYPIXEL) continue;
+                        for (int bi = i; bi < i + C && bi < _h; ++bi)
+                            for (int bj = j; bj < j + C && bj < _w; ++bj)
+                                if (bi != i || bj != j)
+                                    _iter[getIndex(bi, bj, 0, 0)] = v;
+                    }
+                }
+                _iter[cidx] = saveCenter;
+            }
         }
         // Insert all pixels to render. Pixels already resolved by the interior
         // probe get recomputed (a negligible ~1/64 fraction); this avoids relying
@@ -649,6 +681,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                 s.insert({ i, j, 0, 0 });
         if (!_ref_virtual)
             s.erase({ _h / 2, _w / 2, 0, 0 });   // pixel reference was already computed
+        progressBegin((int)s.size(), 0.08, 0.92);
         
         while (!s.empty()) {
             if (_flag_halt) return;
@@ -678,7 +711,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         }
     }
     bool is_super_sampling = (_sub > 1) && (c_method & ColoringMethod::SUPER_SAMPLING);
-    if (!is_super_sampling) return;
+    if (!is_super_sampling) { progressSet(1.0); return; }
     if (_flag_halt) return;
     
     // Oversampling pixels that differs from neighbours with (_sub x _sub) pixels
@@ -691,6 +724,19 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
     double ss_k = 8.0;
     { const char* e = getenv("MANDEL_SS_K"); if (e) ss_k = atof(e); }
     double ss_thresh = log((double)mxit) / ss_k;
+    // Feather (SAC) stores a [0,1] stripe value, not an iteration count, so the
+    // log(mxit) threshold below never fires for it. The exterior stripe pattern is
+    // high-frequency *everywhere*, so cheap adaptive SS can't clean it (it would
+    // have to supersample ~every pixel -> use Export's uniform SS for that). By
+    // default we only supersample the set boundary (interior stores -2, exterior
+    // is >=0, so a sign change marks the edge) -- cheap and it removes the most
+    // visible jaggies. Set MANDEL_SAC_SS_STEPS>0 to also flag stripe edges whose
+    // colour changes by more than that many palette steps/pixel (colour index =
+    // stripe*density/20*colP, colP=2048); lower = more supersampling (slower).
+    const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
+    double sac_steps = 0.0;   // 0 = boundary only
+    { const char* e = getenv("MANDEL_SAC_SS_STEPS"); if (e) sac_steps = atof(e); }
+    const double sac_gain = (double)_ss_density * (2048.0 / 20.0);
     for (int i = 0; i < _h; ++i) {
         for (int j = 0; j < _w; ++j) {
             bool need_sample = false;
@@ -710,18 +756,22 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                     if (need_sample) break;
                 }
             } else {
-                float diff = 0;
+                float cv = _iter[getIndex(i, j, 0, 0)];
+                float diff = 0; bool boundary = false;
                 for (int xi = -1; xi <= 1; ++xi) {
                     for (int yi = -1; yi <= 1; ++yi) {
                         if (xi == 0 && yi == 0) continue;
                         int ny = i + yi;
                         int nx = j + xi;
                         if (nx >= 0 && nx < _w && ny >= 0 && ny < _h) {
-                            diff = std::max(diff, std::abs(_iter[getIndex(i, j, 0, 0)] - _iter[getIndex(ny, nx, 0, 0)]));
+                            float nv = _iter[getIndex(ny, nx, 0, 0)];
+                            diff = std::max(diff, std::abs(cv - nv));
+                            if (sac && cv * nv < 0) boundary = true;   // interior/exterior edge
                         }
                     }
                 }
-                need_sample = (log(diff) > ss_thresh);
+                if (sac) need_sample = boundary || (sac_steps > 0 && diff * sac_gain > sac_steps);
+                else     need_sample = (log(diff) > ss_thresh);
             }
             if (need_sample) {
                 ++mix_cnt;
@@ -805,7 +855,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         }
         _use_bla = saved_bla;
     }
-
+    progressSet(1.0);
 }
 
 
@@ -922,7 +972,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                 ++g_fe_fallback;
             }
             setPixel(arr, value);
-            _done[i] = true;
+            markDone(i);
         };
         if (feSimdOn) {
 #pragma omp parallel for schedule(dynamic, 1)
@@ -1123,7 +1173,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                 } else {
                     setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
                 }
-                _done[i] = true;
+                markDone(i);
                 break;
             }
             if (_use_interior) {
@@ -1139,7 +1189,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                         Float pr = zr - conf_zr, pi = zi - conf_zi;
                         bool ret = (pr * pr + pi * pi < _interior_eps2 * zrad);
                         if (ret && conf_D2 < 1.0) {
-                            if (++conf_count >= _interior_confirm) { setPixel(arr, -2); _done[i] = true; break; }
+                            if (++conf_count >= _interior_confirm) { setPixel(arr, -2); markDone(i); break; }
                             conf_zr = zr; conf_zi = zi; conf_D2 = 1; conf_next = j + conf_P;
                         } else {
                             conf_P = 0; ++conf_giveup;            // not a sustained attracting cycle
@@ -1180,7 +1230,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         }
         if (j >= mxit) {
             setPixel(arr, -2);
-            _done[i] = true;
+            markDone(i);
         }
     }
     }   // end else (scalar path)
@@ -1462,7 +1512,7 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
             anyactive = false;
             for (int l = 0; l < lanes; ++l) {
                 if (!act[l]) continue;
-                if (++j_[l] >= mxit) { setPixel(v[g + l], -2.f); _done[g + l] = true; act[l] = false; }
+                if (++j_[l] >= mxit) { setPixel(v[g + l], -2.f); markDone(g + l); act[l] = false; }
                 else anyactive = true;
             }
             continue;   // dzr/dzi already hold the updated deltas
@@ -1480,7 +1530,7 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
             if (!act[l]) continue;
             if (em & (1 << l)) {                         // escape (checked first)
                 setPixel(v[g + l], (float)(j_[l] + 1 - log(log(zrad_[l]) / 2 / LG2) / LG2));
-                _done[g + l] = true; act[l] = false; continue;
+                markDone(g + l); act[l] = false; continue;
             }
             if ((rm & (1 << l)) || (refit & (1 << l))) {  // Zhuoran rebase
                 if (dzmag_[l] / zrad_[l] > 10000000.0) {
@@ -1495,7 +1545,7 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
             }
             if (++j_[l] >= mxit) {
                 setPixel(v[g + l], -2.f);
-                _done[g + l] = true; act[l] = false; continue;
+                markDone(g + l); act[l] = false; continue;
             }
             anyactive = true;
         }
@@ -2054,4 +2104,38 @@ inline int Mandel::getIndex(int i, int j, int u, int v) const {
 
 void Mandel::SetHalt(bool flag) {
     _flag_halt = flag;
+}
+
+void Mandel::SetProgress(std::atomic<float>* progress, float offset, float scale) {
+    _progress = progress;
+    _progress_offset = offset;
+    _progress_scale = scale;
+}
+
+void Mandel::progressSet(double local) {
+    if (_progress)
+        _progress->store((float)(_progress_offset + _progress_scale
+            * std::clamp(local, 0.0, 1.0)), std::memory_order_relaxed);
+}
+
+void Mandel::progressBegin(int total, double begin, double span) {
+    _progress_done.store(0, std::memory_order_relaxed);
+    _progress_total = total;
+    _progress_report_step = std::max(1, total / 200);
+    _progress_begin = begin;
+    _progress_span = span;
+    progressSet(begin);
+}
+
+void Mandel::progressAdvance() {
+    if (!_progress || _progress_total <= 0) return;
+    int done = _progress_done.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (done == _progress_total || done % _progress_report_step == 0)
+        progressSet(_progress_begin + _progress_span * done / _progress_total);
+}
+
+inline void Mandel::markDone(int i) {
+    if (_done[i]) return;
+    _done[i] = true;
+    progressAdvance();
 }

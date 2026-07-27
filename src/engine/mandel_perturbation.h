@@ -8,6 +8,7 @@
 
 #include <set>
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <vector>
 
@@ -49,6 +50,14 @@ public:
     uint8_t* getImage() const;
 
     void SetHalt(bool flag);
+    void SetProgress(std::atomic<float>* progress, float offset = 0.0f, float scale = 1.0f);
+
+    // Palette density, used only by the SAC/Feather adaptive-supersampling
+    // detector to flag pixels by their actual colour change (colour-index change
+    // per pixel ~= stripe_diff * density/20 * colP). The GUI sets it from the live
+    // colour density before each frame; headless tools leave the default.
+    float _ss_density = 60.0f;
+    void setDensity(float d) { _ss_density = d; }
 
 private:
     inline bool escape(Comp& z) const;
@@ -60,6 +69,10 @@ private:
     inline int getIndex(int i, int j, int u, int v) const;
 
     void setPixel(std::array<int, 4> p, float iteration) const;
+    void progressSet(double local);
+    void progressBegin(int total, double begin, double span);
+    void progressAdvance();
+    inline void markDone(int i);
     void stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mxit, int c_method = 0);
     // AVX2 kernel: iterate a group of up to 4 pixels (non-EDE path). Mirrors the
     // scalar delta loop op-for-op so results are bit-identical. lanes<=4.
@@ -128,6 +141,11 @@ private:
 
 private:
     volatile bool _flag_halt = false;
+    std::atomic<float>* _progress = nullptr;
+    std::atomic<int> _progress_done{0};
+    int _progress_total = 0, _progress_report_step = 1;
+    double _progress_offset = 0.0, _progress_scale = 1.0;
+    double _progress_begin = 0.0, _progress_span = 1.0;
     volatile bool _sub_flag;
     float _ESCAPE_RADIUS = 1e8f;
     const double _TOL = 1e12;

@@ -19,9 +19,12 @@ private:
     mpf_t _t;
     int _mxit;
     int _sub;
+    int _adaptive_sub;
+    bool _uniform_feather = false;
     int _c_method = ColoringMethod::EXTERIOR_DIST_EST;
     int _shift_idx;
     std::atomic_bool _require_update{true};
+    bool _need_settle = false;   // a computing frame was point-sampled; force one AA pass once settled
 
     std::future<void> _task;
 
@@ -61,6 +64,7 @@ public:
     bool SetLocation(const std::string& x, const std::string& y, const std::string& scale);
 
 private:
+    void ConfigureSampling();
     void SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method);
 };
 

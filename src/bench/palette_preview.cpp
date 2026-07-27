@@ -38,17 +38,21 @@ static std::vector<Pal> palettes = {
 
 static void rebuild(const std::vector<Stop>& stops) {
     int n = (int)stops.size();
-    std::vector<float> xs(n + 2), ys(n + 2), out(CP);
     std::vector<std::array<float, 3>> lab(n);
     for (int i = 0; i < n; ++i)
         rgb2lab(stops[i].r, stops[i].g, stops[i].b, lab[i][0], lab[i][1], lab[i][2]);
-    xs[0] = stops.back().pos - 1.0f;
-    xs[n + 1] = stops.front().pos + 1.0f;
-    for (int i = 0; i < n; ++i) xs[i + 1] = stops[i].pos;
+    // Tile over three periods so the spline is periodic across the cycle wrap
+    // (matches PaletteEditor::rebuild in the GUI).
+    int m = 3 * n;
+    std::vector<float> xs(m), out(CP);
+    for (int p = -1; p <= 1; ++p)
+        for (int i = 0; i < n; ++i)
+            xs[(p + 1) * n + i] = stops[i].pos + p;
     for (int c = 0; c < 3; ++c) {
-        ys[0] = lab[n - 1][c]; ys[n + 1] = lab[0][c];
-        for (int i = 0; i < n; ++i) ys[i + 1] = lab[i][c];
-        mono_cubic_interpolate(xs.data(), ys.data(), n + 2, out.data(), CP);
+        std::vector<float> ys(m);
+        for (int p = 0; p < 3; ++p)
+            for (int i = 0; i < n; ++i) ys[p * n + i] = lab[i][c];
+        mono_cubic_interpolate(xs.data(), ys.data(), m, out.data(), CP);
         for (int i = 0; i < CP; ++i) color_map[c][i] = out[i];
     }
     for (int i = 0; i < CP; ++i) {

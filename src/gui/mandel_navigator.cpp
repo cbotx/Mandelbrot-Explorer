@@ -13,7 +13,8 @@
 #include "mandel_navigator.h"
 
 MandelNavigator::MandelNavigator(int width, int height, int sub, int max_iteration, double zoom_step, double zoom_time) 
-        : Navigator(width, height, zoom_step, zoom_time), _sub(sub) {
+        : Navigator(width, height, zoom_step, zoom_time),
+          _mxit(max_iteration), _sub(sub), _adaptive_sub(sub) {
     assert(sub % 2);
     _iter = new float[width * height * sub * sub];
     _mandel = new Mandel(width, height, max_iteration, sub, _iter);
@@ -42,11 +43,34 @@ void MandelNavigator::Reset() {
     StartCompute();
 }
 
+void MandelNavigator::ConfigureSampling() {
+    bool want_uniform = (_c_method & ColoringMethod::SUPER_SAMPLING)
+                     && (_c_method & ColoringMethod::STRIPE_AVERAGE);
+    if (want_uniform == _uniform_feather) return;
+
+    delete[] _iter;
+    delete _mandel;
+    _uniform_feather = want_uniform;
+    _sub = want_uniform ? 2 : _adaptive_sub;
+    size_t count = (size_t)_w * _h * _sub * _sub;
+    _iter = new float[count];
+    if (want_uniform)
+        _mandel = new Mandel(_w * _sub, _h * _sub, _mxit, 1, _iter);
+    else
+        _mandel = new Mandel(_w, _h, _mxit, _sub, _iter);
+    _mandel->setPrecision((int)mpf_get_prec(_scale));
+    _shift_idx = (_w * _sub) * (_sub / 2);
+}
+
 void MandelNavigator::StartCompute() {
     InterruptCompute();
+    ConfigureSampling();
     for (int i = 0; i < _w * _h * _sub * _sub; ++i) _iter[i] = EMPTYPIXEL;
     auto compute_task = [this]() {
-        this->_mandel->Compute(this->_z_re, this->_z_im, this->_scale, this->_mxit, this->_c_method);
+        this->_mandel->setDensity(color_density);   // for the SAC adaptive-SS detector
+        int method = this->_uniform_feather
+            ? (this->_c_method & ~ColoringMethod::SUPER_SAMPLING) : this->_c_method;
+        this->_mandel->Compute(this->_z_re, this->_z_im, this->_scale, this->_mxit, method);
         this->_require_update = true;
     };
     // _task = std::async(&Mandel::Compute, _mandel, _z_re, _z_im, _scale, _mxit, _c_method);
@@ -109,11 +133,45 @@ void MandelNavigator::UpdateCoords() {
 }
 
 void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
-    if (!_require_update && !IsComputing()) return;
+    bool computing = IsComputing();
+    if (!_require_update && !computing && !_need_settle) return;
     _require_update = false;
+    // While a render is in progress the frame is a coarse/partial preview: point-
+    // sample it so the coarse blocks stay clean. Analytic AA (getColorAA) reads
+    // neighbours, and across the artificial coarse-block boundaries it averages a
+    // wide palette range into a muddy/grey edge -- the "grey block borders". AA is
+    // correct only on the settled (fully computed) frame, so defer it until then.
+    // _need_settle guarantees exactly one AA pass after computing finishes even if
+    // the settle tick would otherwise be skipped.
+    const bool settled = !computing;
+    _need_settle = !settled;
+    prepareColorFilter();   // also initializes the linear-light LUT
+    if (_uniform_feather) {
+        const int stride = _w * _sub;
+#pragma omp parallel for schedule(dynamic, 8)
+        for (int i = 0; i < _h; ++i) {
+            for (int j = 0; j < _w; ++j) {
+                double rs = 0, gs = 0, bs = 0; int n = 0;
+                for (int a = 0; a < _sub; ++a) for (int b = 0; b < _sub; ++b) {
+                    float v = _iter[(i * _sub + a) * stride + j * _sub + b];
+                    if (v == EMPTYPIXEL) continue;
+                    float r, g, bl; getColor(v, r, g, bl, _c_method);
+                    int ri = std::clamp((int)(r + 0.5f), 0, 255);
+                    int gi = std::clamp((int)(g + 0.5f), 0, 255);
+                    int bi = std::clamp((int)(bl + 0.5f), 0, 255);
+                    rs += g_srgb2lin[ri]; gs += g_srgb2lin[gi]; bs += g_srgb2lin[bi]; ++n;
+                }
+                if (!n) continue;
+                uint8_t* p = bitmap + ((size_t)i * _w + j) * 3;
+                p[0] = (uint8_t)(srgbEncode(rs / n) * 255.0 + 0.5);
+                p[1] = (uint8_t)(srgbEncode(gs / n) * 255.0 + 0.5);
+                p[2] = (uint8_t)(srgbEncode(bs / n) * 255.0 + 0.5);
+            }
+        }
+        return;
+    }
     const int stride = _w * _sub;
     const int c = _sub / 2;
-    prepareColorFilter();   // rebuild palette box-filter integral once per frame
     const bool ss = (_c_method & ColoringMethod::SUPER_SAMPLING) != 0;
 #pragma omp parallel for schedule(dynamic, 8)
     for (int i = 0; i < _h; ++i) {
@@ -123,16 +181,22 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
             if (_iter[idx] == EMPTYPIXEL) continue;
             // In SS mode a flagged pixel has its full sub-block computed (top-left
             // corner subpixel filled): average it. Otherwise this is the 1-sample
-            // base layer -> analytic AA from the centre + its 4 pixel neighbours.
+            // base layer -> analytic AA from the centre + its 4 pixel neighbours,
+            // but ONLY once settled (see above) -- while computing, point-sample.
             if (ss && _iter[idx - (stride + 1) * c] != EMPTYPIXEL) {
                 SmoothColor(bitmap + idx_bmp, idx, _c_method);
-            } else {
+            } else if (settled) {
                 float vL = j > 0        ? _iter[idx - _sub]         : EMPTYPIXEL;
                 float vR = j < _w - 1   ? _iter[idx + _sub]         : EMPTYPIXEL;
                 float vU = i > 0        ? _iter[idx - stride * _sub] : EMPTYPIXEL;
                 float vD = i < _h - 1   ? _iter[idx + stride * _sub] : EMPTYPIXEL;
                 getColorAA(_iter[idx], vL, vR, vU, vD,
                            bitmap[idx_bmp], bitmap[idx_bmp + 1], bitmap[idx_bmp + 2], _c_method);
+            } else {
+                float r, g, b; getColor(_iter[idx], r, g, b, _c_method);
+                bitmap[idx_bmp]     = (uint8_t)std::clamp((int)(r + 0.5f), 0, 255);
+                bitmap[idx_bmp + 1] = (uint8_t)std::clamp((int)(g + 0.5f), 0, 255);
+                bitmap[idx_bmp + 2] = (uint8_t)std::clamp((int)(b + 0.5f), 0, 255);
             }
         }
     }

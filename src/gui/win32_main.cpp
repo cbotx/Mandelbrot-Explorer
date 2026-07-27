@@ -263,7 +263,9 @@ static void exportRender(mpf_t cx, mpf_t cy, mpf_t scale_view,
         int oh = std::min(sh, H - obase);
         std::fill(ibuf.begin(), ibuf.end(), (float)EMPTYPIXEL);
         mandel.SetHalt(false);
+        mandel.SetProgress(&st->progress, (float)s / nstrips, 0.95f / nstrips);
         mandel.Compute(cx, cy, scale_e, mxit, cmethod, Hss, obase * ss);
+        mandel.SetProgress(nullptr);
         if (st->cancel) break;
 #pragma omp parallel for schedule(dynamic, 4)
         for (int oi = 0; oi < oh; ++oi) {
@@ -416,6 +418,10 @@ static void buildResPresets(ExportDlg* d) {
         if (d->presets[i].w == 1350 && d->presets[i].h == 900) { d->resSel = i; break; }
 }
 
+static const int kSSFactors[] = { 1, 2, 3, 4, 6, 8 };
+static const wchar_t* const kSSNames[] = { L"1\u00d7  (fast)", L"2\u00d7", L"3\u00d7", L"4\u00d7", L"6\u00d7", L"8\u00d7  (max)" };
+static const int kSSCount = 6;
+
 static void exportGetSize(ExportDlg* d) {
     if (d->custom()) {
         d->outW = std::clamp(_wtoi(d->wText.c_str()), 16, 30000);
@@ -424,7 +430,7 @@ static void exportGetSize(ExportDlg* d) {
         d->outW = d->presets[d->resSel].w;
         d->outH = d->presets[d->resSel].h;
     }
-    d->ss = std::clamp(d->ssSel + 1, 1, 4);
+    d->ss = kSSFactors[std::clamp(d->ssSel, 0, kSSCount - 1)];
 }
 
 // Kick off a small preview render on a background thread (cancels any prior one).
@@ -514,8 +520,6 @@ static int exHitTest(ExportDlg* d, POINT p) {
     if (exPtIn(d->rcCancel, p)) return EX_CANCEL;
     return EX_NONE;
 }
-
-static const wchar_t* const kSSNames[4] = { L"1\u00d7  (fast)", L"2\u00d7", L"3\u00d7", L"4\u00d7  (best)" };
 
 static UINT exWinDpi(HWND h) {
     UINT d = GetDpiForWindow(h); return d ? d : 96;
@@ -624,7 +628,7 @@ static void exPaintContent(ExportDlg* d, HDC dc, int cw, int ch) {
     drawText(dc, { S(16), S(78), S(312), S(96) }, L"Custom size  (width \u00d7 height)", CLR_TEXT_DIM, d->fSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     exDrawDD(d, dc, d->rcRes, d->presets[d->resSel].name, d->hover == EX_RES, d->resOpen);
-    exDrawDD(d, dc, d->rcSS, kSSNames[std::clamp(d->ssSel, 0, 3)], d->hover == EX_SS, d->ssOpen);
+    exDrawDD(d, dc, d->rcSS, kSSNames[std::clamp(d->ssSel, 0, kSSCount - 1)], d->hover == EX_SS, d->ssOpen);
 
     bool cust = d->custom();
     exDrawField(d, dc, d->rcW, cust ? d->wText : std::to_wstring(d->outW), d->editField == 1, cust);
@@ -672,7 +676,7 @@ static void exPaintContent(ExportDlg* d, HDC dc, int cw, int ch) {
         SelectObject(dc, op); SelectObject(dc, ob2); DeleteObject(pen);
     };
     if (d->resOpen) drawList(d->rcRes, (int)d->presets.size(), d->resSel, [&](int i) { return std::wstring(d->presets[i].name); });
-    else if (d->ssOpen) drawList(d->rcSS, 4, d->ssSel, [&](int i) { return std::wstring(kSSNames[i]); });
+    else if (d->ssOpen) drawList(d->rcSS, kSSCount, d->ssSel, [&](int i) { return std::wstring(kSSNames[i]); });
 }
 
 LRESULT CALLBACK ExportWndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
@@ -704,7 +708,7 @@ LRESULT CALLBACK ExportWndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         int nh = EX_NONE, ni = -1;
         if (d->resOpen) { for (int i = 0; i < (int)d->presets.size(); ++i) if (exPtIn(exItemRect(d, d->rcRes, i), p)) ni = i; }
-        else if (d->ssOpen) { for (int i = 0; i < 4; ++i) if (exPtIn(exItemRect(d, d->rcSS, i), p)) ni = i; }
+        else if (d->ssOpen) { for (int i = 0; i < kSSCount; ++i) if (exPtIn(exItemRect(d, d->rcSS, i), p)) ni = i; }
         else nh = exHitTest(d, p);
         if (nh != d->hover || ni != d->hoverItem) { d->hover = nh; d->hoverItem = ni; InvalidateRect(h, nullptr, FALSE); }
         return 0;
@@ -720,7 +724,7 @@ LRESULT CALLBACK ExportWndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             d->resOpen = false; InvalidateRect(h, nullptr, FALSE); return 0;
         }
         if (d->ssOpen) {
-            for (int i = 0; i < 4; ++i)
+            for (int i = 0; i < kSSCount; ++i)
                 if (exPtIn(exItemRect(d, d->rcSS, i), p)) {
                     d->ssSel = i; d->ssOpen = false; startPreview(d); InvalidateRect(h, nullptr, FALSE); return 0;
                 }
@@ -871,17 +875,24 @@ struct PaletteEditor {
     void rebuild() {
         if (stops.empty()) return;
         int n = (int)stops.size();
-        std::vector<float> xs(n + 2), ys(n + 2), out(colP);
         std::vector<std::array<float, 3>> lab(n);
         for (int i = 0; i < n; ++i)
             rgb2lab(stops[i].r, stops[i].g, stops[i].b, lab[i][0], lab[i][1], lab[i][2]);
-        xs[0] = stops.back().pos - 1.0f;
-        xs[n + 1] = stops.front().pos + 1.0f;
-        for (int i = 0; i < n; ++i) xs[i + 1] = stops[i].pos;
+        // Tile the stops over three periods [-1, 0, +1] and sample the middle one,
+        // so the monotone-cubic spline is truly periodic (continuous + C1) across
+        // the color-cycle wrap (index colP-1 -> 0). A single ghost on each side
+        // (the previous scheme) left a visible seam for presets whose stops don't
+        // span [0,1] -- e.g. Gems (0.05..0.92) jumped ~11 dLab at the wrap.
+        int m = 3 * n;
+        std::vector<float> xs(m), out(colP);
+        for (int p = -1; p <= 1; ++p)
+            for (int i = 0; i < n; ++i)
+                xs[(p + 1) * n + i] = stops[i].pos + p;
         for (int c = 0; c < 3; ++c) {
-            ys[0] = lab.back()[c]; ys[n + 1] = lab.front()[c];
-            for (int i = 0; i < n; ++i) ys[i + 1] = lab[i][c];
-            mono_cubic_interpolate(xs.data(), ys.data(), n + 2, out.data(), colP);
+            std::vector<float> ys(m);
+            for (int p = 0; p < 3; ++p)
+                for (int i = 0; i < n; ++i) ys[p * n + i] = lab[i][c];
+            mono_cubic_interpolate(xs.data(), ys.data(), m, out.data(), colP);
             for (int i = 0; i < colP; ++i) color_map[c][i] = out[i];
         }
         for (int i = 0; i < colP; ++i) {
