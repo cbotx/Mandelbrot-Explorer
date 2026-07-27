@@ -122,6 +122,15 @@ private:
                  double* outAB = nullptr) const;
     int createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random,
                   int c_method = 0, bool view_center = false);
+    // Periodic-reference experiment (opt-in via MANDEL_PERIODIC, floatexp non-EDE
+    // path). Detect a minibrot nucleus near the view centre; returns its period
+    // (0 if none in view) and fills the nucleus coordinate.
+    int findNucleus(mpf_t nuc_re, mpf_t nuc_im, int maxp);
+    // Build the reference from ONE period at the nucleus (GMP), then replicate it
+    // over [0, mxit] so the existing delta loop / BLA are unchanged. Returns the
+    // effective reference length (mxit). Only the Z orbit is periodic (no EDE
+    // derivative), so this is non-EDE only.
+    int createPeriodicRef(int period, int mxit, int c_method);
     bool calCoefficient(int i, int pr_it, int c_method = 0);
     // Deep-zoom rescaled perturbation (Zhuoran z = S w): the delta w stays an
     // O(1) double while the floatexp scale S carries the deep exponent, so the

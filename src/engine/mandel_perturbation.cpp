@@ -86,6 +86,84 @@ static inline FloatExp mpf_to_fe(mpf_srcptr x) {
 }
 
 
+// ---------------------------------------------------------------------------
+// GMP minibrot nucleus finder for the periodic-reference experiment. Ball
+// (interval) arithmetic finds the dominant period in a disk; Newton refines the
+// critical orbit to return to 0 (the nucleus). All in GMP so it works at any
+// depth (radii below double's underflow). Ported from src/bench/periodic_ref_bench.
+// ---------------------------------------------------------------------------
+namespace {
+struct GScratch {
+    mpf_t t1, t2, t3;
+    explicit GScratch(mp_bitcnt_t p) { mpf_init2(t1, p); mpf_init2(t2, p); mpf_init2(t3, p); }
+    ~GScratch() { mpf_clear(t1); mpf_clear(t2); mpf_clear(t3); }
+};
+// z = z^2 + c (Karatsuba square: 2 muls)
+inline void g_sqadd(mpf_t zr, mpf_t zi, mpf_srcptr cr, mpf_srcptr ci, GScratch& s) {
+    mpf_add(s.t1, zr, zi); mpf_sub(s.t2, zr, zi); mpf_mul(s.t3, zr, zi);
+    mpf_mul(zr, s.t1, s.t2); mpf_add(zr, zr, cr);
+    mpf_mul_ui(zi, s.t3, 2); mpf_add(zi, zi, ci);
+}
+inline void g_abs(mpf_t out, mpf_srcptr zr, mpf_srcptr zi, GScratch& s) {
+    mpf_mul(s.t1, zr, zr); mpf_mul(s.t2, zi, zi); mpf_add(s.t1, s.t1, s.t2); mpf_sqrt(out, s.t1);
+}
+// Ball-arithmetic period: propagate the disk of c-values (centre, radius r) under
+// z->z^2+c as a disk (centre z_n, radius R_n): R' = (2|z|+R)R + r (+ a small
+// precision-scaled roundoff allowance). First p with |z_p| <= R_p => a period-p
+// nucleus lies in the disk. Returns period (0 if none / escaped).
+static int g_ballPeriod(mpf_srcptr cr, mpf_srcptr ci, mpf_srcptr r, int maxp, mp_bitcnt_t prec) {
+    GScratch s(prec);
+    mpf_t zr, zi, R, za, nb, cab, eb, ru, er;
+    mpf_init2(zr, prec); mpf_init2(zi, prec); mpf_init2(R, prec); mpf_init2(za, prec);
+    mpf_init2(nb, prec); mpf_init2(cab, prec); mpf_init2(eb, prec); mpf_init2(ru, prec); mpf_init2(er, prec);
+    mpf_set_ui(zr, 0); mpf_set_ui(zi, 0); mpf_set_ui(R, 0);
+    g_abs(cab, cr, ci, s);
+    mpf_set_ui(ru, 1); mpf_div_2exp(ru, ru, prec > 64 ? prec - 32 : prec / 2);
+    int period = 0;
+    for (int p = 1; p <= maxp; ++p) {
+        g_abs(za, zr, zi, s);                                   // |z| before the step
+        mpf_mul_ui(nb, za, 2); mpf_add(nb, nb, R); mpf_mul(nb, nb, R); mpf_add(nb, nb, r);
+        mpf_mul(er, za, za); mpf_add(er, er, cab); mpf_add_ui(er, er, 1); mpf_mul(er, er, ru);
+        mpf_add(nb, nb, er); mpf_set(R, nb);
+        g_sqadd(zr, zi, cr, ci, s);
+        g_abs(za, zr, zi, s);                                   // |z| after the step
+        if (mpf_cmp(za, R) <= 0) { period = p; break; }
+        mpf_add(eb, R, cab); mpf_add(eb, eb, r); mpf_add_ui(eb, eb, 2);
+        if (mpf_cmp(za, eb) > 0) break;                          // whole disk escaped
+    }
+    mpf_clears(zr, zi, R, za, nb, cab, eb, ru, er, (mpf_ptr)0);
+    return period;
+}
+// Newton-refine (cr,ci) to the period-p nucleus: c <- c - z_p / (dz_p/dc).
+static bool g_newton(mpf_t cr, mpf_t ci, int period, mp_bitcnt_t prec, int maxit) {
+    GScratch s(prec);
+    mpf_t zr, zi, dr, di, den, nr, ni, tol, step2;
+    mpf_init2(zr, prec); mpf_init2(zi, prec); mpf_init2(dr, prec); mpf_init2(di, prec);
+    mpf_init2(den, prec); mpf_init2(nr, prec); mpf_init2(ni, prec); mpf_init2(tol, prec); mpf_init2(step2, prec);
+    mpf_set_ui(tol, 1); mpf_div_2exp(tol, tol, prec > 96 ? prec - 48 : prec / 2); mpf_mul(tol, tol, tol);
+    bool conv = false;
+    for (int it = 0; it < maxit; ++it) {
+        mpf_set_ui(zr, 0); mpf_set_ui(zi, 0); mpf_set_ui(dr, 0); mpf_set_ui(di, 0);
+        for (int i = 0; i < period; ++i) {                      // z_p, dz_p from z0=0
+            mpf_mul(s.t1, zr, dr); mpf_mul(s.t2, zi, di); mpf_sub(s.t3, s.t1, s.t2);
+            mpf_mul_ui(s.t3, s.t3, 2); mpf_add_ui(s.t3, s.t3, 1);
+            mpf_mul(s.t1, zr, di); mpf_mul(s.t2, zi, dr); mpf_add(di, s.t1, s.t2); mpf_mul_ui(di, di, 2);
+            mpf_set(dr, s.t3);
+            g_sqadd(zr, zi, cr, ci, s);
+        }
+        mpf_mul(s.t1, dr, dr); mpf_mul(s.t2, di, di); mpf_add(den, s.t1, s.t2);
+        if (mpf_sgn(den) == 0) break;
+        mpf_mul(s.t1, zr, dr); mpf_mul(s.t2, zi, di); mpf_add(s.t3, s.t1, s.t2); mpf_div(nr, s.t3, den);
+        mpf_mul(s.t1, zi, dr); mpf_mul(s.t2, zr, di); mpf_sub(s.t3, s.t1, s.t2); mpf_div(ni, s.t3, den);
+        mpf_sub(cr, cr, nr); mpf_sub(ci, ci, ni);
+        mpf_mul(s.t1, nr, nr); mpf_mul(s.t2, ni, ni); mpf_add(step2, s.t1, s.t2);
+        if (mpf_cmp(step2, tol) <= 0) { conv = true; break; }
+    }
+    mpf_clears(zr, zi, dr, di, den, nr, ni, tol, step2, (mpf_ptr)0);
+    return conv;
+}
+} // namespace
+
 Mandel::Mandel(int width, int height, int max_iteration, int sub, float* iter) : _w(width), _h(height), _mxit(max_iteration), _sub(sub), _iter(iter) {
     assert(width > 0);
     assert(height > 0);
@@ -456,6 +534,69 @@ void Mandel::ComputeDirect(int mxit, float* out, int step, int c_method) {
     }
 }
 
+int Mandel::findNucleus(mpf_t nuc_re, mpf_t nuc_im, int maxp) {
+    const mp_bitcnt_t prec = mpf_get_prec(_c0_re);
+    mpf_t cre, cim, r, dh, dist, dr, di;
+    mpf_init2(cre, prec); mpf_init2(cim, prec); mpf_init2(r, prec); mpf_init2(dh, prec);
+    mpf_init2(dist, prec); mpf_init2(dr, prec); mpf_init2(di, prec);
+    // View centre = c0 + (halfwidth, halfheight); search radius = halfwidth = 2/scale.
+    mpf_set_ui(r, 2); mpf_div(r, r, _scale);
+    mpf_add(cre, _c0_re, r);
+    mpf_mul_ui(dh, r, _h); mpf_div_ui(dh, dh, _w);
+    mpf_add(cim, _c0_im, dh);
+    int period = g_ballPeriod(cre, cim, r, maxp, prec);
+    int result = 0;
+    if (period > 0) {
+        mpf_set(nuc_re, cre); mpf_set(nuc_im, cim);
+        if (g_newton(nuc_re, nuc_im, period, prec, 200)) {
+            // Accept only if the refined nucleus is inside the search disk.
+            mpf_sub(dr, nuc_re, cre); mpf_sub(di, nuc_im, cim);
+            mpf_mul(dr, dr, dr); mpf_mul(di, di, di); mpf_add(dist, dr, di); mpf_sqrt(dist, dist);
+            if (mpf_cmp(dist, r) <= 0) result = period;
+        }
+    }
+    mpf_clears(cre, cim, r, dh, dist, dr, di, (mpf_ptr)0);
+    return result;
+}
+
+int Mandel::createPeriodicRef(int period, int mxit, int c_method) {
+    // The reference IS the nucleus (bounded, exactly period-p). Build one period
+    // in GMP (reusing calCoefficient, which fills every double/floatexp shadow),
+    // then replicate it over [period, mxit]: the nucleus orbit satisfies
+    // Z_{i} = Z_{i-period}, so the existing delta loop / BLA read a correct
+    // reference without a full mxit-long GMP build.  _ref_z is already the nucleus.
+    _ref_z_f = Comp{ mpf_get_ld(_ref_z_re), mpf_get_ld(_ref_z_im) };
+    _ref = { _h / 2, _w / 2, 0, 0 };
+    _ref_virtual = true;   // the nucleus is not a rendered pixel (skip centre-pixel erase; every pixel is computed)
+    // Fractional pixel coordinate of the nucleus, so the floatexp dc =
+    // _dxfe*(px - _ref_x) equals c_pixel - nucleus exactly.
+    mpf_sub(_t1, _ref_z_re, _c0_re); mpf_div(_t1, _t1, _dx); _ref_x = mpf_get_d(_t1);
+    mpf_sub(_t1, _ref_z_im, _c0_im); mpf_div(_t1, _t1, _dy); _ref_y = mpf_get_d(_t1);
+
+    // Z_0 = nucleus (mirror createRef's index-0 setup).
+    mpf_set(_z_re[0], _ref_z_re); mpf_set(_z_im[0], _ref_z_im);
+    _zf[0] = _ref_z_f; _zfr[0] = _ref_z_f.real(); _zfi[0] = _ref_z_f.imag();
+    _zfr_fe[0] = mpf_to_fe(_ref_z_re); _zfi_fe[0] = mpf_to_fe(_ref_z_im);
+    _z_m3[0] = (_zfr[0] * _zfr[0] + _zfi[0] * _zfi[0]) / 1000000;
+    _df[0] = Comp{ 1 }; _dfr[0] = 1.0; _dfi[0] = 0.0;
+    _dfe_r = FloatExp{ 1.0, 0 }; _dfe_i = FloatExp{ 0.0, 0 };
+    _SA_flag = false; _SA_it = 0; _SA_order = 0;
+    for (int i = 0; i < _SA_N; ++i) _Adf_old[i] = _Bdf_old[i] = 0;
+
+    // One period: Z_1..Z_{period-1} via the exact GMP recurrence (pr_it = 0 so no
+    // series-approximation work). The nucleus orbit is bounded (never escapes).
+    for (int i = 1; i < period; ++i) calCoefficient(i, 0, c_method);
+
+    // Replicate the period across the whole reference. Z_i = Z_{i-period}.
+    for (int i = period; i <= mxit; ++i) {
+        int q = i - period;
+        _zf[i] = _zf[q]; _zfr[i] = _zfr[q]; _zfi[i] = _zfi[q];
+        _zfr_fe[i] = _zfr_fe[q]; _zfi_fe[i] = _zfi_fe[q];
+        _z_m3[i] = _z_m3[q];
+    }
+    return mxit;
+}
+
 
 void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method,
                      int full_h, int row_base) {
@@ -601,6 +742,28 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         Float c0_re_f = mpf_get_ld(_c0_re);
         Float c0_im_f = mpf_get_ld(_c0_im);
         floatPointCompute(c0_re_f, c0_im_f, mxit, c_method);
+        // Periodic-reference experiment (opt-in). If a minibrot nucleus sits in the
+        // view, use it as a bounded period-p reference and build only one period in
+        // GMP (the rest is a cheap replication) instead of a full mxit-long orbit.
+        // Restricted to the floatexp deep path (sub-pixel dc via _ref_x/_ref_y) and
+        // non-EDE (only Z is periodic, not the EDE derivative). Default off.
+        bool periodic_done = false;
+        static int periodic_env = -1;
+        if (periodic_env < 0) { const char* e = getenv("MANDEL_PERIODIC"); periodic_env = e ? atoi(e) : 0; }
+        if (periodic_env && _use_floatexp && !(c_method & ColoringMethod::EXTERIOR_DIST_EST)) {
+            tk = now();
+            int p = findNucleus(_ref_z_re, _ref_z_im, mxit);
+            if (p > 0 && p <= mxit) {
+                ref_it = createPeriodicRef(p, mxit, c_method);
+                _ref_bounded = true;
+                periodic_done = true;
+                if (profile) fprintf(stderr, "  [profile] periodic reference: period=%d (nucleus in view)\n", p);
+            } else if (profile) {
+                fprintf(stderr, "  [profile] periodic reference: no in-view nucleus (period=%d), using full reference\n", p);
+            }
+            pf_ref += now() - tk;
+        }
+        if (!periodic_done) {
         s.insert({ _h / 2, _w / 2, 0, 0 });
         tk = now(); ref_it = createRef(s, mxit, mxit, true, c_method); pf_ref += now() - tk;
         // Content-aware floatexp escalation. Even below the hard 1e280 gate the
@@ -639,6 +802,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                 tk = now(); ref_it = createRef(s, mxit, mxit, true, c_method, true); pf_ref += now() - tk;
             }
         }
+        }   // end if (!periodic_done): normal reference build
         _ref_bounded = (ref_it >= mxit);
         if (_use_bla) { tk = now(); buildBLA(ref_it, (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0); pf_bla += now() - tk; }
         // Reference-orbit stripe prefix sum, so a BLA skip can restore its omitted
