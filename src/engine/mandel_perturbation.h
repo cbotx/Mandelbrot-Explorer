@@ -210,6 +210,9 @@ private:
     // nucleus and the floatexp delta loop indexes it modulo p (only p entries are
     // built, not mxit). 0 = normal (full) reference.
     int _ref_period = 0;
+    // Sub-pixel offset of the nucleus from its nearest pixel (_ref), so the double
+    // path's integer-pixel dc can be corrected to dc = pixel_c - nucleus.
+    Float _ref_frac_re = 0.0, _ref_frac_im = 0.0;
     std::array<int, 4> _new_ref;  // new reference pixel index
     mpf_t _ref_z_re, _ref_z_im;  // reference point coordinate
     Comp _ref_z_f;

@@ -566,18 +566,22 @@ int Mandel::findNucleus(mpf_t nuc_re, mpf_t nuc_im, int maxp) {
 }
 
 int Mandel::createPeriodicRef(int period, int mxit, int c_method) {
-    // The reference IS the nucleus (bounded, exactly period-p). Build one period
-    // in GMP (reusing calCoefficient, which fills every double/floatexp shadow),
-    // then replicate it over [period, mxit]: the nucleus orbit satisfies
-    // Z_{i} = Z_{i-period}, so the existing delta loop / BLA read a correct
-    // reference without a full mxit-long GMP build.  _ref_z is already the nucleus.
+    // The reference IS the nucleus (bounded, exactly period-p). Build ONE period in
+    // GMP (reusing calCoefficient, which fills every double/floatexp shadow); the
+    // delta loop then indexes it modulo p (Z_i = Z_{i-p}), so no mxit-long orbit is
+    // materialised.  _ref_z is already the nucleus.
+    (void)mxit;
     _ref_z_f = Comp{ mpf_get_ld(_ref_z_re), mpf_get_ld(_ref_z_im) };
-    _ref = { _h / 2, _w / 2, 0, 0 };
     _ref_virtual = true;   // the nucleus is not a rendered pixel (skip centre-pixel erase; every pixel is computed)
-    // Fractional pixel coordinate of the nucleus, so the floatexp dc =
-    // _dxfe*(px - _ref_x) equals c_pixel - nucleus exactly.
+    // Fractional pixel coordinate of the nucleus. The floatexp dc = _dxfe*(px-_ref_x)
+    // uses it directly; the double path uses the nearest pixel _ref plus the
+    // sub-pixel remainder _ref_frac so its integer-pixel dc equals c_pixel - nucleus.
     mpf_sub(_t1, _ref_z_re, _c0_re); mpf_div(_t1, _t1, _dx); _ref_x = mpf_get_d(_t1);
     mpf_sub(_t1, _ref_z_im, _c0_im); mpf_div(_t1, _t1, _dy); _ref_y = mpf_get_d(_t1);
+    int px = (int)std::lround(_ref_x), py = (int)std::lround(_ref_y);
+    _ref = { py, px, 0, 0 };
+    _ref_frac_re = (Float)((_ref_x - px) * mpf_get_ld(_dx));   // nucleus - pixel_c(_ref)
+    _ref_frac_im = (Float)((_ref_y - py) * mpf_get_ld(_dy));
 
     // Z_0 = nucleus (mirror createRef's index-0 setup).
     mpf_set(_z_re[0], _ref_z_re); mpf_set(_z_im[0], _ref_z_im);
@@ -586,16 +590,23 @@ int Mandel::createPeriodicRef(int period, int mxit, int c_method) {
     _z_m3[0] = (_zfr[0] * _zfr[0] + _zfi[0] * _zfi[0]) / 1000000;
     _df[0] = Comp{ 1 }; _dfr[0] = 1.0; _dfi[0] = 0.0;
     _dfe_r = FloatExp{ 1.0, 0 }; _dfe_i = FloatExp{ 0.0, 0 };
+    // No series approximation: the double path's SA-init loop (order 0, Adf[0]=SA_delta)
+    // then produces dz = dc, and each pixel starts at reference index 1 (_SA_it = 0).
+    mpf_mul_ui(_t1, _dx, _w); mpf_div_ui(_t1, _t1, 2);
+    mpf_mul_ui(_t2, _dy, _h); mpf_div_ui(_t2, _t2, 2);
+    _SA_delta = { mpf_get_ld(_t1), mpf_get_ld(_t2) };
     _SA_flag = false; _SA_it = 0; _SA_order = 0;
     for (int i = 0; i < _SA_N; ++i) _Adf_old[i] = _Bdf_old[i] = 0;
+    _Adf_old[0] = _SA_delta;
 
     // One period: Z_1..Z_{period-1} via the exact GMP recurrence (pr_it = 0 so no
     // series-approximation work). The nucleus orbit is bounded (never escapes).
+    // Force the floatexp shadow fill so Compute can escalate double->floatexp after
+    // inspecting the reference (the double path itself ignores _zfr_fe).
+    bool save_fe = _use_floatexp; _use_floatexp = true;
     for (int i = 1; i < period; ++i) calCoefficient(i, 0, c_method);
+    _use_floatexp = save_fe;
 
-    // The delta loop indexes this reference modulo the period (Z_{i} = Z_{i-period}),
-    // so only these `period` entries exist -- no mxit-long replication.  BLA is
-    // built over one period; skips are capped to stay within it.
     _ref_period = period;
     return period;
 }
@@ -746,17 +757,21 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         Float c0_im_f = mpf_get_ld(_c0_im);
         floatPointCompute(c0_re_f, c0_im_f, mxit, c_method);
         _ref_period = 0;
-        // Periodic-reference experiment (opt-in). If a minibrot nucleus sits in the
-        // view, use it as a bounded period-p reference: build ONE period in GMP and
-        // let the floatexp delta loop index it modulo p, instead of a full mxit-long
-        // orbit. Restricted to the floatexp deep path (sub-pixel dc via _ref_x/_ref_y),
-        // non-EDE (only Z is periodic, not the EDE derivative), non-SAC (the stripe
-        // prefix sum is not periodic-aware yet), and BLA on (the mod-p index + skip
-        // cap live in the BLA path). Default off.
+        // Periodic-reference optimisation. If a minibrot nucleus sits in the view,
+        // use it as a bounded period-p reference: build ONE period in GMP and let
+        // the delta loop index it modulo p, instead of a full mxit-long orbit. This
+        // only pays off when the (serial, high-precision) reference build is a
+        // meaningful fraction of the frame -- i.e. very deep zoom -- so it is
+        // AUTO-ENABLED for the floatexp deep path (scale > 1e280) and otherwise
+        // opt-in. MANDEL_PERIODIC=1 forces it on at any depth; =0 forces it off.
+        // Requires BLA on, non-EDE, non-SAC (the mod-p index / skip cap / dc live
+        // in those paths; the EDE derivative and SAC prefix sum are not periodic).
         bool periodic_done = false;
         static int periodic_env = -1;
-        if (periodic_env < 0) { const char* e = getenv("MANDEL_PERIODIC"); periodic_env = e ? atoi(e) : 0; }
-        if (periodic_env && _use_floatexp && _use_bla &&
+        if (periodic_env < 0) { const char* e = getenv("MANDEL_PERIODIC"); periodic_env = e ? atoi(e) : -1; }
+        bool periodic_want = (periodic_env == 1) ||
+                             (periodic_env != 0 && mpf_cmp_d(scale, 1e280) > 0);
+        if (periodic_want && _use_bla &&
             !(c_method & ColoringMethod::EXTERIOR_DIST_EST) &&
             !(c_method & ColoringMethod::STRIPE_AVERAGE)) {
             tk = now();
@@ -765,7 +780,16 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                 ref_it = createPeriodicRef(p, mxit, c_method);
                 _ref_bounded = true;
                 periodic_done = true;
-                if (profile) fprintf(stderr, "  [profile] periodic reference: period=%d (nucleus in view)\n", p);
+                // Content-aware escalation (mirrors the full-reference path): if the
+                // nucleus orbit passes close enough to zero that 2*Z*dz underflows,
+                // run the exact floatexp path (the period's floatexp shadow is filled).
+                if (!_use_floatexp) {
+                    double refmin2 = 1e300; bool uf = false;
+                    for (int q = 1; q < p; ++q) { double m2 = _z_m3[q] * 1e6; if (m2 <= 0.0) { uf = true; break; } if (m2 < refmin2) refmin2 = m2; }
+                    double dcmax = 2.0 / mpf_get_d(scale);
+                    if (uf || std::sqrt(refmin2) * dcmax < 1e-300) _use_floatexp = true;
+                }
+                if (profile) fprintf(stderr, "  [profile] periodic reference: period=%d floatexp=%d\n", p, _use_floatexp ? 1 : 0);
             } else if (profile) {
                 fprintf(stderr, "  [profile] periodic reference: no in-view nucleus (period=%d), using full reference\n", p);
             }
@@ -1280,6 +1304,9 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         Comp dc{ mpf_get_ld(t1), mpf_get_ld(t2) };
         mpf_clear(t1);
         mpf_clear(t2);
+        // Periodic reference: the integer-pixel dc above is relative to the nearest
+        // pixel _ref; subtract the nucleus's sub-pixel offset so dc = c_pixel - nucleus.
+        if (_ref_period) { dc = Comp{ dc.real() - _ref_frac_re, dc.imag() - _ref_frac_im }; }
         Float dxf = mpf_get_ld(_dx);
         Comp dz = { 0 };
         Comp dd = { 0 };
@@ -1309,6 +1336,11 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         
 
         int k = j;
+        // Periodic reference: read the orbit modulo the period. rk mirrors k and
+        // rkm1 mirrors k-1, maintained incrementally so the non-periodic path
+        // (per == 0, rk == k, rkm1 == k-1 throughout) stays byte-identical.
+        const int per = _ref_period;
+        int rk = k, rkm1 = k - 1;
         Float m = 1e100;
         // Brent-style periodicity detection (interior): compare the full pixel
         // value z=(zr,zi) to a saved "tortoise" whose position advances at
@@ -1329,12 +1361,13 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                 // Only attempt BLA when dz is small enough that some level could be
                 // valid -- avoids the per-iteration lookup cost when dz is large.
                 // BLA start index s = k-1 (loop-top invariant: dz is at ref index k-1).
-                int skip = tryBLA(k - 1, dzr, dzi, ddr, ddi, dcr, dci, ede,
+                int skip = tryBLA(rkm1, dzr, dzi, ddr, ddi, dcr, dci, ede,
                                   _ESCAPE_RADIUS * _ESCAPE_RADIUS, mx_ref_it);
                 if (skip > 0) {
                     int tid = omp_get_thread_num() & 63;
                     g_bla_stat[tid][0] += skip; ++g_bla_stat[tid][1];
                     k += skip; j += skip;
+                    rk += skip; if (per && rk >= per) rk -= per; rkm1 = (per && rk == 0) ? per - 1 : rk - 1;
                     if (sac) sacc.reset_window();   // the jump breaks the tail window
                     // A BLA skip jumps j forward without visiting the skipped orbit
                     // points, so the periodicity (interior) detector's tortoise/hare
@@ -1369,17 +1402,18 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                 dzi = dzr * dzi * 2 + dci;
             }
             else {
-                tmp = (dzr * _zfr[k - 1] - dzi * _zfi[k - 1]) * 2 + dzr2 - dzi2 + dcr;
-                dzi = (dzr * _zfi[k - 1] + dzi * _zfr[k - 1]) * 2 + dzr * dzi * 2 + dci;
+                tmp = (dzr * _zfr[rkm1] - dzi * _zfi[rkm1]) * 2 + dzr2 - dzi2 + dcr;
+                dzi = (dzr * _zfi[rkm1] + dzi * _zfr[rkm1]) * 2 + dzr * dzi * 2 + dci;
             }
             dzr = tmp;
-            zr = dzr + _zfr[k];
-            zi = dzi + _zfi[k];
+            zr = dzr + _zfr[rk];
+            zi = dzi + _zfi[rk];
             zrad = zr * zr + zi * zi;
 
             if (sac) sacc.push(zr, zi);
 
             ++k;
+            rkm1 = rk; if (per) { if (++rk == per) rk = 0; } else rk = k;
             if (zrad > _ESCAPE_RADIUS * _ESCAPE_RADIUS) {
                 
                 if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
@@ -1423,11 +1457,12 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                     if (j - save_j >= period_win) { zsr = zr; zsi = zi; save_j = j; period_win += period_win; }
                 }
             }
-            // ** Zhuoran method: rebase to original reference with index = 0
-            if (zrad < dzr * dzr + dzi * dzi || k == mx_ref_it) {
+            // ** Zhuoran method: rebase to original reference with index = 0.
+            // Periodic: wrap instead of the ref-end rebase (rk already wraps).
+            if (zrad < dzr * dzr + dzi * dzi || (!per && k == mx_ref_it)) {
                 if ((dzr * dzr + dzi * dzi) / zrad > 10000000) {
                     // Significant magnitude change causes precision loss.
-                    glitch_p[i] = zrad / _z_m3[j];
+                    glitch_p[i] = zrad / _z_m3[per ? j % per : j];
                     break;
                 }
                 dzr = zr;
@@ -1436,9 +1471,9 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                     ddr = dr - 1;
                     ddi = di;
                 }
-                k = 0;
+                k = 0; rk = 0; rkm1 = per ? per - 1 : -1;
             }
-            if (k == mx_ref_it) {
+            if (!per && k == mx_ref_it) {
                 glitch_p[i] = (double)zrad / _z_m3[j];
                 break;
             }
@@ -2094,6 +2129,7 @@ void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g,
 int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random,
                       int c_method, bool view_center) {
     if (s.empty()) return false;
+    _ref_period = 0;   // a normal (non-periodic) reference; delta loop indexes linearly
     ++_ref_cnt;
     std::array<int, 4> p{ _h / 2, _w / 2, 0, 0 };
     if (view_center) {
