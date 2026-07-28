@@ -107,6 +107,7 @@ private:
     // apply the analytic normal-map Lambert shade to the finished bitmap.
     void buildNormalField();
     void applyNormalLight(uint8_t* bitmap);
+    void applyDEOverlay(uint8_t* bitmap);
 };
 
 

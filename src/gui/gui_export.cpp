@@ -83,10 +83,12 @@ static void exportRender(mpf_t cx, mpf_t cy, mpf_t scale_view,
     const bool relief = relief_on != 0;
     std::vector<float> htbuf;
     if (relief) htbuf.assign((size_t)W * H, std::numeric_limits<float>::quiet_NaN());
-    // Analytic normal map: the engine fills a per-subpixel normal-angle buffer.
+    // Analytic normal map / DE overlay: the engine fills a per-subpixel second
+    // buffer (normal angle, or the pixel-normalized distance estimate).
     const bool normal = normal_light_on != 0;
+    const bool deovl = de_overlay_on != 0;
     std::vector<float> normbuf, nfield;
-    if (normal) {
+    if (normal || deovl) {
         normbuf.assign((size_t)Wss * sh * ss, 0.0f);
         mandel.setNormalBuffer(normbuf.data());
         nfield.assign((size_t)W * H, std::numeric_limits<float>::quiet_NaN());
@@ -124,7 +126,7 @@ static void exportRender(mpf_t cx, mpf_t cy, mpf_t scale_view,
                         (hv == EMPTYPIXEL || hv == INTERIOR_SENTINEL)
                             ? std::numeric_limits<float>::quiet_NaN() : (hv < 0 ? 0.0f : hv);
                 }
-                if (normal) {
+                if (normal || deovl) {
                     size_t ci = (size_t)(oi * ss + ss / 2) * Wss + (oj * ss + ss / 2);
                     float hv = ibuf[ci];
                     nfield[orow * W + oj] =
@@ -137,6 +139,7 @@ static void exportRender(mpf_t cx, mpf_t cy, mpf_t scale_view,
     }
     if (relief && !st->cancel) applyReliefTo(out.data(), htbuf.data(), W, H);
     if (normal && !st->cancel) applyNormalLightTo(out.data(), nfield.data(), W, H);
+    if (deovl && !st->cancel) applyDEOverlayTo(out.data(), nfield.data(), W, H);
     { std::lock_guard<std::mutex> lk(st->curMx); st->cur = nullptr; }
     mpf_clear(scale_e);
     st->ok = !st->cancel;

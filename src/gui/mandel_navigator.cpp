@@ -164,7 +164,7 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
     _need_settle = !settled;
     prepareColorFilter();   // also initializes the linear-light LUT
     if (settled && relief_on) buildReliefHeight();
-    if (settled && normal_light_on) buildNormalField();
+    if (settled && (normal_light_on || de_overlay_on)) buildNormalField();
     if (_uniform_feather) {
         const int stride = _w * _sub;
         if (settled) _baseUsub.assign((size_t)_w * _h * _sub * _sub, EMPTYPIXEL);
@@ -191,7 +191,7 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
         }
         if (settled) { _cache_valid = true; _cache_density = color_density; _cache_method = _c_method; }
         applyRelief(bitmap);
-        applyNormalLight(bitmap);
+        applyNormalLight(bitmap);        applyDEOverlay(bitmap);
         return;
     }
     const int stride = _w * _sub;
@@ -244,7 +244,7 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
     }
     if (cacheable) { _cache_valid = true; _cache_density = color_density; _cache_method = _c_method; }
     applyRelief(bitmap);
-    applyNormalLight(bitmap);
+    applyNormalLight(bitmap);    applyDEOverlay(bitmap);
 }
 
 void MandelNavigator::RecolorPhase(uint8_t* bitmap) {
@@ -284,7 +284,7 @@ void MandelNavigator::RecolorPhase(uint8_t* bitmap) {
             }
         }
         applyRelief(bitmap);
-        applyNormalLight(bitmap);
+        applyNormalLight(bitmap);        applyDEOverlay(bitmap);
         return;
     }
 #pragma omp parallel for schedule(dynamic, 8)
@@ -302,7 +302,7 @@ void MandelNavigator::RecolorPhase(uint8_t* bitmap) {
         }
     }
     applyRelief(bitmap);
-    applyNormalLight(bitmap);
+    applyNormalLight(bitmap);    applyDEOverlay(bitmap);
 }
 
 void MandelNavigator::SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method) {
@@ -399,6 +399,11 @@ void MandelNavigator::buildNormalField() {
 void MandelNavigator::applyNormalLight(uint8_t* bitmap) {
     if (!normal_light_on || _normalField.size() != (size_t)_w * _h) return;
     applyNormalLightTo(bitmap, _normalField.data(), _w, _h);
+}
+
+void MandelNavigator::applyDEOverlay(uint8_t* bitmap) {
+    if (!de_overlay_on || _normalField.size() != (size_t)_w * _h) return;
+    applyDEOverlayTo(bitmap, _normalField.data(), _w, _h);
 }
 
 void MandelNavigator::SetMxit(int mxit) {

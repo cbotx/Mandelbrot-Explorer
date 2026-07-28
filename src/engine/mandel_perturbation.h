@@ -32,7 +32,12 @@ enum ColoringMethod {
     // Orbit-trap colouring: tracks the orbit's closest approach to a composite
     // trap (point + Pickover cross + ring) and outputs a palette coordinate. Needs
     // the full orbit (BLA is disabled), so it is slow at deep zoom.
-    ORBIT_TRAP = 32
+    ORBIT_TRAP = 32,
+    // Smooth colour + exterior distance estimate overlay: outputs the smooth value
+    // into `_iter` (base colour) AND the pixel-normalised distance estimate into
+    // `_normal`, so the GUI can draw the B&W filament layer on top of the smooth
+    // colouring (Wikipedia's "DE + smooth"). Reuses the EDE derivative.
+    DE_OVERLAY = 64
 };
 
 class Mandel {

@@ -345,7 +345,7 @@ public:
         rcSS  = { px, y, px + w, y + bh }; y += S(56);
         rcColoringDD = { px, y, px + w, y + bh }; y += S(56);
         // Relief light controls occupy panel space only while Relief mode is active.
-        if (relief_on || normal_light_on) {
+        if (relief_on || normal_light_on || de_overlay_on) {
             rcReliefAz  = { px, y + S(24), px + w, y + S(38) }; y += S(52);
             rcReliefEl  = { px, y + S(24), px + w, y + S(38) }; y += S(52);
             rcReliefStr = { px, y + S(24), px + w, y + S(38) }; y += S(52);
@@ -742,12 +742,12 @@ public:
     }
     // ---- coloring-mode dropdown (Smooth / Distance / Feather / Relief) ----
     static const wchar_t* coloringName(int i) {
-        static const wchar_t* n[6] = { L"Smooth", L"Distance (EDE)", L"Feather (stripe)", L"Relief (3D light)", L"Normal light (3D)", L"Orbit trap" };
-        return n[i < 0 ? 0 : (i > 5 ? 5 : i)];
+        static const wchar_t* n[7] = { L"Smooth", L"Distance (EDE)", L"Feather (stripe)", L"Relief (3D light)", L"Normal light (3D)", L"Orbit trap", L"DE + smooth" };
+        return n[i < 0 ? 0 : (i > 6 ? 6 : i)];
     }
     int coloringItemH() const { return S(28); }
     RECT coloringListRect() const {
-        int n = 6;
+        int n = 7;
         return { rcColoringDD.left, rcColoringDD.bottom + S(2), rcColoringDD.right,
                  rcColoringDD.bottom + S(2) + n * coloringItemH() };
     }
@@ -755,7 +755,7 @@ public:
         RECT lr = coloringListRect();
         if (x < lr.left || x > lr.right || y < lr.top || y > lr.bottom) return -1;
         int i = (y - lr.top) / coloringItemH();
-        return (i < 0 || i > 5) ? -1 : i;
+        return (i < 0 || i > 6) ? -1 : i;
     }
     void drawColoringDD(HDC dc) {
         bool hov = hover == H_EDE;
@@ -770,7 +770,7 @@ public:
         RECT lr = coloringListRect();
         fillRound(dc, lr, CLR_CARD, CLR_ACCENT, S(8));
         int ih = coloringItemH();
-        for (int i = 0; i < 6; ++i) {
+        for (int i = 0; i < 7; ++i) {
             RECT ir = { lr.left, lr.top + i * ih, lr.right, lr.top + (i + 1) * ih };
             if (i == coloringHover) fillRect(dc, { ir.left + S(3), ir.top, ir.right - S(3), ir.bottom }, CLR_CARD_HOV);
             RECT tr = ir; tr.left += S(14);
@@ -778,21 +778,24 @@ public:
         }
     }
     void selectColoring(int idx) {
-        if (idx < 0 || idx > 5) return;
+        if (idx < 0 || idx > 6) return;
         coloringIdx = idx;
         relief_on = (idx == 3) ? 1 : 0;
         normal_light_on = (idx == 4) ? 1 : 0;
+        de_overlay_on = (idx == 6) ? 1 : 0;
         int m = nav->GetCMethod();
-        m &= ~(ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::STRIPE_AVERAGE | ColoringMethod::NORMAL_MAP | ColoringMethod::ORBIT_TRAP);
+        m &= ~(ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::STRIPE_AVERAGE | ColoringMethod::NORMAL_MAP | ColoringMethod::ORBIT_TRAP | ColoringMethod::DE_OVERLAY);
         if (idx == 1) m |= ColoringMethod::EXTERIOR_DIST_EST;
         else if (idx == 2) m |= ColoringMethod::STRIPE_AVERAGE;
         else if (idx == 4) m |= ColoringMethod::NORMAL_MAP;
         else if (idx == 5) m |= ColoringMethod::ORBIT_TRAP;
+        else if (idx == 6) m |= ColoringMethod::DE_OVERLAY;
         // idx 3 (Relief) uses the plain smooth field (method 0) + slope post-shade;
         // idx 4 (Normal light) uses the engine's analytic normal + Lambert shade;
-        // idx 5 (Orbit trap) outputs a trap palette coordinate (BLA off -> slow deep).
+        // idx 5 (Orbit trap) outputs a trap palette coordinate (BLA off -> slow deep);
+        // idx 6 (DE + smooth) draws the distance-estimate B&W layer over the smooth base.
         nav->SetCMethod(m);
-        layout();   // light sliders appear/disappear -> reflow the panel
+        layout();   // light/strength slider appears/disappears -> reflow the panel
         startRender();
     }
 
@@ -983,7 +986,7 @@ public:
         label(dc, rcColoringDD.left, rcColoringDD.top - S(20), L"Coloring");
         drawColoringDD(dc);
 
-        if (relief_on || normal_light_on) {
+        if (relief_on || normal_light_on || de_overlay_on) {
             wchar_t rab[32]; swprintf_s(rab, L"%.0f\u00B0", relief_light_az * 180.0f / 3.14159265f);
             labelRow(dc, rcReliefAz, L"Light azimuth", rab);
             drawSlider(dc, rcReliefAz, std::clamp(relief_light_az / (2.0 * 3.14159265358979), 0.0, 1.0), H_RELAZ);
@@ -1088,7 +1091,7 @@ public:
         RECT dt = rcDensTrack; dt.top -= S(8); dt.bottom += S(8); if (inRect(dt,x,y)) return H_DENSTRACK;
         RECT pt = rcPhaseTrack; pt.top -= S(8); pt.bottom += S(8); if (inRect(pt,x,y)) return H_PHASETRACK;
         RECT sp = rcSpeedTrack; sp.top -= S(8); sp.bottom += S(8); if (inRect(sp,x,y)) return H_SPEEDTRACK;
-        if (relief_on || normal_light_on) {
+        if (relief_on || normal_light_on || de_overlay_on) {
             RECT ra = rcReliefAz;  ra.top -= S(8); ra.bottom += S(8); if (inRect(ra,x,y)) return H_RELAZ;
             RECT re = rcReliefEl;  re.top -= S(8); re.bottom += S(8); if (inRect(re,x,y)) return H_RELEL;
             RECT rs = rcReliefStr; rs.top -= S(8); rs.bottom += S(8); if (inRect(rs,x,y)) return H_RELSTR;
@@ -1423,7 +1426,7 @@ public:
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            if (relief_on || normal_light_on) {
+            if (relief_on || normal_light_on || de_overlay_on) {
                 RECT ra = rcReliefAz; ra.top -= S(10); ra.bottom += S(10);
                 if (inRect(ra, q.x, q.y)) {
                     const double TWO_PI = 6.28318530717959;

@@ -45,6 +45,7 @@ static int g_trap = 0;
 // MANDEL_RELIEF_STR (slope strength).
 static int g_relief = 0;
 static double g_light_az = 2.3, g_light_el = 0.55, g_relief_str = 1.0;
+static double g_de_k = 1.5;   // DE-overlay falloff (MANDEL_DE_K)
 
 static float reliefShadeAt(const float* iter, int y, int x, int Ws, int Hs) {
     float c = iter[(size_t)y * Ws + x];
@@ -151,6 +152,7 @@ int main(int argc, char** argv) {
     if (getenv("MANDEL_LIGHT_AZ")) g_light_az = atof(getenv("MANDEL_LIGHT_AZ"));
     if (getenv("MANDEL_LIGHT_EL")) g_light_el = atof(getenv("MANDEL_LIGHT_EL"));
     if (getenv("MANDEL_RELIEF_STR")) g_relief_str = atof(getenv("MANDEL_RELIEF_STR"));
+    if (getenv("MANDEL_DE_K")) g_de_k = atof(getenv("MANDEL_DE_K"));
 
     float* iter = new float[Ws * Hs];
     for (int i = 0; i < Ws * Hs; ++i) iter[i] = EMPTYPIXEL;
@@ -164,6 +166,14 @@ int main(int argc, char** argv) {
         for (int i = 0; i < Ws * Hs; ++i) normbuf[i] = 0.0f;
         mandel.setNormalBuffer(normbuf);
     }
+    // Optional DE-overlay buffer (MANDEL_DE_OVERLAY=1): pixel-normalised distance
+    // estimate for the B&W filament layer drawn over the smooth colouring.
+    float* debuf = nullptr;
+    if (getenv("MANDEL_DE_OVERLAY") && atoi(getenv("MANDEL_DE_OVERLAY"))) {
+        debuf = new float[Ws * Hs];
+        for (int i = 0; i < Ws * Hs; ++i) debuf[i] = 0.0f;
+        mandel.setNormalBuffer(debuf);
+    }
     mpf_t mcx, mcy, msc;
     mpf_init_set_str(mcx, cx, 10);
     mpf_init_set_str(mcy, cy, 10);
@@ -176,6 +186,7 @@ int main(int argc, char** argv) {
     if (getenv("MANDEL_SAC") && atoi(getenv("MANDEL_SAC"))) { cmethod |= ColoringMethod::STRIPE_AVERAGE; g_sac = 1; }
     if (getenv("MANDEL_TRAP") && atoi(getenv("MANDEL_TRAP"))) { cmethod |= ColoringMethod::ORBIT_TRAP; g_trap = 1; }
     if (normbuf) cmethod |= ColoringMethod::NORMAL_MAP;
+    if (debuf) cmethod |= ColoringMethod::DE_OVERLAY;
     mandel.Compute(mcx, mcy, msc, mxit, cmethod);
     if (getenv("MANDEL_STRIPS") && atoi(getenv("MANDEL_STRIPS")) > 0) {
         // Validation: re-render in horizontal strips (each a strip-sized Mandel
@@ -223,6 +234,12 @@ int main(int argc, char** argv) {
                         double lz = sin(g_light_el);
                         double d = (nx*lx + ny*ly + nz*lz) * inv; if (d < 0) d = 0;
                         sh = (float)(0.3 + 0.8 * d);
+                    } else if (debuf) {
+                        // DE overlay: dark filament structure (small DE) over the
+                        // smooth colour; bw -> 1 far from the boundary, 0 on it.
+                        double de = debuf[(size_t)yy * Ws + xx];
+                        double bw = de / (de + g_de_k);
+                        sh = (float)(0.12 + 0.88 * bw);
                     } else if (g_relief) {
                         sh = reliefShadeAt(iter, yy, xx, Ws, Hs);
                     }

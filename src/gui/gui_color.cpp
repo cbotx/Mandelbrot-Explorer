@@ -16,6 +16,7 @@ float color_phase = 0.0f;
 // coloring mode. Light from the upper-left, moderate slope.
 int   relief_on = 0;
 int   normal_light_on = 0;
+int   de_overlay_on = 0;
 float relief_light_az = 2.3f;
 float relief_light_el = 0.55f;
 float relief_strength = 1.0f;
@@ -149,7 +150,24 @@ void applyNormalLightTo(uint8_t* rgb, const float* angle, int W, int H) {
         }
 }
 
-// ---- analytic anti-aliasing (gradient-based palette prefiltering) ----------
+// Distance-estimate B&W overlay: multiply the smooth colour by a shade that goes
+// dark near the set boundary (small DE) and to full colour far away, drawing the
+// fine filament structure over the base. relief_strength tunes the falloff.
+void applyDEOverlayTo(uint8_t* rgb, const float* de, int W, int H) {
+    const double k = 1.5 + 3.0 * (double)relief_strength;   // strength -> falloff distance
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < H; ++i)
+        for (int j = 0; j < W; ++j) {
+            float d = de[(size_t)i * W + j];
+            if (std::isnan(d)) continue;                  // interior/empty: unshaded
+            double bw = (double)d / ((double)d + k);      // 0 on the boundary -> 1 far away
+            double sh = 0.12 + 0.88 * bw;
+            uint8_t* q = rgb + ((size_t)i * W + j) * 3;
+            q[0] = (uint8_t)(srgbEncode(g_srgb2lin[q[0]] * sh) * 255.0 + 0.5);
+            q[1] = (uint8_t)(srgbEncode(g_srgb2lin[q[1]] * sh) * 255.0 + 0.5);
+            q[2] = (uint8_t)(srgbEncode(g_srgb2lin[q[2]] * sh) * 255.0 + 0.5);
+        }
+}
 // Integrates the palette in LINEAR light so the analytic average is gamma-correct
 // and consistent with the supersampled (SmoothColor) path.
 static double g_palInt[3][colP + 1];   // prefix sum of linear(color_map), [colP] = full sum

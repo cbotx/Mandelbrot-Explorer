@@ -305,9 +305,10 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method,
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
     const bool normal = (c_method & ColoringMethod::NORMAL_MAP) != 0;
     const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
-    // The total derivative dz/dc is iterated for EDE (distance) and for the normal
-    // map (which needs its argument); track it whenever either is requested.
-    const bool deriv = (c_method & ColoringMethod::EXTERIOR_DIST_EST) || normal;
+    const bool de_ovl = (c_method & ColoringMethod::DE_OVERLAY) != 0;
+    // The total derivative dz/dc is iterated for EDE (distance), the normal map
+    // (its argument) and the DE overlay (distance); track it for any of them.
+    const bool deriv = (c_method & ColoringMethod::EXTERIOR_DIST_EST) || normal || de_ovl;
     SacAccum sacc; if (sac) sacc.init(sacWindow());
     TrapAccum trapc;
     int i = 1;
@@ -336,6 +337,10 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method,
             } else if (normal) {
                 // normal angle = arg(z) - arg(dz/dc); base colour = smooth value.
                 if (normalOut) *normalOut = atan2((double)z_im, (double)z_re) - atan2((double)dc_im, (double)dc_re);
+                return (i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
+            } else if (de_ovl) {
+                // base colour = smooth value; overlay = (raw) distance estimate.
+                if (normalOut) *normalOut = sqrt(tmp) * log(tmp) / sqrt(dc_re * dc_re + dc_im * dc_im);
                 return (i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
             } else if (trap) {
                 return trapc.value(i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
@@ -707,8 +712,9 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
         const bool normalmap = (c_method & ColoringMethod::NORMAL_MAP) != 0;
         const bool trapmap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
-        // SAC, the normal map and orbit traps take the scalar path (no SIMD variant).
-        const bool simd0on = simd0 && !(c_method & ColoringMethod::STRIPE_AVERAGE) && !normalmap && !trapmap;   // shallow SIMD has no SAC
+        const bool deovl = (c_method & ColoringMethod::DE_OVERLAY) != 0;
+        // SAC, the normal map, orbit traps and the DE overlay take the scalar path.
+        const bool simd0on = simd0 && !(c_method & ColoringMethod::STRIPE_AVERAGE) && !normalmap && !trapmap && !deovl;   // shallow SIMD has no SAC
         // Coarse-to-fine: a ~1/16-work strided pass paints the whole frame with a
         // blocky preview (picked up immediately by the async display) before the
         // full-resolution pass below sharpens it. ~instant feedback on every view.
@@ -752,6 +758,10 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                         double nrm = 0.0;
                         _iter[idx] = (float)floatPointCompute(c0_re_f + dx_f * j, cim, mxit, c_method, &nrm);
                         _normal[idx] = (float)nrm;
+                    } else if (deovl && _normal) {
+                        double de = 0.0;
+                        _iter[idx] = (float)floatPointCompute(c0_re_f + dx_f * j, cim, mxit, c_method, &de);
+                        _normal[idx] = (_iter[idx] < 0) ? 0.0f : (float)(de / dx_f);   // pixel-normalised DE
                     } else {
                         _iter[idx] = floatPointCompute(c0_re_f + dx_f * j, cim, mxit, c_method);
                         if (ede && _iter[idx] >= 0) _iter[idx] /= dx_f;
@@ -816,6 +826,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         if (periodic_want && _use_bla &&
             !(c_method & ColoringMethod::EXTERIOR_DIST_EST) &&
             !(c_method & ColoringMethod::NORMAL_MAP) &&
+            !(c_method & ColoringMethod::DE_OVERLAY) &&
             !(c_method & ColoringMethod::ORBIT_TRAP) &&
             !(c_method & ColoringMethod::STRIPE_AVERAGE)) {
             tk = now();
@@ -880,7 +891,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         }
         }   // end if (!periodic_done): normal reference build
         if (!periodic_done) _ref_bounded = (ref_it >= mxit);
-        if (_use_bla) { tk = now(); buildBLA(ref_it, (c_method & (ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::NORMAL_MAP)) != 0); pf_bla += now() - tk; }
+        if (_use_bla) { tk = now(); buildBLA(ref_it, (c_method & (ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::NORMAL_MAP | ColoringMethod::DE_OVERLAY)) != 0); pf_bla += now() - tk; }
         // Reference-orbit stripe prefix sum, so a BLA skip can restore its omitted
         // stripe-average contributions (z ~ X during a valid skip) instead of
         // dropping them -- otherwise the dropped fraction grows with distance from
@@ -972,7 +983,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             const bool ss_follows =
                 (_sub > 1) && (c_method & ColoringMethod::SUPER_SAMPLING);
             if ((!s.empty() || ss_follows) && _use_bla) {
-                tk = now(); buildBLA(ref_it, (c_method & (ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::NORMAL_MAP)) != 0);
+                tk = now(); buildBLA(ref_it, (c_method & (ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::NORMAL_MAP | ColoringMethod::DE_OVERLAY)) != 0);
                 pf_bla += now() - tk;
             }
         }
@@ -1204,8 +1215,9 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
 
     const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
     const bool normal = (c_method & ColoringMethod::NORMAL_MAP) != 0;
-    // The total derivative dz/dc is tracked for EDE and for the normal map.
-    const bool deriv = ede || normal;
+    const bool de_ovl = (c_method & ColoringMethod::DE_OVERLAY) != 0;
+    // The total derivative dz/dc is tracked for EDE, the normal map and DE overlay.
+    const bool deriv = ede || normal || de_ovl;
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
     // Orbit traps need every orbit point, so BLA (which skips runs) is disabled.
     const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
@@ -1229,7 +1241,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
 
         std::vector<FloatExp> Dcr(n), Dci(n);
         std::vector<float> val(n);
-        std::vector<float> nrm(normal ? n : 0);
+        std::vector<float> nrm((normal || de_ovl) ? n : 0);
 #pragma omp parallel for schedule(dynamic, 64)
         for (int i = 0; i < (int)v.size(); ++i) {
             if (_flag_halt) continue;
@@ -1263,7 +1275,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                 ++g_fe_fallback;
             }
             setPixel(arr, value);
-            if (normal && _normal) _normal[getIndex(arr)] = nrm[i];
+            if ((normal || de_ovl) && _normal) _normal[getIndex(arr)] = nrm[i];
             markDone(i);
         };
         if (feSimdOn) {
@@ -1278,7 +1290,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
 #pragma omp parallel for schedule(dynamic, 1)
             for (int i = 0; i < (int)v.size(); ++i) {
                 if (_flag_halt) continue;
-                val[i] = pixelRescaled(Dcr[i], Dci[i], mx_ref_it, mxit, c_method, normal ? &nrm[i] : nullptr);
+                val[i] = pixelRescaled(Dcr[i], Dci[i], mx_ref_it, mxit, c_method, (normal || de_ovl) ? &nrm[i] : nullptr);
                 finalize(i);
             }
         }
@@ -1476,6 +1488,10 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                     // base colour = smooth value; normal angle = arg(z) - arg(dz/dc).
                     setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
                     if (_normal) _normal[getIndex(arr)] = (float)(atan2((double)zi, (double)zr) - atan2((double)di, (double)dr));
+                } else if (de_ovl) {
+                    // base colour = smooth value; overlay = pixel-normalised DE.
+                    setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
+                    if (_normal) _normal[getIndex(arr)] = (float)(sqrt(zrad) / dxf * log(zrad) / sqrt(dr * dr + di * di));
                 } else if (trap) {
                     setPixel(arr, trapc.value(j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2)));
                 } else if (sac) {
@@ -1920,7 +1936,8 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
     // coefficients tryBLAfe uses for dz -- the derivative of dz = A dz + B dc).
     const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
     const bool normal = (c_method & ColoringMethod::NORMAL_MAP) != 0;
-    const bool deriv = ede || normal;   // track J = dz/dc for EDE (|J|) and normal (arg J)
+    const bool de_ovl = (c_method & ColoringMethod::DE_OVERLAY) != 0;
+    const bool deriv = ede || normal || de_ovl;   // track J = dz/dc for EDE (|J|), normal (arg J), DE overlay
     FloatExp SJ{ 1.0, 0 };            // |J| scale; J_1 = d(dc)/dc = 1
     double jr = 1.0, ji = 0.0, invSJd = 1.0;   // invSJd = 1/SJ carries the "+1" seed
 
@@ -1996,6 +2013,13 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
             if (normal) {
                 // normal angle = arg(z) - arg(J); SJ > 0 so arg(J) = atan2(ji, jr).
                 if (normalOut) *normalOut = (float)(atan2(zi, zr) - atan2(ji, jr));
+                return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
+            }
+            if (de_ovl) {
+                // base colour = smooth value; overlay = pixel-normalised DE.
+                double num = sqrt(zrad) * log(zrad);
+                FloatExp Jmag = fe_mul_d(SJ, sqrt(jr * jr + ji * ji));
+                if (normalOut) *normalOut = (float)fe_to_double(fe_div(fe_from(num), fe_mul(_dxfe, Jmag)));
                 return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
             }
             if (trap) {
@@ -2319,9 +2343,11 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
 }
 
 bool Mandel::calCoefficient(int i, int pr_it, int c_method) {
-    // Track the reference derivative for EDE (|D|) and the normal map (arg D).
+    // Track the reference derivative for EDE (|D|), the normal map (arg D) and the
+    // DE overlay (|D|).
     const bool deriv = (c_method & ColoringMethod::EXTERIOR_DIST_EST)
-                    || (c_method & ColoringMethod::NORMAL_MAP);
+                    || (c_method & ColoringMethod::NORMAL_MAP)
+                    || (c_method & ColoringMethod::DE_OVERLAY);
     // The full-precision orbit uses two rotating buffers: c = current (i), p =
     // previous (i-1). Opposite parity, so the two are always distinct.
     const int c = i & 1, p = (i - 1) & 1;
