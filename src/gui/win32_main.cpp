@@ -903,15 +903,25 @@ public:
         color_density = std::clamp(p.density, 10.0f, 200.0f);
         ssOn = p.ss;
         coloringIdx = p.coloring;
+        // Keep the coloring flags + method mask consistent with the preset's coloring
+        // (as selectColoring does), otherwise a leftover relief/normal/DE overlay from
+        // the previous mode stays active -> a doubled image and its sliders never leave.
+        relief_on       = (coloringIdx == 3) ? 1 : 0;
+        normal_light_on = (coloringIdx == 4) ? 1 : 0;
+        de_overlay_on   = (coloringIdx == 6) ? 1 : 0;
         int m = 0;
         if (ssOn) m |= ColoringMethod::SUPER_SAMPLING;
         if (coloringIdx == 1) m |= ColoringMethod::EXTERIOR_DIST_EST;
         else if (coloringIdx == 2) m |= ColoringMethod::STRIPE_AVERAGE;
+        else if (coloringIdx == 4) m |= ColoringMethod::NORMAL_MAP;
+        else if (coloringIdx == 5) m |= ColoringMethod::ORBIT_TRAP;
+        else if (coloringIdx == 6) m |= ColoringMethod::DE_OVERLAY;
         nav->SetCMethod(m);
         // palette by name
         const auto& pr = palettePresets();
         for (int i = 0; i < (int)pr.size(); ++i)
             if (wcscmp(pr[i].name, p.palette) == 0) { paletteIdx = i; palette.load(i); break; }
+        layout();   // light sliders appear/disappear with the preset's coloring -> reflow
         std::string scale = expandSci(p.zoom);
         if (!scale.empty() && nav->SetLocation(p.x, p.y, scale)) startRender();
         InvalidateRect(hwnd, nullptr, FALSE);
