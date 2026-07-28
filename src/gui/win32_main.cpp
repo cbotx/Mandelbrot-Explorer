@@ -88,12 +88,28 @@ void getColor(float iteration, uint8_t& r, uint8_t& g, uint8_t& b, int method) {
 // previous RMS/gamma-2 approximation.
 float g_srgb2lin[256];
 static bool g_lutReady = false;
+// Linear-radiance [0,1] -> sRGB [0,255] lookup, so the hot re-colour paths avoid
+// a pow() per channel. 8192 entries + linear interpolation keeps the error below
+// ~0.2 of an 8-bit level (steepest near 0, where lerp halves the residual).
+static constexpr int ENC_N = 8192;
+float g_enc255[ENC_N + 1];
 static void initSrgbLut() {
     for (int i = 0; i < 256; ++i) {
         double c = i / 255.0;
         g_srgb2lin[i] = (float)(c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4));
     }
+    for (int i = 0; i <= ENC_N; ++i) {
+        double L = (double)i / ENC_N;
+        g_enc255[i] = (float)((L <= 0.0031308 ? 12.92 * L : 1.055 * std::pow(L, 1.0 / 2.4) - 0.055) * 255.0);
+    }
     g_lutReady = true;
+}
+// Fast linear[0,1] -> sRGB[0,255] via the LUT (lerp). Clamps out-of-range input.
+float srgbEncode255(double L) {
+    if (L <= 0.0) return 0.0f;
+    if (L >= 1.0) return 255.0f;
+    double f = L * ENC_N; int i = (int)f; double t = f - i;
+    return g_enc255[i] * (float)(1.0 - t) + g_enc255[i + 1] * (float)t;
 }
 static inline double srgb2linF(double v255) {           // fractional sRGB 0..255 -> linear
     double c = v255 / 255.0; if (c < 0) c = 0; else if (c > 1) c = 1;
@@ -145,13 +161,16 @@ void applyReliefTo(uint8_t* rgb, const float* height, int W, int H) {
 // and consistent with the supersampled (SmoothColor) path.
 static double g_palInt[3][colP + 1];   // prefix sum of linear(color_map), [colP] = full sum
 static double g_palMean[3];            // sRGB(mean linear) of the whole palette (full-cycle limit)
+float g_palLin[3][colP];               // per-entry linear radiance of the palette (SS re-colour)
 
 void prepareColorFilter() {
     if (!g_lutReady) initSrgbLut();
     for (int c = 0; c < 3; ++c) {
         double s = 0; g_palInt[c][0] = 0;
         for (int i = 0; i < colP; ++i) {
-            s += srgb2linF(color_map[c][i]); g_palInt[c][i + 1] = s;
+            double lin = srgb2linF(color_map[c][i]);
+            g_palLin[c][i] = (float)lin;
+            s += lin; g_palInt[c][i + 1] = s;
         }
         g_palMean[c] = enc255(s / colP);
     }
@@ -210,8 +229,7 @@ void colorShadeAA(float baseU, float width, float phase, uint8_t& r, uint8_t& g,
     auto avg = [&](int c) {
         double m = (palPrefix(c, e) - palPrefix(c, a)) / width;   // mean linear radiance
         if (m < 0) m = 0;                                          // guard fp cancellation
-        double s = enc255(m);                                      // encode back to sRGB
-        return s > 255.0 ? 255.0f : (float)s;
+        return srgbEncode255(m);                                   // LUT encode to sRGB [0,255]
     };
     r = (uint8_t)avg(0); g = (uint8_t)avg(1); b = (uint8_t)avg(2);
 }

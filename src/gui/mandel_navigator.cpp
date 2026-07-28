@@ -168,20 +168,18 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
                 for (int a = 0; a < _sub; ++a) for (int b = 0; b < _sub; ++b) {
                     int sidx = (i * _sub + a) * stride + j * _sub + b;
                     float v = _iter[sidx];
-                    if (settled) _baseUsub[sidx] = (v == EMPTYPIXEL) ? EMPTYPIXEL
-                                                                     : colorBaseIndex(v, _c_method);
+                    float bu = (v == EMPTYPIXEL) ? EMPTYPIXEL : colorBaseIndex(v, _c_method);
+                    if (settled) _baseUsub[sidx] = bu;
                     if (v == EMPTYPIXEL) continue;
-                    float r, g, bl; getColor(v, r, g, bl, _c_method);
-                    int ri = std::clamp((int)(r + 0.5f), 0, 255);
-                    int gi = std::clamp((int)(g + 0.5f), 0, 255);
-                    int bi = std::clamp((int)(bl + 0.5f), 0, 255);
-                    rs += g_srgb2lin[ri]; gs += g_srgb2lin[gi]; bs += g_srgb2lin[bi]; ++n;
+                    if (bu < 0) { ++n; continue; }          // interior -> black (linear 0)
+                    int x = ((int)(bu + color_phase)) % colP; if (x < 0) x += colP;
+                    rs += g_palLin[0][x]; gs += g_palLin[1][x]; bs += g_palLin[2][x]; ++n;
                 }
                 if (!n) continue;
                 uint8_t* p = bitmap + ((size_t)i * _w + j) * 3;
-                p[0] = (uint8_t)(srgbEncode(rs / n) * 255.0 + 0.5);
-                p[1] = (uint8_t)(srgbEncode(gs / n) * 255.0 + 0.5);
-                p[2] = (uint8_t)(srgbEncode(bs / n) * 255.0 + 0.5);
+                p[0] = (uint8_t)(srgbEncode255(rs / n) + 0.5f);
+                p[1] = (uint8_t)(srgbEncode255(gs / n) + 0.5f);
+                p[2] = (uint8_t)(srgbEncode255(bs / n) + 0.5f);
             }
         }
         if (settled) { _cache_valid = true; _cache_density = color_density; _cache_method = _c_method; }
@@ -265,21 +263,15 @@ void MandelNavigator::RecolorPhase(uint8_t* bitmap) {
                 for (int a = 0; a < _sub; ++a) for (int b = 0; b < _sub; ++b) {
                     float bu = _baseUsub[(size_t)(i * _sub + a) * stride + j * _sub + b];
                     if (bu == EMPTYPIXEL) continue;
-                    int ri, gi, bi;
-                    if (bu < 0) { ri = gi = bi = 0; }
-                    else {
-                        int x = ((int)(bu + color_phase)) % colP; if (x < 0) x += colP;
-                        ri = std::clamp((int)(color_map[0][x] + 0.5f), 0, 255);
-                        gi = std::clamp((int)(color_map[1][x] + 0.5f), 0, 255);
-                        bi = std::clamp((int)(color_map[2][x] + 0.5f), 0, 255);
-                    }
-                    rs += g_srgb2lin[ri]; gs += g_srgb2lin[gi]; bs += g_srgb2lin[bi]; ++n;
+                    if (bu < 0) { ++n; continue; }         // interior -> black (linear 0)
+                    int x = ((int)(bu + color_phase)) % colP; if (x < 0) x += colP;
+                    rs += g_palLin[0][x]; gs += g_palLin[1][x]; bs += g_palLin[2][x]; ++n;
                 }
                 if (!n) continue;
                 uint8_t* p = bitmap + ((size_t)i * _w + j) * 3;
-                p[0] = (uint8_t)(srgbEncode(rs / n) * 255.0 + 0.5);
-                p[1] = (uint8_t)(srgbEncode(gs / n) * 255.0 + 0.5);
-                p[2] = (uint8_t)(srgbEncode(bs / n) * 255.0 + 0.5);
+                p[0] = (uint8_t)(srgbEncode255(rs / n) + 0.5f);
+                p[1] = (uint8_t)(srgbEncode255(gs / n) + 0.5f);
+                p[2] = (uint8_t)(srgbEncode255(bs / n) + 0.5f);
             }
         }
         applyRelief(bitmap);
@@ -343,19 +335,13 @@ void MandelNavigator::shadeSmoothBlockCached(uint8_t* out, int idx) const {
     for (int i = idx - _shift_idx; i <= idx + _shift_idx; i += _w * _sub)
         for (int j = -_sub / 2; j <= _sub / 2; ++j) {
             float bu = _baseUsub[i + j];
-            int ri, gi, bi;
-            if (bu < 0) { ri = gi = bi = 0; }              // interior/empty subpixel
-            else {
-                int x = ((int)(bu + color_phase)) % colP; if (x < 0) x += colP;
-                ri = std::clamp((int)(color_map[0][x] + 0.5f), 0, 255);
-                gi = std::clamp((int)(color_map[1][x] + 0.5f), 0, 255);
-                bi = std::clamp((int)(color_map[2][x] + 0.5f), 0, 255);
-            }
-            rs += g_srgb2lin[ri]; gs += g_srgb2lin[gi]; bs += g_srgb2lin[bi]; ws += 1;
+            if (bu < 0) { ws += 1; continue; }             // interior/empty -> black (linear 0)
+            int x = ((int)(bu + color_phase)) % colP; if (x < 0) x += colP;
+            rs += g_palLin[0][x]; gs += g_palLin[1][x]; bs += g_palLin[2][x]; ws += 1;
         }
-    out[0] = (uint8_t)(srgbEncode(rs / ws) * 255.0 + 0.5);
-    out[1] = (uint8_t)(srgbEncode(gs / ws) * 255.0 + 0.5);
-    out[2] = (uint8_t)(srgbEncode(bs / ws) * 255.0 + 0.5);
+    out[0] = (uint8_t)(srgbEncode255(rs / ws) + 0.5f);
+    out[1] = (uint8_t)(srgbEncode255(gs / ws) + 0.5f);
+    out[2] = (uint8_t)(srgbEncode255(bs / ws) + 0.5f);
 }
 
 // Build a per-pixel height field (centre subpixel smooth value); interior/empty

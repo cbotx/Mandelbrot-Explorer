@@ -63,6 +63,11 @@ float colorBaseIndex(float iteration, int c_method);
 // linear [0,1] back to an sRGB [0,255] value.
 extern float g_srgb2lin[256];
 float srgbEncode(double lin);
+// Fast linear[0,1] -> sRGB[0,255] via an interpolated LUT (no pow); rebuilt with
+// g_srgb2lin. g_palLin is the per-entry linear radiance of the current palette
+// (rebuilt by prepareColorFilter), for the supersampled re-colour hot path.
+float srgbEncode255(double lin);
+extern float g_palLin[3][colP];
 
 void rgbRotate(float& fr, float& fg, float& fb, float rad);
 
