@@ -92,8 +92,15 @@ struct TrapAccum {
     }
     inline float value(double mu) const {
         double d = std::min(std::min(std::sqrt(minPoint), minCross * 1.5), minCircle);
-        double trap = -std::log10(std::max(d, 1e-14));
-        return (float)(0.17 * trap + 0.025 * mu + 0.10 * trapAngle);
+        // Clamp so -log10(d) >= 0: beyond ~1 the orbit never came near a trap, so there
+        // is no "hit" (trap = 0). This ALSO keeps the returned value non-negative --
+        // a negative colour value would collide with the baseU<0 interior sentinel in
+        // the AA re-colour path and paint far-field pixels solid black.
+        if (d > 1.0) d = 1.0;
+        double trap = -std::log10(std::max(d, 1e-14));      // >= 0
+        if (mu < 0) mu = 0;                                 // far-field fast escapes
+        double ang = 0.5 + 0.5 * (trapAngle * (1.0 / 3.14159265358979));   // [0,1]
+        return (float)(0.17 * trap + 0.025 * mu + 0.10 * ang);            // always >= 0
     }
 };
 }
