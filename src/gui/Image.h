@@ -16,6 +16,7 @@ extern float color_phase;
 // space gradient, Lambert-shaded by a light direction; modulates the palette
 // colour. Composes with any coloring/palette and with the phase animation.
 extern int   relief_on;          // 1 => apply relief post-shade
+extern int   normal_light_on;    // 1 => apply analytic normal-map post-shade
 extern float relief_light_az;    // light azimuth  (radians)
 extern float relief_light_el;    // light elevation (radians)
 extern float relief_strength;    // slope strength
@@ -24,6 +25,9 @@ extern float relief_strength;    // slope strength
 // from a per-pixel height field (NaN => interior/empty, left unshaded). Multiplies
 // in linear light. Reads relief_light_az/el and relief_strength.
 void applyReliefTo(uint8_t* rgb, const float* height, int W, int H);
+// Post-shade using an analytic per-pixel surface-normal angle (NaN => unshaded),
+// as produced by the engine's NORMAL_MAP output. Deep-zoom-correct.
+void applyNormalLightTo(uint8_t* rgb, const float* angle, int W, int H);
 
 void writePPMImage(int* data, int width, int height, const char* filename, int maxIterations);
 

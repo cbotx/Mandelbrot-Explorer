@@ -154,6 +154,14 @@ int main(int argc, char** argv) {
     for (int i = 0; i < Ws * Hs; ++i) iter[i] = EMPTYPIXEL;
     Mandel mandel(Ws, Hs, mxit, 1, iter);
     mandel.setPrecision(precision);
+    // Optional analytic normal-map buffer (MANDEL_NORMAL=1). Filled with the
+    // per-pixel surface-normal angle arg(z)-arg(dz/dc) by the engine.
+    float* normbuf = nullptr;
+    if (getenv("MANDEL_NORMAL") && atoi(getenv("MANDEL_NORMAL"))) {
+        normbuf = new float[Ws * Hs];
+        for (int i = 0; i < Ws * Hs; ++i) normbuf[i] = 0.0f;
+        mandel.setNormalBuffer(normbuf);
+    }
     mpf_t mcx, mcy, msc;
     mpf_init_set_str(mcx, cx, 10);
     mpf_init_set_str(mcy, cy, 10);
@@ -164,6 +172,7 @@ int main(int argc, char** argv) {
     int cmethod = (getenv("MANDEL_EDE") && atoi(getenv("MANDEL_EDE"))) ? ColoringMethod::EXTERIOR_DIST_EST : 0;
     if (cmethod & ColoringMethod::EXTERIOR_DIST_EST) g_ede = 1;
     if (getenv("MANDEL_SAC") && atoi(getenv("MANDEL_SAC"))) { cmethod |= ColoringMethod::STRIPE_AVERAGE; g_sac = 1; }
+    if (normbuf) cmethod |= ColoringMethod::NORMAL_MAP;
     mandel.Compute(mcx, mcy, msc, mxit, cmethod);
     if (getenv("MANDEL_STRIPS") && atoi(getenv("MANDEL_STRIPS")) > 0) {
         // Validation: re-render in horizontal strips (each a strip-sized Mandel
@@ -200,7 +209,20 @@ int main(int argc, char** argv) {
                 for (int b = 0; b < SS; ++b) {
                     int yy = i * SS + a, xx = j * SS + b;
                     float r, g, bb; getColor(iter[(size_t)yy * Ws + xx], r, g, bb);
-                    float sh = g_relief ? reliefShadeAt(iter, yy, xx, Ws, Hs) : 1.0f;
+                    float sh = 1.0f;
+                    if (normbuf) {
+                        // Analytic normal-map Lambert shade from arg(z)-arg(dz/dc).
+                        float ang = normbuf[(size_t)yy * Ws + xx];
+                        double nx = cos(ang), ny = sin(ang), nz = 1.0;
+                        double inv = 1.0 / sqrt(nx*nx + ny*ny + nz*nz);
+                        double lx = cos(g_light_el)*cos(g_light_az);
+                        double ly = cos(g_light_el)*sin(g_light_az);
+                        double lz = sin(g_light_el);
+                        double d = (nx*lx + ny*ly + nz*lz) * inv; if (d < 0) d = 0;
+                        sh = (float)(0.3 + 0.8 * d);
+                    } else if (g_relief) {
+                        sh = reliefShadeAt(iter, yy, xx, Ws, Hs);
+                    }
                     lr += toLin(r) * sh; lg += toLin(g) * sh; lb += toLin(bb) * sh;
                 }
             int n = SS * SS;

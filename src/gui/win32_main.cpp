@@ -46,6 +46,7 @@ float color_phase = 0.0f;
 // Relief (screen-space slope) lighting. Off by default; enabled by the "Relief"
 // coloring mode. Light from the upper-left, moderate slope.
 int   relief_on = 0;
+int   normal_light_on = 0;
 float relief_light_az = 2.3f;
 float relief_light_el = 0.55f;
 float relief_strength = 1.0f;
@@ -149,6 +150,31 @@ void applyReliefTo(uint8_t* rgb, const float* height, int W, int H) {
             double d = (nx * lx + ny * ly + nz * lz) * inv;
             if (d < 0) d = 0;
             double sh = 0.25 + 0.85 * d;                  // ambient + diffuse
+            uint8_t* q = rgb + ((size_t)i * W + j) * 3;
+            q[0] = (uint8_t)(srgbEncode(g_srgb2lin[q[0]] * sh) * 255.0 + 0.5);
+            q[1] = (uint8_t)(srgbEncode(g_srgb2lin[q[1]] * sh) * 255.0 + 0.5);
+            q[2] = (uint8_t)(srgbEncode(g_srgb2lin[q[2]] * sh) * 255.0 + 0.5);
+        }
+}
+
+// Analytic normal-map post-shade: the engine gives a per-pixel surface-normal
+// angle (arg(z)-arg(dz/dc)); tilt the unit (cos,sin) by relief_strength and
+// Lambert-shade against the light. Deep-zoom-correct (unlike screen-space relief).
+void applyNormalLightTo(uint8_t* rgb, const float* angle, int W, int H) {
+    const double lx = std::cos((double)relief_light_el) * std::cos((double)relief_light_az);
+    const double ly = std::cos((double)relief_light_el) * std::sin((double)relief_light_az);
+    const double lz = std::sin((double)relief_light_el);
+    const double str = relief_strength;
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < H; ++i)
+        for (int j = 0; j < W; ++j) {
+            float a = angle[(size_t)i * W + j];
+            if (std::isnan(a)) continue;                  // interior/empty: unshaded
+            double nx = std::cos((double)a) * str, ny = std::sin((double)a) * str, nz = 1.0;
+            double inv = 1.0 / std::sqrt(nx * nx + ny * ny + nz * nz);
+            double d = (nx * lx + ny * ly + nz * lz) * inv;
+            if (d < 0) d = 0;
+            double sh = 0.3 + 0.8 * d;
             uint8_t* q = rgb + ((size_t)i * W + j) * 3;
             q[0] = (uint8_t)(srgbEncode(g_srgb2lin[q[0]] * sh) * 255.0 + 0.5);
             q[1] = (uint8_t)(srgbEncode(g_srgb2lin[q[1]] * sh) * 255.0 + 0.5);
@@ -361,6 +387,14 @@ static void exportRender(mpf_t cx, mpf_t cy, mpf_t scale_view,
     const bool relief = relief_on != 0;
     std::vector<float> htbuf;
     if (relief) htbuf.assign((size_t)W * H, std::numeric_limits<float>::quiet_NaN());
+    // Analytic normal map: the engine fills a per-subpixel normal-angle buffer.
+    const bool normal = normal_light_on != 0;
+    std::vector<float> normbuf, nfield;
+    if (normal) {
+        normbuf.assign((size_t)Wss * sh * ss, 0.0f);
+        mandel.setNormalBuffer(normbuf.data());
+        nfield.assign((size_t)W * H, std::numeric_limits<float>::quiet_NaN());
+    }
 
     for (int s = 0; s < nstrips && !st->cancel; ++s) {
         int obase = s * sh;
@@ -394,11 +428,19 @@ static void exportRender(mpf_t cx, mpf_t cy, mpf_t scale_view,
                         (hv == EMPTYPIXEL || hv == INTERIOR_SENTINEL)
                             ? std::numeric_limits<float>::quiet_NaN() : (hv < 0 ? 0.0f : hv);
                 }
+                if (normal) {
+                    size_t ci = (size_t)(oi * ss + ss / 2) * Wss + (oj * ss + ss / 2);
+                    float hv = ibuf[ci];
+                    nfield[orow * W + oj] =
+                        (hv == EMPTYPIXEL || hv == INTERIOR_SENTINEL)
+                            ? std::numeric_limits<float>::quiet_NaN() : normbuf[ci];
+                }
             }
         }
         st->progress = (float)(s + 1) / nstrips;
     }
     if (relief && !st->cancel) applyReliefTo(out.data(), htbuf.data(), W, H);
+    if (normal && !st->cancel) applyNormalLightTo(out.data(), nfield.data(), W, H);
     { std::lock_guard<std::mutex> lk(st->curMx); st->cur = nullptr; }
     mpf_clear(scale_e);
     st->ok = !st->cancel;
@@ -1209,7 +1251,7 @@ public:
         rcSS  = { px, y, px + w, y + bh }; y += S(56);
         rcColoringDD = { px, y, px + w, y + bh }; y += S(56);
         // Relief light controls occupy panel space only while Relief mode is active.
-        if (relief_on) {
+        if (relief_on || normal_light_on) {
             rcReliefAz  = { px, y + S(24), px + w, y + S(38) }; y += S(52);
             rcReliefEl  = { px, y + S(24), px + w, y + S(38) }; y += S(52);
             rcReliefStr = { px, y + S(24), px + w, y + S(38) }; y += S(52);
@@ -1602,12 +1644,12 @@ public:
     }
     // ---- coloring-mode dropdown (Smooth / Distance / Feather / Relief) ----
     static const wchar_t* coloringName(int i) {
-        static const wchar_t* n[4] = { L"Smooth", L"Distance (EDE)", L"Feather (stripe)", L"Relief (3D light)" };
-        return n[i < 0 ? 0 : (i > 3 ? 3 : i)];
+        static const wchar_t* n[5] = { L"Smooth", L"Distance (EDE)", L"Feather (stripe)", L"Relief (3D light)", L"Normal light (3D)" };
+        return n[i < 0 ? 0 : (i > 4 ? 4 : i)];
     }
     int coloringItemH() const { return S(28); }
     RECT coloringListRect() const {
-        int n = 4;
+        int n = 5;
         return { rcColoringDD.left, rcColoringDD.bottom + S(2), rcColoringDD.right,
                  rcColoringDD.bottom + S(2) + n * coloringItemH() };
     }
@@ -1615,7 +1657,7 @@ public:
         RECT lr = coloringListRect();
         if (x < lr.left || x > lr.right || y < lr.top || y > lr.bottom) return -1;
         int i = (y - lr.top) / coloringItemH();
-        return (i < 0 || i > 3) ? -1 : i;
+        return (i < 0 || i > 4) ? -1 : i;
     }
     void drawColoringDD(HDC dc) {
         bool hov = hover == H_EDE;
@@ -1630,7 +1672,7 @@ public:
         RECT lr = coloringListRect();
         fillRound(dc, lr, CLR_CARD, CLR_ACCENT, S(8));
         int ih = coloringItemH();
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 5; ++i) {
             RECT ir = { lr.left, lr.top + i * ih, lr.right, lr.top + (i + 1) * ih };
             if (i == coloringHover) fillRect(dc, { ir.left + S(3), ir.top, ir.right - S(3), ir.bottom }, CLR_CARD_HOV);
             RECT tr = ir; tr.left += S(14);
@@ -1638,16 +1680,19 @@ public:
         }
     }
     void selectColoring(int idx) {
-        if (idx < 0 || idx > 3) return;
+        if (idx < 0 || idx > 4) return;
         coloringIdx = idx;
         relief_on = (idx == 3) ? 1 : 0;
+        normal_light_on = (idx == 4) ? 1 : 0;
         int m = nav->GetCMethod();
-        m &= ~(ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::STRIPE_AVERAGE);
+        m &= ~(ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::STRIPE_AVERAGE | ColoringMethod::NORMAL_MAP);
         if (idx == 1) m |= ColoringMethod::EXTERIOR_DIST_EST;
         else if (idx == 2) m |= ColoringMethod::STRIPE_AVERAGE;
-        // idx 3 (Relief) uses the plain smooth field (method 0) + slope post-shade.
+        else if (idx == 4) m |= ColoringMethod::NORMAL_MAP;
+        // idx 3 (Relief) uses the plain smooth field (method 0) + slope post-shade;
+        // idx 4 (Normal light) uses the engine's analytic normal + Lambert shade.
         nav->SetCMethod(m);
-        layout();   // relief sliders appear/disappear -> reflow the panel
+        layout();   // light sliders appear/disappear -> reflow the panel
         startRender();
     }
 
@@ -1838,7 +1883,7 @@ public:
         label(dc, rcColoringDD.left, rcColoringDD.top - S(20), L"Coloring");
         drawColoringDD(dc);
 
-        if (relief_on) {
+        if (relief_on || normal_light_on) {
             wchar_t rab[32]; swprintf_s(rab, L"%.0f\u00B0", relief_light_az * 180.0f / 3.14159265f);
             labelRow(dc, rcReliefAz, L"Light azimuth", rab);
             drawSlider(dc, rcReliefAz, std::clamp(relief_light_az / (2.0 * 3.14159265358979), 0.0, 1.0), H_RELAZ);
@@ -1943,7 +1988,7 @@ public:
         RECT dt = rcDensTrack; dt.top -= S(8); dt.bottom += S(8); if (inRect(dt,x,y)) return H_DENSTRACK;
         RECT pt = rcPhaseTrack; pt.top -= S(8); pt.bottom += S(8); if (inRect(pt,x,y)) return H_PHASETRACK;
         RECT sp = rcSpeedTrack; sp.top -= S(8); sp.bottom += S(8); if (inRect(sp,x,y)) return H_SPEEDTRACK;
-        if (relief_on) {
+        if (relief_on || normal_light_on) {
             RECT ra = rcReliefAz;  ra.top -= S(8); ra.bottom += S(8); if (inRect(ra,x,y)) return H_RELAZ;
             RECT re = rcReliefEl;  re.top -= S(8); re.bottom += S(8); if (inRect(re,x,y)) return H_RELEL;
             RECT rs = rcReliefStr; rs.top -= S(8); rs.bottom += S(8); if (inRect(rs,x,y)) return H_RELSTR;
@@ -2235,7 +2280,7 @@ public:
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            if (relief_on) {
+            if (relief_on || normal_light_on) {
                 RECT ra = rcReliefAz; ra.top -= S(10); ra.bottom += S(10);
                 if (inRect(ra, q.x, q.y)) {
                     const double TWO_PI = 6.28318530717959;

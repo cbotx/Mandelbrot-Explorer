@@ -23,7 +23,12 @@ enum ColoringMethod {
     SUPER_SAMPLING = 1,
     EXTERIOR_DIST_EST = 2,
     INTERIOR_DIST_EST = 4,
-    STRIPE_AVERAGE = 8
+    STRIPE_AVERAGE = 8,
+    // Analytic normal-map lighting: outputs the smooth escape value into `_iter`
+    // (as method 0) AND the surface-normal angle arg(z) - arg(dz/dc) into a second
+    // buffer `_normal`, from the same derivative EDE tracks. The GUI shades the
+    // base colour by a Lambert light using that normal (light stays animatable).
+    NORMAL_MAP = 16
 };
 
 class Mandel {
@@ -58,6 +63,9 @@ public:
     // colour density before each frame; headless tools leave the default.
     float _ss_density = 60.0f;
     void setDensity(float d) { _ss_density = d; }
+    // Optional second output buffer for NORMAL_MAP: per-pixel surface-normal angle
+    // (same layout as the iter buffer). nullptr => no normal output.
+    void setNormalBuffer(float* n) { _normal = n; }
 
 private:
     inline bool escape(Comp& z) const;
@@ -136,7 +144,7 @@ private:
     // O(1) double while the floatexp scale S carries the deep exponent, so the
     // inner loop is native-double yet correct far past double's ~1e320 underflow.
     // Used when _use_floatexp; returns the pixel escape value (interior -> -2).
-    float pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit, int c_method) const;
+    float pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit, int c_method, float* normalOut = nullptr) const;
     // AVX2 4-wide version of pixelRescaled: iterates up to 4 deep-zoom pixels in
     // lockstep, vectorising the rescaled double step while keeping BLA / rescale /
     // rebase as cheap per-lane scalar events. Writes smooth-iteration values into
@@ -145,7 +153,7 @@ private:
                             int mx_ref_it, int mxit, int c_method, float* out) const;
     int SACheckMagnitude() const;
     float accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_method = 0) const;
-    double floatPointCompute(Float c_re, Float c_im, int mxit, int c_method = 0) const;
+    double floatPointCompute(Float c_re, Float c_im, int mxit, int c_method = 0, double* normalOut = nullptr) const;
     bool attractor(double z_in_re, double z_in_im, const double c_re, const double c_im, int period) const;
 
 private:
@@ -162,6 +170,7 @@ private:
 
     int _sub;
     float* _iter;
+    float* _normal = nullptr;   // optional NORMAL_MAP output (surface-normal angle)
     const int _w, _h;
     const int _mxit;
     mpf_t* _z_re, * _z_im;  // reference orbit

@@ -42,6 +42,11 @@ private:
     // Per-pixel smooth height (centre subpixel), rebuilt on each settled frame;
     // applyRelief() re-shades from it each frame so the light stays animatable.
     std::vector<float> _reliefHt;   // (_w*_h), NaN for interior/empty pixels
+    // Analytic normal-map: the engine fills _normal (sub-grid) with the per-pixel
+    // surface-normal angle; _normalField is the per-output-pixel angle (centre
+    // subpixel), NaN for interior/empty. applyNormalLight() shades from it.
+    float* _normal = nullptr;
+    std::vector<float> _normalField;
 
     std::future<void> _task;
 
@@ -98,6 +103,10 @@ private:
     void buildReliefHeight();
     // Multiply the finished bitmap by per-pixel Lambert slope shading.
     void applyRelief(uint8_t* bitmap);
+    // Build _normalField from the engine's _normal (centre subpixel per pixel) and
+    // apply the analytic normal-map Lambert shade to the finished bitmap.
+    void buildNormalField();
+    void applyNormalLight(uint8_t* bitmap);
 };
 
 

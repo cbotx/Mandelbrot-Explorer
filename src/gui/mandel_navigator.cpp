@@ -26,7 +26,9 @@ MandelNavigator::MandelNavigator(int width, int height, int sub, int max_iterati
           _mxit(max_iteration), _sub(sub), _adaptive_sub(sub) {
     assert(sub % 2);
     _iter = new float[width * height * sub * sub];
+    _normal = new float[width * height * sub * sub];
     _mandel = new Mandel(width, height, max_iteration, sub, _iter);
+    _mandel->setNormalBuffer(_normal);
     _shift_idx = (_w * _sub) * (_sub / 2);
     _require_update = true;
     mpf_init_set_d(_z_re, -0.5);
@@ -38,6 +40,7 @@ MandelNavigator::MandelNavigator(int width, int height, int sub, int max_iterati
 MandelNavigator::~MandelNavigator() {
     InterruptCompute();
     delete[] _iter;
+    delete[] _normal;
     delete _mandel;
     mpf_clear(_z_re);
     mpf_clear(_z_im);
@@ -63,10 +66,13 @@ void MandelNavigator::ConfigureSampling() {
     _sub = want_uniform ? 2 : _adaptive_sub;
     size_t count = (size_t)_w * _h * _sub * _sub;
     _iter = new float[count];
+    delete[] _normal;
+    _normal = new float[count];
     if (want_uniform)
         _mandel = new Mandel(_w * _sub, _h * _sub, _mxit, 1, _iter);
     else
         _mandel = new Mandel(_w, _h, _mxit, _sub, _iter);
+    _mandel->setNormalBuffer(_normal);
     _mandel->setPrecision((int)mpf_get_prec(_scale));
     _shift_idx = (_w * _sub) * (_sub / 2);
     _cache_valid = false;                       // sampling mode changed -> cache stale
@@ -158,6 +164,7 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
     _need_settle = !settled;
     prepareColorFilter();   // also initializes the linear-light LUT
     if (settled && relief_on) buildReliefHeight();
+    if (settled && normal_light_on) buildNormalField();
     if (_uniform_feather) {
         const int stride = _w * _sub;
         if (settled) _baseUsub.assign((size_t)_w * _h * _sub * _sub, EMPTYPIXEL);
@@ -184,6 +191,7 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
         }
         if (settled) { _cache_valid = true; _cache_density = color_density; _cache_method = _c_method; }
         applyRelief(bitmap);
+        applyNormalLight(bitmap);
         return;
     }
     const int stride = _w * _sub;
@@ -236,6 +244,7 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
     }
     if (cacheable) { _cache_valid = true; _cache_density = color_density; _cache_method = _c_method; }
     applyRelief(bitmap);
+    applyNormalLight(bitmap);
 }
 
 void MandelNavigator::RecolorPhase(uint8_t* bitmap) {
@@ -275,6 +284,7 @@ void MandelNavigator::RecolorPhase(uint8_t* bitmap) {
             }
         }
         applyRelief(bitmap);
+        applyNormalLight(bitmap);
         return;
     }
 #pragma omp parallel for schedule(dynamic, 8)
@@ -292,6 +302,7 @@ void MandelNavigator::RecolorPhase(uint8_t* bitmap) {
         }
     }
     applyRelief(bitmap);
+    applyNormalLight(bitmap);
 }
 
 void MandelNavigator::SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method) {
@@ -366,6 +377,28 @@ void MandelNavigator::buildReliefHeight() {
 void MandelNavigator::applyRelief(uint8_t* bitmap) {
     if (!relief_on || _reliefHt.size() != (size_t)_w * _h) return;
     applyReliefTo(bitmap, _reliefHt.data(), _w, _h);
+}
+
+// Per-pixel analytic normal angle from the engine's _normal (centre subpixel);
+// NaN for interior/empty so those stay unshaded.
+void MandelNavigator::buildNormalField() {
+    const int stride = _w * _sub;
+    const int c = _sub / 2;
+    const float NaN = std::numeric_limits<float>::quiet_NaN();
+    _normalField.assign((size_t)_w * _h, 0.0f);
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < _h; ++i)
+        for (int j = 0; j < _w; ++j) {
+            size_t sidx = (size_t)(i * _sub + c) * stride + (j * _sub + c);
+            float v = _iter[sidx];
+            _normalField[(size_t)i * _w + j] =
+                (v == EMPTYPIXEL || v == INTERIOR_SENTINEL) ? NaN : _normal[sidx];
+        }
+}
+
+void MandelNavigator::applyNormalLight(uint8_t* bitmap) {
+    if (!normal_light_on || _normalField.size() != (size_t)_w * _h) return;
+    applyNormalLightTo(bitmap, _normalField.data(), _w, _h);
 }
 
 void MandelNavigator::SetMxit(int mxit) {
