@@ -1128,7 +1128,7 @@ public:
     std::vector<uint8_t> bitmap = std::vector<uint8_t>((size_t)RENDER_W * RENDER_H * 3, 0);
     std::vector<uint8_t> display = std::vector<uint8_t>((size_t)RENDER_W * RENDER_H * 3, 0); // BGR
     std::vector<uint8_t> scaled;   // view-resolution upscale of `display` (BGR top-down)
-    int scaledW = 0, scaledH = 0;
+    int scaledW = 0, scaledH = 0, scaledStride = 0;   // scaledStride = DWORD-aligned row bytes
     PaletteEditor palette;
 
     // widget rects (computed in layout())
@@ -1338,8 +1338,12 @@ public:
     // Replaces GDI's single-threaded HALFTONE StretchDIBits, which dominates the
     // frame time on large windows; the follow-up blit is then a 1:1 copy.
     void scaleDisplay(int vW, int vH) {
-        if (scaledW != vW || scaledH != vH || (int)scaled.size() != vW * vH * 3) {
-            scaled.assign((size_t)vW * vH * 3, 0); scaledW = vW; scaledH = vH;
+        // DIB scanlines must be DWORD-aligned; pad each row to a 4-byte multiple so
+        // StretchDIBits reads it with the stride it derives from biWidth (otherwise
+        // rows drift -> shear + channel separation for non-4-aligned widths).
+        int stride = ((vW * 3) + 3) & ~3;
+        if (scaledW != vW || scaledH != vH || (int)scaled.size() != stride * vH) {
+            scaled.assign((size_t)stride * vH, 0); scaledW = vW; scaledH = vH; scaledStride = stride;
         }
         const uint8_t* src = display.data();
         uint8_t* dst = scaled.data();
@@ -1351,7 +1355,7 @@ public:
             int y0c = std::clamp(y0, 0, RENDER_H - 1), y1c = std::clamp(y0 + 1, 0, RENDER_H - 1);
             const uint8_t* r0 = src + (size_t)y0c * RENDER_W * 3;
             const uint8_t* r1 = src + (size_t)y1c * RENDER_W * 3;
-            uint8_t* d = dst + (size_t)y * vW * 3;
+            uint8_t* d = dst + (size_t)y * stride;
             for (int x = 0; x < vW; ++x) {
                 double fsx = (x + 0.5) * sxr - 0.5;
                 int x0 = (int)std::floor(fsx); double tx = fsx - x0;
@@ -2025,6 +2029,24 @@ public:
         for (int k = 0; k < N; ++k) { fractalOnlyTick = true; InvalidateRect(hwnd, nullptr, FALSE); UpdateWindow(hwnd); }
         double pt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t3).count() / N;
         RECT rcw; GetClientRect(hwnd, &rcw); RECT vr = viewRect();
+        // Dump the upscaled `scaled` buffer to a BMP (stride-aware) so the DIB
+        // alignment can be verified headlessly.
+        if (getenv("MANDEL_GUI_DUMP")) {
+            int vW = vr.right - vr.left, vH = vr.bottom - vr.top;
+            buildDisplay(); scaleDisplay(vW, vH);
+            FILE* bf = nullptr; fopen_s(&bf, "build\\gui_scaled.bmp", "wb");
+            if (bf) {
+                uint32_t ds = (uint32_t)scaledStride * vH, fs = 54 + ds, off = 54;
+                uint8_t fh[14] = { 'B','M' }; memcpy(fh + 2, &fs, 4); memcpy(fh + 10, &off, 4);
+                uint8_t ih[40] = { 0 }; uint32_t v; v = 40; memcpy(ih, &v, 4);
+                int32_t iw = vW, ihh = vH; memcpy(ih + 4, &iw, 4); memcpy(ih + 8, &ihh, 4);
+                uint16_t pl = 1, bp = 24; memcpy(ih + 12, &pl, 2); memcpy(ih + 14, &bp, 2);
+                memcpy(ih + 20, &ds, 4);
+                fwrite(fh, 1, 14, bf); fwrite(ih, 1, 40, bf);
+                for (int y = vH - 1; y >= 0; --y) fwrite(scaled.data() + (size_t)y * scaledStride, 1, scaledStride, bf);
+                fclose(bf);
+            }
+        }
         FILE* f = nullptr; fopen_s(&f, "build\\gui_bench.txt", "a");
         if (f) {
             fprintf(f, "SS=%d  recolor=%.3f ms  full=%.3f  buildDisplay=%.3f  present(paint)=%.3f  view=%ldx%ld win=%ldx%ld\n",
