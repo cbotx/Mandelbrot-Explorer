@@ -63,6 +63,8 @@ static inline bool isInterior(float it) { return it == INTERIOR_SENTINEL; }
 static float colorFunction(float it, int method) {
     if (method & ColoringMethod::STRIPE_AVERAGE)
         return it * (color_density / 20.0f);   // SAC value in [0,1] -> banded palette
+    if (method & ColoringMethod::ORBIT_TRAP)
+        return it;                              // orbit-trap value is already a palette coordinate
     if (method & ColoringMethod::EXTERIOR_DIST_EST)
         return tanhf(it * color_density / 3600.0f * 5.0f);
     if (it < 0.0f) it = 0.0f;                  // far-field fast escapes: small negative count
@@ -1648,12 +1650,12 @@ public:
     }
     // ---- coloring-mode dropdown (Smooth / Distance / Feather / Relief) ----
     static const wchar_t* coloringName(int i) {
-        static const wchar_t* n[5] = { L"Smooth", L"Distance (EDE)", L"Feather (stripe)", L"Relief (3D light)", L"Normal light (3D)" };
-        return n[i < 0 ? 0 : (i > 4 ? 4 : i)];
+        static const wchar_t* n[6] = { L"Smooth", L"Distance (EDE)", L"Feather (stripe)", L"Relief (3D light)", L"Normal light (3D)", L"Orbit trap" };
+        return n[i < 0 ? 0 : (i > 5 ? 5 : i)];
     }
     int coloringItemH() const { return S(28); }
     RECT coloringListRect() const {
-        int n = 5;
+        int n = 6;
         return { rcColoringDD.left, rcColoringDD.bottom + S(2), rcColoringDD.right,
                  rcColoringDD.bottom + S(2) + n * coloringItemH() };
     }
@@ -1661,7 +1663,7 @@ public:
         RECT lr = coloringListRect();
         if (x < lr.left || x > lr.right || y < lr.top || y > lr.bottom) return -1;
         int i = (y - lr.top) / coloringItemH();
-        return (i < 0 || i > 4) ? -1 : i;
+        return (i < 0 || i > 5) ? -1 : i;
     }
     void drawColoringDD(HDC dc) {
         bool hov = hover == H_EDE;
@@ -1676,7 +1678,7 @@ public:
         RECT lr = coloringListRect();
         fillRound(dc, lr, CLR_CARD, CLR_ACCENT, S(8));
         int ih = coloringItemH();
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < 6; ++i) {
             RECT ir = { lr.left, lr.top + i * ih, lr.right, lr.top + (i + 1) * ih };
             if (i == coloringHover) fillRect(dc, { ir.left + S(3), ir.top, ir.right - S(3), ir.bottom }, CLR_CARD_HOV);
             RECT tr = ir; tr.left += S(14);
@@ -1684,17 +1686,19 @@ public:
         }
     }
     void selectColoring(int idx) {
-        if (idx < 0 || idx > 4) return;
+        if (idx < 0 || idx > 5) return;
         coloringIdx = idx;
         relief_on = (idx == 3) ? 1 : 0;
         normal_light_on = (idx == 4) ? 1 : 0;
         int m = nav->GetCMethod();
-        m &= ~(ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::STRIPE_AVERAGE | ColoringMethod::NORMAL_MAP);
+        m &= ~(ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::STRIPE_AVERAGE | ColoringMethod::NORMAL_MAP | ColoringMethod::ORBIT_TRAP);
         if (idx == 1) m |= ColoringMethod::EXTERIOR_DIST_EST;
         else if (idx == 2) m |= ColoringMethod::STRIPE_AVERAGE;
         else if (idx == 4) m |= ColoringMethod::NORMAL_MAP;
+        else if (idx == 5) m |= ColoringMethod::ORBIT_TRAP;
         // idx 3 (Relief) uses the plain smooth field (method 0) + slope post-shade;
-        // idx 4 (Normal light) uses the engine's analytic normal + Lambert shade.
+        // idx 4 (Normal light) uses the engine's analytic normal + Lambert shade;
+        // idx 5 (Orbit trap) outputs a trap palette coordinate (BLA off -> slow deep).
         nav->SetCMethod(m);
         layout();   // light sliders appear/disappear -> reflow the panel
         startRender();
@@ -2046,6 +2050,26 @@ public:
                 for (int y = vH - 1; y >= 0; --y) fwrite(scaled.data() + (size_t)y * scaledStride, 1, scaledStride, bf);
                 fclose(bf);
             }
+            // Final composited frame (RGB, 900x600) exactly as shown in the view.
+            FILE* ff = nullptr; fopen_s(&ff, "build\\gui_frame.bmp", "wb");
+            if (ff) {
+                int stride = (RENDER_W * 3 + 3) & ~3; uint32_t ds = (uint32_t)stride * RENDER_H, fs = 54 + ds, off = 54;
+                uint8_t fh[14] = { 'B','M' }; memcpy(fh + 2, &fs, 4); memcpy(fh + 10, &off, 4);
+                uint8_t ih[40] = { 0 }; uint32_t v; v = 40; memcpy(ih, &v, 4);
+                int32_t iw = RENDER_W, ihh = RENDER_H; memcpy(ih + 4, &iw, 4); memcpy(ih + 8, &ihh, 4);
+                uint16_t pl = 1, bp = 24; memcpy(ih + 12, &pl, 2); memcpy(ih + 14, &bp, 2);
+                memcpy(ih + 20, &ds, 4);
+                fwrite(fh, 1, 14, ff); fwrite(ih, 1, 40, ff);
+                std::vector<uint8_t> row(stride, 0);
+                for (int y = RENDER_H - 1; y >= 0; --y) {
+                    for (int x = 0; x < RENDER_W; ++x) {
+                        const uint8_t* s = bitmap.data() + ((size_t)y * RENDER_W + x) * 3;
+                        row[x * 3] = s[2]; row[x * 3 + 1] = s[1]; row[x * 3 + 2] = s[0];   // RGB->BGR
+                    }
+                    fwrite(row.data(), 1, stride, ff);
+                }
+                fclose(ff);
+            }
         }
         FILE* f = nullptr; fopen_s(&f, "build\\gui_bench.txt", "a");
         if (f) {
@@ -2135,6 +2159,10 @@ public:
                 const char* e = getenv("MANDEL_GUI_SS");
                 ssOn = !e || atoi(e);
                 if (ssOn) nav->SetCMethod(nav->GetCMethod() | ColoringMethod::SUPER_SAMPLING);
+                if (const char* cc = getenv("MANDEL_GUI_COLOR")) selectColoring(atoi(cc));
+                const char* gx = getenv("MANDEL_GUI_CX"), *gy = getenv("MANDEL_GUI_CY"), *gz = getenv("MANDEL_GUI_ZOOM");
+                if (gx && gy && gz) { std::string sc = expandSci(gz); if (!sc.empty()) nav->SetLocation(gx, gy, sc); }
+                if (const char* ds = getenv("MANDEL_GUI_DENS")) color_density = (float)atof(ds);
             }
             layout(); startRender();
             SetTimer(hwnd, TIMER_ID, 16, nullptr);

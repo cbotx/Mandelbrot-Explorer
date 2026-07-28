@@ -36,6 +36,7 @@ static inline float color_func(float it) {
 
 static int g_sac = 0;
 static int g_ede = 0;
+static int g_trap = 0;
 
 // ---- screen-space slope (relief) lighting -------------------------------
 // Height = smooth escape value; the normal comes from its screen-space gradient,
@@ -71,6 +72,7 @@ static void getColor(float it, float& r, float& g, float& b) {
     // banded feather texture. Iteration counts use the log-power curve.
     float f = g_sac ? it * (color_density / 20.0f)
             : g_ede ? tanhf(it * color_density / 3600.0f * 5.0f)
+            : g_trap ? it                       // orbit-trap value is a palette coordinate
             : color_func(it);
     int x = (int)(f * colP) % colP;
     if (x < 0) x += colP;
@@ -172,6 +174,7 @@ int main(int argc, char** argv) {
     int cmethod = (getenv("MANDEL_EDE") && atoi(getenv("MANDEL_EDE"))) ? ColoringMethod::EXTERIOR_DIST_EST : 0;
     if (cmethod & ColoringMethod::EXTERIOR_DIST_EST) g_ede = 1;
     if (getenv("MANDEL_SAC") && atoi(getenv("MANDEL_SAC"))) { cmethod |= ColoringMethod::STRIPE_AVERAGE; g_sac = 1; }
+    if (getenv("MANDEL_TRAP") && atoi(getenv("MANDEL_TRAP"))) { cmethod |= ColoringMethod::ORBIT_TRAP; g_trap = 1; }
     if (normbuf) cmethod |= ColoringMethod::NORMAL_MAP;
     mandel.Compute(mcx, mcy, msc, mxit, cmethod);
     if (getenv("MANDEL_STRIPS") && atoi(getenv("MANDEL_STRIPS")) > 0) {

@@ -76,6 +76,26 @@ struct SacAccum {
         return (float)(a2 + (a1 - a2) * frac);
     }
 };
+// Orbit-trap accumulator: tracks the orbit's closest approach to a composite trap
+// (a point at 0, the Pickover cross x=0/y=0, and the ring |z|=0.5) plus the angle
+// at the point-trap minimum, and maps them to a palette coordinate. Deterministic
+// (no randomness); the trap shape is the design parameter.
+struct TrapAccum {
+    double minPoint = 1e300, trapAngle = 0.0, minCross = 1e300, minCircle = 1e300;
+    inline void push(double zr, double zi) {
+        double m2 = zr * zr + zi * zi;
+        if (m2 < minPoint) { minPoint = m2; trapAngle = atan2(zi, zr); }
+        double cross = std::min(std::fabs(zr), std::fabs(zi));
+        if (cross < minCross) minCross = cross;
+        double circle = std::fabs(std::sqrt(m2) - 0.5);
+        if (circle < minCircle) minCircle = circle;
+    }
+    inline float value(double mu) const {
+        double d = std::min(std::min(std::sqrt(minPoint), minCross * 1.5), minCircle);
+        double trap = -std::log10(std::max(d, 1e-14));
+        return (float)(0.17 * trap + 0.025 * mu + 0.10 * trapAngle);
+    }
+};
 }
 
 // GMP mpf -> floatexp (m * 2^e, 0.5 <= |m| < 1), no underflow.
@@ -284,10 +304,12 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method,
     Float tmp;
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
     const bool normal = (c_method & ColoringMethod::NORMAL_MAP) != 0;
+    const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
     // The total derivative dz/dc is iterated for EDE (distance) and for the normal
     // map (which needs its argument); track it whenever either is requested.
     const bool deriv = (c_method & ColoringMethod::EXTERIOR_DIST_EST) || normal;
     SacAccum sacc; if (sac) sacc.init(sacWindow());
+    TrapAccum trapc;
     int i = 1;
     while (i < mxit) {
         tmp = 2.0 * (d_re * z_re - d_im * z_im);
@@ -305,6 +327,7 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method,
         z_re = tmp;
 
         if (sac) sacc.push((double)z_re, (double)z_im);
+        if (trap) trapc.push((double)z_re, (double)z_im);
 
         tmp = z_re * z_re + z_im * z_im;
         if (tmp > _ESCAPE_RADIUS * _ESCAPE_RADIUS) {
@@ -314,6 +337,8 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method,
                 // normal angle = arg(z) - arg(dz/dc); base colour = smooth value.
                 if (normalOut) *normalOut = atan2((double)z_im, (double)z_re) - atan2((double)dc_im, (double)dc_re);
                 return (i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
+            } else if (trap) {
+                return trapc.value(i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
             } else if (sac) {
                 return sacc.value((double)tmp, (double)_ESCAPE_RADIUS);
             } else {
@@ -681,8 +706,9 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         if (simd0 < 0) { const char* e = getenv("MANDEL_SIMD"); simd0 = e ? atoi(e) : 1; }
         const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
         const bool normalmap = (c_method & ColoringMethod::NORMAL_MAP) != 0;
-        // SAC and the normal map take the scalar path (no SIMD variant).
-        const bool simd0on = simd0 && !(c_method & ColoringMethod::STRIPE_AVERAGE) && !normalmap;   // shallow SIMD has no SAC
+        const bool trapmap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
+        // SAC, the normal map and orbit traps take the scalar path (no SIMD variant).
+        const bool simd0on = simd0 && !(c_method & ColoringMethod::STRIPE_AVERAGE) && !normalmap && !trapmap;   // shallow SIMD has no SAC
         // Coarse-to-fine: a ~1/16-work strided pass paints the whole frame with a
         // blocky preview (picked up immediately by the async display) before the
         // full-resolution pass below sharpens it. ~instant feedback on every view.
@@ -790,6 +816,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         if (periodic_want && _use_bla &&
             !(c_method & ColoringMethod::EXTERIOR_DIST_EST) &&
             !(c_method & ColoringMethod::NORMAL_MAP) &&
+            !(c_method & ColoringMethod::ORBIT_TRAP) &&
             !(c_method & ColoringMethod::STRIPE_AVERAGE)) {
             tk = now();
             int p = findNucleus(_ref_z_re, _ref_z_im, mxit);
@@ -1180,6 +1207,9 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
     // The total derivative dz/dc is tracked for EDE and for the normal map.
     const bool deriv = ede || normal;
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
+    // Orbit traps need every orbit point, so BLA (which skips runs) is disabled.
+    const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
+    const bool use_bla_loop = _use_bla && !trap;
     static int simd_env = -1;
     if (simd_env < 0) { const char* e = getenv("MANDEL_SIMD"); simd_env = e ? atoi(e) : 1; }
 
@@ -1195,7 +1225,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         // BLA already skips most steps and is checked per-lane scalar every
         // iteration, so keep the default (BLA) path scalar and use SIMD only when
         // BLA is off (where the quadratic step is the whole cost).
-        const bool feSimdOn = fesimd && !_use_bla && !sac && !deriv;
+        const bool feSimdOn = fesimd && !_use_bla && !sac && !deriv && !trap;
 
         std::vector<FloatExp> Dcr(n), Dci(n);
         std::vector<float> val(n);
@@ -1260,7 +1290,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         return;
     }
 
-    const bool use_simd = simd_env && !deriv && !sac && !_use_bla && !_use_interior;   // BLA/interior/EDE/normal/SAC paths are scalar
+    const bool use_simd = simd_env && !deriv && !sac && !_use_bla && !_use_interior && !trap;   // BLA/interior/EDE/normal/SAC/trap paths are scalar
 
     if (use_simd) {
         // ---- setup: per-pixel dc + series-approximation initial delta ----
@@ -1377,9 +1407,10 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         // (the escaping tail) so it stays rich at deep zoom and pan-invariant. A
         // BLA skip breaks the tail, so it resets the window.
         SacAccum sacc; if (sac) sacc.init(sacWindow());
+        TrapAccum trapc;
         while (j < mxit) {
             if (_flag_halt) break;
-            if (_use_bla && dzr * dzr + dzi * dzi < _bla_rmax2) {
+            if (use_bla_loop && dzr * dzr + dzi * dzi < _bla_rmax2) {
                 // Only attempt BLA when dz is small enough that some level could be
                 // valid -- avoids the per-iteration lookup cost when dz is large.
                 // BLA start index s = k-1 (loop-top invariant: dz is at ref index k-1).
@@ -1433,6 +1464,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
             zrad = zr * zr + zi * zi;
 
             if (sac) sacc.push(zr, zi);
+            if (trap) trapc.push(zr, zi);
 
             ++k;
             rkm1 = rk; if (per) { if (++rk == per) rk = 0; } else rk = k;
@@ -1444,6 +1476,8 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                     // base colour = smooth value; normal angle = arg(z) - arg(dz/dc).
                     setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
                     if (_normal) _normal[getIndex(arr)] = (float)(atan2((double)zi, (double)zr) - atan2((double)di, (double)dr));
+                } else if (trap) {
+                    setPixel(arr, trapc.value(j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2)));
                 } else if (sac) {
                     setPixel(arr, sacc.value((double)zrad, (double)_ESCAPE_RADIUS));
                 } else {
@@ -1874,6 +1908,8 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
     // then restores a skip's omitted points via the reference-orbit prefix sum.
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
     SacAccum sacc; if (sac) sacc.init(sacWindow());
+    const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;   // BLA disabled below
+    TrapAccum trapc;
 
     // Exterior distance estimation. The double path tracks the derivative in
     // double, but at deep zoom the true derivative |dz/dc| ~ 1/dx overflows it,
@@ -1895,7 +1931,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         // path convention: table index s = m-1). On a skip, dz/S/wr/wi are
         // advanced; recompute the scalar scale s and unit d = dc/S, and restart
         // the periodicity detector (a multi-iter skip leaves its state stale).
-        if (_use_bla && m >= 2) {
+        if (_use_bla && !trap && m >= 2) {
             double ab[4];
             int skip = tryBLAfe(rm, S, S2, wr, wi, dcr, dci, ESC2, per ? per : reflen, deriv ? ab : nullptr);
             if (skip > 0) {
@@ -1949,6 +1985,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         double zr = Xr + s * wr, zi = Xi + s * wi;      // z = X_m + S w
         double zrad = zr * zr + zi * zi;
         if (sac) sacc.push(zr, zi);
+        if (trap) trapc.push(zr, zi);
         if (zrad > ESC2) {
             if (ede) {
                 // dist = |z| log|z|^2 / (dx * |z'|); |z'| = SJ * |j| in floatexp.
@@ -1960,6 +1997,9 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
                 // normal angle = arg(z) - arg(J); SJ > 0 so arg(J) = atan2(ji, jr).
                 if (normalOut) *normalOut = (float)(atan2(zi, zr) - atan2(ji, jr));
                 return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
+            }
+            if (trap) {
+                return trapc.value((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
             }
             if (!sac)
                 return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);

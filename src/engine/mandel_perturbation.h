@@ -28,7 +28,11 @@ enum ColoringMethod {
     // (as method 0) AND the surface-normal angle arg(z) - arg(dz/dc) into a second
     // buffer `_normal`, from the same derivative EDE tracks. The GUI shades the
     // base colour by a Lambert light using that normal (light stays animatable).
-    NORMAL_MAP = 16
+    NORMAL_MAP = 16,
+    // Orbit-trap colouring: tracks the orbit's closest approach to a composite
+    // trap (point + Pickover cross + ring) and outputs a palette coordinate. Needs
+    // the full orbit (BLA is disabled), so it is slow at deep zoom.
+    ORBIT_TRAP = 32
 };
 
 class Mandel {
