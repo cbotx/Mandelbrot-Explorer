@@ -357,8 +357,13 @@ public:
         rcDensTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         rcPhaseTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         rcSpeedTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
-        rcSS  = { px, y, px + w, y + bh }; y += S(56);
-        rcColoringDD = { px, y, px + w, y + bh }; y += S(56);
+        // Unlabeled toggle: box sits at y (no label above), then a uniform 14px gap.
+        rcSS  = { px, y, px + w, y + bh }; y += bh + S(14);
+        // Labeled dropdowns reserve S(24) at the top for their caption (drawn at
+        // box.top-S(20)) -- the same rhythm as the sliders and the gradient bar -- so
+        // the gap to the next control stays uniform instead of double-gapping after a
+        // dropdown and overlapping before one.
+        rcColoringDD = { px, y + S(24), px + w, y + S(24) + bh }; y += S(24) + bh + S(14);
         // Relief/normal light use azimuth+elevation+strength; DE overlay uses only the
         // falloff strength (there is no light direction), so it shows a single slider.
         if (relief_on || normal_light_on) {
@@ -371,7 +376,7 @@ public:
         } else {
             rcReliefAz = rcReliefEl = rcReliefStr = RECT{};
         }
-        rcPaletteDD = { px, y, px + w, y + bh }; y += S(44);
+        rcPaletteDD = { px, y + S(24), px + w, y + S(24) + bh }; y += S(24) + bh + S(14);
         rcGradient = { px, y + S(22), px + w, y + S(62) }; y += S(84);
         rcColor = { px, y, px + w, y + bh }; y += bh + S(16);
         rcGalleryDD = { px, y, px + w, y + bh }; y += bh;
@@ -380,6 +385,13 @@ public:
         // make the panel vertically scrollable. Everything above is laid out from an
         // unscrolled origin; shift all rects up by the (clamped) scroll offset.
         panelContentH = y + S(18);
+        // An expanded dropdown list is an overlay drawn below its box; its height is not
+        // part of the normal stacked content, so extend the scrollable range to reach the
+        // bottom items (otherwise the last entry stays clipped even at max scroll). Rects
+        // are still unscrolled here, so the list rects are at their natural positions.
+        if (coloringOpen) panelContentH = std::max(panelContentH, (int)coloringListRect().bottom + S(18));
+        if (paletteOpen)  panelContentH = std::max(panelContentH, (int)paletteListRect().bottom  + S(18));
+        if (galleryOpen)  panelContentH = std::max(panelContentH, (int)galleryListRect().bottom  + S(18));
         panelViewH = rc.bottom;
         int maxs = std::max(0, panelContentH - panelViewH);
         panelScroll = std::clamp(panelScroll, 0, maxs);
@@ -1391,6 +1403,11 @@ public:
                 }
                 // Apply a gallery preset (e.g. 0 = Night City) for realistic testing.
                 if (const char* gi = getenv("MANDEL_GUI_GALLERY")) applyPreset(atoi(gi));
+                // Force the palette dropdown open (verify it scrolls fully into view).
+                if (getenv("MANDEL_GUI_OPENPAL")) {
+                    paletteOpen = true; layout();
+                    int over = (int)paletteListRect().bottom - panelViewH + S(8); if (over > 0) panelScrollBy(over);
+                }
                 // Real sustained-fps logging mode: run the actual timer/animation loop
                 // and log the measured animFps, instead of the one-shot micro-bench.
                 if (const char* fl = getenv("MANDEL_GUI_FPSLOG")) {
@@ -1487,9 +1504,9 @@ public:
                 return 0;
             }
             Hit h = hitTest(x,y);
-            if (h == H_PALETTE_DD) { paletteOpen = true; paletteHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-            if (h == H_EDE) { coloringOpen = true; coloringHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-            if (h == H_GALLERY_DD) { galleryOpen = true; galleryHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+            if (h == H_PALETTE_DD) { paletteOpen = true; paletteHover = -1; pressed = H_NONE; layout(); int over = (int)paletteListRect().bottom - panelViewH + S(8); if (over > 0) panelScrollBy(over); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+            if (h == H_EDE) { coloringOpen = true; coloringHover = -1; pressed = H_NONE; layout(); int over = (int)coloringListRect().bottom - panelViewH + S(8); if (over > 0) panelScrollBy(over); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+            if (h == H_GALLERY_DD) { galleryOpen = true; galleryHover = -1; pressed = H_NONE; layout(); int over = (int)galleryListRect().bottom - panelViewH + S(8); if (over > 0) panelScrollBy(over); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
             pressed = h;
             if (h == H_PANELSB) { SetCapture(hwnd); panelSbDrag = true; panelSbGrabY = y; panelSbGrabScroll = panelScroll; return 0; }
             if (h == H_GRADIENT) { gradientDown(x); return 0; }
