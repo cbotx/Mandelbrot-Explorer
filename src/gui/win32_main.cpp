@@ -908,7 +908,7 @@ enum Hit {
     H_RESET, H_RENDER, H_SAVE, H_COPY, H_PASTE,
     H_MAXTRACK, H_DENSTRACK, H_PHASETRACK, H_SPEEDTRACK,
     H_RELAZ, H_RELEL, H_RELSTR,
-    H_SS, H_EDE, H_PALETTE_DD, H_COLOR, H_GALLERY_DD
+    H_SS, H_EDE, H_PALETTE_DD, H_COLOR, H_GALLERY_DD, H_PANELSB
 };
 
 // Gallery demo presets: a saved location plus the exact render settings used to
@@ -1088,6 +1088,11 @@ public:
     bool navDragging = false, wasComputing = false;
     Hit hover = H_NONE, pressed = H_NONE;
     int liveFrames = 0;   // frames still needing per-tick repaint (animation/compute)
+    // ---- panel vertical scroll (the control stack can exceed the window height) --
+    int panelScroll = 0;      // current scroll offset in device px (>=0)
+    int panelContentH = 0;    // natural stacked height of all panel controls
+    int panelViewH = 0;       // visible panel height (client bottom)
+    bool panelSbDrag = false; int panelSbGrabY = 0, panelSbGrabScroll = 0;
     int dpi = 96;         // display DPI; all metrics scale by dpi/96
     std::chrono::steady_clock::time_point renderStart;
     double lastRenderMs = 0;
@@ -1188,7 +1193,44 @@ public:
         rcPaletteDD = { px, y, px + w, y + bh }; y += S(44);
         rcGradient = { px, y + S(22), px + w, y + S(62) }; y += S(84);
         rcColor = { px, y, px + w, y + bh }; y += bh + S(16);
-        rcGalleryDD = { px, y, px + w, y + bh };
+        rcGalleryDD = { px, y, px + w, y + bh }; y += bh;
+
+        // The stacked controls can exceed the window height (e.g. in Relief mode);
+        // make the panel vertically scrollable. Everything above is laid out from an
+        // unscrolled origin; shift all rects up by the (clamped) scroll offset.
+        panelContentH = y + S(18);
+        panelViewH = rc.bottom;
+        int maxs = std::max(0, panelContentH - panelViewH);
+        panelScroll = std::clamp(panelScroll, 0, maxs);
+        if (panelScroll != 0) {
+            RECT* all[] = { &rcReset, &rcRender, &rcSave, &rcCopy, &rcPaste,
+                            &rcLocation, &rcMaxTrack, &rcDensTrack, &rcPhaseTrack, &rcSpeedTrack,
+                            &rcReliefAz, &rcReliefEl, &rcReliefStr,
+                            &rcSS, &rcColoringDD, &rcPaletteDD, &rcGradient, &rcColor, &rcGalleryDD };
+            for (RECT* r : all) OffsetRect(r, 0, -panelScroll);
+        }
+    }
+
+    int panelMaxScroll() const { return std::max(0, panelContentH - panelViewH); }
+    void panelScrollBy(int dyDevice) {
+        int maxs = panelMaxScroll();
+        int ns = std::clamp(panelScroll + dyDevice, 0, maxs);
+        if (ns == panelScroll) return;
+        panelScroll = ns; layout(); needFull = true; InvalidateRect(hwnd, nullptr, FALSE);
+    }
+    // Scrollbar thumb rect on the panel's right edge (empty if nothing to scroll).
+    RECT panelScrollbarRect() const {
+        int maxs = panelMaxScroll();
+        if (maxs <= 0 || panelContentH <= 0) return RECT{};
+        RECT rc; GetClientRect(hwnd, &rc);
+        int sbw = S(7);
+        int trackX = rc.right - sbw - S(2);
+        int trackTop = S(2), trackBot = rc.bottom - S(2);
+        int trackH = std::max(1, trackBot - trackTop);
+        int thumbH = std::max(S(28), (int)((double)trackH * panelViewH / panelContentH));
+        thumbH = std::min(thumbH, trackH);
+        int thumbY = trackTop + (int)((double)(trackH - thumbH) * panelScroll / maxs);
+        return { trackX, thumbY, trackX + sbw, thumbY + thumbH };
     }
 
     void createFonts() {
@@ -1782,6 +1824,12 @@ public:
         if (paletteOpen) drawPaletteList(dc);
         if (coloringOpen) drawColoringList(dc);
         if (galleryOpen) drawGalleryList(dc);
+        // panel scrollbar thumb (only when the control stack overflows)
+        RECT sbThumb = panelScrollbarRect();
+        if (sbThumb.right > sbThumb.left) {
+            bool hov = hover == H_PANELSB || pressed == H_PANELSB;
+            fillRound(dc, sbThumb, hov ? CLR_ACCENT : CLR_TRACK, CLR_PANEL, S(3));
+        }
         } // end panel (full paints only)
 
         // status bar (always -- text changes with compute state / timings)
@@ -1803,6 +1851,7 @@ public:
     }
 
     Hit hitTest(int x, int y) {
+        { RECT sb = panelScrollbarRect(); if (sb.right > sb.left && inRect(sb, x, y)) return H_PANELSB; }
         if (inRect(rcReset,x,y)) return H_RESET;
         if (inRect(rcRender,x,y)) return H_RENDER;
         if (inRect(rcSave,x,y)) return H_SAVE;
@@ -1909,6 +1958,17 @@ public:
         case WM_MOUSEMOVE: {
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
             if (palette.dragging) { gradientMove(x); return 0; }
+            if (pressed == H_PANELSB) {
+                int maxs = panelMaxScroll();
+                RECT rc; GetClientRect(hwnd, &rc);
+                int trackH = std::max(1, (int)(rc.bottom - 2 * S(2)));
+                int thumbH = std::max(S(28), (int)((double)trackH * panelViewH / std::max(1, panelContentH)));
+                int span = std::max(1, trackH - thumbH);
+                int ns = panelSbGrabScroll + (int)((double)(y - panelSbGrabY) * maxs / span);
+                panelScroll = std::clamp(ns, 0, maxs);
+                layout(); needFull = true; InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (pressed == H_MAXTRACK) { setMaxFromT((double)(x - rcMaxTrack.left)/(rcMaxTrack.right-rcMaxTrack.left), false); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (pressed == H_DENSTRACK) { color_density = (float)std::round(std::clamp(10.0 + 190.0*(x-rcDensTrack.left)/(rcDensTrack.right-rcDensTrack.left),10.0,200.0)); nav->SetRedisplay(); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (pressed == H_PHASETRACK) { setPhaseFromX(x); return 0; }
@@ -1952,6 +2012,7 @@ public:
             if (h == H_EDE) { coloringOpen = true; coloringHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
             if (h == H_GALLERY_DD) { galleryOpen = true; galleryHover = -1; pressed = H_NONE; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
             pressed = h;
+            if (h == H_PANELSB) { SetCapture(hwnd); panelSbDrag = true; panelSbGrabY = y; panelSbGrabScroll = panelScroll; return 0; }
             if (h == H_GRADIENT) { gradientDown(x); return 0; }
             if (h == H_MAXTRACK) { SetCapture(hwnd); setMaxFromT((double)(x-rcMaxTrack.left)/(rcMaxTrack.right-rcMaxTrack.left), false); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (h == H_DENSTRACK) { SetCapture(hwnd); color_density=(float)std::round(std::clamp(10.0+190.0*(x-rcDensTrack.left)/(rcDensTrack.right-rcDensTrack.left),10.0,200.0)); nav->SetRedisplay(); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
@@ -1968,6 +2029,7 @@ public:
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
             Hit h = hitTest(x,y);
             if (palette.dragging) { palette.dragging = false; ReleaseCapture(); }
+            else if (panelSbDrag) { panelSbDrag = false; ReleaseCapture(); }
             else if (navDragging) { navDragging = false; nav->DragEnd(); ReleaseCapture(); }
             else if (pressed == H_MAXTRACK || pressed == H_DENSTRACK) {
                 ReleaseCapture();
@@ -2064,7 +2126,12 @@ public:
                 POINT p = mapToRender(q.x, q.y);
                 if (wd > 0) nav->ZoomIn(p.x,p.y); else nav->ZoomOut(p.x,p.y);
                 keepLive();
+                return 0;
             }
+            // Anywhere else over the panel: scroll the control stack (if it overflows).
+            RECT rcC; GetClientRect(hwnd, &rcC);
+            if (q.x >= rcC.right - S(PANEL_W) && panelMaxScroll() > 0)
+                panelScrollBy(wd > 0 ? -S(48) : S(48));
             return 0;
         }
         case WM_KEYDOWN:
