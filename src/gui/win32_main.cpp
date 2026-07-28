@@ -506,10 +506,11 @@ public:
         int vW = vr.right - vr.left, vH = vr.bottom - vr.top;
         // Cap the native render budget: the engine holds _sub*_sub floats/pixel in two
         // arrays, so an unbounded maximized window on a huge/high-DPI monitor could
-        // allocate pathologically (and an OOM would be fatal). Beyond the cap we render
-        // a bit smaller and let the 1:1-blit fall back to the scaled path; normal
-        // windows (<= ~2 Mpx, incl. 1080p maximized) stay fully pixel-native.
-        const double MAX_PX = 2.0e6;
+        // allocate pathologically (and an OOM would be fatal). 4 Mpx keeps the two
+        // sample arrays around ~0.8 GB (_sub=5) and covers typical large windows incl.
+        // ~1440p natively; only beyond it (approaching 4K maximized) do we render a bit
+        // smaller and let the 1:1 blit fall back to the scaled path.
+        const double MAX_PX = 4.0e6;
         double px = (double)vW * (double)vH;
         if (px > MAX_PX) {
             double s = std::sqrt(MAX_PX / px);
@@ -1322,6 +1323,12 @@ public:
                 if (gx && gy && gz) { std::string sc = expandSci(gz); if (!sc.empty()) nav->SetLocation(gx, gy, sc); }
                 if (const char* ds = getenv("MANDEL_GUI_DENS")) color_density = (float)atof(ds);
                 if (const char* pp = getenv("MANDEL_GUI_PAL")) { paletteIdx = atoi(pp); palette.load(paletteIdx); }
+                // Force a deterministic window size for reproducible perf measurement.
+                if (const char* ww = getenv("MANDEL_GUI_WINW")) {
+                    int winw = atoi(ww); const char* wh = getenv("MANDEL_GUI_WINH");
+                    int winh = wh ? atoi(wh) : (int)(winw * 0.66);
+                    if (winw > 200 && winh > 200) MoveWindow(hwnd, 40, 40, winw, winh, TRUE);
+                }
             }
             layout(); startRender();
             SetTimer(hwnd, TIMER_ID, 16, nullptr);

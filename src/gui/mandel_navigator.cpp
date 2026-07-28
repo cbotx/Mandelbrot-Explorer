@@ -203,14 +203,15 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
                     if (settled) _baseUsub[sidx] = bu;
                     if (v == EMPTYPIXEL) continue;
                     if (bu < 0) { ++n; continue; }          // interior -> black (linear 0)
-                    int x = ((int)(bu + color_phase)) % colP; if (x < 0) x += colP;
+                    int x = ((int)(bu + color_phase)) & (colP - 1);
                     rs += g_palLin[0][x]; gs += g_palLin[1][x]; bs += g_palLin[2][x]; ++n;
                 }
                 if (!n) continue;
                 uint8_t* p = bitmap + ((size_t)i * _w + j) * 3;
-                p[0] = (uint8_t)(srgbEncode255(rs / n) + 0.5f);
-                p[1] = (uint8_t)(srgbEncode255(gs / n) + 0.5f);
-                p[2] = (uint8_t)(srgbEncode255(bs / n) + 0.5f);
+                double inv = 1.0 / n;
+                p[0] = (uint8_t)(srgbEncode255(rs * inv) + 0.5f);
+                p[1] = (uint8_t)(srgbEncode255(gs * inv) + 0.5f);
+                p[2] = (uint8_t)(srgbEncode255(bs * inv) + 0.5f);
             }
         }
         if (settled) { _cache_valid = true; _cache_density = color_density; _cache_method = _c_method; }
@@ -297,14 +298,15 @@ void MandelNavigator::RecolorPhase(uint8_t* bitmap) {
                     float bu = _baseUsub[(size_t)(i * _sub + a) * stride + j * _sub + b];
                     if (bu == EMPTYPIXEL) continue;
                     if (bu < 0) { ++n; continue; }         // interior -> black (linear 0)
-                    int x = ((int)(bu + color_phase)) % colP; if (x < 0) x += colP;
+                    int x = ((int)(bu + color_phase)) & (colP - 1);
                     rs += g_palLin[0][x]; gs += g_palLin[1][x]; bs += g_palLin[2][x]; ++n;
                 }
                 if (!n) continue;
                 uint8_t* p = bitmap + ((size_t)i * _w + j) * 3;
-                p[0] = (uint8_t)(srgbEncode255(rs / n) + 0.5f);
-                p[1] = (uint8_t)(srgbEncode255(gs / n) + 0.5f);
-                p[2] = (uint8_t)(srgbEncode255(bs / n) + 0.5f);
+                double inv = 1.0 / n;
+                p[0] = (uint8_t)(srgbEncode255(rs * inv) + 0.5f);
+                p[1] = (uint8_t)(srgbEncode255(gs * inv) + 0.5f);
+                p[2] = (uint8_t)(srgbEncode255(bs * inv) + 0.5f);
             }
         }
         applyRelief(bitmap);
@@ -371,12 +373,13 @@ void MandelNavigator::shadeSmoothBlockCached(uint8_t* out, int idx) const {
         for (int j = -_sub / 2; j <= _sub / 2; ++j) {
             float bu = _baseUsub[i + j];
             if (bu < 0) { ws += 1; continue; }             // interior/empty -> black (linear 0)
-            int x = ((int)(bu + color_phase)) % colP; if (x < 0) x += colP;
+            int x = ((int)(bu + color_phase)) & (colP - 1);  // colP is 2^11 -> mask == %colP (bu,phase >= 0)
             rs += g_palLin[0][x]; gs += g_palLin[1][x]; bs += g_palLin[2][x]; ws += 1;
         }
-    out[0] = (uint8_t)(srgbEncode255(rs / ws) + 0.5f);
-    out[1] = (uint8_t)(srgbEncode255(gs / ws) + 0.5f);
-    out[2] = (uint8_t)(srgbEncode255(bs / ws) + 0.5f);
+    double inv = ws > 0.0 ? 1.0 / ws : 0.0;
+    out[0] = (uint8_t)(srgbEncode255(rs * inv) + 0.5f);
+    out[1] = (uint8_t)(srgbEncode255(gs * inv) + 0.5f);
+    out[2] = (uint8_t)(srgbEncode255(bs * inv) + 0.5f);
 }
 
 // Build a per-pixel height field (centre subpixel smooth value); interior/empty
