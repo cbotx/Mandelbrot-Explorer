@@ -269,7 +269,14 @@ public:
     double lastRecolorMs = 0;   // last RecolorPhase/UpdateBitmap cost (animation diag)
     double animFps = 0;         // smoothed animation frame rate
     std::chrono::steady_clock::time_point lastFrameTs{};
+    std::chrono::steady_clock::time_point lastRenderTs{};  // for the ~60fps redraw cap
     bool benchMode = false;     // MANDEL_GUI_BENCH: headless recolor micro-benchmark
+    // MANDEL_GUI_FPSLOG=<sec>: run the REAL animation/timer loop (not the isolated
+    // micro-bench) and log the measured sustained animFps + per-frame costs, then exit.
+    bool fpsLogMode = false;
+    double fpsLogDur = 0.0;
+    std::chrono::steady_clock::time_point fpsLogStart{}, fpsLogLast{};
+    int fpsLogSamples = 0; double fpsLogSum = 0, fpsLogMin = 1e9;
 
     // ---- palette-phase animation --------------------------------------------
     // animSpeed is the signed cycle rate in [-1, 1]; 0 (slider centre) = paused.
@@ -1242,7 +1249,7 @@ public:
 
     void timer() {
         bool computing = nav->IsComputing();
-        if (benchMode && !computing) { runRecolorBench(); return; }
+        if (benchMode && !fpsLogMode && !computing) { runRecolorBench(); return; }
         bool anim = std::fabs(animSpeed) > 1e-4f;
         bool active = computing || wasComputing || navDragging || palette.dragging ||
                       pressed == H_MAXTRACK || pressed == H_DENSTRACK ||
@@ -1251,6 +1258,17 @@ public:
                       liveFrames > 0 || anim;
         auto now = std::chrono::steady_clock::now();
         if (!active) { lastAnimTick = now; return; }   // idle: no repaint, no CPU spin
+        // Frame-rate cap: the timer runs fine (see SetTimer) only to avoid the 16 ms
+        // WM_TIMER beat -- where a ~15 ms handler crossing the 16 ms tick boundary was
+        // coalesced to the next tick (~31 ms => ~32 fps). Skip ticks that arrive sooner
+        // than ~60 fps so a cheap frame doesn't over-render (waste CPU).
+        if (lastRenderTs.time_since_epoch().count()) {
+            static double capMs = -1;
+            if (capMs < 0) { const char* c = getenv("MANDEL_GUI_CAPMS"); capMs = c ? atof(c) : 12.0; }
+            double sinceRender = std::chrono::duration<double, std::milli>(now - lastRenderTs).count();
+            if (sinceRender < capMs) return;
+        }
+        lastRenderTs = now;
         if (liveFrames > 0) --liveFrames;
         nav->Update();
         // Advance the palette phase by elapsed wall-clock time so the cycle speed
@@ -1296,6 +1314,40 @@ public:
                           pressed == H_RELAZ || pressed == H_RELEL || pressed == H_RELSTR;
         fractalOnlyTick = !uiInteract;
         InvalidateRect(hwnd, nullptr, FALSE);
+        // Force the paint NOW (synchronously) so the logged animFps reflects the real
+        // recolor+buildDisplay+present cost per frame, then sample the sustained rate.
+        if (fpsLogMode) {
+            UpdateWindow(hwnd);   // process the WM_PAINT synchronously (real present)
+            if (!computing) {
+                auto tnow = std::chrono::steady_clock::now();
+                double handlerMs = std::chrono::duration<double, std::milli>(tnow - now).count();
+                if (fpsLogStart.time_since_epoch().count() == 0) { fpsLogStart = tnow; fpsLogLast = tnow; }
+                double sinceLast = std::chrono::duration<double>(tnow - fpsLogLast).count();
+                if (sinceLast >= 0.5) {
+                    fpsLogLast = tnow;
+                    if (animFps > 0) { fpsLogSum += animFps; ++fpsLogSamples; if (animFps < fpsLogMin) fpsLogMin = animFps; }
+                    RECT vr = viewRect();
+                    FILE* f = nullptr; fopen_s(&f, "build\\gui_fpslog.txt", "a");
+                    if (f) {
+                        fprintf(f, "[fpslog] anim=%.1f fps (%.1f ms/frame)  handler=%.2f ms  recolor=%.2f  present=%.2f  view=%ldx%ld ss=%d\n",
+                                animFps, animFps > 0 ? 1000.0 / animFps : 0.0, handlerMs, lastRecolorMs, lastPresentMs,
+                                vr.right - vr.left, vr.bottom - vr.top, ssOn ? 1 : 0);
+                        fclose(f);
+                    }
+                }
+                if (std::chrono::duration<double>(tnow - fpsLogStart).count() >= fpsLogDur) {
+                    double avg = fpsLogSamples ? fpsLogSum / fpsLogSamples : 0.0;
+                    printf("[fpslog] DONE avg=%.1f fps  min=%.1f fps  samples=%d  render=%dx%d ss=%d\n",
+                           avg, (fpsLogMin < 1e8 ? fpsLogMin : 0.0), fpsLogSamples, renderW, renderH, ssOn ? 1 : 0);
+                    fflush(stdout);
+                    FILE* f = nullptr; fopen_s(&f, "build\\gui_fpslog.txt", "a");
+                    if (f) { fprintf(f, "avg=%.1f fps  min=%.1f fps  recolor=%.2f present=%.2f render=%dx%d ss=%d\n",
+                                     avg, (fpsLogMin < 1e8 ? fpsLogMin : 0.0), lastRecolorMs, lastPresentMs, renderW, renderH, ssOn ? 1 : 0);
+                             fclose(f); }
+                    PostQuitMessage(0);
+                }
+            }
+        }
     }
 
     LRESULT message(UINT msg, WPARAM wp, LPARAM lp) {
@@ -1329,9 +1381,23 @@ public:
                     int winh = wh ? atoi(wh) : (int)(winw * 0.66);
                     if (winw > 200 && winh > 200) MoveWindow(hwnd, 40, 40, winw, winh, TRUE);
                 }
+                // Apply a gallery preset (e.g. 0 = Night City) for realistic testing.
+                if (const char* gi = getenv("MANDEL_GUI_GALLERY")) applyPreset(atoi(gi));
+                // Real sustained-fps logging mode: run the actual timer/animation loop
+                // and log the measured animFps, instead of the one-shot micro-bench.
+                if (const char* fl = getenv("MANDEL_GUI_FPSLOG")) {
+                    fpsLogMode = true; fpsLogDur = atof(fl); if (fpsLogDur <= 0) fpsLogDur = 5.0;
+                    const char* as = getenv("MANDEL_GUI_ANIMSPEED");
+                    animSpeed = as ? (float)atof(as) : 0.6f;
+                    lastAnimTick = std::chrono::steady_clock::now();
+                }
             }
             layout(); startRender();
-            SetTimer(hwnd, TIMER_ID, 16, nullptr);
+            // Fine timer period (~4 ms) so the ~60 fps redraw cap in timer() paces the
+            // animation instead of the coarse 16 ms WM_TIMER, which coalesced a ~15 ms
+            // handler to the next tick (~31 ms => ~32 fps). The cap prevents over-render.
+            { int tms = 4; if (const char* t = getenv("MANDEL_GUI_TIMERMS")) { tms = atoi(t); if (tms < 1) tms = 1; }
+              SetTimer(hwnd, TIMER_ID, tms, nullptr); }
             return 0;
         }
         case WM_DPICHANGED: {
