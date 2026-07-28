@@ -1563,7 +1563,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                 }
                 dzr = zr;
                 dzi = zi;
-                if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
+                if (deriv) {   // EDE, normal-map AND DE-overlay all track dz/dc; reset on rebase
                     ddr = dr - 1;
                     ddi = di;
                 }
