@@ -99,8 +99,11 @@ struct TrapAccum {
         if (d > 1.0) d = 1.0;
         double trap = -std::log10(std::max(d, 1e-14));      // >= 0
         if (mu < 0) mu = 0;                                 // far-field fast escapes
-        double ang = 0.5 + 0.5 * (trapAngle * (1.0 / 3.14159265358979));   // [0,1]
-        return (float)(0.17 * trap + 0.025 * mu + 0.10 * ang);            // always >= 0
+        // NB: no atan2(trapAngle) term -- a wrapping angle added to a linear palette
+        // coordinate seams at the +/-pi branch cut (a visible left/right divide when the
+        // closest-point direction crosses the negative real axis). Distance + smooth
+        // count already give a rich, seamless trap.
+        return (float)(0.17 * trap + 0.025 * mu);           // always >= 0, seamless
     }
 };
 }
