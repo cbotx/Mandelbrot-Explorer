@@ -187,8 +187,12 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
     const bool settled = !computing;
     _need_settle = !settled;
     prepareColorFilter();   // also initializes the linear-light LUT
-    if (settled && relief_on) buildReliefHeight();
-    if (settled && (normal_light_on || de_overlay_on)) buildNormalField();
+    // Rebuild the relief / normal-DE field EVERY frame (not only when settled) from the
+    // current _iter, so the post-shade layer always tracks the base it is drawn over.
+    // Building only on settle left the overlay from the previous location while the base
+    // showed the new one -> the two layers visibly slid apart during a pan/zoom redraw.
+    if (relief_on) buildReliefHeight();
+    if (normal_light_on || de_overlay_on) buildNormalField();
     if (_uniform_feather) {
         const int stride = _w * _sub;
         if (settled) _baseUsub.assign((size_t)_w * _h * _sub * _sub, EMPTYPIXEL);
