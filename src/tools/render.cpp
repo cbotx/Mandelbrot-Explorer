@@ -223,6 +223,19 @@ int main(int argc, char** argv) {
                 for (int b = 0; b < SS; ++b) {
                     int yy = i * SS + a, xx = j * SS + b;
                     float r, g, bb; getColor(iter[(size_t)yy * Ws + xx], r, g, bb);
+                    double clinR = toLin(r), clinG = toLin(g), clinB = toLin(bb);
+                    if (debuf) {
+                        // DE drawn as a PURE black&white layer: greyscale filament lace
+                        // near the boundary (fading to black on the set), the smooth
+                        // gradient colour surviving only in the exterior (bw -> 1).
+                        double de = debuf[(size_t)yy * Ws + xx];
+                        double bw = de / (de + g_de_k);
+                        double gray = bw, cw = bw * bw;
+                        lr += clinR * cw + gray * (1.0 - cw);
+                        lg += clinG * cw + gray * (1.0 - cw);
+                        lb += clinB * cw + gray * (1.0 - cw);
+                        continue;
+                    }
                     float sh = 1.0f;
                     if (normbuf) {
                         // Analytic normal-map Lambert shade from arg(z)-arg(dz/dc).
@@ -234,16 +247,10 @@ int main(int argc, char** argv) {
                         double lz = sin(g_light_el);
                         double d = (nx*lx + ny*ly + nz*lz) * inv; if (d < 0) d = 0;
                         sh = (float)(0.3 + 0.8 * d);
-                    } else if (debuf) {
-                        // DE overlay: dark filament structure (small DE) over the
-                        // smooth colour; bw -> 1 far from the boundary, 0 on it.
-                        double de = debuf[(size_t)yy * Ws + xx];
-                        double bw = de / (de + g_de_k);
-                        sh = (float)(0.12 + 0.88 * bw);
                     } else if (g_relief) {
                         sh = reliefShadeAt(iter, yy, xx, Ws, Hs);
                     }
-                    lr += toLin(r) * sh; lg += toLin(g) * sh; lb += toLin(bb) * sh;
+                    lr += clinR * sh; lg += clinG * sh; lb += clinB * sh;
                 }
             int n = SS * SS;
             uint8_t* p = &img[(i * W + j) * 3];

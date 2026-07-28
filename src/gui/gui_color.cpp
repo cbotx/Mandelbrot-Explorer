@@ -154,18 +154,27 @@ void applyNormalLightTo(uint8_t* rgb, const float* angle, int W, int H) {
 // dark near the set boundary (small DE) and to full colour far away, drawing the
 // fine filament structure over the base. relief_strength tunes the falloff.
 void applyDEOverlayTo(uint8_t* rgb, const float* de, int W, int H) {
+    // The distance estimate is drawn as a PURE black&white layer on top of the smooth
+    // gradient: the gradient supplies the colour of the smooth exterior, while near the
+    // set boundary the delicate DE structure takes over as greyscale (the filament lace
+    // in black&white, fading to black on the set). No hue comes from the DE itself.
     const double k = 1.5 + 3.0 * (double)relief_strength;   // strength -> falloff distance
 #pragma omp parallel for schedule(static)
     for (int i = 0; i < H; ++i)
         for (int j = 0; j < W; ++j) {
-            float d = de[(size_t)i * W + j];
-            if (std::isnan(d)) continue;                  // interior/empty: unshaded
-            double bw = (double)d / ((double)d + k);      // 0 on the boundary -> 1 far away
-            double sh = 0.12 + 0.88 * bw;
+            float dd = de[(size_t)i * W + j];
+            if (std::isnan(dd)) continue;                 // interior/empty: leave as-is
+            double bw = (double)dd / ((double)dd + k);    // 0 on the boundary -> 1 far away
+            double gray = bw;                             // the B&W distance value
+            // colour weight: full gradient colour far away, pure grey near the boundary
+            double cw = bw * bw;
             uint8_t* q = rgb + ((size_t)i * W + j) * 3;
-            q[0] = (uint8_t)(srgbEncode(g_srgb2lin[q[0]] * sh) * 255.0 + 0.5);
-            q[1] = (uint8_t)(srgbEncode(g_srgb2lin[q[1]] * sh) * 255.0 + 0.5);
-            q[2] = (uint8_t)(srgbEncode(g_srgb2lin[q[2]] * sh) * 255.0 + 0.5);
+            double r = g_srgb2lin[q[0]] * cw + gray * (1.0 - cw);
+            double g = g_srgb2lin[q[1]] * cw + gray * (1.0 - cw);
+            double b = g_srgb2lin[q[2]] * cw + gray * (1.0 - cw);
+            q[0] = (uint8_t)(srgbEncode(r) * 255.0 + 0.5);
+            q[1] = (uint8_t)(srgbEncode(g) * 255.0 + 0.5);
+            q[2] = (uint8_t)(srgbEncode(b) * 255.0 + 0.5);
         }
 }
 // Integrates the palette in LINEAR light so the analytic average is gamma-correct
