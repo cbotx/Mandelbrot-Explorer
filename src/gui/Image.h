@@ -11,6 +11,20 @@ extern float color_density;
 // fractal. Wraps modulo colP.
 extern float color_phase;
 
+// ---- Screen-space slope (relief) lighting -------------------------------
+// Optional post-shade: height = smooth escape value, normal from its screen-
+// space gradient, Lambert-shaded by a light direction; modulates the palette
+// colour. Composes with any coloring/palette and with the phase animation.
+extern int   relief_on;          // 1 => apply relief post-shade
+extern float relief_light_az;    // light azimuth  (radians)
+extern float relief_light_el;    // light elevation (radians)
+extern float relief_strength;    // slope strength
+
+// Post-shade an RGB image (row-major, 3 bytes/pixel) by Lambert slope lighting
+// from a per-pixel height field (NaN => interior/empty, left unshaded). Multiplies
+// in linear light. Reads relief_light_az/el and relief_strength.
+void applyReliefTo(uint8_t* rgb, const float* height, int W, int H);
+
 void writePPMImage(int* data, int width, int height, const char* filename, int maxIterations);
 
 void writePNGImage(uint8_t* img, int width, int height, const char* filename);

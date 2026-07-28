@@ -38,6 +38,11 @@ private:
     float _cache_density = -1.0f;   // color_density the cache was built with
     int _cache_method = -1;         // _c_method the cache was built with
 
+    // ---- relief (screen-space slope) height cache --------------------------
+    // Per-pixel smooth height (centre subpixel), rebuilt on each settled frame;
+    // applyRelief() re-shades from it each frame so the light stays animatable.
+    std::vector<float> _reliefHt;   // (_w*_h), NaN for interior/empty pixels
+
     std::future<void> _task;
 
 public:
@@ -84,6 +89,10 @@ public:
 private:
     void ConfigureSampling();
     void SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method);
+    // Build _reliefHt from the settled _iter field (centre subpixel per pixel).
+    void buildReliefHeight();
+    // Multiply the finished bitmap by per-pixel Lambert slope shading.
+    void applyRelief(uint8_t* bitmap);
 };
 
 

@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -39,6 +40,13 @@
 float color_map[3][colP];
 float color_density = 60.0f;
 float color_phase = 0.0f;
+
+// Relief (screen-space slope) lighting. Off by default; enabled by the "Relief"
+// coloring mode. Light from the upper-left, moderate slope.
+int   relief_on = 0;
+float relief_light_az = 2.3f;
+float relief_light_el = 0.55f;
+float relief_strength = 1.0f;
 
 // The engine marks set-interior pixels with the exact sentinel -2.0f; every
 // exterior (escaped) pixel carries a smooth iteration count. That count can be
@@ -95,6 +103,40 @@ float srgbEncode(double L) {                            // linear 0..1 -> sRGB 0
     return (float)(L <= 0.0031308 ? 12.92 * L : 1.055 * std::pow(L, 1.0 / 2.4) - 0.055);
 }
 static inline double enc255(double L) { return srgbEncode(L) * 255.0; }
+
+// Lambert slope (relief) post-shade shared by the live view and the PNG export.
+// height: per-pixel smooth value, NaN for interior/empty (left unshaded).
+void applyReliefTo(uint8_t* rgb, const float* height, int W, int H) {
+    const double lx = std::cos((double)relief_light_el) * std::cos((double)relief_light_az);
+    const double ly = std::cos((double)relief_light_el) * std::sin((double)relief_light_az);
+    const double lz = std::sin((double)relief_light_el);
+    const double str = relief_strength;
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < H; ++i)
+        for (int j = 0; j < W; ++j) {
+            float hc = height[(size_t)i * W + j];
+            if (std::isnan(hc)) continue;                 // interior/empty: unshaded
+            auto Hh = [&](int yy, int xx) -> float {
+                float t = height[(size_t)yy * W + xx];
+                return std::isnan(t) ? hc : t;            // clamp across set boundary
+            };
+            float hl = j > 0     ? Hh(i, j - 1) : hc;
+            float hr = j < W - 1 ? Hh(i, j + 1) : hc;
+            float hu = i > 0     ? Hh(i - 1, j) : hc;
+            float hd = i < H - 1 ? Hh(i + 1, j) : hc;
+            double nx = -((double)(hr - hl) * 0.5) * str;
+            double ny = -((double)(hd - hu) * 0.5) * str;
+            double nz = 1.0;
+            double inv = 1.0 / std::sqrt(nx * nx + ny * ny + nz * nz);
+            double d = (nx * lx + ny * ly + nz * lz) * inv;
+            if (d < 0) d = 0;
+            double sh = 0.25 + 0.85 * d;                  // ambient + diffuse
+            uint8_t* q = rgb + ((size_t)i * W + j) * 3;
+            q[0] = (uint8_t)(srgbEncode(g_srgb2lin[q[0]] * sh) * 255.0 + 0.5);
+            q[1] = (uint8_t)(srgbEncode(g_srgb2lin[q[1]] * sh) * 255.0 + 0.5);
+            q[2] = (uint8_t)(srgbEncode(g_srgb2lin[q[2]] * sh) * 255.0 + 0.5);
+        }
+}
 
 // ---- analytic anti-aliasing (gradient-based palette prefiltering) ----------
 // Integrates the palette in LINEAR light so the analytic average is gamma-correct
@@ -294,6 +336,12 @@ static void exportRender(mpf_t cx, mpf_t cy, mpf_t scale_view,
     mandel.setPrecision(prec);
     st->cur = &mandel;
 
+    // Relief needs neighbouring output pixels for the slope; strips break vertical
+    // neighbours, so accumulate a full-image height field and post-shade at the end.
+    const bool relief = relief_on != 0;
+    std::vector<float> htbuf;
+    if (relief) htbuf.assign((size_t)W * H, std::numeric_limits<float>::quiet_NaN());
+
     for (int s = 0; s < nstrips && !st->cancel; ++s) {
         int obase = s * sh;
         int oh = std::min(sh, H - obase);
@@ -315,14 +363,22 @@ static void exportRender(mpf_t cx, mpf_t cy, mpf_t scale_view,
                     }
                 // Engine rows are y-up (row 0 = smallest imaginary = bottom); flip
                 // vertically so the PNG/preview is upright like the main view.
-                uint8_t* p = &out[((size_t)(H - 1 - (obase + oi)) * W + oj) * 3];
+                size_t orow = (size_t)(H - 1 - (obase + oi));
+                uint8_t* p = &out[(orow * W + oj) * 3];
                 p[0] = (uint8_t)(srgbEncode(lr / n) * 255.0 + 0.5);
                 p[1] = (uint8_t)(srgbEncode(lg / n) * 255.0 + 0.5);
                 p[2] = (uint8_t)(srgbEncode(lb / n) * 255.0 + 0.5);
+                if (relief) {
+                    float hv = ibuf[(size_t)(oi * ss + ss / 2) * Wss + (oj * ss + ss / 2)];
+                    htbuf[orow * W + oj] =
+                        (hv == EMPTYPIXEL || hv == INTERIOR_SENTINEL)
+                            ? std::numeric_limits<float>::quiet_NaN() : (hv < 0 ? 0.0f : hv);
+                }
             }
         }
         st->progress = (float)(s + 1) / nstrips;
     }
+    if (relief && !st->cancel) applyReliefTo(out.data(), htbuf.data(), W, H);
     { std::lock_guard<std::mutex> lk(st->curMx); st->cur = nullptr; }
     mpf_clear(scale_e);
     st->ok = !st->cancel;
@@ -851,6 +907,7 @@ enum Hit {
     H_NONE, H_VIEW, H_GRADIENT,
     H_RESET, H_RENDER, H_SAVE, H_COPY, H_PASTE,
     H_MAXTRACK, H_DENSTRACK, H_PHASETRACK, H_SPEEDTRACK,
+    H_RELAZ, H_RELEL, H_RELSTR,
     H_SS, H_EDE, H_PALETTE_DD, H_COLOR, H_GALLERY_DD
 };
 
@@ -1013,6 +1070,7 @@ public:
     // widget rects (computed in layout())
     RECT rcReset{}, rcRender{}, rcSave{}, rcCopy{}, rcPaste{};
     RECT rcLocation{}, rcMaxTrack{}, rcDensTrack{}, rcPhaseTrack{}, rcSpeedTrack{};
+    RECT rcReliefAz{}, rcReliefEl{}, rcReliefStr{};
     RECT rcSS{}, rcColoringDD{}, rcPaletteDD{}, rcColor{}, rcGradient{};
     RECT rcGalleryDD{};
 
@@ -1067,6 +1125,23 @@ public:
         animSpeed = (float)((t - 0.5) * 2.0);
         lastAnimTick = std::chrono::steady_clock::now();   // avoid a phase jump on (re)start
     }
+    // Relief light/strength sliders (post-shade only; no fractal recompute).
+    static constexpr double RELIEF_STR_MAX = 3.0;
+    void setReliefAzFromX(int x) {
+        double t = std::clamp((double)(x - rcReliefAz.left) / std::max(1L, rcReliefAz.right - rcReliefAz.left), 0.0, 1.0);
+        relief_light_az = (float)(t * 2.0 * 3.14159265358979);
+        recolorPhaseNow();
+    }
+    void setReliefElFromX(int x) {
+        double t = std::clamp((double)(x - rcReliefEl.left) / std::max(1L, rcReliefEl.right - rcReliefEl.left), 0.0, 1.0);
+        relief_light_el = (float)(0.05 + t * (1.5 - 0.05));   // ~3deg..86deg above horizon
+        recolorPhaseNow();
+    }
+    void setReliefStrFromX(int x) {
+        double t = std::clamp((double)(x - rcReliefStr.left) / std::max(1L, rcReliefStr.right - rcReliefStr.left), 0.0, 1.0);
+        relief_strength = (float)(t * RELIEF_STR_MAX);
+        recolorPhaseNow();
+    }
     // Immediate cheap re-colour + present for the current phase (paused-drag feedback).
     void recolorPhaseNow() {
         color_phase = std::fmod(color_phase, (float)colP); if (color_phase < 0) color_phase += colP;
@@ -1102,6 +1177,14 @@ public:
         rcSpeedTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         rcSS  = { px, y, px + w, y + bh }; y += S(56);
         rcColoringDD = { px, y, px + w, y + bh }; y += S(56);
+        // Relief light controls occupy panel space only while Relief mode is active.
+        if (relief_on) {
+            rcReliefAz  = { px, y + S(24), px + w, y + S(38) }; y += S(52);
+            rcReliefEl  = { px, y + S(24), px + w, y + S(38) }; y += S(52);
+            rcReliefStr = { px, y + S(24), px + w, y + S(38) }; y += S(52);
+        } else {
+            rcReliefAz = rcReliefEl = rcReliefStr = RECT{};
+        }
         rcPaletteDD = { px, y, px + w, y + bh }; y += S(44);
         rcGradient = { px, y + S(22), px + w, y + S(62) }; y += S(84);
         rcColor = { px, y, px + w, y + bh }; y += bh + S(16);
@@ -1420,14 +1503,14 @@ public:
         int i = (y - lr.top) / paletteItemH();
         return (i >= 0 && i < (int)palettePresets().size()) ? i : -1;
     }
-    // ---- coloring-mode dropdown (Smooth / Distance / Feather) ----
+    // ---- coloring-mode dropdown (Smooth / Distance / Feather / Relief) ----
     static const wchar_t* coloringName(int i) {
-        static const wchar_t* n[3] = { L"Smooth", L"Distance (EDE)", L"Feather (stripe)" };
-        return n[i < 0 ? 0 : (i > 2 ? 2 : i)];
+        static const wchar_t* n[4] = { L"Smooth", L"Distance (EDE)", L"Feather (stripe)", L"Relief (3D light)" };
+        return n[i < 0 ? 0 : (i > 3 ? 3 : i)];
     }
     int coloringItemH() const { return S(28); }
     RECT coloringListRect() const {
-        int n = 3;
+        int n = 4;
         return { rcColoringDD.left, rcColoringDD.bottom + S(2), rcColoringDD.right,
                  rcColoringDD.bottom + S(2) + n * coloringItemH() };
     }
@@ -1435,7 +1518,7 @@ public:
         RECT lr = coloringListRect();
         if (x < lr.left || x > lr.right || y < lr.top || y > lr.bottom) return -1;
         int i = (y - lr.top) / coloringItemH();
-        return (i < 0 || i > 2) ? -1 : i;
+        return (i < 0 || i > 3) ? -1 : i;
     }
     void drawColoringDD(HDC dc) {
         bool hov = hover == H_EDE;
@@ -1450,7 +1533,7 @@ public:
         RECT lr = coloringListRect();
         fillRound(dc, lr, CLR_CARD, CLR_ACCENT, S(8));
         int ih = coloringItemH();
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 4; ++i) {
             RECT ir = { lr.left, lr.top + i * ih, lr.right, lr.top + (i + 1) * ih };
             if (i == coloringHover) fillRect(dc, { ir.left + S(3), ir.top, ir.right - S(3), ir.bottom }, CLR_CARD_HOV);
             RECT tr = ir; tr.left += S(14);
@@ -1458,13 +1541,16 @@ public:
         }
     }
     void selectColoring(int idx) {
-        if (idx < 0 || idx > 2) return;
+        if (idx < 0 || idx > 3) return;
         coloringIdx = idx;
+        relief_on = (idx == 3) ? 1 : 0;
         int m = nav->GetCMethod();
         m &= ~(ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::STRIPE_AVERAGE);
         if (idx == 1) m |= ColoringMethod::EXTERIOR_DIST_EST;
         else if (idx == 2) m |= ColoringMethod::STRIPE_AVERAGE;
+        // idx 3 (Relief) uses the plain smooth field (method 0) + slope post-shade.
         nav->SetCMethod(m);
+        layout();   // relief sliders appear/disappear -> reflow the panel
         startRender();
     }
 
@@ -1643,6 +1729,18 @@ public:
         label(dc, rcColoringDD.left, rcColoringDD.top - S(20), L"Coloring");
         drawColoringDD(dc);
 
+        if (relief_on) {
+            wchar_t rab[32]; swprintf_s(rab, L"%.0f\u00B0", relief_light_az * 180.0f / 3.14159265f);
+            labelRow(dc, rcReliefAz, L"Light azimuth", rab);
+            drawSlider(dc, rcReliefAz, std::clamp(relief_light_az / (2.0 * 3.14159265358979), 0.0, 1.0), H_RELAZ);
+            wchar_t reb[32]; swprintf_s(reb, L"%.0f\u00B0", relief_light_el * 180.0f / 3.14159265f);
+            labelRow(dc, rcReliefEl, L"Light elevation", reb);
+            drawSlider(dc, rcReliefEl, std::clamp((relief_light_el - 0.05) / (1.5 - 0.05), 0.0, 1.0), H_RELEL);
+            wchar_t rsb[32]; swprintf_s(rsb, L"%.2f", relief_strength);
+            labelRow(dc, rcReliefStr, L"Relief strength", rsb);
+            drawSlider(dc, rcReliefStr, std::clamp(relief_strength / RELIEF_STR_MAX, 0.0, 1.0), H_RELSTR);
+        }
+
         label(dc, rcPaletteDD.left, rcPaletteDD.top - S(20), L"Palette");
         drawPaletteDD(dc);
 
@@ -1715,6 +1813,11 @@ public:
         RECT dt = rcDensTrack; dt.top -= S(8); dt.bottom += S(8); if (inRect(dt,x,y)) return H_DENSTRACK;
         RECT pt = rcPhaseTrack; pt.top -= S(8); pt.bottom += S(8); if (inRect(pt,x,y)) return H_PHASETRACK;
         RECT sp = rcSpeedTrack; sp.top -= S(8); sp.bottom += S(8); if (inRect(sp,x,y)) return H_SPEEDTRACK;
+        if (relief_on) {
+            RECT ra = rcReliefAz;  ra.top -= S(8); ra.bottom += S(8); if (inRect(ra,x,y)) return H_RELAZ;
+            RECT re = rcReliefEl;  re.top -= S(8); re.bottom += S(8); if (inRect(re,x,y)) return H_RELEL;
+            RECT rs = rcReliefStr; rs.top -= S(8); rs.bottom += S(8); if (inRect(rs,x,y)) return H_RELSTR;
+        }
         if (inRect(rcSS,x,y)) return H_SS;
         if (inRect(rcColoringDD,x,y)) return H_EDE;
         if (inRect(rcPaletteDD,x,y)) return H_PALETTE_DD;
@@ -1731,6 +1834,7 @@ public:
         bool active = computing || wasComputing || navDragging || palette.dragging ||
                       pressed == H_MAXTRACK || pressed == H_DENSTRACK ||
                       pressed == H_PHASETRACK || pressed == H_SPEEDTRACK ||
+                      pressed == H_RELAZ || pressed == H_RELEL || pressed == H_RELSTR ||
                       liveFrames > 0 || anim;
         auto now = std::chrono::steady_clock::now();
         if (!active) { lastAnimTick = now; return; }   // idle: no repaint, no CPU spin
@@ -1750,7 +1854,8 @@ public:
         // control drags (which also (re)builds the phase cache).
         bool phaseOnly = !computing && !wasComputing && !navDragging &&
                          pressed != H_MAXTRACK && pressed != H_DENSTRACK &&
-                         (anim || pressed == H_PHASETRACK || pressed == H_SPEEDTRACK);
+                         (anim || pressed == H_PHASETRACK || pressed == H_SPEEDTRACK ||
+                          pressed == H_RELAZ || pressed == H_RELEL || pressed == H_RELSTR);
         if (phaseOnly) nav->RecolorPhase(bitmap.data());
         else nav->UpdateBitmap(bitmap.data());
         if (wasComputing && !computing)
@@ -1762,7 +1867,8 @@ public:
         // panel rebuild; UI-control interaction still gets a full paint.
         bool uiInteract = palette.dragging ||
                           pressed == H_MAXTRACK || pressed == H_DENSTRACK ||
-                          pressed == H_PHASETRACK || pressed == H_SPEEDTRACK;
+                          pressed == H_PHASETRACK || pressed == H_SPEEDTRACK ||
+                          pressed == H_RELAZ || pressed == H_RELEL || pressed == H_RELSTR;
         fractalOnlyTick = !uiInteract;
         InvalidateRect(hwnd, nullptr, FALSE);
     }
@@ -1807,6 +1913,9 @@ public:
             if (pressed == H_DENSTRACK) { color_density = (float)std::round(std::clamp(10.0 + 190.0*(x-rcDensTrack.left)/(rcDensTrack.right-rcDensTrack.left),10.0,200.0)); nav->SetRedisplay(); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (pressed == H_PHASETRACK) { setPhaseFromX(x); return 0; }
             if (pressed == H_SPEEDTRACK) { setSpeedFromX(x); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
+            if (pressed == H_RELAZ) { setReliefAzFromX(x); return 0; }
+            if (pressed == H_RELEL) { setReliefElFromX(x); return 0; }
+            if (pressed == H_RELSTR) { setReliefStrFromX(x); return 0; }
             if (navDragging) { POINT p = mapToRender(x,y); nav->Drag(p.x,p.y); return 0; }
             if (paletteOpen) { int it = paletteItemAt(x,y); if (it != paletteHover) { paletteHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
             if (coloringOpen) { int it = coloringItemAt(x,y); if (it != coloringHover) { coloringHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
@@ -1848,6 +1957,9 @@ public:
             if (h == H_DENSTRACK) { SetCapture(hwnd); color_density=(float)std::round(std::clamp(10.0+190.0*(x-rcDensTrack.left)/(rcDensTrack.right-rcDensTrack.left),10.0,200.0)); nav->SetRedisplay(); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
             if (h == H_PHASETRACK) { SetCapture(hwnd); setPhaseFromX(x); return 0; }
             if (h == H_SPEEDTRACK) { SetCapture(hwnd); setSpeedFromX(x); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
+            if (h == H_RELAZ) { SetCapture(hwnd); setReliefAzFromX(x); return 0; }
+            if (h == H_RELEL) { SetCapture(hwnd); setReliefElFromX(x); return 0; }
+            if (h == H_RELSTR) { SetCapture(hwnd); setReliefStrFromX(x); return 0; }
             if (h == H_VIEW) { POINT p = mapToRender(x,y); navDragging = true; SetCapture(hwnd); nav->DragStart(p.x,p.y); }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -1860,8 +1972,9 @@ public:
             else if (pressed == H_MAXTRACK || pressed == H_DENSTRACK) {
                 ReleaseCapture();
                 if (pressed == H_MAXTRACK) startRender(); else startRender();
-            } else if (pressed == H_PHASETRACK || pressed == H_SPEEDTRACK) {
-                ReleaseCapture();   // phase/speed re-colour only; no fractal recompute
+            } else if (pressed == H_PHASETRACK || pressed == H_SPEEDTRACK ||
+                       pressed == H_RELAZ || pressed == H_RELEL || pressed == H_RELSTR) {
+                ReleaseCapture();   // phase/speed/relief re-colour only; no fractal recompute
             } else if (h == pressed && h != H_NONE) {
                 switch (h) {
                 case H_RESET: nav->Reset(); renderStart = std::chrono::steady_clock::now(); wasComputing = true; keepLive(); break;
@@ -1927,6 +2040,25 @@ public:
                 lastAnimTick = std::chrono::steady_clock::now();
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
+            }
+            if (relief_on) {
+                RECT ra = rcReliefAz; ra.top -= S(10); ra.bottom += S(10);
+                if (inRect(ra, q.x, q.y)) {
+                    const double TWO_PI = 6.28318530717959;
+                    double v = relief_light_az + (wd > 0 ? 0.05236 : -0.05236);   // ~3deg/notch
+                    v = std::fmod(v, TWO_PI); if (v < 0) v += TWO_PI;
+                    relief_light_az = (float)v; recolorPhaseNow(); return 0;
+                }
+                RECT re = rcReliefEl; re.top -= S(10); re.bottom += S(10);
+                if (inRect(re, q.x, q.y)) {
+                    relief_light_el = (float)std::clamp((double)relief_light_el + (wd > 0 ? 0.03 : -0.03), 0.05, 1.5);
+                    recolorPhaseNow(); return 0;
+                }
+                RECT rs = rcReliefStr; rs.top -= S(10); rs.bottom += S(10);
+                if (inRect(rs, q.x, q.y)) {
+                    relief_strength = (float)std::clamp((double)relief_strength + (wd > 0 ? 0.05 : -0.05), 0.0, RELIEF_STR_MAX);
+                    recolorPhaseNow(); return 0;
+                }
             }
             if (inRect(viewRect(), q.x, q.y)) {
                 POINT p = mapToRender(q.x, q.y);

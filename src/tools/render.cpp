@@ -37,6 +37,34 @@ static inline float color_func(float it) {
 static int g_sac = 0;
 static int g_ede = 0;
 
+// ---- screen-space slope (relief) lighting -------------------------------
+// Height = smooth escape value; the normal comes from its screen-space gradient,
+// Lambert-shaded by a light direction. Modulates the palette colour (composes
+// with any palette). Env: MANDEL_RELIEF=1, MANDEL_LIGHT_AZ/EL (radians),
+// MANDEL_RELIEF_STR (slope strength).
+static int g_relief = 0;
+static double g_light_az = 2.3, g_light_el = 0.55, g_relief_str = 1.0;
+
+static float reliefShadeAt(const float* iter, int y, int x, int Ws, int Hs) {
+    float c = iter[(size_t)y * Ws + x];
+    if (c < 0) return 1.0f;                       // interior / empty: unshaded
+    auto val = [&](int yy, int xx) -> float {
+        if (xx < 0 || xx >= Ws || yy < 0 || yy >= Hs) return c;
+        float v = iter[(size_t)yy * Ws + xx];
+        return v < 0 ? c : v;                     // clamp to centre across the set boundary
+    };
+    float sx = (val(y, x + 1) - val(y, x - 1)) * 0.5f;
+    float sy = (val(y + 1, x) - val(y - 1, x)) * 0.5f;
+    double nx = -sx * g_relief_str, ny = -sy * g_relief_str, nz = 1.0;
+    double inv = 1.0 / std::sqrt(nx * nx + ny * ny + nz * nz);
+    double lx = std::cos(g_light_el) * std::cos(g_light_az);
+    double ly = std::cos(g_light_el) * std::sin(g_light_az);
+    double lz = std::sin(g_light_el);
+    double d = (nx * lx + ny * ly + nz * lz) * inv;   // L is unit
+    if (d < 0) d = 0;
+    return (float)(0.25 + 0.85 * d);              // ambient + diffuse
+}
+
 static void getColor(float it, float& r, float& g, float& b) {
     if (it < 0) { r = g = b = 0; return; }   // interior -> black
     // SAC value is already in [0,1]; map it around the palette a few times for
@@ -117,6 +145,10 @@ int main(int argc, char** argv) {
 
     colorMapInit();
     if (getenv("MANDEL_DENS")) color_density = (float)atof(getenv("MANDEL_DENS"));
+    if (getenv("MANDEL_RELIEF")) g_relief = atoi(getenv("MANDEL_RELIEF"));
+    if (getenv("MANDEL_LIGHT_AZ")) g_light_az = atof(getenv("MANDEL_LIGHT_AZ"));
+    if (getenv("MANDEL_LIGHT_EL")) g_light_el = atof(getenv("MANDEL_LIGHT_EL"));
+    if (getenv("MANDEL_RELIEF_STR")) g_relief_str = atof(getenv("MANDEL_RELIEF_STR"));
 
     float* iter = new float[Ws * Hs];
     for (int i = 0; i < Ws * Hs; ++i) iter[i] = EMPTYPIXEL;
@@ -166,8 +198,10 @@ int main(int argc, char** argv) {
             float lr = 0, lg = 0, lb = 0;
             for (int a = 0; a < SS; ++a)
                 for (int b = 0; b < SS; ++b) {
-                    float r, g, bb; getColor(iter[(i * SS + a) * Ws + (j * SS + b)], r, g, bb);
-                    lr += toLin(r); lg += toLin(g); lb += toLin(bb);
+                    int yy = i * SS + a, xx = j * SS + b;
+                    float r, g, bb; getColor(iter[(size_t)yy * Ws + xx], r, g, bb);
+                    float sh = g_relief ? reliefShadeAt(iter, yy, xx, Ws, Hs) : 1.0f;
+                    lr += toLin(r) * sh; lg += toLin(g) * sh; lb += toLin(bb) * sh;
                 }
             int n = SS * SS;
             uint8_t* p = &img[(i * W + j) * 3];

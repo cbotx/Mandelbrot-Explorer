@@ -1,6 +1,8 @@
 #include <gmp.h>
 #include <cassert>
+#include <cmath>
 #include <future>
+#include <limits>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -11,6 +13,10 @@
 #include "Image.h"
 
 #include "mandel_navigator.h"
+
+// The engine marks set-interior pixels with the sentinel -2.0f (EMPTYPIXEL=-10
+// marks not-yet-computed). Relief skips both so they carry no slope.
+static constexpr float INTERIOR_SENTINEL = -2.0f;
 
 MandelNavigator::MandelNavigator(int width, int height, int sub, int max_iteration, double zoom_step, double zoom_time) 
         : Navigator(width, height, zoom_step, zoom_time),
@@ -148,6 +154,7 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
     const bool settled = !computing;
     _need_settle = !settled;
     prepareColorFilter();   // also initializes the linear-light LUT
+    if (settled && relief_on) buildReliefHeight();
     if (_uniform_feather) {
         const int stride = _w * _sub;
         if (settled) _baseUsub.assign((size_t)_w * _h * _sub * _sub, EMPTYPIXEL);
@@ -175,6 +182,7 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
             }
         }
         if (settled) { _cache_valid = true; _cache_density = color_density; _cache_method = _c_method; }
+        applyRelief(bitmap);
         return;
     }
     const int stride = _w * _sub;
@@ -216,6 +224,7 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
         }
     }
     if (cacheable) { _cache_valid = true; _cache_density = color_density; _cache_method = _c_method; }
+    applyRelief(bitmap);
 }
 
 void MandelNavigator::RecolorPhase(uint8_t* bitmap) {
@@ -260,6 +269,7 @@ void MandelNavigator::RecolorPhase(uint8_t* bitmap) {
                 p[2] = (uint8_t)(srgbEncode(bs / n) * 255.0 + 0.5);
             }
         }
+        applyRelief(bitmap);
         return;
     }
 #pragma omp parallel for schedule(dynamic, 8)
@@ -270,6 +280,7 @@ void MandelNavigator::RecolorPhase(uint8_t* bitmap) {
             colorShadeAA(_baseU[p], _widthC[p], color_phase, q[0], q[1], q[2]);
         }
     }
+    applyRelief(bitmap);
 }
 
 void MandelNavigator::SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method) {
@@ -295,6 +306,30 @@ void MandelNavigator::SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method)
     bitmap_pixel[0] = (uint8_t)(srgbEncode(rs) * 255.0 + 0.5);
     bitmap_pixel[1] = (uint8_t)(srgbEncode(gs) * 255.0 + 0.5);
     bitmap_pixel[2] = (uint8_t)(srgbEncode(bs) * 255.0 + 0.5);
+}
+
+// Build a per-pixel height field (centre subpixel smooth value); interior/empty
+// pixels are NaN so they carry no slope and stay unshaded.
+void MandelNavigator::buildReliefHeight() {
+    const int stride = _w * _sub;
+    const int c = _sub / 2;
+    const float NaN = std::numeric_limits<float>::quiet_NaN();
+    _reliefHt.assign((size_t)_w * _h, 0.0f);
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < _h; ++i)
+        for (int j = 0; j < _w; ++j) {
+            float v = _iter[(size_t)(i * _sub + c) * stride + (j * _sub + c)];
+            _reliefHt[(size_t)i * _w + j] =
+                (v == EMPTYPIXEL || v == INTERIOR_SENTINEL) ? NaN : (v < 0 ? 0.0f : v);
+        }
+}
+
+// Post-shade the finished bitmap by Lambert slope lighting derived from the
+// screen-space gradient of the height field. Composes with any coloring and the
+// phase animation (recomputed each frame from the cached height).
+void MandelNavigator::applyRelief(uint8_t* bitmap) {
+    if (!relief_on || _reliefHt.size() != (size_t)_w * _h) return;
+    applyReliefTo(bitmap, _reliefHt.data(), _w, _h);
 }
 
 void MandelNavigator::SetMxit(int mxit) {
