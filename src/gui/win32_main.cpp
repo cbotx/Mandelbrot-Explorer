@@ -11,6 +11,7 @@
 #include <commdlg.h>
 #include <commctrl.h>
 #include <wincodec.h>
+#include <timeapi.h>
 
 #include <algorithm>
 #include <array>
@@ -36,6 +37,7 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "winmm.lib")
 
 float color_map[3][colP];
 float color_density = 60.0f;
@@ -1103,6 +1105,10 @@ public:
     bool needFull = true;          // force a full redraw (buffer (re)created / first paint)
     bool fractalOnlyTick = false;  // set by the timer for pure fractal animation frames
     double lastPresentMs = 0;
+    double lastRecolorMs = 0;   // last RecolorPhase/UpdateBitmap cost (animation diag)
+    double animFps = 0;         // smoothed animation frame rate
+    std::chrono::steady_clock::time_point lastFrameTs{};
+    bool benchMode = false;     // MANDEL_GUI_BENCH: headless recolor micro-benchmark
 
     // ---- palette-phase animation --------------------------------------------
     // animSpeed is the signed cycle rate in [-1, 1]; 0 (slider centre) = paused.
@@ -1839,6 +1845,11 @@ public:
             ? L"  Rendering..."
             : L"  Ready   last render " + std::to_wstring((int)lastRenderMs) + L" ms";
         st += L"   present " + std::to_wstring((int)(lastPresentMs + 0.5)) + L" ms";
+        if (animFps > 0) {
+            wchar_t fb[64];
+            swprintf_s(fb, L"   anim %.0f fps (recolor %.1f ms)", animFps, lastRecolorMs);
+            st += fb;
+        }
         if (!nav->IsComputing())
             st += L"    Drag pan   Wheel zoom   R reset   Space render   S save   C copy";
         RECT str = status; str.left += S(10);
@@ -1877,8 +1888,31 @@ public:
         return H_NONE;
     }
 
+    // Env-gated micro-benchmark: on the first settled frame, time the cached phase
+    // re-colour (RecolorPhase) vs a full re-colour (UpdateBitmap) and write the
+    // result to build\gui_bench.txt, then quit. MANDEL_GUI_SS selects SS on/off.
+    void runRecolorBench() {
+        benchMode = false;   // run once
+        nav->SetRedisplay(); nav->UpdateBitmap(bitmap.data());   // ensure settled cache is built
+        const int N = 60;
+        auto t0 = std::chrono::steady_clock::now();
+        for (int k = 0; k < N; ++k) { color_phase += 3.0f; nav->RecolorPhase(bitmap.data()); }
+        double rp = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / N;
+        auto t1 = std::chrono::steady_clock::now();
+        for (int k = 0; k < N; ++k) { color_phase += 3.0f; nav->SetRedisplay(); nav->UpdateBitmap(bitmap.data()); }
+        double ub = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count() / N;
+        FILE* f = nullptr; fopen_s(&f, "build\\gui_bench.txt", "a");
+        if (f) {
+            fprintf(f, "SS=%d  cached RecolorPhase=%.3f ms (%.0f fps)  full re-colour=%.3f ms (%.0f fps)\n",
+                    ssOn ? 1 : 0, rp, rp > 0 ? 1000.0 / rp : 0, ub, ub > 0 ? 1000.0 / ub : 0);
+            fclose(f);
+        }
+        PostQuitMessage(0);
+    }
+
     void timer() {
         bool computing = nav->IsComputing();
+        if (benchMode && !computing) { runRecolorBench(); return; }
         bool anim = std::fabs(animSpeed) > 1e-4f;
         bool active = computing || wasComputing || navDragging || palette.dragging ||
                       pressed == H_MAXTRACK || pressed == H_DENSTRACK ||
@@ -1905,8 +1939,20 @@ public:
                          pressed != H_MAXTRACK && pressed != H_DENSTRACK &&
                          (anim || pressed == H_PHASETRACK || pressed == H_SPEEDTRACK ||
                           pressed == H_RELAZ || pressed == H_RELEL || pressed == H_RELSTR);
+        auto _rc0 = std::chrono::steady_clock::now();
         if (phaseOnly) nav->RecolorPhase(bitmap.data());
         else nav->UpdateBitmap(bitmap.data());
+        lastRecolorMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - _rc0).count();
+        // Smoothed frame rate while animating (measured cadence, not the timer set point).
+        if (anim || pressed == H_PHASETRACK || pressed == H_RELAZ ||
+            pressed == H_RELEL || pressed == H_RELSTR) {
+            if (lastFrameTs.time_since_epoch().count()) {
+                double dtf = std::chrono::duration<double>(now - lastFrameTs).count();
+                if (dtf > 0) { double f = 1.0 / dtf; animFps = animFps ? animFps * 0.85 + f * 0.15 : f; }
+            }
+            lastFrameTs = now;
+        } else { lastFrameTs = {}; animFps = 0; }
         if (wasComputing && !computing)
             lastRenderMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - renderStart).count();
@@ -1937,6 +1983,12 @@ public:
             nav->SetCMethod(coloringIdx == 1 ? ColoringMethod::EXTERIOR_DIST_EST
                           : coloringIdx == 2 ? ColoringMethod::STRIPE_AVERAGE : 0);
             nav->BindFixImageCallback(fixCallback);
+            if (getenv("MANDEL_GUI_BENCH")) {
+                benchMode = true;
+                const char* e = getenv("MANDEL_GUI_SS");
+                ssOn = !e || atoi(e);
+                if (ssOn) nav->SetCMethod(nav->GetCMethod() | ColoringMethod::SUPER_SAMPLING);
+            }
             layout(); startRender();
             SetTimer(hwnd, TIMER_ID, 16, nullptr);
             return 0;
@@ -2182,6 +2234,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     // older Windows to system DPI awareness.
     if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
         SetProcessDPIAware();
+    // Raise the system timer resolution to 1 ms so the 16 ms animation WM_TIMER
+    // actually fires at ~60 Hz. At the default ~15.6 ms resolution a 16 ms timer
+    // is coalesced to the next tick (~31 ms => ~32 fps, with jitter).
+    timeBeginPeriod(1);
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS | CS_OWNDC;
     wc.lpfnWndProc = windowProc;
@@ -2214,5 +2270,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         DispatchMessageW(&msg);
     }
     g_app = nullptr;
+    timeEndPeriod(1);
     return (int)msg.wParam;
 }

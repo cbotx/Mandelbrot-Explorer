@@ -17,6 +17,9 @@
 // The engine marks set-interior pixels with the sentinel -2.0f (EMPTYPIXEL=-10
 // marks not-yet-computed). Relief skips both so they carry no slope.
 static constexpr float INTERIOR_SENTINEL = -2.0f;
+// Cache marker in _baseU: this pixel is an SS SmoothColor sub-block; its phase
+// re-colour reads per-subpixel base indices from _baseUsub instead of colorShadeAA.
+static constexpr float SS_SENTINEL = -3.0f;
 
 MandelNavigator::MandelNavigator(int width, int height, int sub, int max_iteration, double zoom_step, double zoom_time) 
         : Navigator(width, height, zoom_step, zoom_time),
@@ -188,11 +191,15 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
     const int stride = _w * _sub;
     const int c = _sub / 2;
     const bool ss = (_c_method & ColoringMethod::SUPER_SAMPLING) != 0;
-    // The phase cache is only usable when every pixel took the analytic-AA path
-    // (SS off): SS-flagged pixels are averaged sub-blocks that this cache does
-    // not store, so those modes fall back to a full re-colour during animation.
-    const bool cacheable = !ss && settled;
-    if (cacheable) { _baseU.assign((size_t)_w * _h, -1.0f); _widthC.assign((size_t)_w * _h, 0.0f); }
+    // Cache the settled frame for cheap phase re-colour during animation. Non-SS
+    // pixels cache (baseU,width) for colorShadeAA; SS SmoothColor pixels cache
+    // per-subpixel base indices in _baseUsub and are marked with SS_SENTINEL.
+    const bool cacheable = settled;
+    if (cacheable) {
+        _baseU.assign((size_t)_w * _h, -1.0f); _widthC.assign((size_t)_w * _h, 0.0f);
+        if (ss) { size_t cnt = (size_t)_w * _h * _sub * _sub;
+                  if (_baseUsub.size() != cnt) _baseUsub.assign(cnt, EMPTYPIXEL); }
+    }
 #pragma omp parallel for schedule(dynamic, 8)
     for (int i = 0; i < _h; ++i) {
         for (int j = 0; j < _w; ++j) {
@@ -204,7 +211,13 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
             // base layer -> analytic AA from the centre + its 4 pixel neighbours,
             // but ONLY once settled (see above) -- while computing, point-sample.
             if (ss && _iter[idx - (stride + 1) * c] != EMPTYPIXEL) {
-                SmoothColor(bitmap + idx_bmp, idx, _c_method);
+                if (cacheable) {
+                    cacheSmoothBlock(idx, _c_method);
+                    shadeSmoothBlockCached(bitmap + idx_bmp, idx);
+                    _baseU[(size_t)i * _w + j] = SS_SENTINEL;
+                } else {
+                    SmoothColor(bitmap + idx_bmp, idx, _c_method);
+                }
             } else if (settled) {
                 float vL = j > 0        ? _iter[idx - _sub]         : EMPTYPIXEL;
                 float vR = j < _w - 1   ? _iter[idx + _sub]         : EMPTYPIXEL;
@@ -274,10 +287,16 @@ void MandelNavigator::RecolorPhase(uint8_t* bitmap) {
     }
 #pragma omp parallel for schedule(dynamic, 8)
     for (int i = 0; i < _h; ++i) {
+        const int stride = _w * _sub, c = _sub / 2;
         for (int j = 0; j < _w; ++j) {
             size_t p = (size_t)i * _w + j;
             uint8_t* q = bitmap + p * 3;
-            colorShadeAA(_baseU[p], _widthC[p], color_phase, q[0], q[1], q[2]);
+            if (_baseU[p] == SS_SENTINEL) {
+                int idx = (i * _sub + c) * stride + (j * _sub + c);
+                shadeSmoothBlockCached(q, idx);
+            } else {
+                colorShadeAA(_baseU[p], _widthC[p], color_phase, q[0], q[1], q[2]);
+            }
         }
     }
     applyRelief(bitmap);
@@ -306,6 +325,37 @@ void MandelNavigator::SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method)
     bitmap_pixel[0] = (uint8_t)(srgbEncode(rs) * 255.0 + 0.5);
     bitmap_pixel[1] = (uint8_t)(srgbEncode(gs) * 255.0 + 0.5);
     bitmap_pixel[2] = (uint8_t)(srgbEncode(bs) * 255.0 + 0.5);
+}
+
+// Fill _baseUsub for one SmoothColor sub-block from _iter (phase-independent
+// analysis, done once when the frame settles).
+void MandelNavigator::cacheSmoothBlock(int idx, int method) {
+    for (int i = idx - _shift_idx; i <= idx + _shift_idx; i += _w * _sub)
+        for (int j = -_sub / 2; j <= _sub / 2; ++j)
+            _baseUsub[i + j] = colorBaseIndex(_iter[i + j], method);
+}
+
+// Re-shade a SmoothColor sub-block from the cached per-subpixel base indices with
+// the live color_phase, averaging in linear light -- matches SmoothColor exactly
+// but without any colorFunction (pow/log) work, so it is cheap enough for 60 fps.
+void MandelNavigator::shadeSmoothBlockCached(uint8_t* out, int idx) const {
+    double rs = 0, gs = 0, bs = 0, ws = 0;
+    for (int i = idx - _shift_idx; i <= idx + _shift_idx; i += _w * _sub)
+        for (int j = -_sub / 2; j <= _sub / 2; ++j) {
+            float bu = _baseUsub[i + j];
+            int ri, gi, bi;
+            if (bu < 0) { ri = gi = bi = 0; }              // interior/empty subpixel
+            else {
+                int x = ((int)(bu + color_phase)) % colP; if (x < 0) x += colP;
+                ri = std::clamp((int)(color_map[0][x] + 0.5f), 0, 255);
+                gi = std::clamp((int)(color_map[1][x] + 0.5f), 0, 255);
+                bi = std::clamp((int)(color_map[2][x] + 0.5f), 0, 255);
+            }
+            rs += g_srgb2lin[ri]; gs += g_srgb2lin[gi]; bs += g_srgb2lin[bi]; ws += 1;
+        }
+    out[0] = (uint8_t)(srgbEncode(rs / ws) * 255.0 + 0.5);
+    out[1] = (uint8_t)(srgbEncode(gs / ws) * 255.0 + 0.5);
+    out[2] = (uint8_t)(srgbEncode(bs / ws) * 255.0 + 0.5);
 }
 
 // Build a per-pixel height field (centre subpixel smooth value); interior/empty

@@ -89,6 +89,11 @@ public:
 private:
     void ConfigureSampling();
     void SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method);
+    // SS phase cache: fill per-subpixel base palette indices for a SmoothColor
+    // sub-block (settle), and re-shade a sub-block from those cached indices with
+    // the live phase (animation) -- byte-identical to SmoothColor but pow/log-free.
+    void cacheSmoothBlock(int idx, int method);
+    void shadeSmoothBlockCached(uint8_t* out, int idx) const;
     // Build _reliefHt from the settled _iter field (centre subpixel per pixel).
     void buildReliefHeight();
     // Multiply the finished bitmap by per-pixel Lambert slope shading.
