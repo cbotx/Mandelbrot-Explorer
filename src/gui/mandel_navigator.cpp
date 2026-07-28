@@ -16,7 +16,7 @@
 
 // The engine marks set-interior pixels with the sentinel -2.0f (EMPTYPIXEL=-10
 // marks not-yet-computed). Relief skips both so they carry no slope.
-static constexpr float INTERIOR_SENTINEL = -2.0f;
+// (INTERIOR_SENTINEL is declared in Image.h.)
 // Cache marker in _baseU: this pixel is an SS SmoothColor sub-block; its phase
 // re-colour reads per-subpixel base indices from _baseUsub instead of colorShadeAA.
 static constexpr float SS_SENTINEL = -3.0f;

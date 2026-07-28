@@ -9,7 +9,7 @@ cl /nologo /O2 /EHsc /openmp /std:c++17 /arch:AVX2 /MT ^
    /DUNICODE /D_UNICODE ^
    /I "%VCPKG%\include" /I src\engine /I src\gui ^
    /Fo:build\ ^
-   src\gui\win32_main.cpp src\gui\mandel_navigator.cpp src\gui\navigator.cpp ^
+   src\gui\win32_main.cpp src\gui\gui_color.cpp src\gui\mandel_navigator.cpp src\gui\navigator.cpp ^
    src\engine\mandel_perturbation.cpp src\engine\float_math.cpp src\engine\interpolate.cpp src\engine\color.cpp ^
    /Fe:build\mandel_gui.exe ^
    /link /SUBSYSTEM:WINDOWS /LIBPATH:"%VCPKG%\lib" ^

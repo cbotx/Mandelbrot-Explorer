@@ -4,6 +4,10 @@
 #include <cstdint>
 
 static const int colP = 2048;
+// The engine marks set-interior pixels with the exact sentinel -2.0f; exterior
+// pixels carry a (possibly slightly negative) smooth count, so interior must be
+// tested against the exact sentinel, not "< 0". EMPTYPIXEL (-10) marks not-computed.
+constexpr float INTERIOR_SENTINEL = -2.0f;
 extern float color_map[3][colP];
 extern float color_density;
 // Palette-cycle phase in palette-index units [0, colP). Added to every colour
@@ -67,6 +71,9 @@ float colorBaseIndex(float iteration, int c_method);
 // linear [0,1] back to an sRGB [0,255] value.
 extern float g_srgb2lin[256];
 float srgbEncode(double lin);
+// Build the sRGB LUTs on first use (idempotent); needed before g_srgb2lin /
+// srgbEncode255 are read on a path that doesn't call prepareColorFilter.
+void ensureSrgbLut();
 // Fast linear[0,1] -> sRGB[0,255] via an interpolated LUT (no pow); rebuilt with
 // g_srgb2lin. g_palLin is the per-entry linear radiance of the current palette
 // (rebuilt by prepareColorFilter), for the supersampled re-colour hot path.
