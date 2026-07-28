@@ -97,6 +97,16 @@ static const std::vector<NamedPal>& palettePresets() {
         { L"Ocean",    { {0,4,12,38},{0.22f,10,64,120},{0.46f,36,150,190},{0.66f,150,220,230},{0.85f,244,252,255} } },
         { L"Lava",     { {0,10,8,20},{0.16f,140,25,30},{0.36f,240,110,30},{0.56f,250,215,120},{0.72f,180,210,230},{0.88f,50,70,140} } },
         { L"Snowy",    { {0,255,255,255},{0.12f,32,107,203},{0.34f,214,223,255} } },
+        // --- rainbow family (Lab-interpolated -> smooth, non-muddy transitions) ---
+        // Balanced jewel-toned spectrum; hues spaced evenly, wraps violet -> red.
+        { L"Rainbow",  { {0.00f,205,60,72},{0.15f,232,132,52},{0.29f,240,206,92},{0.44f,110,190,110},{0.58f,58,176,184},{0.72f,72,112,202},{0.86f,150,92,192} } },
+        // Higher chroma but kept in gamut, so colours read clean rather than neon-dirty.
+        { L"Vibrant",  { {0.00f,232,38,58},{0.15f,255,138,20},{0.29f,250,222,40},{0.44f,64,198,82},{0.58f,26,188,200},{0.72f,44,96,228},{0.86f,166,58,214} } },
+        // Pastel: each hue lifted toward a bright neutral grey (soft, premium, airy).
+        { L"Pastel",   { {0.00f,232,168,172},{0.15f,242,202,166},{0.29f,244,228,182},{0.44f,186,222,190},{0.58f,168,218,222},{0.72f,176,192,236},{0.86f,206,182,230} } },
+        // Rainbow with one bright peak + one deep-violet trough per cycle (a b&w value
+        // sweep of the same period overlaid on the spectrum) -> strong depth/contrast.
+        { L"Prism",    { {0.00f,28,10,44},{0.12f,92,58,168},{0.26f,66,120,212},{0.40f,74,196,196},{0.50f,238,246,236},{0.62f,246,202,86},{0.76f,232,112,58},{0.88f,150,44,96} } },
     };
     return p;
 }
@@ -1245,6 +1255,7 @@ public:
                 const char* gx = getenv("MANDEL_GUI_CX"), *gy = getenv("MANDEL_GUI_CY"), *gz = getenv("MANDEL_GUI_ZOOM");
                 if (gx && gy && gz) { std::string sc = expandSci(gz); if (!sc.empty()) nav->SetLocation(gx, gy, sc); }
                 if (const char* ds = getenv("MANDEL_GUI_DENS")) color_density = (float)atof(ds);
+                if (const char* pp = getenv("MANDEL_GUI_PAL")) { paletteIdx = atoi(pp); palette.load(paletteIdx); }
             }
             layout(); startRender();
             SetTimer(hwnd, TIMER_ID, 16, nullptr);
