@@ -206,6 +206,10 @@ private:
     std::array<int, 4> _ref;  // reference pixel index
     double _ref_x = 0.0, _ref_y = 0.0;  // reference position in pixel coordinates
     bool _ref_virtual = false;           // exact view center, not an actual pixel
+    // Periodic-reference experiment: when >0 the reference is a period-p minibrot
+    // nucleus and the floatexp delta loop indexes it modulo p (only p entries are
+    // built, not mxit). 0 = normal (full) reference.
+    int _ref_period = 0;
     std::array<int, 4> _new_ref;  // new reference pixel index
     mpf_t _ref_z_re, _ref_z_im;  // reference point coordinate
     Comp _ref_z_f;

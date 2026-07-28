@@ -113,25 +113,31 @@ inline void g_abs(mpf_t out, mpf_srcptr zr, mpf_srcptr zi, GScratch& s) {
 // nucleus lies in the disk. Returns period (0 if none / escaped).
 static int g_ballPeriod(mpf_srcptr cr, mpf_srcptr ci, mpf_srcptr r, int maxp, mp_bitcnt_t prec) {
     GScratch s(prec);
-    mpf_t zr, zi, R, za, nb, cab, eb, ru, er;
-    mpf_init2(zr, prec); mpf_init2(zi, prec); mpf_init2(R, prec); mpf_init2(za, prec);
-    mpf_init2(nb, prec); mpf_init2(cab, prec); mpf_init2(eb, prec); mpf_init2(ru, prec); mpf_init2(er, prec);
+    mpf_t zr, zi, R, R2m, zabs2, nb, ru, t;
+    mpf_init2(zr, prec); mpf_init2(zi, prec); mpf_init2(R, prec); mpf_init2(R2m, prec);
+    mpf_init2(zabs2, prec); mpf_init2(nb, prec); mpf_init2(ru, prec); mpf_init2(t, prec);
     mpf_set_ui(zr, 0); mpf_set_ui(zi, 0); mpf_set_ui(R, 0);
-    g_abs(cab, cr, ci, s);
+    const double cab = std::hypot(mpf_get_d(cr), mpf_get_d(ci));   // |c| ~ O(1)
     mpf_set_ui(ru, 1); mpf_div_2exp(ru, ru, prec > 64 ? prec - 32 : prec / 2);
     int period = 0;
     for (int p = 1; p <= maxp; ++p) {
-        g_abs(za, zr, zi, s);                                   // |z| before the step
-        mpf_mul_ui(nb, za, 2); mpf_add(nb, nb, R); mpf_mul(nb, nb, R); mpf_add(nb, nb, r);
-        mpf_mul(er, za, za); mpf_add(er, er, cab); mpf_add_ui(er, er, 1); mpf_mul(er, er, ru);
-        mpf_add(nb, nb, er); mpf_set(R, nb);
+        // Orbit magnitudes are O(1), so |z| for the radius recurrence is taken in
+        // double (no mpf_sqrt): R' = (2|z| + R) R + r + roundoff. R stays in GMP
+        // because r (= 2/scale) can be far below double's underflow.
+        double za = std::hypot(mpf_get_d(zr), mpf_get_d(zi));
+        mpf_set_d(t, 2.0 * za); mpf_add(nb, t, R); mpf_mul(nb, nb, R); mpf_add(nb, nb, r);
+        mpf_set_d(t, za * za + cab + 1.0); mpf_mul(t, t, ru); mpf_add(nb, nb, t);
+        mpf_set(R, nb);
         g_sqadd(zr, zi, cr, ci, s);
-        g_abs(za, zr, zi, s);                                   // |z| after the step
-        if (mpf_cmp(za, R) <= 0) { period = p; break; }
-        mpf_add(eb, R, cab); mpf_add(eb, eb, r); mpf_add_ui(eb, eb, 2);
-        if (mpf_cmp(za, eb) > 0) break;                          // whole disk escaped
+        // Exact disk-contains-0 test |z|^2 <= R^2 (GMP, no sqrt).
+        mpf_mul(s.t1, zr, zr); mpf_mul(s.t2, zi, zi); mpf_add(zabs2, s.t1, s.t2);
+        mpf_mul(R2m, R, R);
+        if (mpf_cmp(zabs2, R2m) <= 0) { period = p; break; }
+        // Escape: the whole disk left the bailout region. R, r are tiny; |c|+2 dominates.
+        double zb = std::hypot(mpf_get_d(zr), mpf_get_d(zi));
+        if (zb > cab + 2.0 + mpf_get_d(R)) break;
     }
-    mpf_clears(zr, zi, R, za, nb, cab, eb, ru, er, (mpf_ptr)0);
+    mpf_clears(zr, zi, R, R2m, zabs2, nb, ru, t, (mpf_ptr)0);
     return period;
 }
 // Newton-refine (cr,ci) to the period-p nucleus: c <- c - z_p / (dz_p/dc).
@@ -587,14 +593,11 @@ int Mandel::createPeriodicRef(int period, int mxit, int c_method) {
     // series-approximation work). The nucleus orbit is bounded (never escapes).
     for (int i = 1; i < period; ++i) calCoefficient(i, 0, c_method);
 
-    // Replicate the period across the whole reference. Z_i = Z_{i-period}.
-    for (int i = period; i <= mxit; ++i) {
-        int q = i - period;
-        _zf[i] = _zf[q]; _zfr[i] = _zfr[q]; _zfi[i] = _zfi[q];
-        _zfr_fe[i] = _zfr_fe[q]; _zfi_fe[i] = _zfi_fe[q];
-        _z_m3[i] = _z_m3[q];
-    }
-    return mxit;
+    // The delta loop indexes this reference modulo the period (Z_{i} = Z_{i-period}),
+    // so only these `period` entries exist -- no mxit-long replication.  BLA is
+    // built over one period; skips are capped to stay within it.
+    _ref_period = period;
+    return period;
 }
 
 
@@ -742,18 +745,23 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         Float c0_re_f = mpf_get_ld(_c0_re);
         Float c0_im_f = mpf_get_ld(_c0_im);
         floatPointCompute(c0_re_f, c0_im_f, mxit, c_method);
+        _ref_period = 0;
         // Periodic-reference experiment (opt-in). If a minibrot nucleus sits in the
-        // view, use it as a bounded period-p reference and build only one period in
-        // GMP (the rest is a cheap replication) instead of a full mxit-long orbit.
-        // Restricted to the floatexp deep path (sub-pixel dc via _ref_x/_ref_y) and
-        // non-EDE (only Z is periodic, not the EDE derivative). Default off.
+        // view, use it as a bounded period-p reference: build ONE period in GMP and
+        // let the floatexp delta loop index it modulo p, instead of a full mxit-long
+        // orbit. Restricted to the floatexp deep path (sub-pixel dc via _ref_x/_ref_y),
+        // non-EDE (only Z is periodic, not the EDE derivative), non-SAC (the stripe
+        // prefix sum is not periodic-aware yet), and BLA on (the mod-p index + skip
+        // cap live in the BLA path). Default off.
         bool periodic_done = false;
         static int periodic_env = -1;
         if (periodic_env < 0) { const char* e = getenv("MANDEL_PERIODIC"); periodic_env = e ? atoi(e) : 0; }
-        if (periodic_env && _use_floatexp && !(c_method & ColoringMethod::EXTERIOR_DIST_EST)) {
+        if (periodic_env && _use_floatexp && _use_bla &&
+            !(c_method & ColoringMethod::EXTERIOR_DIST_EST) &&
+            !(c_method & ColoringMethod::STRIPE_AVERAGE)) {
             tk = now();
             int p = findNucleus(_ref_z_re, _ref_z_im, mxit);
-            if (p > 0 && p <= mxit) {
+            if (p > 2 && p <= mxit) {
                 ref_it = createPeriodicRef(p, mxit, c_method);
                 _ref_bounded = true;
                 periodic_done = true;
@@ -803,7 +811,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             }
         }
         }   // end if (!periodic_done): normal reference build
-        _ref_bounded = (ref_it >= mxit);
+        if (!periodic_done) _ref_bounded = (ref_it >= mxit);
         if (_use_bla) { tk = now(); buildBLA(ref_it, (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0); pf_bla += now() - tk; }
         // Reference-orbit stripe prefix sum, so a BLA skip can restore its omitted
         // stripe-average contributions (z ~ X during a valid skip) instead of
@@ -1778,6 +1786,12 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
     // is memory-bound, so halving the reference footprint is the real lever.
     const double* zfp = reinterpret_cast<const double*>(_zf);
     const int reflen = mx_ref_it + 1;
+    // Periodic reference (MANDEL_PERIODIC): the orbit repeats every `per` entries,
+    // so read it at rm = (m-1) mod per and never force-rebase on running off the
+    // end (it wraps instead). rm is maintained incrementally so the non-periodic
+    // path (per == 0, rm == m-1 throughout) stays byte-identical.
+    const int per = _ref_period;
+    int rm = 0;                          // reference index for X_m (mirrors m-1)
 
     FloatExp S = fe_sqrt(fe_add(fe_mul(dcr, dcr), fe_mul(dci, dci)));   // |dc|
     double wr, wi, dr, di;
@@ -1820,7 +1834,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         // the periodicity detector (a multi-iter skip leaves its state stale).
         if (_use_bla && m >= 2) {
             double ab[4];
-            int skip = tryBLAfe(m - 1, S, S2, wr, wi, dcr, dci, ESC2, reflen, ede ? ab : nullptr);
+            int skip = tryBLAfe(rm, S, S2, wr, wi, dcr, dci, ESC2, per ? per : reflen, ede ? ab : nullptr);
             if (skip > 0) {
                 if (sac) {
                     if (sacc.W > 0) sacc.reset_window();      // tail broken by the jump
@@ -1837,6 +1851,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
                     else { jr = fe_to_double(fe_div(nJr, SJ)); ji = fe_to_double(fe_div(nJi, SJ)); invSJd = 1.0 / fe_to_double(SJ); }
                 }
                 m += skip; iter += skip; g.sk++; g.skl += skip;
+                rm += skip; if (per && rm >= per) rm -= per;   // land < per (skip is capped)
                 s = fe_to_double(S); S2 = fe_mul(S, S);
                 dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
                 zsr = 1e30; zsi = 1e30; save_iter = iter; period_win = 1;
@@ -1845,12 +1860,13 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
             }
         }
         // w' = 2 X_m w + s w^2 + d   (dz_m -> dz_{m+1}); X_0 = 0.
-        double Xr = m ? zfp[2 * (m - 1)] : 0.0, Xi = m ? zfp[2 * (m - 1) + 1] : 0.0;
+        double Xr = m ? zfp[2 * rm] : 0.0, Xi = m ? zfp[2 * rm + 1] : 0.0;
         double zmr = Xr + s * wr, zmi = Xi + s * wi;   // z at index m (pre-step), for J' = 2 z J + 1
         double w2r = wr * wr - wi * wi, w2i = 2.0 * wr * wi;
         double nwr = 2.0 * (Xr * wr - Xi * wi) + s * w2r + dr;
         double nwi = 2.0 * (Xr * wi + Xi * wr) + s * w2i + di;
         wr = nwr; wi = nwi; ++m; ++iter; g.st++;
+        rm++; if (per && rm == per) rm = 0;             // advance the (mod-per) ref index
         if (ede) {
             // J_{m+1} = 2 z_m J_m + 1 (exact; z_m is the reconstructed value).
             double a = 2.0 * (zmr * jr - zmi * ji) + invSJd;   // "+1" is invSJd in the SJ scale
@@ -1866,7 +1882,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
             }
         }
 
-        Xr = m ? zfp[2 * (m - 1)] : 0.0; Xi = m ? zfp[2 * (m - 1) + 1] : 0.0;
+        Xr = m ? zfp[2 * rm] : 0.0; Xi = m ? zfp[2 * rm + 1] : 0.0;
         double zr = Xr + s * wr, zi = Xi + s * wi;      // z = X_m + S w
         double zrad = zr * zr + zi * zi;
         if (sac) sacc.push(zr, zi);
@@ -1920,14 +1936,14 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         // -> large-area glitch. dzmag2 = |S w|^2 in double (0 if S underflows deep,
         // where the zrad<1e-8 branch still handles the near-zero reference passes).
         double dzmag2 = s * s * (wr * wr + wi * wi);
-        if (zrad < 1e-8 || zrad < dzmag2 || m >= reflen) {
-            FloatExp Xmr = m ? _zfr_fe[m - 1] : FloatExp{ 0.0, 0 };
-            FloatExp Xmi = m ? _zfi_fe[m - 1] : FloatExp{ 0.0, 0 };
+        if (zrad < 1e-8 || zrad < dzmag2 || (!per && m >= reflen)) {
+            FloatExp Xmr = m ? _zfr_fe[rm] : FloatExp{ 0.0, 0 };
+            FloatExp Xmi = m ? _zfi_fe[rm] : FloatExp{ 0.0, 0 };
             FloatExp Swr = fe_mul_d(S, wr), Swi = fe_mul_d(S, wi);      // S w = dz_true
             FloatExp zrfe = fe_add(Xmr, Swr), zife = fe_add(Xmi, Swi);
             FloatExp zradfe = fe_add(fe_mul(zrfe, zrfe), fe_mul(zife, zife));
             FloatExp dzfe = fe_add(fe_mul(Swr, Swr), fe_mul(Swi, Swi));
-            if (m >= reflen || fe_abs_less(zradfe, dzfe)) {
+            if ((!per && m >= reflen) || fe_abs_less(zradfe, dzfe)) {
                 FloatExp Snew = fe_sqrt(zradfe);
                 if (Snew.m == 0.0) { wr = wi = 0.0; }
                 else {
@@ -1935,7 +1951,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
                     wr = fe_to_double(fe_div(zrfe, S)); wi = fe_to_double(fe_div(zife, S));
                     dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
                 }
-                m = 0;
+                m = 0; rm = -1;      // critical point; next ++ makes rm = 0 (mirrors m-1)
             }
         }
     }
