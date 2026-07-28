@@ -1190,6 +1190,9 @@ public:
     // result to build\gui_bench.txt, then quit. MANDEL_GUI_SS selects SS on/off.
     void runRecolorBench() {
         benchMode = false;   // run once
+        // Engine compute (render) time: from the last startRender() to this first settle.
+        double renderMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - renderStart).count();
         nav->SetRedisplay(); nav->UpdateBitmap(bitmap.data());   // ensure settled cache is built
         const int N = 60;
         auto t0 = std::chrono::steady_clock::now();
@@ -1269,8 +1272,8 @@ public:
         }
         FILE* f = nullptr; fopen_s(&f, "build\\gui_bench.txt", "a");
         if (f) {
-            fprintf(f, "SS=%d  recolor=%.3f ms  full=%.3f  buildDisplay=%.3f  present(paint)=%.3f  view=%ldx%ld win=%ldx%ld\n",
-                    ssOn ? 1 : 0, rp, ub, bd, pt,
+            fprintf(f, "SS=%d  render=%.1f ms  recolor=%.3f ms  full=%.3f  buildDisplay=%.3f  present(paint)=%.3f  view=%ldx%ld win=%ldx%ld\n",
+                    ssOn ? 1 : 0, renderMs, rp, ub, bd, pt,
                     vr.right - vr.left, vr.bottom - vr.top, rcw.right, rcw.bottom);
             fclose(f);
         }

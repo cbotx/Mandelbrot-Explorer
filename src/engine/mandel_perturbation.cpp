@@ -1100,8 +1100,11 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             }
         }
     }
-    // printf("Mixing %0.2f%% pixels\n", 1.f * mix_cnt / _w / _h * 100);
-    
+    if (getenv("MANDEL_PROFILE")) {
+        FILE* f = nullptr; fopen_s(&f, "build\\ss_profile.txt", "a");
+        if (f) { fprintf(f, "[ss] supersample-flagged %d / %d px = %.1f%%  (sub=%d -> +%d subpx each)\n",
+                         mix_cnt, _w * _h, 100.0 * mix_cnt / (_w * _h), _sub, _sub * _sub - 1); fclose(f); }
+    }    
     if (_flag_halt) return;
     if (method == 0) {
         Float c0_re_f = mpf_get_ld(_c0_re);
