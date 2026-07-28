@@ -359,10 +359,14 @@ public:
         rcSpeedTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         rcSS  = { px, y, px + w, y + bh }; y += S(56);
         rcColoringDD = { px, y, px + w, y + bh }; y += S(56);
-        // Relief light controls occupy panel space only while Relief mode is active.
-        if (relief_on || normal_light_on || de_overlay_on) {
+        // Relief/normal light use azimuth+elevation+strength; DE overlay uses only the
+        // falloff strength (there is no light direction), so it shows a single slider.
+        if (relief_on || normal_light_on) {
             rcReliefAz  = { px, y + S(24), px + w, y + S(38) }; y += S(52);
             rcReliefEl  = { px, y + S(24), px + w, y + S(38) }; y += S(52);
+            rcReliefStr = { px, y + S(24), px + w, y + S(38) }; y += S(52);
+        } else if (de_overlay_on) {
+            rcReliefAz = rcReliefEl = RECT{};
             rcReliefStr = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         } else {
             rcReliefAz = rcReliefEl = rcReliefStr = RECT{};
@@ -1035,7 +1039,7 @@ public:
         label(dc, rcColoringDD.left, rcColoringDD.top - S(20), L"Coloring");
         drawColoringDD(dc);
 
-        if (relief_on || normal_light_on || de_overlay_on) {
+        if (relief_on || normal_light_on) {
             wchar_t rab[32]; swprintf_s(rab, L"%.0f\u00B0", relief_light_az * 180.0f / 3.14159265f);
             labelRow(dc, rcReliefAz, L"Light azimuth", rab);
             drawSlider(dc, rcReliefAz, std::clamp(relief_light_az / (2.0 * 3.14159265358979), 0.0, 1.0), H_RELAZ);
@@ -1044,6 +1048,10 @@ public:
             drawSlider(dc, rcReliefEl, std::clamp((relief_light_el - 0.05) / (1.5 - 0.05), 0.0, 1.0), H_RELEL);
             wchar_t rsb[32]; swprintf_s(rsb, L"%.2f", relief_strength);
             labelRow(dc, rcReliefStr, L"Relief strength", rsb);
+            drawSlider(dc, rcReliefStr, std::clamp(relief_strength / RELIEF_STR_MAX, 0.0, 1.0), H_RELSTR);
+        } else if (de_overlay_on) {
+            wchar_t rsb[32]; swprintf_s(rsb, L"%.2f", relief_strength);
+            labelRow(dc, rcReliefStr, L"DE thickness", rsb);
             drawSlider(dc, rcReliefStr, std::clamp(relief_strength / RELIEF_STR_MAX, 0.0, 1.0), H_RELSTR);
         }
 
