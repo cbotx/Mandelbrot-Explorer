@@ -1042,6 +1042,15 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
     double sac_steps = 0.0;   // 0 = boundary only
     { const char* e = getenv("MANDEL_SAC_SS_STEPS"); if (e) sac_steps = atof(e); }
     const double sac_gain = (double)_ss_density * (2048.0 / 20.0);
+    // Orbit trap stores a small trap VALUE (not an iteration count), so the log(mxit)
+    // iteration-difference threshold below never fires -> SS had no effect. Flag the
+    // set boundary plus pixels whose trap colour changes by more than TRAP_SS_STEPS
+    // palette entries/pixel (colour index = trap*density/60*colP). Trap detail is
+    // high-frequency, so keep the default moderate; lower = more SS (slower).
+    const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
+    double trap_steps = 3.0;
+    { const char* e = getenv("MANDEL_TRAP_SS_STEPS"); if (e) trap_steps = atof(e); }
+    const double trap_gain = (double)_ss_density / 60.0 * 2048.0;
     for (int i = 0; i < _h; ++i) {
         for (int j = 0; j < _w; ++j) {
             bool need_sample = false;
@@ -1071,12 +1080,13 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                         if (nx >= 0 && nx < _w && ny >= 0 && ny < _h) {
                             float nv = _iter[getIndex(ny, nx, 0, 0)];
                             diff = std::max(diff, std::abs(cv - nv));
-                            if (sac && cv * nv < 0) boundary = true;   // interior/exterior edge
+                            if ((sac || trap) && cv * nv < 0) boundary = true;   // interior/exterior edge
                         }
                     }
                 }
-                if (sac) need_sample = boundary || (sac_steps > 0 && diff * sac_gain > sac_steps);
-                else     need_sample = (log(diff) > ss_thresh);
+                if (sac)       need_sample = boundary || (sac_steps > 0 && diff * sac_gain > sac_steps);
+                else if (trap) need_sample = boundary || (diff * trap_gain > trap_steps);
+                else           need_sample = (log(diff) > ss_thresh);
             }
             if (need_sample) {
                 ++mix_cnt;

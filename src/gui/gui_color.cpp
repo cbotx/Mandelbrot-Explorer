@@ -29,7 +29,7 @@ static float colorFunction(float it, int method) {
     if (method & ColoringMethod::STRIPE_AVERAGE)
         return it * (color_density / 20.0f);   // SAC value in [0,1] -> banded palette
     if (method & ColoringMethod::ORBIT_TRAP)
-        return it;                              // orbit-trap value is already a palette coordinate
+        return it * (color_density / 60.0f);    // density scales the trap band frequency
     if (method & ColoringMethod::EXTERIOR_DIST_EST)
         return tanhf(it * color_density / 3600.0f * 5.0f);
     if (it < 0.0f) it = 0.0f;                  // far-field fast escapes: small negative count
