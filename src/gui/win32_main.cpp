@@ -223,6 +223,11 @@ public:
     std::vector<uint8_t> display = std::vector<uint8_t>((size_t)RENDER_W * RENDER_H * 3, 0); // BGR
     std::vector<uint8_t> scaled;   // view-resolution upscale of `display` (BGR top-down)
     int scaledW = 0, scaledH = 0, scaledStride = 0;   // scaledStride = DWORD-aligned row bytes
+    // Native-resolution rendering: the fractal is computed at the current view size
+    // (renderW x renderH), so the on-screen blit is 1:1 (no upscale -> no beating).
+    // These start at the compile-time default and follow the window on resize.
+    int renderW = RENDER_W, renderH = RENDER_H;
+    bool inSizeMove = false;       // between WM_ENTERSIZEMOVE/EXITSIZEMOVE (defer retarget)
     PaletteEditor palette;
 
     // widget rects (computed in layout())
@@ -322,7 +327,10 @@ public:
         int aw = std::max(1, (int)rc.right - S(PANEL_W));
         int ah = std::max(1, (int)rc.bottom - S(STATUS_H));
         double s = std::min((double)aw / RENDER_W, (double)ah / RENDER_H);
-        int w = std::max(1, (int)(RENDER_W * s)), h = std::max(1, (int)(RENDER_H * s));
+        int w = std::max(4, (int)(RENDER_W * s)), h = std::max(1, (int)(RENDER_H * s));
+        // The render buffer == this view size and is blitted 1:1; GDI DIB rows must be
+        // DWORD-aligned, so keep the width a multiple of 4 (w*3 then divisible by 4).
+        w &= ~3;
         return { (aw - w) / 2, (ah - h) / 2, (aw - w) / 2 + w, (ah - h) / 2 + h };
     }
 
@@ -412,25 +420,25 @@ public:
         // pan/zoom track the cursor consistently on the y axis. Parallelised: this
         // runs every animation/pan frame, so it must stay well under the 16 ms budget.
 #pragma omp parallel for schedule(static)
-        for (int y = 0; y < RENDER_H; ++y) {
-            double fy = ly + (ry - ly) * ((RENDER_H - 1 - y) + 0.5) / RENDER_H;
-            int sy = (int)(fy * RENDER_H);
-            for (int x = 0; x < RENDER_W; ++x) {
-                double fx = lx + (rx - lx) * (x + 0.5) / RENDER_W;
-                int sx = (int)(fx * RENDER_W);
-                size_t d = ((size_t)y * RENDER_W + x) * 3;
-                if (sx < 0 || sx >= RENDER_W || sy < 0 || sy >= RENDER_H) {
+        for (int y = 0; y < renderH; ++y) {
+            double fy = ly + (ry - ly) * ((renderH - 1 - y) + 0.5) / renderH;
+            int sy = (int)(fy * renderH);
+            for (int x = 0; x < renderW; ++x) {
+                double fx = lx + (rx - lx) * (x + 0.5) / renderW;
+                int sx = (int)(fx * renderW);
+                size_t d = ((size_t)y * renderW + x) * 3;
+                if (sx < 0 || sx >= renderW || sy < 0 || sy >= renderH) {
                     display[d] = display[d+1] = display[d+2] = 0;
                 } else {
-                    size_t s = ((size_t)sy * RENDER_W + sx) * 3;
+                    size_t s = ((size_t)sy * renderW + sx) * 3;
                     display[d] = bitmap[s+2]; display[d+1] = bitmap[s+1]; display[d+2] = bitmap[s];
                 }
             }
         }
     }
-    // Parallel bilinear upscale of `display` (RENDER_W x RENDER_H) to the view size.
-    // Replaces GDI's single-threaded HALFTONE StretchDIBits, which dominates the
-    // frame time on large windows; the follow-up blit is then a 1:1 copy.
+    // Parallel bilinear upscale of `display` (renderW x renderH) to the view size.
+    // Only used transiently while a window resize is in progress (before the render
+    // buffers retarget); in the native steady state the blit is 1:1 (no scaling).
     void scaleDisplay(int vW, int vH) {
         // DIB scanlines must be DWORD-aligned; pad each row to a 4-byte multiple so
         // StretchDIBits reads it with the stride it derives from biWidth (otherwise
@@ -441,19 +449,19 @@ public:
         }
         const uint8_t* src = display.data();
         uint8_t* dst = scaled.data();
-        const double sxr = (double)RENDER_W / vW, syr = (double)RENDER_H / vH;
+        const double sxr = (double)renderW / vW, syr = (double)renderH / vH;
 #pragma omp parallel for schedule(static)
         for (int y = 0; y < vH; ++y) {
             double fsy = (y + 0.5) * syr - 0.5;
             int y0 = (int)std::floor(fsy); double ty = fsy - y0;
-            int y0c = std::clamp(y0, 0, RENDER_H - 1), y1c = std::clamp(y0 + 1, 0, RENDER_H - 1);
-            const uint8_t* r0 = src + (size_t)y0c * RENDER_W * 3;
-            const uint8_t* r1 = src + (size_t)y1c * RENDER_W * 3;
+            int y0c = std::clamp(y0, 0, renderH - 1), y1c = std::clamp(y0 + 1, 0, renderH - 1);
+            const uint8_t* r0 = src + (size_t)y0c * renderW * 3;
+            const uint8_t* r1 = src + (size_t)y1c * renderW * 3;
             uint8_t* d = dst + (size_t)y * stride;
             for (int x = 0; x < vW; ++x) {
                 double fsx = (x + 0.5) * sxr - 0.5;
                 int x0 = (int)std::floor(fsx); double tx = fsx - x0;
-                int x0c = std::clamp(x0, 0, RENDER_W - 1) * 3, x1c = std::clamp(x0 + 1, 0, RENDER_W - 1) * 3;
+                int x0c = std::clamp(x0, 0, renderW - 1) * 3, x1c = std::clamp(x0 + 1, 0, renderW - 1) * 3;
                 double w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty), w01 = (1 - tx) * ty, w11 = tx * ty;
                 for (int ch = 0; ch < 3; ++ch)
                     d[x * 3 + ch] = (uint8_t)(r0[x0c + ch] * w00 + r0[x1c + ch] * w10 +
@@ -465,10 +473,10 @@ public:
         buildDisplay();
         // display is top-down/upright; bitmap is y-up, so flip rows back when baking
         // the warped preview as the new base (keeps the transition frame upright).
-        for (int y = 0; y < RENDER_H; ++y) {
-            const uint8_t* src = &display[(size_t)y * RENDER_W * 3];
-            uint8_t* dst = &bitmap[(size_t)(RENDER_H - 1 - y) * RENDER_W * 3];
-            for (int x = 0; x < RENDER_W; ++x) {
+        for (int y = 0; y < renderH; ++y) {
+            const uint8_t* src = &display[(size_t)y * renderW * 3];
+            uint8_t* dst = &bitmap[(size_t)(renderH - 1 - y) * renderW * 3];
+            for (int x = 0; x < renderW; ++x) {
                 dst[x*3] = src[x*3+2]; dst[x*3+1] = src[x*3+1]; dst[x*3+2] = src[x*3];
             }
         }
@@ -482,11 +490,39 @@ public:
         keepLive();
         InvalidateRect(hwnd, nullptr, FALSE);
     }
+    // Re-point the render buffers at a new view size (native-resolution display).
+    // Rebuilds the navigator's sample buffers + our RGB buffers, then re-renders.
+    void retargetRender(int vW, int vH) {
+        if (!nav || vW < 8 || vH < 8) return;
+        if (vW == renderW && vH == renderH) return;
+        renderW = vW; renderH = vH;
+        bitmap.assign((size_t)renderW * renderH * 3, 0);
+        display.assign((size_t)renderW * renderH * 3, 0);
+        nav->Resize(renderW, renderH);
+        startRender();
+    }
+    void retargetToView() {
+        RECT vr = viewRect();
+        int vW = vr.right - vr.left, vH = vr.bottom - vr.top;
+        // Cap the native render budget: the engine holds _sub*_sub floats/pixel in two
+        // arrays, so an unbounded maximized window on a huge/high-DPI monitor could
+        // allocate pathologically (and an OOM would be fatal). Beyond the cap we render
+        // a bit smaller and let the 1:1-blit fall back to the scaled path; normal
+        // windows (<= ~2 Mpx, incl. 1080p maximized) stay fully pixel-native.
+        const double MAX_PX = 2.0e6;
+        double px = (double)vW * (double)vH;
+        if (px > MAX_PX) {
+            double s = std::sqrt(MAX_PX / px);
+            vW = std::max(4, (int)(vW * s)) & ~3;
+            vH = std::max(1, (int)(vH * s));
+        }
+        retargetRender(vW, vH);
+    }
     POINT mapToRender(int x, int y) const {
         RECT r = viewRect();
-        int px = (int)((x - r.left) * (double)RENDER_W / std::max(1L, r.right - r.left));
-        int py = (int)((y - r.top) * (double)RENDER_H / std::max(1L, r.bottom - r.top));
-        return { std::clamp(px, 0, RENDER_W - 1), std::clamp(py, 0, RENDER_H - 1) };
+        int px = (int)((x - r.left) * (double)renderW / std::max(1L, r.right - r.left));
+        int py = (int)((y - r.top) * (double)renderH / std::max(1L, r.bottom - r.top));
+        return { std::clamp(px, 0, renderW - 1), std::clamp(py, 0, renderH - 1) };
     }
 
     // ---- value mapping ----
@@ -610,11 +646,11 @@ public:
         ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
         if (GetSaveFileNameW(&ofn)) {
             buildDisplay();
-            std::vector<uint8_t> rgb((size_t)RENDER_W * RENDER_H * 3);   // display is BGR -> RGB
-            for (size_t i = 0; i < (size_t)RENDER_W * RENDER_H; ++i) {
+            std::vector<uint8_t> rgb((size_t)renderW * renderH * 3);   // display is BGR -> RGB
+            for (size_t i = 0; i < (size_t)renderW * renderH; ++i) {
                 rgb[i * 3] = display[i * 3 + 2]; rgb[i * 3 + 1] = display[i * 3 + 1]; rgb[i * 3 + 2] = display[i * 3];
             }
-            writeExportPNG(file, rgb, RENDER_W, RENDER_H);
+            writeExportPNG(file, rgb, renderW, renderH);
         }
     }
 
@@ -913,20 +949,25 @@ public:
         int vW = vr.right - vr.left, vH = vr.bottom - vr.top;
         BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 24; bi.bmiHeader.biCompression = BI_RGB;
-        // Upscale: 0=GDI COLORONCOLOR (nearest), 2=GDI HALFTONE (bilinear, slow),
-        // default=our parallel bilinear + 1:1 blit (bilinear quality, multithreaded).
+        // Native steady state: the render buffer matches the view exactly -> 1:1 blit
+        // of `display` (no resampling, no beating). The scale/GDI paths are only hit
+        // transiently while a window resize is in flight (before the buffers retarget).
         static int stretchEnv = -1;
         if (stretchEnv < 0) { const char* e = getenv("MANDEL_STRETCH"); stretchEnv = e ? atoi(e) : 1; }
-        if ((stretchEnv == 1 || stretchEnv == 3) && (vW != RENDER_W || vH != RENDER_H)) {
+        if (vW == renderW && vH == renderH) {
+            bi.bmiHeader.biWidth = renderW; bi.bmiHeader.biHeight = -renderH;
+            StretchDIBits(dc, vr.left, vr.top, vW, vH, 0, 0, renderW, renderH,
+                          display.data(), &bi, DIB_RGB_COLORS, SRCCOPY);   // 1:1 copy
+        } else if (stretchEnv == 1 || stretchEnv == 3) {
             scaleDisplay(vW, vH);
             bi.bmiHeader.biWidth = vW; bi.bmiHeader.biHeight = -vH;
             StretchDIBits(dc, vr.left, vr.top, vW, vH, 0, 0, vW, vH,
                           scaled.data(), &bi, DIB_RGB_COLORS, SRCCOPY);   // 1:1 copy
         } else {
-            bi.bmiHeader.biWidth = RENDER_W; bi.bmiHeader.biHeight = -RENDER_H;
+            bi.bmiHeader.biWidth = renderW; bi.bmiHeader.biHeight = -renderH;
             SetStretchBltMode(dc, stretchEnv == 2 ? HALFTONE : COLORONCOLOR);
             StretchDIBits(dc, vr.left, vr.top, vW, vH,
-                          0, 0, RENDER_W, RENDER_H, display.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+                          0, 0, renderW, renderH, display.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
         }
 
         // panel + all controls: only rebuilt when UI state changed. On fractal/
@@ -1145,25 +1186,47 @@ public:
                 for (int y = vH - 1; y >= 0; --y) fwrite(scaled.data() + (size_t)y * scaledStride, 1, scaledStride, bf);
                 fclose(bf);
             }
-            // Final composited frame (RGB, 900x600) exactly as shown in the view.
+            // Final composited frame (RGB, renderW x renderH) exactly as shown.
             FILE* ff = nullptr; fopen_s(&ff, "build\\gui_frame.bmp", "wb");
             if (ff) {
-                int stride = (RENDER_W * 3 + 3) & ~3; uint32_t ds = (uint32_t)stride * RENDER_H, fs = 54 + ds, off = 54;
+                int stride = (renderW * 3 + 3) & ~3; uint32_t ds = (uint32_t)stride * renderH, fs = 54 + ds, off = 54;
                 uint8_t fh[14] = { 'B','M' }; memcpy(fh + 2, &fs, 4); memcpy(fh + 10, &off, 4);
                 uint8_t ih[40] = { 0 }; uint32_t v; v = 40; memcpy(ih, &v, 4);
-                int32_t iw = RENDER_W, ihh = RENDER_H; memcpy(ih + 4, &iw, 4); memcpy(ih + 8, &ihh, 4);
+                int32_t iw = renderW, ihh = renderH; memcpy(ih + 4, &iw, 4); memcpy(ih + 8, &ihh, 4);
                 uint16_t pl = 1, bp = 24; memcpy(ih + 12, &pl, 2); memcpy(ih + 14, &bp, 2);
                 memcpy(ih + 20, &ds, 4);
                 fwrite(fh, 1, 14, ff); fwrite(ih, 1, 40, ff);
                 std::vector<uint8_t> row(stride, 0);
-                for (int y = RENDER_H - 1; y >= 0; --y) {
-                    for (int x = 0; x < RENDER_W; ++x) {
-                        const uint8_t* s = bitmap.data() + ((size_t)y * RENDER_W + x) * 3;
+                for (int y = renderH - 1; y >= 0; --y) {
+                    for (int x = 0; x < renderW; ++x) {
+                        const uint8_t* s = bitmap.data() + ((size_t)y * renderW + x) * 3;
                         row[x * 3] = s[2]; row[x * 3 + 1] = s[1]; row[x * 3 + 2] = s[0];   // RGB->BGR
                     }
                     fwrite(row.data(), 1, stride, ff);
                 }
                 fclose(ff);
+            }
+            // Actual presented frame (post-StretchDIBits) grabbed from the back buffer,
+            // so the on-screen 1:1 blit can be verified headlessly (alignment / no shear).
+            if (memDC && memBmp) {
+                BITMAPINFO pbi{}; pbi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                pbi.bmiHeader.biWidth = memW; pbi.bmiHeader.biHeight = memH; pbi.bmiHeader.biPlanes = 1;
+                pbi.bmiHeader.biBitCount = 24; pbi.bmiHeader.biCompression = BI_RGB;
+                int pst = (memW * 3 + 3) & ~3; std::vector<uint8_t> pbuf((size_t)pst * memH);
+                if (GetDIBits(memDC, memBmp, 0, memH, pbuf.data(), &pbi, DIB_RGB_COLORS)) {
+                    FILE* pf = nullptr; fopen_s(&pf, "build\\gui_present.bmp", "wb");
+                    if (pf) {
+                        uint32_t ds = (uint32_t)pst * memH, fs = 54 + ds, off = 54;
+                        uint8_t fh[14] = { 'B','M' }; memcpy(fh + 2, &fs, 4); memcpy(fh + 10, &off, 4);
+                        uint8_t ih[40] = { 0 }; uint32_t v = 40; memcpy(ih, &v, 4);
+                        int32_t iw = memW, ihh = memH; memcpy(ih + 4, &iw, 4); memcpy(ih + 8, &ihh, 4);
+                        uint16_t pl = 1, bp = 24; memcpy(ih + 12, &pl, 2); memcpy(ih + 14, &bp, 2);
+                        memcpy(ih + 20, &ds, 4);
+                        fwrite(fh, 1, 14, pf); fwrite(ih, 1, 40, pf);
+                        fwrite(pbuf.data(), 1, (size_t)pst * memH, pf);
+                        fclose(pf);
+                    }
+                }
             }
         }
         FILE* f = nullptr; fopen_s(&f, "build\\gui_bench.txt", "a");
@@ -1274,7 +1337,19 @@ public:
             layout(); InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
-        case WM_SIZE: layout(); InvalidateRect(hwnd, nullptr, FALSE); return 0;
+        case WM_ENTERSIZEMOVE: inSizeMove = true; return 0;
+        case WM_EXITSIZEMOVE:
+            // Interactive resize finished -> retarget the render buffers to the new
+            // view size (native resolution) and re-render once.
+            inSizeMove = false; retargetToView(); layout();
+            InvalidateRect(hwnd, nullptr, TRUE); return 0;
+        case WM_SIZE:
+            layout();
+            // Maximize/restore/DPI changes arrive without ENTERSIZEMOVE; retarget them
+            // immediately. Interactive border drags defer to WM_EXITSIZEMOVE (above),
+            // painting a transient scaled preview until then.
+            if (wp != SIZE_MINIMIZED && !inSizeMove) retargetToView();
+            InvalidateRect(hwnd, nullptr, FALSE); return 0;
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: paint(); return 0;
         case WM_TIMER: if (wp == TIMER_ID) timer(); return 0;
@@ -1463,8 +1538,8 @@ public:
             else if (wp == 'S') saveImage();
             else if (wp == 'C') copyLocation();
             else if (wp == 'V') pasteLocation();
-            else if (wp == VK_ADD || wp == VK_OEM_PLUS) { nav->ZoomIn(RENDER_W/2, RENDER_H/2); keepLive(); }
-            else if (wp == VK_SUBTRACT || wp == VK_OEM_MINUS) { nav->ZoomOut(RENDER_W/2, RENDER_H/2); keepLive(); }
+            else if (wp == VK_ADD || wp == VK_OEM_PLUS) { nav->ZoomIn(renderW/2, renderH/2); keepLive(); }
+            else if (wp == VK_SUBTRACT || wp == VK_OEM_MINUS) { nav->ZoomOut(renderW/2, renderH/2); keepLive(); }
             return 0;
         case WM_GETMINMAXINFO: {
             auto* m = (MINMAXINFO*)lp;

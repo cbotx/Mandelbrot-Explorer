@@ -55,6 +55,30 @@ void MandelNavigator::Reset() {
     StartCompute();
 }
 
+void MandelNavigator::Resize(int width, int height) {
+    if (width < 8) width = 8;
+    if (height < 8) height = 8;
+    if (width == _w && height == _h) return;
+    InterruptCompute();
+    _w = width; _h = height;
+    // Rebuild the sample buffers + engine at the new size (mirrors ConfigureSampling).
+    delete[] _iter;
+    delete[] _normal;
+    delete _mandel;
+    size_t count = (size_t)_w * _h * _sub * _sub;
+    _iter = new float[count];
+    _normal = new float[count];
+    if (_uniform_feather)
+        _mandel = new Mandel(_w * _sub, _h * _sub, _mxit, 1, _iter);
+    else
+        _mandel = new Mandel(_w, _h, _mxit, _sub, _iter);
+    _mandel->setNormalBuffer(_normal);
+    _mandel->setPrecision((int)mpf_get_prec(_scale));
+    _shift_idx = (_w * _sub) * (_sub / 2);
+    _cache_valid = false;      // size changed -> phase/relief/normal caches stale
+    _require_update = true;
+}
+
 void MandelNavigator::ConfigureSampling() {
     bool want_uniform = (_c_method & ColoringMethod::SUPER_SAMPLING)
                      && (_c_method & ColoringMethod::STRIPE_AVERAGE);

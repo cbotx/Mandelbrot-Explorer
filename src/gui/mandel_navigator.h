@@ -57,6 +57,11 @@ public:
 
     void Reset();
 
+    // Re-target the render buffers to a new pixel size (native-resolution display:
+    // the fractal is computed at the window's view size, no upscaling). Rebuilds
+    // _iter/_normal/_mandel and invalidates the phase cache; the caller re-renders.
+    void Resize(int width, int height);
+
     void StartCompute();
 
     void InterruptCompute();
