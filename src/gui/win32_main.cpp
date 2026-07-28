@@ -1085,6 +1085,8 @@ public:
     std::unique_ptr<MandelNavigator> nav;
     std::vector<uint8_t> bitmap = std::vector<uint8_t>((size_t)RENDER_W * RENDER_H * 3, 0);
     std::vector<uint8_t> display = std::vector<uint8_t>((size_t)RENDER_W * RENDER_H * 3, 0); // BGR
+    std::vector<uint8_t> scaled;   // view-resolution upscale of `display` (BGR top-down)
+    int scaledW = 0, scaledH = 0;
     PaletteEditor palette;
 
     // widget rects (computed in layout())
@@ -1287,6 +1289,35 @@ public:
                     size_t s = ((size_t)sy * RENDER_W + sx) * 3;
                     display[d] = bitmap[s+2]; display[d+1] = bitmap[s+1]; display[d+2] = bitmap[s];
                 }
+            }
+        }
+    }
+    // Parallel bilinear upscale of `display` (RENDER_W x RENDER_H) to the view size.
+    // Replaces GDI's single-threaded HALFTONE StretchDIBits, which dominates the
+    // frame time on large windows; the follow-up blit is then a 1:1 copy.
+    void scaleDisplay(int vW, int vH) {
+        if (scaledW != vW || scaledH != vH || (int)scaled.size() != vW * vH * 3) {
+            scaled.assign((size_t)vW * vH * 3, 0); scaledW = vW; scaledH = vH;
+        }
+        const uint8_t* src = display.data();
+        uint8_t* dst = scaled.data();
+        const double sxr = (double)RENDER_W / vW, syr = (double)RENDER_H / vH;
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < vH; ++y) {
+            double fsy = (y + 0.5) * syr - 0.5;
+            int y0 = (int)std::floor(fsy); double ty = fsy - y0;
+            int y0c = std::clamp(y0, 0, RENDER_H - 1), y1c = std::clamp(y0 + 1, 0, RENDER_H - 1);
+            const uint8_t* r0 = src + (size_t)y0c * RENDER_W * 3;
+            const uint8_t* r1 = src + (size_t)y1c * RENDER_W * 3;
+            uint8_t* d = dst + (size_t)y * vW * 3;
+            for (int x = 0; x < vW; ++x) {
+                double fsx = (x + 0.5) * sxr - 0.5;
+                int x0 = (int)std::floor(fsx); double tx = fsx - x0;
+                int x0c = std::clamp(x0, 0, RENDER_W - 1) * 3, x1c = std::clamp(x0 + 1, 0, RENDER_W - 1) * 3;
+                double w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty), w01 = (1 - tx) * ty, w11 = tx * ty;
+                for (int ch = 0; ch < 3; ++ch)
+                    d[x * 3 + ch] = (uint8_t)(r0[x0c + ch] * w00 + r0[x1c + ch] * w10 +
+                                              r1[x0c + ch] * w01 + r1[x1c + ch] * w11 + 0.5);
             }
         }
     }
@@ -1731,12 +1762,24 @@ public:
 
         // fractal view (always -- it changes every tick)
         RECT vr = viewRect();
+        int vW = vr.right - vr.left, vH = vr.bottom - vr.top;
         BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = RENDER_W; bi.bmiHeader.biHeight = -RENDER_H;
         bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 24; bi.bmiHeader.biCompression = BI_RGB;
-        SetStretchBltMode(dc, HALFTONE);
-        StretchDIBits(dc, vr.left, vr.top, vr.right-vr.left, vr.bottom-vr.top,
-                      0,0, RENDER_W, RENDER_H, display.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+        // Upscale: 0=GDI COLORONCOLOR (nearest), 2=GDI HALFTONE (bilinear, slow),
+        // default=our parallel bilinear + 1:1 blit (bilinear quality, multithreaded).
+        static int stretchEnv = -1;
+        if (stretchEnv < 0) { const char* e = getenv("MANDEL_STRETCH"); stretchEnv = e ? atoi(e) : 1; }
+        if ((stretchEnv == 1 || stretchEnv == 3) && (vW != RENDER_W || vH != RENDER_H)) {
+            scaleDisplay(vW, vH);
+            bi.bmiHeader.biWidth = vW; bi.bmiHeader.biHeight = -vH;
+            StretchDIBits(dc, vr.left, vr.top, vW, vH, 0, 0, vW, vH,
+                          scaled.data(), &bi, DIB_RGB_COLORS, SRCCOPY);   // 1:1 copy
+        } else {
+            bi.bmiHeader.biWidth = RENDER_W; bi.bmiHeader.biHeight = -RENDER_H;
+            SetStretchBltMode(dc, stretchEnv == 2 ? HALFTONE : COLORONCOLOR);
+            StretchDIBits(dc, vr.left, vr.top, vW, vH,
+                          0, 0, RENDER_W, RENDER_H, display.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+        }
 
         // panel + all controls: only rebuilt when UI state changed. On fractal/
         // compute/drag ticks the panel persists in the cached buffer.
@@ -1873,7 +1916,16 @@ public:
         RECT str = status; str.left += S(10);
         drawText(dc, str, st, CLR_TEXT_DIM, fSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+        if (full) {
+            BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+        } else {
+            // Fractal-only tick: only the view and the status bar changed; the panel
+            // is unchanged on screen, so skip re-blitting it (saves a big copy when
+            // the window is large).
+            BitBlt(wdc, vr.left, vr.top, vW, vH, dc, vr.left, vr.top, SRCCOPY);
+            BitBlt(wdc, status.left, status.top, status.right - status.left,
+                   status.bottom - status.top, dc, status.left, status.top, SRCCOPY);
+        }
         EndPaint(hwnd, &ps);
         lastPresentMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - _pt0).count();
@@ -1919,10 +1971,20 @@ public:
         auto t1 = std::chrono::steady_clock::now();
         for (int k = 0; k < N; ++k) { color_phase += 3.0f; nav->SetRedisplay(); nav->UpdateBitmap(bitmap.data()); }
         double ub = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count() / N;
+        // Present-path timing: buildDisplay (warp/copy) and a full synchronous paint
+        // (StretchDIBits + status + BitBlt) with the panel skipped, as in animation.
+        auto t2 = std::chrono::steady_clock::now();
+        for (int k = 0; k < N; ++k) buildDisplay();
+        double bd = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count() / N;
+        auto t3 = std::chrono::steady_clock::now();
+        for (int k = 0; k < N; ++k) { fractalOnlyTick = true; InvalidateRect(hwnd, nullptr, FALSE); UpdateWindow(hwnd); }
+        double pt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t3).count() / N;
+        RECT rcw; GetClientRect(hwnd, &rcw); RECT vr = viewRect();
         FILE* f = nullptr; fopen_s(&f, "build\\gui_bench.txt", "a");
         if (f) {
-            fprintf(f, "SS=%d  cached RecolorPhase=%.3f ms (%.0f fps)  full re-colour=%.3f ms (%.0f fps)\n",
-                    ssOn ? 1 : 0, rp, rp > 0 ? 1000.0 / rp : 0, ub, ub > 0 ? 1000.0 / ub : 0);
+            fprintf(f, "SS=%d  recolor=%.3f ms  full=%.3f  buildDisplay=%.3f  present(paint)=%.3f  view=%ldx%ld win=%ldx%ld\n",
+                    ssOn ? 1 : 0, rp, ub, bd, pt,
+                    vr.right - vr.left, vr.bottom - vr.top, rcw.right, rcw.bottom);
             fclose(f);
         }
         PostQuitMessage(0);
@@ -2281,6 +2343,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         nullptr, nullptr, instance, &app);
     if (!hwnd) return 1;
     ShowWindow(hwnd, show); UpdateWindow(hwnd);
+    if (getenv("MANDEL_GUI_MAX")) ShowWindow(hwnd, SW_MAXIMIZE);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
