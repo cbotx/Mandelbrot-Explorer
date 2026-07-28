@@ -359,10 +359,10 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method,
         }
 
         tmp = d_re * d_re + d_im * d_im;
-        if (tmp < 0.000000001) return -2;
+        if (tmp < 0.000000001) return trap ? trapc.value(0.0) : -2;   // interior: trap-colour or sentinel
         ++i;
     }
-    return -2;
+    return trap ? trapc.value(0.0) : -2;   // interior (hit mxit)
 
 }
 
@@ -1522,7 +1522,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                         Float pr = zr - conf_zr, pi = zi - conf_zi;
                         bool ret = (pr * pr + pi * pi < _interior_eps2 * zrad);
                         if (ret && conf_D2 < 1.0) {
-                            if (++conf_count >= _interior_confirm) { setPixel(arr, -2); markDone(i); break; }
+                            if (++conf_count >= _interior_confirm) { setPixel(arr, trap ? trapc.value(0.0) : -2); markDone(i); break; }
                             conf_zr = zr; conf_zi = zi; conf_D2 = 1; conf_next = j + conf_P;
                         } else {
                             conf_P = 0; ++conf_giveup;            // not a sustained attracting cycle
@@ -1563,7 +1563,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
             ++j;
         }
         if (j >= mxit) {
-            setPixel(arr, -2);
+            setPixel(arr, trap ? trapc.value(0.0) : -2);
             markDone(i);
         }
     }
@@ -2043,7 +2043,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
                 if (iter >= conf_next) {
                     double pr = zr - conf_zr, pi = zi - conf_zi;
                     if (pr * pr + pi * pi < _interior_eps2 * zrad && conf_D2 < 1.0) {
-                        if (++conf_count >= _interior_confirm) return -2.f;
+                        if (++conf_count >= _interior_confirm) return trap ? trapc.value(0.0) : -2.f;
                         conf_zr = zr; conf_zi = zi; conf_D2 = 1; conf_next = iter + conf_P;
                     } else { conf_P = 0; ++conf_giveup; }
                 }
@@ -2094,7 +2094,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
             }
         }
     }
-    return -2.f;   // interior (hit maxit)
+    return trap ? trapc.value(0.0) : -2.f;   // interior (hit maxit): trap-colour or sentinel
 }
 
 // AVX2 4-wide rescaled deep-zoom kernel. Each lane carries its own scale S, delta
