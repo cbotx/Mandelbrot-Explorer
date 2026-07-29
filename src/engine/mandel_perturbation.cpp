@@ -560,6 +560,34 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
     return res;
 }
 
+// Sensitivity helper for the mxit-boundary check: instead of re-running a full
+// accuratePointCompute of the whole reference orbit (mxit+64 GMP iterations) just
+// to learn whether the reference escapes just past mxit, CONTINUE the orbit we
+// already built for `extra` more iterations from its tail Z_last. Same orbit, same
+// escape decision, but ~mxit/extra times cheaper. Precision-consistent (uses the
+// reference's own representation: BigFixed tail when active, else the mpf tail).
+bool Mandel::refTailEscapes(int last, int extra) const {
+    mpf_t zr, zi, t1, t2;
+    mpf_init(zr); mpf_init(zi); mpf_init(t1); mpf_init(t2);
+    if (_use_bigfixed) { bf_to_mpf(zr, _bz_re[last & 1]); bf_to_mpf(zi, _bz_im[last & 1]); }
+    else { mpf_set(zr, _z_re[last & 1]); mpf_set(zi, _z_im[last & 1]); }
+    const double R2 = (double)_ESCAPE_RADIUS * (double)_ESCAPE_RADIUS;
+    bool esc = false;
+    for (int k = 0; k < extra && !esc; ++k) {
+        mpf_mul(t1, zr, zi);            // zr*zi
+        mpf_mul(zr, zr, zr);            // zr^2
+        mpf_mul(t2, zi, zi);            // zi^2
+        mpf_sub(zr, zr, t2);            // zr^2 - zi^2
+        mpf_add(zr, zr, _ref_z_re);     // + cr
+        mpf_mul_ui(zi, t1, 2);          // 2 zr zi
+        mpf_add(zi, zi, _ref_z_im);     // + ci
+        mpf_mul(t1, zr, zr); mpf_mul(t2, zi, zi); mpf_add(t1, t1, t2);
+        if (mpf_get_d(t1) > R2) esc = true;
+    }
+    mpf_clears(zr, zi, t1, t2, (mpf_ptr)0);
+    return esc;
+}
+
 
 void Mandel::ComputeDirect(int mxit, float* out, int step, int c_method) {
     // Brute-force ground truth: iterate every sampled pixel in full mpf_t
@@ -897,8 +925,14 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             }
         }
         if (_use_floatexp && ref_it >= mxit - 16) {
-            bool sensitive = ref_it < mxit ||
-                accuratePointCompute(_ref_z_re, _ref_z_im, mxit + 64, c_method) >= 0;
+            // "Sensitive" = the reference escapes at or just beyond mxit (its
+            // classification then depends on accumulated double rounding), so it is
+            // rebuilt from the exact geometric centre. Continue the orbit we already
+            // built ~80 iterations past its tail instead of re-running a full mpf
+            // accuratePointCompute of the whole orbit + derivative (which cost ~3s at
+            // 1e876, dwarfing the reference build itself). refTailEscapes uses the
+            // reference's own representation so it is exact and at least as sensitive.
+            bool sensitive = ref_it < mxit || refTailEscapes(ref_it, 80);
             if (sensitive) {
                 // Rebuild from the exact geometric center so the result cannot
                 // depend on which center pixel exists for even/odd dimensions.
@@ -2621,7 +2655,6 @@ bool Mandel::calCoefficient(int i, int pr_it, int c_method) {
     _zfi[i] = _zf[i].imag();
     if (_use_floatexp) { _zfr_fe[i] = mpf_to_fe(_z_re[c]); _zfi_fe[i] = mpf_to_fe(_z_im[c]); }
     }
-
     // _z_m3[i] = tmp_z.abs().get_real_imag().first / 1000; // for Pauldelbrot condition
     _z_m3[i] = { (_zfr[i] * _zfr[i] + _zfi[i] * _zfi[i]) / 1000000 };
 

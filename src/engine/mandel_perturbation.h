@@ -166,6 +166,7 @@ private:
                             int mx_ref_it, int mxit, int c_method, float* out) const;
     int SACheckMagnitude() const;
     float accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_method = 0) const;
+    bool refTailEscapes(int last, int extra) const;
     double floatPointCompute(Float c_re, Float c_im, int mxit, int c_method = 0, double* normalOut = nullptr) const;
     bool attractor(double z_in_re, double z_in_im, const double c_re, const double c_im, int period) const;
 
