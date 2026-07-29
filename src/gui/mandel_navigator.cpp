@@ -241,6 +241,19 @@ void MandelNavigator::UpdateBitmap(uint8_t* bitmap) {
             int idx_bmp = (i * _w + j) * 3;
             int idx = (i * _sub + c) * stride + (j * _sub + c);
             if (_iter[idx] == EMPTYPIXEL) continue;
+            // Post-shade overlays (relief / normal-light / DE) were snapshotted from
+            // _iter just above; the async compute keeps filling pixels while this
+            // base-colour loop runs, so a pixel finished *after* that snapshot would be
+            // base-coloured here yet get no overlay -> for one frame it flashes as the
+            // bare base (e.g. the smooth gradient with the DE lace missing) before the
+            // next frame's snapshot restores the overlay. Keep such a pixel on the warped
+            // preview (which carries a consistent base+overlay) until the overlay field
+            // includes it. Interior pixels carry no overlay, so colour them as usual.
+            if (!settled && _iter[idx] != INTERIOR_SENTINEL) {
+                size_t pf = (size_t)i * _w + j;
+                if ((de_overlay_on || normal_light_on) && std::isnan(_normalField[pf])) continue;
+                if (relief_on && std::isnan(_reliefHt[pf])) continue;
+            }
             // In SS mode a flagged pixel has its full sub-block computed (top-left
             // corner subpixel filled): average it. Otherwise this is the 1-sample
             // base layer -> analytic AA from the centre + its 4 pixel neighbours,
