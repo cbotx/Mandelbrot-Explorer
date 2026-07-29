@@ -167,6 +167,12 @@ private:
     int SACheckMagnitude() const;
     float accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_method = 0) const;
     bool refTailEscapes(int last, int extra) const;
+    // Builds the deep-zoom reference orbit (periodic-nucleus or full), applies the
+    // content-aware floatexp escalation and the mxit-boundary sensitivity rebuild,
+    // and returns its length. Extracted from Compute; sets _ref_period/_ref_bounded/
+    // _use_floatexp, seeds the pixel set `s`, and accumulates the timer `pf_ref`.
+    int buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, int mxit,
+                            int c_method, bool profile, double& pf_ref);
     double floatPointCompute(Float c_re, Float c_im, int mxit, int c_method = 0, double* normalOut = nullptr) const;
     bool attractor(double z_in_re, double z_in_im, const double c_re, const double c_im, int period) const;
 

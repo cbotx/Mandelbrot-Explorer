@@ -32,6 +32,12 @@ static long long g_blafe_safe[64] = { 0 };   // [tid] tryBLAfe overflow-safe flo
 static int g_int_rep = -2;       // env MANDEL_INT_REP: exact state-repetition interior detection (default on; -2=unread)
 static int g_bigfixed = -2;      // env MANDEL_BIGFIXED: -2 unparsed, -1 auto (on for floatexp), 0 off, >=1 force on
 
+// Monotonic seconds, for the MANDEL_PROFILE phase timers.
+static inline double nowSec() {
+    return std::chrono::duration_cast<std::chrono::duration<double>>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+}
+
 // Stripe Average Coloring window. Averaging the stripe term over the whole orbit
 // washes out at deep zoom (orbits are long and nearly identical, so Feather goes
 // flat); the per-pixel structure lives in the escaping tail. Weighting recent
@@ -692,6 +698,98 @@ int Mandel::createPeriodicRef(int period, int mxit, int c_method) {
 }
 
 
+// Build the deep-zoom reference orbit and return its length. Extracted verbatim
+// from Compute's method==1 path: try a periodic-nucleus reference when eligible,
+// else a full reference from the centre pixel; then apply the content-aware
+// floatexp escalation (rebuild in floatexp if the orbit passes too close to zero)
+// and the mxit-boundary sensitivity rebuild (from the exact centre). Sets
+// _ref_period / _ref_bounded / _use_floatexp and accumulates the pf_ref timer.
+int Mandel::buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, int mxit,
+                                int c_method, bool profile, double& pf_ref) {
+    double tk;
+    int ref_it = 0;
+    _ref_period = 0;
+    // Periodic-reference optimisation: if a minibrot nucleus sits in the view, use
+    // it as a bounded period-p reference (build ONE period, index modulo p) instead
+    // of a full mxit-long orbit. Auto-enabled for the floatexp deep path
+    // (scale > 1e280); MANDEL_PERIODIC=1 forces on, =0 off. Requires BLA on and
+    // non-EDE/non-SAC (the mod-p index / skip cap live only in those paths).
+    bool periodic_done = false;
+    static int periodic_env = -1;
+    if (periodic_env < 0) { const char* e = getenv("MANDEL_PERIODIC"); periodic_env = e ? atoi(e) : -1; }
+    bool periodic_want = (periodic_env == 1) ||
+                         (periodic_env != 0 && mpf_cmp_d(scale, 1e280) > 0);
+    if (periodic_want && _use_bla &&
+        !(c_method & ColoringMethod::EXTERIOR_DIST_EST) &&
+        !(c_method & ColoringMethod::NORMAL_MAP) &&
+        !(c_method & ColoringMethod::DE_OVERLAY) &&
+        !(c_method & ColoringMethod::ORBIT_TRAP) &&
+        !(c_method & ColoringMethod::STRIPE_AVERAGE)) {
+        tk = nowSec();
+        int p = findNucleus(_ref_z_re, _ref_z_im, mxit);
+        if (p > 2 && p <= mxit) {
+            ref_it = createPeriodicRef(p, mxit, c_method);
+            _ref_bounded = true;
+            periodic_done = true;
+            // Content-aware escalation: if the nucleus orbit passes close enough to
+            // zero that 2*Z*dz underflows, run the exact floatexp path.
+            if (!_use_floatexp) {
+                double refmin2 = 1e300; bool uf = false;
+                for (int q = 1; q < p; ++q) { double m2 = _z_m3[q] * 1e6; if (m2 <= 0.0) { uf = true; break; } if (m2 < refmin2) refmin2 = m2; }
+                double dcmax = 2.0 / mpf_get_d(scale);
+                if (uf || std::sqrt(refmin2) * dcmax < 1e-300) _use_floatexp = true;
+            }
+            if (profile) fprintf(stderr, "  [profile] periodic reference: period=%d floatexp=%d\n", p, _use_floatexp ? 1 : 0);
+        } else if (profile) {
+            fprintf(stderr, "  [profile] periodic reference: no in-view nucleus (period=%d), using full reference\n", p);
+        }
+        pf_ref += nowSec() - tk;
+    }
+    if (!periodic_done) {
+        s.insert({ _h / 2, _w / 2, 0, 0 });
+        tk = nowSec(); ref_it = createRef(s, mxit, mxit, true, c_method); pf_ref += nowSec() - tk;
+        // Content-aware floatexp escalation. Even below the hard 1e280 gate the plain
+        // double delta loop loses precision when the reference orbit passes close to
+        // zero (2*Z*dz falls into the denormal range for far pixels). Detect it from
+        // the just-built reference's closest approach to zero and redo it in floatexp;
+        // references that stay clear of zero (e.g. flake@1e157) keep the fast double
+        // path. Only meaningful once dz^2 can underflow (scale > ~1e150).
+        if (!_use_floatexp && mpf_cmp_d(scale, 1e150) > 0) {
+            double refmin2 = 1e300; bool underflowed = false;
+            for (int q = 1; q <= ref_it; ++q) {
+                double m2 = _z_m3[q] * 1e6;                 // |Z_q|^2 (double shadow)
+                if (m2 <= 0.0) { underflowed = true; break; }   // |Z| below ~1.5e-154
+                if (m2 < refmin2) refmin2 = m2;
+            }
+            double dcmax = 2.0 / mpf_get_d(scale);          // ~max pixel |dc|
+            if (underflowed || std::sqrt(refmin2) * dcmax < 1e-300) {
+                _use_floatexp = true;
+                s.insert({ _h / 2, _w / 2, 0, 0 });
+                tk = nowSec(); ref_it = createRef(s, mxit, mxit, true, c_method, true); pf_ref += nowSec() - tk;
+            }
+        }
+        if (_use_floatexp && ref_it >= mxit - 16) {
+            // "Sensitive" = the reference escapes at or just beyond mxit (its
+            // classification then depends on accumulated double rounding), so it is
+            // rebuilt from the exact geometric centre. Continue the orbit we already
+            // built ~80 iterations past its tail instead of re-running a full mpf
+            // accuratePointCompute of the whole orbit + derivative (which cost ~3s at
+            // 1e876, dwarfing the reference build). refTailEscapes uses the
+            // reference's own representation so it is exact and at least as sensitive.
+            bool sensitive = ref_it < mxit || refTailEscapes(ref_it, 80);
+            if (sensitive) {
+                // Rebuild from the exact geometric centre so the result cannot depend
+                // on which centre pixel exists for even/odd dimensions.
+                s.insert({ _h / 2, _w / 2, 0, 0 });
+                tk = nowSec(); ref_it = createRef(s, mxit, mxit, true, c_method, true); pf_ref += nowSec() - tk;
+            }
+        }
+        _ref_bounded = (ref_it >= mxit);
+    }
+    return ref_it;
+}
+
+
 void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method,
                      int full_h, int row_base) {
     std::cout << "mxit: " << mxit << '\n';
@@ -853,95 +951,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         Float c0_re_f = mpf_get_ld(_c0_re);
         Float c0_im_f = mpf_get_ld(_c0_im);
         floatPointCompute(c0_re_f, c0_im_f, mxit, c_method);
-        _ref_period = 0;
-        // Periodic-reference optimisation. If a minibrot nucleus sits in the view,
-        // use it as a bounded period-p reference: build ONE period in GMP and let
-        // the delta loop index it modulo p, instead of a full mxit-long orbit. This
-        // only pays off when the (serial, high-precision) reference build is a
-        // meaningful fraction of the frame -- i.e. very deep zoom -- so it is
-        // AUTO-ENABLED for the floatexp deep path (scale > 1e280) and otherwise
-        // opt-in. MANDEL_PERIODIC=1 forces it on at any depth; =0 forces it off.
-        // Requires BLA on, non-EDE, non-SAC (the mod-p index / skip cap / dc live
-        // in those paths; the EDE derivative and SAC prefix sum are not periodic).
-        bool periodic_done = false;
-        static int periodic_env = -1;
-        if (periodic_env < 0) { const char* e = getenv("MANDEL_PERIODIC"); periodic_env = e ? atoi(e) : -1; }
-        bool periodic_want = (periodic_env == 1) ||
-                             (periodic_env != 0 && mpf_cmp_d(scale, 1e280) > 0);
-        if (periodic_want && _use_bla &&
-            !(c_method & ColoringMethod::EXTERIOR_DIST_EST) &&
-            !(c_method & ColoringMethod::NORMAL_MAP) &&
-            !(c_method & ColoringMethod::DE_OVERLAY) &&
-            !(c_method & ColoringMethod::ORBIT_TRAP) &&
-            !(c_method & ColoringMethod::STRIPE_AVERAGE)) {
-            tk = now();
-            int p = findNucleus(_ref_z_re, _ref_z_im, mxit);
-            if (p > 2 && p <= mxit) {
-                ref_it = createPeriodicRef(p, mxit, c_method);
-                _ref_bounded = true;
-                periodic_done = true;
-                // Content-aware escalation (mirrors the full-reference path): if the
-                // nucleus orbit passes close enough to zero that 2*Z*dz underflows,
-                // run the exact floatexp path (the period's floatexp shadow is filled).
-                if (!_use_floatexp) {
-                    double refmin2 = 1e300; bool uf = false;
-                    for (int q = 1; q < p; ++q) { double m2 = _z_m3[q] * 1e6; if (m2 <= 0.0) { uf = true; break; } if (m2 < refmin2) refmin2 = m2; }
-                    double dcmax = 2.0 / mpf_get_d(scale);
-                    if (uf || std::sqrt(refmin2) * dcmax < 1e-300) _use_floatexp = true;
-                }
-                if (profile) fprintf(stderr, "  [profile] periodic reference: period=%d floatexp=%d\n", p, _use_floatexp ? 1 : 0);
-            } else if (profile) {
-                fprintf(stderr, "  [profile] periodic reference: no in-view nucleus (period=%d), using full reference\n", p);
-            }
-            pf_ref += now() - tk;
-        }
-        if (!periodic_done) {
-        s.insert({ _h / 2, _w / 2, 0, 0 });
-        tk = now(); ref_it = createRef(s, mxit, mxit, true, c_method); pf_ref += now() - tk;
-        // Content-aware floatexp escalation. Even below the hard 1e280 gate the
-        // plain-double delta loop loses precision when the reference orbit passes
-        // close to zero: near that pass the update term 2*Z*dz falls into the
-        // denormal range (< ~1e-308) for far-from-reference pixels, since
-        // |Z_min| * max|dc| can be tiny (e.g. 6e-108 * 2e-215 ~ 1e-322 at
-        // 4.86e215). The resulting ~1e-4 error is invisible at low colour density
-        // but the steep high-density palette mapping amplifies it into wrong
-        // colours / muddy blocks (reported at 4.86e215, density>=100). The floatexp
-        // path is exact there (matches the GMP oracle). Detect it from the just-
-        // built reference's closest approach to zero and redo it in floatexp when
-        // needed; references that stay clear of zero (e.g. flake@1e157) keep the
-        // fast double path. Only meaningful once dz^2 can underflow (scale>~1e150).
-        if (!_use_floatexp && mpf_cmp_d(scale, 1e150) > 0) {
-            double refmin2 = 1e300; bool underflowed = false;
-            for (int q = 1; q <= ref_it; ++q) {
-                double m2 = _z_m3[q] * 1e6;                 // |Z_q|^2 (double shadow)
-                if (m2 <= 0.0) { underflowed = true; break; }   // |Z| below ~1.5e-154
-                if (m2 < refmin2) refmin2 = m2;
-            }
-            double dcmax = 2.0 / mpf_get_d(scale);          // ~max pixel |dc|
-            if (underflowed || std::sqrt(refmin2) * dcmax < 1e-300) {
-                _use_floatexp = true;
-                s.insert({ _h / 2, _w / 2, 0, 0 });
-                tk = now(); ref_it = createRef(s, mxit, mxit, true, c_method, true); pf_ref += now() - tk;
-            }
-        }
-        if (_use_floatexp && ref_it >= mxit - 16) {
-            // "Sensitive" = the reference escapes at or just beyond mxit (its
-            // classification then depends on accumulated double rounding), so it is
-            // rebuilt from the exact geometric centre. Continue the orbit we already
-            // built ~80 iterations past its tail instead of re-running a full mpf
-            // accuratePointCompute of the whole orbit + derivative (which cost ~3s at
-            // 1e876, dwarfing the reference build itself). refTailEscapes uses the
-            // reference's own representation so it is exact and at least as sensitive.
-            bool sensitive = ref_it < mxit || refTailEscapes(ref_it, 80);
-            if (sensitive) {
-                // Rebuild from the exact geometric center so the result cannot
-                // depend on which center pixel exists for even/odd dimensions.
-                s.insert({ _h / 2, _w / 2, 0, 0 });
-                tk = now(); ref_it = createRef(s, mxit, mxit, true, c_method, true); pf_ref += now() - tk;
-            }
-        }
-        }   // end if (!periodic_done): normal reference build
-        if (!periodic_done) _ref_bounded = (ref_it >= mxit);
+        ref_it = buildReferenceOrbit(s, scale, mxit, c_method, profile, pf_ref);
         if (_use_bla) { tk = now(); buildBLA(ref_it, (c_method & (ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::NORMAL_MAP | ColoringMethod::DE_OVERLAY)) != 0); pf_bla += now() - tk; }
         // Reference-orbit stripe prefix sum, so a BLA skip can restore its omitted
         // stripe-average contributions (z ~ X during a valid skip) instead of
