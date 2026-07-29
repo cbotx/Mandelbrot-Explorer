@@ -5,6 +5,7 @@
 #include <gmp.h>
 
 #include "floatexp.h"
+#include "bigfixed.h"
 
 #include <set>
 #include <algorithm>
@@ -118,6 +119,9 @@ private:
     std::vector<std::vector<BLADeriv>> _blaD;   // parallel to _bla; only built under EDE
     double _bla_eps = 0.0;
     double _bla_rmax2 = 0.0;      // largest BLA validity radius^2 (gate for tryBLA)
+    double _bla_dcmax2 = 0.0;     // max |dc|^2 over the frame (BLA-effectiveness gate)
+    bool _simd_bla_idle = false;  // measured: BLA barely skips -> compute-bound -> SIMD ok
+    bool _simd_measured = false;  // whether _simd_bla_idle has been measured this frame
     bool _use_bla = false;
     int _bla_minlevel = 0;        // only apply BLAs with skip >= 2^_bla_minlevel
     bool _ref_bounded = false;    // reference orbit never escapes (minibrot center)
@@ -135,7 +139,7 @@ private:
     // (updating S/wr/wi) and returns the skip (>0), else 0. dz-only (the rescaled
     // kernel returns smooth iteration, so no EDE derivative is carried).
     int tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi,
-                 FloatExp dcr, FloatExp dci, double ESC2, int mx_ref_it,
+                 double dr, double di, double ESC2, int mx_ref_it,
                  double* outAB = nullptr) const;
     int createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random,
                   int c_method = 0, bool view_center = false);
@@ -184,6 +188,15 @@ private:
     const int _mxit;
     mpf_t* _z_re, * _z_im;  // reference orbit
     Comp* _zf;
+    // BigFixed reference orbit (env MANDEL_BIGFIXED): a Mandelbrot-specific fixed-
+    // point bignum that replaces the generic mpf_t orbit recurrence (~1.5x faster
+    // multiply via high-half short product). Auto-enabled on the deep floatexp path
+    // (where it wins); env forces on(>=1)/off(0). Set per reference build in createRef.
+    bool _use_bigfixed = false;
+    // Rotating 2-buffer like _z_re/_z_im; _bfL limbs (with guard for near-zero).
+    BigFixed _bz_re[2], _bz_im[2], _bc_re, _bc_im, _bt1, _bt2, _bab, _bre, _bim;
+    std::vector<uint64_t> _bftmp;   // 2*_bfL scratch for bf_mul
+    int _bfL = 0;
 
     // Exterior DE
     Comp* _df;

@@ -28,6 +28,9 @@ static long long g_bla_stat[64][8];
 static int g_bla_noescape = -1;   // env MANDEL_BLA_NOESCAPE: force-skip the escape check (timing only)
 static long long g_fe_fallback = 0;
 static long long g_fe_stat[64][3];   // [tid] 0=BLA skip-iters 1=BLA applies 2=normal steps (MANDEL_PROFILE)
+static long long g_blafe_safe[64] = { 0 };   // [tid] tryBLAfe overflow-safe floatexp fallbacks
+static int g_int_rep = -2;       // env MANDEL_INT_REP: exact state-repetition interior detection (default on; -2=unread)
+static int g_bigfixed = -2;      // env MANDEL_BIGFIXED: -2 unparsed, -1 auto (on for floatexp), 0 off, >=1 force on
 
 // Stripe Average Coloring window. Averaging the stripe term over the whole orbit
 // washes out at deep zoom (orbits are long and nearly identical, so Feather goes
@@ -633,6 +636,7 @@ int Mandel::createPeriodicRef(int period, int mxit, int c_method) {
 
     // Z_0 = nucleus (mirror createRef's index-0 setup).
     mpf_set(_z_re[0], _ref_z_re); mpf_set(_z_im[0], _ref_z_im);
+    _use_bigfixed = false;   // periodic nucleus orbit is short (one period) and does not init BigFixed state; use mpf
     _zf[0] = _ref_z_f; _zfr[0] = _ref_z_f.real(); _zfi[0] = _ref_z_f.imag();
     _zfr_fe[0] = mpf_to_fe(_ref_z_re); _zfi_fe[0] = mpf_to_fe(_ref_z_im);
     _z_m3[0] = (_zfr[0] * _zfr[0] + _zfi[0] * _zfi[0]) / 1000000;
@@ -798,6 +802,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         if (g_bla_noescape < 0) { const char* e = getenv("MANDEL_BLA_NOESCAPE"); g_bla_noescape = e ? atoi(e) : 0; }
         memset(g_bla_stat, 0, sizeof(g_bla_stat));
         memset(g_fe_stat, 0, sizeof(g_fe_stat));
+        _simd_measured = false; _simd_bla_idle = false;   // re-measured per frame from the coarse probe
         { const char* e = getenv("MANDEL_INTERIOR"); _use_interior = !e || atoi(e); }
         { const char* e = getenv("MANDEL_INT_EPS"); double ep = e ? atof(e) : 1e-13; _interior_eps2 = ep * ep; }
         { const char* e = getenv("MANDEL_INT_CONFIRM"); _interior_confirm = e ? atoi(e) : 4; }
@@ -808,7 +813,9 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         { const char* e = getenv("MANDEL_FE");
           _use_floatexp = e ? atoi(e) != 0 : (mpf_cmp_d(scale, 1e280) > 0); }
         g_fe_fallback = 0;
+        memset(g_blafe_safe, 0, sizeof(g_blafe_safe));
         _fe_cutoff_sensitive = false;
+        if (g_int_rep == -2) { const char* e = getenv("MANDEL_INT_REP"); g_int_rep = e ? atoi(e) : 1; }   // default ON
         _dxfe = mpf_to_fe(_dx); _dyfe = mpf_to_fe(_dy);
         double pf_ref = 0, pf_step = 0, pf_bla = 0;
         const bool profile = getenv("MANDEL_PROFILE") != nullptr;
@@ -933,6 +940,22 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                 for (int j = 0; j < _w; j += C)
                     probe.insert({ i, j, 0, 0 });
             if (!probe.empty() && !_flag_halt) stepParallel(probe, ref_it, mxit, c_method);
+            // Measure how much BLA actually skipped on the probe. If it barely skips
+            // (compute-bound), the SIMD double kernel wins; if it skips most steps
+            // (memory-bound deep zoom), SIMD is ~1x/slightly worse, so stay scalar.
+            // This measured gate is more reliable than the rmax<dcmax proxy: a view
+            // can have rmax>dcmax yet still never trigger a valid skip (e.g. night
+            // city at 1.7e40) -- there SIMD still wins.
+            {
+                long long sk = 0, no = 0;
+                for (int t = 0; t < 64; ++t) { sk += g_bla_stat[t][0]; no += g_bla_stat[t][2]; }
+                double frac = (sk + no) ? (double)sk / (double)(sk + no) : 0.0;
+                _simd_bla_idle = !_use_bla || (frac < 0.5);
+                _simd_measured = true;
+                if (profile)
+                    fprintf(stderr, "  [profile] SIMD gate: probe BLA skip-frac=%.3f -> %s\n",
+                            frac, _simd_bla_idle ? "SIMD (compute-bound)" : "scalar (BLA-effective)");
+            }
             if (_use_interior) {
                 int nint = 0;
                 for (int i = 0; i < _h; i += C)
@@ -1012,6 +1035,8 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                         fap, fsk, fst, fap ? (double)fsk / fap : 0.0, (fsk + fst) ? 100.0 * fsk / (fsk + fst) : 0.0);
                 fprintf(stderr, "  [profile] FE: cutoff-sensitive=%d GMP-fallback-pixels=%lld\n",
                         _fe_cutoff_sensitive ? 1 : 0, g_fe_fallback);
+                long long safe = 0; for (int t = 0; t < 64; ++t) safe += g_blafe_safe[t];
+                fprintf(stderr, "  [profile] FE-BLA overflow-safe fallbacks=%lld\n", safe);
             }
         }
     }
@@ -1325,7 +1350,19 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         return;
     }
 
-    const bool use_simd = simd_env && !deriv && !sac && !_use_bla && !_use_interior && !trap;   // BLA/interior/EDE/normal/SAC/trap paths are scalar
+    // solveSimd4 now mirrors the scalar BLA + interior-detection loop per lane, so
+    // SIMD is no longer gated off when BLA / interior are on. It stays scalar only
+    // for the paths solveSimd4 does not implement (EDE/normal derivative, SAC, trap).
+    // The compute-bound gate (`bla_idle`) keeps SIMD off on BLA-effective deep views
+    // where BLA already skips most steps (memory-bound; SIMD ~1x or slightly worse).
+    // Prefer the coarse-probe MEASUREMENT (actual skip fraction); before it is taken
+    // (the probe pass itself) fall back to the rmax<dcmax proxy. `_ref_period == 0`:
+    // solveSimd4 has no periodic (mod-p, nucleus-fraction) support, so a periodic
+    // reference must stay on the scalar path regardless of the compute-bound gate.
+    const bool bla_idle = _simd_measured ? _simd_bla_idle : (!_use_bla || (_bla_rmax2 < _bla_dcmax2));
+    static int simd_force = -1;
+    if (simd_force < 0) { const char* e = getenv("MANDEL_SIMD_ALL"); simd_force = e ? atoi(e) : 0; }
+    const bool use_simd = simd_env && !deriv && !sac && !trap && _ref_period == 0 && (bla_idle || simd_force);
 
     if (use_simd) {
         // ---- setup: per-pixel dc + series-approximation initial delta ----
@@ -1420,7 +1457,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         Float tmp;
         Float zr, zi, dr, di;
         Float dzr2, dzi2, zrad;
-        
+
 
         int k = j;
         // Periodic reference: read the orbit modulo the period. rk mirrors k and
@@ -1443,8 +1480,25 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         // BLA skip breaks the tail, so it resets the window.
         SacAccum sacc; if (sac) sacc.init(sacWindow());
         TrapAccum trapc;
+        // Exact state-repetition interior detector (MANDEL_INT_REP, default on). The
+        // full pixel state is (dzr, dzi, k); it is deterministic, so if it EXACTLY
+        // repeats, the orbit loops forever -> provably interior (an escaping orbit
+        // never repeats its state). Zero false positives by construction;
+        // BLA-compatible (BLA is deterministic). Brent-style: save a state, compare at
+        // geometric intervals. Gated on _use_interior (auto-off for exterior-only
+        // views -> no overhead) and !trap (trap's interior value depends on the orbit
+        // accumulator).
+        const bool int_rep = g_int_rep > 0 && _use_interior && !trap;
+        double sdzr = 1e300, sdzi = 1e300; int sk = -1; int save_j2 = j, twin2 = 1;
         while (j < mxit) {
             if (_flag_halt) break;
+            if (int_rep) {
+                if (k == sk && dzr == sdzr && dzi == sdzi) {   // exact repeat -> interior
+                    setPixel(arr, -2); markDone(i);
+                    break;
+                }
+                if (j - save_j2 >= twin2) { sdzr = dzr; sdzi = dzi; sk = k; save_j2 = j; twin2 += twin2; }
+            }
             if (use_bla_loop && dzr * dzr + dzi * dzi < _bla_rmax2) {
                 // Only attempt BLA when dz is small enough that some level could be
                 // valid -- avoids the per-iteration lookup cost when dz is large.
@@ -1457,12 +1511,10 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                     k += skip; j += skip;
                     rk += skip; if (per && rk >= per) rk -= per; rkm1 = (per && rk == 0) ? per - 1 : rk - 1;
                     if (sac) sacc.reset_window();   // the jump breaks the tail window
-                    // A BLA skip jumps j forward without visiting the skipped orbit
-                    // points, so the periodicity (interior) detector's tortoise/hare
-                    // and any in-progress cycle confirmation are now stale -- using
-                    // them would falsely flag exterior pixels as interior. Restart the
-                    // detector from here (interior pixels still reach mxit quickly via
-                    // further skips).
+                    // A BLA skip jumps j forward, making the tortoise/hare periodicity
+                    // detector stale, so restart it. (The exact-state interior detector
+                    // below is unaffected -- it compares the full (dz,k) state, which is
+                    // deterministic across skips.)
                     zsr = 1e30; zsi = 1e30; save_j = j; period_win = 1;
                     conf_P = 0; conf_giveup = 0;
                     continue;
@@ -1629,6 +1681,7 @@ void Mandel::buildBLA(int reflen, bool ede) {
     double mxx = std::max(_ref_x, (double)(_w - 1) - _ref_x) + 0.5;
     double mxy = std::max(_ref_y, (double)(_h - 1) - _ref_y) + 0.5;
     double dcmax = std::sqrt(dxf * dxf * mxx * mxx + dyf * dyf * mxy * mxy);
+    _bla_dcmax2 = dcmax * dcmax;   // frame max |dc|^2, for the SIMD compute-bound gate
 
     std::vector<BLAEntry> lvl0;
     std::vector<BLADeriv> lvl0D;
@@ -1744,7 +1797,7 @@ int Mandel::tryBLA(int s, double& dzr, double& dzi, double& ddr, double& ddi,
 // is re-rescaled back into (S,wr,wi). Reuses the same BLA table (built in double)
 // -- the coefficients A,B are O(1) and representable in double.
 int Mandel::tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi,
-                     FloatExp dcr, FloatExp dci, double ESC2, int mx_ref_it,
+                     double dr, double di, double ESC2, int mx_ref_it,
                      double* outAB) const {
     if (s < 1 || _bla.empty()) return 0;
     int maxp = (int)_bla.size() - 1;
@@ -1761,20 +1814,50 @@ int Mandel::tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi,
         if (b.r2 <= 0 || !fe_abs_less(dz2, fe_from(b.r2))) continue;   // radius too small
         int land = s + b.l;
         if (land >= mx_ref_it - 1) continue;
-        // dz = S*w (floatexp), nz = A*dz + B*dc
-        FloatExp dzr = fe_mul_d(S, wr), dzi = fe_mul_d(S, wi);
-        FloatExp nzr = fe_add(fe_sub(fe_mul_d(dzr, b.ar), fe_mul_d(dzi, b.ai)),
-                              fe_sub(fe_mul_d(dcr, b.br), fe_mul_d(dci, b.bi)));
-        FloatExp nzi = fe_add(fe_add(fe_mul_d(dzr, b.ai), fe_mul_d(dzi, b.ar)),
-                              fe_add(fe_mul_d(dcr, b.bi), fe_mul_d(dci, b.br)));
-        // Never skip past an escape: z = X_land + nz (near escape nz is O(1)).
+        // The BLA map nz = A*dz + B*dc shares the delta scale S: with dz = S*w and
+        // dc = S*d (d = dc/S, kept in double by the caller), nz = S*(A*w + B*d). A,B
+        // are the double table coefficients and w,d are O(1), so the new unit delta
+        // w' = A*w + B*d is normally computed entirely in double -- no underflow (S is
+        // factored out) -- replacing ~8 fe_mul_d + 6 fe_add (each a frexp/ldexp) with
+        // plain double on the hot 99.9%-skip path. BUT over a long skip |A| can be
+        // enormous (up to the double range), so if |w'| is large enough that w'^2 (the
+        // re-rescale) or A*w itself could overflow, fall back to an exact floatexp
+        // re-rescale (rare: only very long skips near escape).
+        double nwr = (b.ar * wr - b.ai * wi) + (b.br * dr - b.bi * di);
+        double nwi = (b.ar * wi + b.ai * wr) + (b.br * di + b.bi * dr);
+        const double BIG = 1e150;   // w'^2 must stay < DBL_MAX (~1.8e308)
         const double* zfp = reinterpret_cast<const double*>(_zf);
-        double fr = zfp[2 * land] + fe_to_double(nzr), fi = zfp[2 * land + 1] + fe_to_double(nzi);
-        if (fr * fr + fi * fi > ESC2) return 0;
-        // Accept: re-rescale dz = nz -> (S, wr, wi).
-        FloatExp Snew = fe_sqrt(fe_add(fe_mul(nzr, nzr), fe_mul(nzi, nzi)));
-        if (Snew.m == 0.0) { S = FloatExp{ 1.0, 0 }; wr = wi = 0.0; }
-        else { S = Snew; wr = fe_to_double(fe_div(nzr, S)); wi = fe_to_double(fe_div(nzi, S)); }
+        if (std::isfinite(nwr) && std::isfinite(nwi) && std::fabs(nwr) < BIG && std::fabs(nwi) < BIG) {
+            // fast double path. Never skip past an escape: z = X_land + S*w'.
+            double fr = zfp[2 * land]     + fe_to_double(fe_mul_d(S, nwr));
+            double fi = zfp[2 * land + 1] + fe_to_double(fe_mul_d(S, nwi));
+            if (fr * fr + fi * fi > ESC2) return 0;
+            // Accept: re-rescale dz = S*w' -> keep |w| ~ 1, fold |w'| into S.
+            double wm2 = nwr * nwr + nwi * nwi;
+            if (wm2 == 0.0) { S = FloatExp{ 1.0, 0 }; wr = wi = 0.0; }
+            else {
+                double wmag = std::sqrt(wm2);
+                S = fe_mul(S, fe_from(wmag));
+                double inv = 1.0 / wmag;
+                wr = nwr * inv; wi = nwi * inv;
+            }
+        } else {
+            // Overflow-safe floatexp re-rescale: recompute nz = A*dz + B*dc directly in
+            // floatexp (dz = S*w, dc = S*d), so the huge A never leaves the extended
+            // exponent range. Matches the pre-optimization behaviour.
+            g_blafe_safe[omp_get_thread_num() & 63]++;
+            FloatExp dzr = fe_mul_d(S, wr), dzi = fe_mul_d(S, wi);
+            FloatExp dcrfe = fe_mul_d(S, dr), dcife = fe_mul_d(S, di);
+            FloatExp nzr = fe_add(fe_sub(fe_mul_d(dzr, b.ar), fe_mul_d(dzi, b.ai)),
+                                  fe_sub(fe_mul_d(dcrfe, b.br), fe_mul_d(dcife, b.bi)));
+            FloatExp nzi = fe_add(fe_add(fe_mul_d(dzr, b.ai), fe_mul_d(dzi, b.ar)),
+                                  fe_add(fe_mul_d(dcrfe, b.bi), fe_mul_d(dcife, b.br)));
+            double fr = zfp[2 * land] + fe_to_double(nzr), fi = zfp[2 * land + 1] + fe_to_double(nzi);
+            if (fr * fr + fi * fi > ESC2) return 0;
+            FloatExp Snew = fe_sqrt(fe_add(fe_mul(nzr, nzr), fe_mul(nzi, nzi)));
+            if (Snew.m == 0.0) { S = FloatExp{ 1.0, 0 }; wr = wi = 0.0; }
+            else { S = Snew; wr = fe_to_double(fe_div(nzr, S)); wi = fe_to_double(fe_div(nzi, S)); }
+        }
         // Export the linear map (A, B) so the caller can carry the EDE total
         // derivative through the same skip: J -> A*J + B (see pixelRescaled).
         if (outAB) { outAB[0] = b.ar; outAB[1] = b.ai; outAB[2] = b.br; outAB[3] = b.bi; }
@@ -1786,7 +1869,9 @@ int Mandel::tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi,
 // scalar loop in the same order (no FMA contraction), so the per-pixel result
 // is bit-identical to the scalar path. The reference orbit is read per lane via
 // gather; escape / rebase / glitch decisions are done in a short scalar pass
-// over the 4 lanes (rare events), keeping the arithmetic vectorized.
+// over the 4 lanes (rare events), keeping the arithmetic vectorized. BLA skips
+// and periodicity-based interior detection are mirrored per lane (see below), so
+// this path is a faithful vector image of the scalar stepParallel loop.
 void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
                         const double* Adcr, const double* Adci,
                         const double* Adzr, const double* Adzi,
@@ -1798,23 +1883,78 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
     alignas(32) double dcr_[4] = { 0,0,0,0 }, dci_[4] = { 0,0,0,0 };
     int k_[4] = { 0,0,0,0 }, j_[4] = { 0,0,0,0 };
     bool act[4] = { false,false,false,false };
+    // Per-lane Brent periodicity (interior) detector state, mirroring the scalar
+    // stepParallel loop exactly. Only exercised when _use_interior.
+    double zsr[4], zsi[4], confD2[4], confZr[4], confZi[4];
+    int save_j[4], pwin[4], confP[4], confNext[4], confCount[4], confGiveup[4];
     for (int l = 0; l < lanes; ++l) {
         dzr_[l] = Adzr[g + l]; dzi_[l] = Adzi[g + l];
         dcr_[l] = Adcr[g + l]; dci_[l] = Adci[g + l];
         k_[l] = j_[l] = _SA_it + 1;
         act[l] = true;
+        zsr[l] = 1e30; zsi[l] = 1e30; save_j[l] = j_[l]; pwin[l] = 1;
+        confP[l] = 0; confNext[l] = 0; confCount[l] = 0; confGiveup[l] = 0;
+        confD2[l] = 0.0; confZr[l] = 0.0; confZi[l] = 0.0;
+        // Mirror the scalar `while (j < mxit)` entry guard: if series approximation
+        // stayed valid to the iteration cap (_SA_it + 1 >= mxit), the pixel is
+        // interior (-2) and must NOT enter the loop (which would gather _zfr past
+        // the reference end). Rare (tiny views hugging the reference) but real.
+        if (j_[l] >= mxit) { setPixel(v[g + l], -2.f); markDone(g + l); act[l] = false; }
     }
+
+    bool anyactive = false;
+    for (int l = 0; l < lanes; ++l) if (act[l]) { anyactive = true; break; }
 
     __m256d dzr = _mm256_load_pd(dzr_), dzi = _mm256_load_pd(dzi_);
     const __m256d dcr = _mm256_load_pd(dcr_), dci = _mm256_load_pd(dci_);
     const __m256d two = _mm256_set1_pd(2.0);
     const __m256d ESC2v = _mm256_set1_pd(ESC2);
+    const __m256d rmax2v = _mm256_set1_pd(_bla_rmax2);
+    const bool use_bla = _use_bla;
+    const bool use_int = _use_interior;
 
-    bool anyactive = (lanes > 0);
     while (anyactive) {
         if (_flag_halt) return;
-        // Manual gather: hardware vgather is slow on Zen, so pack the per-lane
-        // reference-orbit values with scalar loads. k_ is always a valid index.
+
+        // ---- BLA: skip a run of reference iterations for lanes whose |dz| is small
+        // enough (deep-into-structure). Vector-gated: if no active lane is eligible
+        // (|dz|^2 < rmax2) this is one compare + movemask and the fast path is
+        // untouched. Mirrors the scalar loop's BLA block (start index s = k-1). A
+        // skipping lane advances itself and sits out this round's vector step (like
+        // the scalar `continue`). ----
+        int blaSkipped = 0;
+        if (use_bla) {
+            __m256d dzmag_top = _mm256_add_pd(_mm256_mul_pd(dzr, dzr), _mm256_mul_pd(dzi, dzi));
+            int elig = _mm256_movemask_pd(_mm256_cmp_pd(dzmag_top, rmax2v, _CMP_LT_OQ));
+            if (elig) {
+                _mm256_store_pd(dzr_, dzr); _mm256_store_pd(dzi_, dzi);
+                for (int l = 0; l < lanes; ++l) {
+                    if (!act[l] || !(elig & (1 << l))) continue;
+                    double ddr = 0, ddi = 0;
+                    int skip = tryBLA(k_[l] - 1, dzr_[l], dzi_[l], ddr, ddi,
+                                      dcr_[l], dci_[l], false, ESC2, mx_ref_it);
+                    int tid = omp_get_thread_num() & 63;
+                    if (skip > 0) {
+                        g_bla_stat[tid][0] += skip; ++g_bla_stat[tid][1];
+                        k_[l] += skip; j_[l] += skip; blaSkipped |= 1 << l;
+                        // a BLA skip jumps j forward, so the periodicity detector's
+                        // tortoise/hare and any in-progress confirmation are stale.
+                        zsr[l] = 1e30; zsi[l] = 1e30; save_j[l] = j_[l]; pwin[l] = 1;
+                        confP[l] = 0; confGiveup[l] = 0;
+                        if (j_[l] >= mxit) {          // skip reached the cap -> interior
+                            setPixel(v[g + l], -2.f); markDone(g + l);
+                            act[l] = false; blaSkipped &= ~(1 << l);
+                        }
+                    } else {
+                        ++g_bla_stat[tid][2];
+                    }
+                }
+                if (blaSkipped) { dzr = _mm256_load_pd(dzr_); dzi = _mm256_load_pd(dzi_); }
+            }
+        }
+
+        // ---- manual gather + vector quadratic step (all lanes; skipped/inactive
+        // lanes compute unused values, filtered out below). ----
         alignas(32) double zprr[4], zpri[4], zcrr[4], zcri[4];
         for (int l = 0; l < 4; ++l) {
             int kk = k_[l];
@@ -1840,47 +1980,81 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
         u = _mm256_add_pd(u, w);
         __m256d ndzi = _mm256_add_pd(u, dci);
 
+        // Preserve BLA-skipped lanes' deltas (they did not step this round).
+        if (blaSkipped) {
+            alignas(32) double ns_r[4], ns_i[4];
+            _mm256_store_pd(ns_r, ndzr); _mm256_store_pd(ns_i, ndzi);
+            for (int l = 0; l < lanes; ++l) if (blaSkipped & (1 << l)) { ns_r[l] = dzr_[l]; ns_i[l] = dzi_[l]; }
+            ndzr = _mm256_load_pd(ns_r); ndzi = _mm256_load_pd(ns_i);
+        }
         dzr = ndzr; dzi = ndzi;
         __m256d zr = _mm256_add_pd(dzr, Zcr);
         __m256d zi = _mm256_add_pd(dzi, Zci);
         __m256d zrad = _mm256_add_pd(_mm256_mul_pd(zr, zr), _mm256_mul_pd(zi, zi));
         __m256d dzmag = _mm256_add_pd(_mm256_mul_pd(dzr, dzr), _mm256_mul_pd(dzi, dzi));
 
-        // Vector decisions. Escape / rebase / wrap are rare per iteration, so
-        // most iterations take the fast path with no stores and no scalar work.
+        // Vector escape / rebase masks (raw; per-lane guarded below). Fused pass:
+        // advance k, build refit, and fold escape/rebase/interior-due into `need`.
         int em = _mm256_movemask_pd(_mm256_cmp_pd(zrad, ESC2v, _CMP_GT_OQ));
         int rm = _mm256_movemask_pd(_mm256_cmp_pd(zrad, dzmag, _CMP_LT_OQ));
-        int refit = 0, actmask = 0;
+        int refit = 0, need = 0;
         for (int l = 0; l < lanes; ++l) {
-            if (!act[l]) continue;
-            actmask |= 1 << l;
+            if (!act[l] || (blaSkipped & (1 << l))) continue;   // not a stepping lane
+            int bit = 1 << l;
             ++k_[l];
-            if (k_[l] == mx_ref_it) refit |= 1 << l;
+            if (em & bit) need |= bit;
+            else if (rm & bit) need |= bit;
+            if (k_[l] == mx_ref_it) { refit |= bit; need |= bit; }
+            // interior detector needs this iteration's z during a confirmation (every
+            // iteration) or at a search probe (every 16th) -> take the per-lane path.
+            if (use_int && (confP[l] > 0 || ((j_[l] & 15) == 0 && confGiveup[l] < 3))) need |= bit;
         }
-        int need = (em | rm | refit) & actmask;
         if (need == 0) {
             anyactive = false;
             for (int l = 0; l < lanes; ++l) {
                 if (!act[l]) continue;
+                if (blaSkipped & (1 << l)) { anyactive = true; continue; }   // skipped: re-loop
                 if (++j_[l] >= mxit) { setPixel(v[g + l], -2.f); markDone(g + l); act[l] = false; }
                 else anyactive = true;
             }
             continue;   // dzr/dzi already hold the updated deltas
         }
 
-        // slow path: at least one lane escaped / rebased / wrapped.
+        // slow path: at least one stepping lane escaped / needs interior / rebased.
         alignas(32) double zr_[4], zi_[4], zrad_[4], dzmag_[4], dzrs[4], dzis[4];
         _mm256_store_pd(zr_, zr);     _mm256_store_pd(zi_, zi);
         _mm256_store_pd(zrad_, zrad); _mm256_store_pd(dzmag_, dzmag);
         _mm256_store_pd(dzrs, dzr);   _mm256_store_pd(dzis, dzi);
 
         bool changed = false;
-        anyactive = false;
         for (int l = 0; l < lanes; ++l) {
-            if (!act[l]) continue;
+            if (!act[l] || (blaSkipped & (1 << l))) continue;
             if (em & (1 << l)) {                         // escape (checked first)
                 setPixel(v[g + l], (float)(j_[l] + 1 - log(log(zrad_[l]) / 2 / LG2) / LG2));
                 markDone(g + l); act[l] = false; continue;
+            }
+            // Interior (periodicity) detection, mirroring stepParallel. It only
+            // affects whether/when a non-escaping pixel is classified interior
+            // (value -2); exterior pixels and their smooth values are untouched.
+            if (use_int) {
+                double zrl = zrad_[l];
+                if (confP[l] > 0) {
+                    confD2[l] *= 4.0 * zrl; if (confD2[l] > 1e18) confD2[l] = 1e18;
+                    if (j_[l] >= confNext[l]) {
+                        double pr = zr_[l] - confZr[l], pi = zi_[l] - confZi[l];
+                        if (pr * pr + pi * pi < _interior_eps2 * zrl && confD2[l] < 1.0) {
+                            if (++confCount[l] >= _interior_confirm) { setPixel(v[g + l], -2.f); markDone(g + l); act[l] = false; continue; }
+                            confZr[l] = zr_[l]; confZi[l] = zi_[l]; confD2[l] = 1; confNext[l] = j_[l] + confP[l];
+                        } else { confP[l] = 0; ++confGiveup[l]; }
+                    }
+                } else if ((j_[l] & 15) == 0 && confGiveup[l] < 3) {
+                    double pr = zr_[l] - zsr[l], pi = zi_[l] - zsi[l];
+                    if (pr * pr + pi * pi < _interior_eps2 * zrl) {
+                        confP[l] = j_[l] - save_j[l]; if (confP[l] < 1) confP[l] = 1;
+                        confZr[l] = zr_[l]; confZi[l] = zi_[l]; confD2[l] = 1; confNext[l] = j_[l] + confP[l]; confCount[l] = 0;
+                    }
+                    if (j_[l] - save_j[l] >= pwin[l]) { zsr[l] = zr_[l]; zsi[l] = zi_[l]; save_j[l] = j_[l]; pwin[l] += pwin[l]; }
+                }
             }
             if ((rm & (1 << l)) || (refit & (1 << l))) {  // Zhuoran rebase
                 if (dzmag_[l] / zrad_[l] > 10000000.0) {
@@ -1897,9 +2071,10 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
                 setPixel(v[g + l], -2.f);
                 markDone(g + l); act[l] = false; continue;
             }
-            anyactive = true;
         }
         if (changed) { dzr = _mm256_load_pd(dzrs); dzi = _mm256_load_pd(dzis); }
+        anyactive = false;
+        for (int l = 0; l < lanes; ++l) if (act[l]) { anyactive = true; break; }
     }
 }
 
@@ -1964,8 +2139,19 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
     FloatExp SJ{ 1.0, 0 };            // |J| scale; J_1 = d(dc)/dc = 1
     double jr = 1.0, ji = 0.0, invSJd = 1.0;   // invSJd = 1/SJ carries the "+1" seed
 
+    // Exact state-repetition interior detector (see stepParallel). The floatexp
+    // pixel state is (wr, wi, S, m); it is deterministic, so a bit-exact repeat
+    // proves the orbit loops -> interior. Zero false positives by construction.
+    const bool int_rep = g_int_rep > 0 && _use_interior && !trap;
+    double swr = 1e300, swi = 1e300; FloatExp sS{ 1e300, 0 }; int sm = -1, save_iter2 = 1, twin2r = 1;
+
     while (iter < mxit) {
         if (_flag_halt) break;
+        if (int_rep) {
+            if (m == sm && wr == swr && wi == swi && S.m == sS.m && S.e == sS.e)
+                return -2.f;                       // exact state repeat -> provably interior
+            if (iter - save_iter2 >= twin2r) { swr = wr; swi = wi; sS = S; sm = m; save_iter2 = iter; twin2r += twin2r; }
+        }
         // BLA: skip a run of reference iterations when the rescaled dz is small
         // enough (deep zoom -> almost always). dz is at reference index m (double
         // path convention: table index s = m-1). On a skip, dz/S/wr/wi are
@@ -1973,7 +2159,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         // the periodicity detector (a multi-iter skip leaves its state stale).
         if (_use_bla && !trap && m >= 2) {
             double ab[4];
-            int skip = tryBLAfe(rm, S, S2, wr, wi, dcr, dci, ESC2, per ? per : reflen, deriv ? ab : nullptr);
+            int skip = tryBLAfe(rm, S, S2, wr, wi, dr, di, ESC2, per ? per : reflen, deriv ? ab : nullptr);
             if (skip > 0) {
                 if (sac) {
                     if (sacc.W > 0) sacc.reset_window();      // tail broken by the jump
@@ -2159,7 +2345,7 @@ void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g,
             if (iter[l] >= mxit) { out[g + l] = -2.f; act[l] = false; continue; }
             bool skipped = false;
             if (_use_bla && m[l] >= 2) {
-                int skip = tryBLAfe(m[l] - 1, S[l], fe_mul(S[l], S[l]), wr[l], wi[l], dcr[l], dci[l], ESC2, reflen);
+                int skip = tryBLAfe(m[l] - 1, S[l], fe_mul(S[l], S[l]), wr[l], wi[l], dr[l], di[l], ESC2, reflen);
                 if (skip > 0) {
                     m[l] += skip; iter[l] += skip;
                     sS[l] = fe_to_double(S[l]);
@@ -2313,6 +2499,21 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
     // _z[0] = _ref_z;
     mpf_set(_z_re[0], _ref_z_re);
     mpf_set(_z_im[0], _ref_z_im);
+    if (g_bigfixed == -2) { const char* e = getenv("MANDEL_BIGFIXED"); g_bigfixed = e ? atoi(e) : -1; }
+    // Auto (env unset): use BigFixed on the deep floatexp path, where its high-half
+    // short product beats mpf; env forces on (>=1) or off (0). mpf elsewhere.
+    _use_bigfixed = (g_bigfixed == -1) ? _use_floatexp : (g_bigfixed > 0);
+    if (_use_bigfixed) {
+        // Fixed-point orbit: L limbs = precision/64 + guard for near-zero passes
+        // (fixed-point loses relative precision as |Z|->0; the extra guard limbs
+        // keep >=53 significant bits so the deep floatexp shadow stays accurate).
+        int prec = (int)mpf_get_prec(_ref_z_re);
+        _bfL = (prec + 63) / 64 + 2;                 // ceil(prec/64) fractional + integer + 1 round-guard limb
+        _bftmp.assign((size_t)2 * _bfL, 0ull);
+        bf_from_mpf(_bc_re, _ref_z_re, _bfL); bf_from_mpf(_bc_im, _ref_z_im, _bfL);
+        _bz_re[0] = _bc_re; _bz_im[0] = _bc_im;       // z_0 = c
+        _bt1.setL(_bfL); _bt2.setL(_bfL); _bab.setL(_bfL); _bre.setL(_bfL); _bim.setL(_bfL);
+    }
 
     _zf[0] = _ref_z_f;
     _zfr[0] = _ref_z_f.real();
@@ -2350,6 +2551,7 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
                     if ((c_method & ColoringMethod::EXTERIOR_DIST_EST) && rv >= 0) rv /= (float)mpf_get_d(_dx);
                     setPixel(_ref, rv);
                 } else {
+                    if (_use_bigfixed) { bf_to_mpf(_z_re[i & 1], _bz_re[i & 1]); bf_to_mpf(_z_im[i & 1], _bz_im[i & 1]); }
                     setPixel(_ref, getEscapeTime(_z_re[i & 1], _z_im[i & 1], i));
                 }
             }
@@ -2376,6 +2578,35 @@ bool Mandel::calCoefficient(int i, int pr_it, int c_method) {
     const int c = i & 1, p = (i - 1) & 1;
     // _z[i] = _z[i - 1] * _z[i - 1] + _ref_z;  (complex square via Karatsuba:
     // re = (a+b)(a-b), im = 2ab -> 2 big multiplies instead of 3)
+    // _z[i] = _z[i - 1] * _z[i - 1] + _ref_z;  (complex square via Karatsuba:
+    // re = (a+b)(a-b), im = 2ab -> 2 big multiplies instead of 3)
+    if (_use_bigfixed) {
+        // Fixed-point (BigFixed) orbit step: same Karatsuba complex square, but the
+        // fixed-size fixed-point bignum avoids mpf's dynamic-size/rounding overhead.
+        const BigFixed& a = _bz_re[p]; const BigFixed& b = _bz_im[p];
+        bf_add(_bt1, a, b);                        // a + b
+        bf_sub(_bt2, a, b);                        // a - b
+        bf_mul(_bab, a, b, _bftmp.data());         // a * b
+        bf_mul(_bre, _bt1, _bt2, _bftmp.data());   // a^2 - b^2
+        bf_add(_bim, _bab, _bab);                  // 2ab
+        bf_add(_bz_re[c], _bre, _bc_re);           // + c
+        bf_add(_bz_im[c], _bim, _bc_im);
+        if (_use_floatexp) {
+            // Deep path needs both shadows. bf_to_fe already extracts the top-2-limb
+            // mantissa+exponent; derive the double from it via fe_to_double (a cheap
+            // ldexp) instead of a second limb scan in toDouble(). fe_to_double(bf_to_fe(x))
+            // == x.toDouble() exactly (same top bits, same rounding), so this is exact.
+            FloatExp fr = bf_to_fe(_bz_re[c]), fi = bf_to_fe(_bz_im[c]);
+            _zfr_fe[i] = fr; _zfi_fe[i] = fi;
+            double zr = fe_to_double(fr), zi = fe_to_double(fi);
+            _zf[i] = Comp{ zr, zi };
+            _zfr[i] = zr; _zfi[i] = zi;
+        } else {
+            double zr = _bz_re[c].toDouble(), zi = _bz_im[c].toDouble();
+            _zf[i] = Comp{ zr, zi };
+            _zfr[i] = zr; _zfi[i] = zi;
+        }
+    } else {
     mpf_add(_t1, _z_re[p], _z_im[p]);       // a + b
     mpf_sub(_t2, _z_re[p], _z_im[p]);       // a - b
     mpf_mul(_z_im[c], _z_re[p], _z_im[p]);  // a*b   (read a,b before _z_re[c] write)
@@ -2389,6 +2620,7 @@ bool Mandel::calCoefficient(int i, int pr_it, int c_method) {
     _zfr[i] = _zf[i].real();
     _zfi[i] = _zf[i].imag();
     if (_use_floatexp) { _zfr_fe[i] = mpf_to_fe(_z_re[c]); _zfi_fe[i] = mpf_to_fe(_z_im[c]); }
+    }
 
     // _z_m3[i] = tmp_z.abs().get_real_imag().first / 1000; // for Pauldelbrot condition
     _z_m3[i] = { (_zfr[i] * _zfr[i] + _zfi[i] * _zfi[i]) / 1000000 };

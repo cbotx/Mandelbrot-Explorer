@@ -188,6 +188,9 @@ int main(int argc, char** argv) {
         "reference parity (period-1329 boundary, 1e1000)",
         parityRe, parityIm, pow10(1000), 10000, 16
     };
+    // A 1e876 needle point (floatexp path, high-half multiply range). Deep exterior
+    // stress with a different reference orbit than the 1e1000 cases.
+    TestCase deep876{ "deep876 (1e876 needle, floatexp)", testcases::deep1_x, testcases::deep1_y, pow10(876), 300000, 24 };
 
     // Optional reference-footprint sweep: override mxit for all cases.
     if (const char* e = getenv("MANDEL_MXIT")) {
@@ -211,5 +214,6 @@ int main(int argc, char** argv) {
     if (which == "all" || which == "flake")    rc |= runCase(flake, W, H);
     if (which == "exterior1000")               rc |= runCase(exterior1000, W, H);
     if (which == "parity1000")                 rc |= runCase(parity1000, W, H);
+    if (which == "deep876")                    rc |= runCase(deep876, W, H);
     return rc;
 }
