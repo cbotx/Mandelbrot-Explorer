@@ -20,6 +20,8 @@ int   de_overlay_on = 0;
 float relief_light_az = 2.3f;
 float relief_light_el = 0.55f;
 float relief_strength = 1.0f;
+float de_k = 4.8f;       // DE overlay: colour-ramp / boundary scale (GUI slider)
+float de_scale = 1.6f;   // DE overlay: optical (inverse-square) falloff scale (GUI slider)
 
 // INTERIOR_SENTINEL (-2.0f) is declared in Image.h. A far-field point can escape
 // with a slightly NEGATIVE smooth count, so "interior" must be the exact sentinel.
@@ -150,28 +152,32 @@ void applyNormalLightTo(uint8_t* rgb, const float* angle, int W, int H) {
         }
 }
 
-// Distance-estimate B&W overlay: multiply the smooth colour by a shade that goes
-// dark near the set boundary (small DE) and to full colour far away, drawing the
-// fine filament structure over the base. relief_strength tunes the falloff.
+// Distance-estimate glow overlay, composited over the smooth base in linear light.
+// The DE value is proportional to the true distance from the set boundary (the light
+// source), so the fade follows the optical INVERSE-SQUARE law. Two tunables are exposed
+// as GUI sliders -- de_k (colour/boundary scale) and de_scale (optical falloff distance);
+// the rest are the constants dialled in with the standalone DE gradient editor.
 void applyDEOverlayTo(uint8_t* rgb, const float* de, int W, int H) {
-    // The distance estimate is drawn as a PURE black&white layer on top of the smooth
-    // gradient: the gradient supplies the colour of the smooth exterior, while near the
-    // set boundary the delicate DE structure takes over as greyscale (the filament lace
-    // in black&white, fading to black on the set). No hue comes from the DE itself.
-    const double k = 1.5 + 3.0 * (double)relief_strength;   // strength -> falloff distance
+    const double k = de_k;                          // bw = de/(de+k)  colour-ramp scale
+    const double scaleDe = std::max(1e-3, (double)de_scale);   // optical falloff distance
+    const double riseW = 0.27, riseCurve = 2.0;     // black -> glow ramp (edge shape)
+    const double coreDe = 0.0, fadeExp = 2.0;       // fadeExp=2 -> 1/r^2 inverse-square
+    const double glow = 1.0;                        // white glow (linear radiance)
 #pragma omp parallel for schedule(static)
     for (int i = 0; i < H; ++i)
         for (int j = 0; j < W; ++j) {
             float dd = de[(size_t)i * W + j];
             if (std::isnan(dd)) continue;                 // interior/empty: leave as-is
-            double bw = (double)dd / ((double)dd + k);    // 0 on the boundary -> 1 far away
-            double gray = bw;                             // the B&W distance value
-            // colour weight: full gradient colour far away, pure grey near the boundary
-            double cw = bw * bw;
+            double d = (double)dd;
+            double bw = d / (d + k);                      // 0 boundary -> 1 far
+            double level = (bw >= riseW) ? 1.0 : std::pow(bw / riseW, riseCurve);
+            double rad = d - coreDe;                      // distance beyond the light core
+            double alpha = (rad <= 0.0) ? 1.0 : 1.0 / (1.0 + std::pow(rad / scaleDe, fadeExp));
+            double gcol = glow * level;                   // glow radiance (grey level)
             uint8_t* q = rgb + ((size_t)i * W + j) * 3;
-            double r = g_srgb2lin[q[0]] * cw + gray * (1.0 - cw);
-            double g = g_srgb2lin[q[1]] * cw + gray * (1.0 - cw);
-            double b = g_srgb2lin[q[2]] * cw + gray * (1.0 - cw);
+            double r = gcol * alpha + g_srgb2lin[q[0]] * (1.0 - alpha);
+            double g = gcol * alpha + g_srgb2lin[q[1]] * (1.0 - alpha);
+            double b = gcol * alpha + g_srgb2lin[q[2]] * (1.0 - alpha);
             q[0] = (uint8_t)(srgbEncode(r) * 255.0 + 0.5);
             q[1] = (uint8_t)(srgbEncode(g) * 255.0 + 0.5);
             q[2] = (uint8_t)(srgbEncode(b) * 255.0 + 0.5);

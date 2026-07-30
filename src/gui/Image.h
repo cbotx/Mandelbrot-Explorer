@@ -25,6 +25,8 @@ extern int   de_overlay_on;      // 1 => apply DE (distance-estimate) B&W overla
 extern float relief_light_az;    // light azimuth  (radians)
 extern float relief_light_el;    // light elevation (radians)
 extern float relief_strength;    // slope strength
+extern float de_k;               // DE overlay: colour/boundary scale (bw = de/(de+k))
+extern float de_scale;           // DE overlay: optical (inverse-square) falloff scale
 
 // Post-shade an RGB image (row-major, 3 bytes/pixel) by Lambert slope lighting
 // from a per-pixel height field (NaN => interior/empty, left unshaded). Multiplies

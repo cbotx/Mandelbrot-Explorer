@@ -306,9 +306,14 @@ public:
     }
     // Relief light/strength sliders (post-shade only; no fractal recompute).
     static constexpr double RELIEF_STR_MAX = 3.0;
+    // DE-overlay slider ranges: in DE mode the azimuth+strength slots become the two
+    // DE tunables (boundary scale de_k and optical falloff scale de_scale).
+    static constexpr double DE_K_MIN = 0.1, DE_K_MAX = 8.0;
+    static constexpr double DE_SCALE_MIN = 0.1, DE_SCALE_MAX = 8.0;
     void setReliefAzFromX(int x) {
         double t = std::clamp((double)(x - rcReliefAz.left) / std::max(1L, rcReliefAz.right - rcReliefAz.left), 0.0, 1.0);
-        relief_light_az = (float)(t * 2.0 * 3.14159265358979);
+        if (de_overlay_on) de_k = (float)(DE_K_MIN + t * (DE_K_MAX - DE_K_MIN));
+        else relief_light_az = (float)(t * 2.0 * 3.14159265358979);
         recolorPhaseNow();
     }
     void setReliefElFromX(int x) {
@@ -318,7 +323,8 @@ public:
     }
     void setReliefStrFromX(int x) {
         double t = std::clamp((double)(x - rcReliefStr.left) / std::max(1L, rcReliefStr.right - rcReliefStr.left), 0.0, 1.0);
-        relief_strength = (float)(t * RELIEF_STR_MAX);
+        if (de_overlay_on) de_scale = (float)(DE_SCALE_MIN + t * (DE_SCALE_MAX - DE_SCALE_MIN));
+        else relief_strength = (float)(t * RELIEF_STR_MAX);
         recolorPhaseNow();
     }
     // Immediate cheap re-colour + present for the current phase (paused-drag feedback).
@@ -371,7 +377,8 @@ public:
             rcReliefEl  = { px, y + S(24), px + w, y + S(38) }; y += S(52);
             rcReliefStr = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         } else if (de_overlay_on) {
-            rcReliefAz = rcReliefEl = RECT{};
+            rcReliefAz  = { px, y + S(24), px + w, y + S(38) }; y += S(52);
+            rcReliefEl  = RECT{};
             rcReliefStr = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         } else {
             rcReliefAz = rcReliefEl = rcReliefStr = RECT{};
@@ -1072,9 +1079,12 @@ public:
             labelRow(dc, rcReliefStr, L"Relief strength", rsb);
             drawSlider(dc, rcReliefStr, std::clamp(relief_strength / RELIEF_STR_MAX, 0.0, 1.0), H_RELSTR);
         } else if (de_overlay_on) {
-            wchar_t rsb[32]; swprintf_s(rsb, L"%.2f", relief_strength);
-            labelRow(dc, rcReliefStr, L"DE thickness", rsb);
-            drawSlider(dc, rcReliefStr, std::clamp(relief_strength / RELIEF_STR_MAX, 0.0, 1.0), H_RELSTR);
+            wchar_t kb[32]; swprintf_s(kb, L"%.2f", de_k);
+            labelRow(dc, rcReliefAz, L"DE boundary scale", kb);
+            drawSlider(dc, rcReliefAz, std::clamp((de_k - DE_K_MIN) / (DE_K_MAX - DE_K_MIN), 0.0, 1.0), H_RELAZ);
+            wchar_t scb[32]; swprintf_s(scb, L"%.2f", de_scale);
+            labelRow(dc, rcReliefStr, L"DE falloff scale", scb);
+            drawSlider(dc, rcReliefStr, std::clamp((de_scale - DE_SCALE_MIN) / (DE_SCALE_MAX - DE_SCALE_MIN), 0.0, 1.0), H_RELSTR);
         }
 
         label(dc, rcPaletteDD.left, rcPaletteDD.top - S(20), L"Palette");
@@ -1615,10 +1625,15 @@ public:
             if (relief_on || normal_light_on || de_overlay_on) {
                 RECT ra = rcReliefAz; ra.top -= S(10); ra.bottom += S(10);
                 if (inRect(ra, q.x, q.y)) {
-                    const double TWO_PI = 6.28318530717959;
-                    double v = relief_light_az + (wd > 0 ? 0.05236 : -0.05236);   // ~3deg/notch
-                    v = std::fmod(v, TWO_PI); if (v < 0) v += TWO_PI;
-                    relief_light_az = (float)v; recolorPhaseNow(); return 0;
+                    if (de_overlay_on) {
+                        de_k = (float)std::clamp((double)de_k + (wd > 0 ? 0.1 : -0.1), DE_K_MIN, DE_K_MAX);
+                    } else {
+                        const double TWO_PI = 6.28318530717959;
+                        double v = relief_light_az + (wd > 0 ? 0.05236 : -0.05236);   // ~3deg/notch
+                        v = std::fmod(v, TWO_PI); if (v < 0) v += TWO_PI;
+                        relief_light_az = (float)v;
+                    }
+                    recolorPhaseNow(); return 0;
                 }
                 RECT re = rcReliefEl; re.top -= S(10); re.bottom += S(10);
                 if (inRect(re, q.x, q.y)) {
@@ -1627,7 +1642,11 @@ public:
                 }
                 RECT rs = rcReliefStr; rs.top -= S(10); rs.bottom += S(10);
                 if (inRect(rs, q.x, q.y)) {
-                    relief_strength = (float)std::clamp((double)relief_strength + (wd > 0 ? 0.05 : -0.05), 0.0, RELIEF_STR_MAX);
+                    if (de_overlay_on) {
+                        de_scale = (float)std::clamp((double)de_scale + (wd > 0 ? 0.05 : -0.05), DE_SCALE_MIN, DE_SCALE_MAX);
+                    } else {
+                        relief_strength = (float)std::clamp((double)relief_strength + (wd > 0 ? 0.05 : -0.05), 0.0, RELIEF_STR_MAX);
+                    }
                     recolorPhaseNow(); return 0;
                 }
             }

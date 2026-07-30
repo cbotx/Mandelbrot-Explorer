@@ -106,7 +106,14 @@ void MandelNavigator::StartCompute() {
     InterruptCompute();
     ConfigureSampling();
     _cache_valid = false;                       // fractal changing -> phase cache stale
-    for (int i = 0; i < _w * _h * _sub * _sub; ++i) _iter[i] = EMPTYPIXEL;
+    // Clear BOTH buffers. _iter marks pixels unresolved; _normal (the DE / normal-map
+    // field) must be reset to NaN too, otherwise buildNormalField reads the PREVIOUS
+    // view's DE for a pixel whose _iter is freshly filled but whose _normal has not yet
+    // been rewritten -- the DE overlay then renders at the old (pre-pan) screen
+    // positions for one transient (a ghost), while the smooth base looks correct.
+    const float NaN = std::numeric_limits<float>::quiet_NaN();
+    const size_t cnt = (size_t)_w * _h * _sub * _sub;
+    for (size_t i = 0; i < cnt; ++i) { _iter[i] = EMPTYPIXEL; _normal[i] = NaN; }
     auto compute_task = [this]() {
         this->_mandel->setDensity(color_density);   // for the SAC adaptive-SS detector
         int method = this->_uniform_feather
