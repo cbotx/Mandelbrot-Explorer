@@ -10,6 +10,7 @@
 
 #include "navigator.h"
 #include "mandel_perturbation.h"
+#include "formula_spec.h"
 #include "float_math.h"
 
 class MandelNavigator : public Navigator {
@@ -80,6 +81,7 @@ public:
     int GetMxit() const { return _mxit; }
     // Copy the current view: center (re/im) and scale into caller-owned mpf_t.
     void GetView(mpf_t re, mpf_t im, mpf_t scale) const;
+    static constexpr FormulaContext GetFormulaContext() { return quadraticMandelbrot(); }
     
     int GetCMethod();
 
