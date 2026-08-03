@@ -35,6 +35,7 @@
 #include "interpolate.h"
 #include "mandel_navigator.h"
 #include "mandel_perturbation.h"
+#include "orbit_overlay.h"
 
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -54,7 +55,7 @@ enum Hit {
     H_RESET, H_RENDER, H_SAVE, H_COPY, H_PASTE,
     H_MAXTRACK, H_DENSTRACK, H_PHASETRACK, H_SPEEDTRACK,
     H_RELAZ, H_RELEL, H_RELSTR,
-    H_SS, H_EDE, H_PALETTE_DD, H_COLOR, H_GALLERY_DD, H_PANELSB
+    H_SS, H_ORBIT, H_EDE, H_PALETTE_DD, H_COLOR, H_GALLERY_DD, H_PANELSB
 };
 
 // Gallery demo presets: a saved location plus the exact render settings used to
@@ -236,6 +237,7 @@ public:
     RECT rcReliefAz{}, rcReliefEl{}, rcReliefStr{};
     RECT rcSS{}, rcColoringDD{}, rcPaletteDD{}, rcColor{}, rcGradient{};
     RECT rcGalleryDD{};
+    RECT rcOrbitToggle{}, rcOrbitThumb{};
 
     // state
     int maxIter = 500000;
@@ -244,6 +246,12 @@ public:
     bool coloringOpen = false;              // coloring dropdown expanded
     int coloringHover = -1;                 // hovered item while open (-1 none)
     int paletteIdx = 0;                    // index into palettePresets()
+    bool orbitOn = false;
+    std::unique_ptr<OrbitWorker> orbitWorker;
+    OrbitResult orbitResult;
+    std::vector<uint8_t> orbitThumbnail;
+    std::chrono::steady_clock::time_point lastOrbitRequest{};
+    int lastOrbitX = -10000, lastOrbitY = -10000;
     bool paletteOpen = false;              // dropdown expanded
     int paletteHover = -1;                 // hovered item while open (-1 none)
     bool galleryOpen = false;              // gallery dropdown expanded
@@ -271,6 +279,7 @@ public:
     std::chrono::steady_clock::time_point lastFrameTs{};
     std::chrono::steady_clock::time_point lastRenderTs{};  // for the ~60fps redraw cap
     bool benchMode = false;     // MANDEL_GUI_BENCH: headless recolor micro-benchmark
+    bool orbitBench = false;    // MANDEL_GUI_ORBIT_BENCH: compute one centre orbit and exit
     // MANDEL_GUI_FPSLOG=<sec>: run the REAL animation/timer loop (not the isolated
     // micro-bench) and log the measured sustained animFps + per-frame costs, then exit.
     bool fpsLogMode = false;
@@ -288,6 +297,129 @@ public:
 
     int S(int v) const { return MulDiv(v, dpi, 96); }   // scale a design px to device px
     void keepLive(int frames = 60) { liveFrames = std::max(liveFrames, frames); }
+
+    static constexpr int ORBIT_W = 280;
+    static constexpr int ORBIT_H = 192;
+    static constexpr double ORBIT_X0 = -2.5;
+    static constexpr double ORBIT_X1 = 1.0;
+    static constexpr double ORBIT_Y0 = -1.2;
+    static constexpr double ORBIT_Y1 = 1.2;
+
+    void buildOrbitThumbnail() {
+        orbitThumbnail.assign((size_t)ORBIT_W * ORBIT_H * 3, 0);
+#pragma omp parallel for schedule(static)
+        for (int y = 0; y < ORBIT_H; ++y) {
+            double ci = ORBIT_Y1 - (ORBIT_Y1 - ORBIT_Y0) * y / (ORBIT_H - 1);
+            for (int x = 0; x < ORBIT_W; ++x) {
+                double cr = ORBIT_X0 + (ORBIT_X1 - ORBIT_X0) * x / (ORBIT_W - 1);
+                double zr = 0.0, zi = 0.0;
+                int i = 0;
+                for (; i < 160 && zr * zr + zi * zi <= 16.0; ++i) {
+                    double nr = zr * zr - zi * zi + cr;
+                    zi = 2.0 * zr * zi + ci;
+                    zr = nr;
+                }
+                uint8_t* p = &orbitThumbnail[((size_t)y * ORBIT_W + x) * 3];
+                if (i == 160) {
+                    p[0] = 16; p[1] = 13; p[2] = 10;
+                } else {
+                    double t = std::sqrt((double)i / 160.0);
+                    p[0] = (uint8_t)(30 + 95 * t);
+                    p[1] = (uint8_t)(24 + 135 * t);
+                    p[2] = (uint8_t)(20 + 215 * t);
+                }
+            }
+        }
+    }
+
+    POINT orbitMap(double re, double im, const RECT& r) const {
+        int x = r.left + (int)((re - ORBIT_X0) / (ORBIT_X1 - ORBIT_X0) *
+                               (r.right - r.left - 1));
+        int y = r.top + (int)((ORBIT_Y1 - im) / (ORBIT_Y1 - ORBIT_Y0) *
+                              (r.bottom - r.top - 1));
+        return { x, y };
+    }
+
+    void drawOrbitThumbnail(HDC dc) {
+        if (!orbitOn || rcOrbitThumb.right <= rcOrbitThumb.left) return;
+        label(dc, rcOrbitThumb.left, rcOrbitThumb.top - S(20), L"Orbit in the full set");
+        fillRound(dc, rcOrbitThumb, CLR_CARD, CLR_BORDER, S(8));
+        RECT image = rcOrbitThumb;
+        InflateRect(&image, -S(6), -S(6));
+        BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = ORBIT_W; bi.bmiHeader.biHeight = -ORBIT_H;
+        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 24;
+        bi.bmiHeader.biCompression = BI_RGB;
+        SetStretchBltMode(dc, HALFTONE);
+        StretchDIBits(dc, image.left, image.top, image.right - image.left,
+                      image.bottom - image.top, 0, 0, ORBIT_W, ORBIT_H,
+                      orbitThumbnail.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+
+        int saved = SaveDC(dc);
+        IntersectClipRect(dc, image.left, image.top, image.right, image.bottom);
+        if (orbitResult.points.size() >= 2) {
+            std::vector<POINT> points;
+            points.reserve(orbitResult.points.size());
+            for (const OrbitPoint& p : orbitResult.points)
+                points.push_back(orbitMap(p.re, p.im, image));
+            HPEN line = CreatePen(PS_SOLID, std::max(1, S(1)), RGB(255, 230, 96));
+            HGDIOBJ old = SelectObject(dc, line);
+            Polyline(dc, points.data(), (int)points.size());
+            SelectObject(dc, old); DeleteObject(line);
+        }
+        POINT cp = orbitMap(orbitResult.cRe, orbitResult.cIm, image);
+        HBRUSH marker = CreateSolidBrush(CLR_GREEN);
+        HGDIOBJ oldBrush = SelectObject(dc, marker);
+        HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+        int mr = std::max(2, S(3));
+        Ellipse(dc, cp.x - mr, cp.y - mr, cp.x + mr + 1, cp.y + mr + 1);
+        SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(marker);
+        RestoreDC(dc, saved);
+
+        if (orbitResult.generation == 0) {
+            drawText(dc, image, L"Move over the main image", CLR_TEXT, fSmall,
+                     DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            wchar_t text[96];
+            swprintf_s(text, L"%d iter%s   %.1f ms", orbitResult.iterations,
+                       orbitResult.escaped ? L"  escaped" : L"", orbitResult.computeMs);
+            RECT info = image; info.left += S(6); info.bottom -= S(4);
+            drawText(dc, info, text, CLR_TEXT, fSmall,
+                     DT_LEFT | DT_BOTTOM | DT_SINGLELINE);
+        }
+    }
+
+    void requestOrbit(int x, int y, bool applyBoundary = true) {
+        if (!orbitOn || navDragging || !nav) return;
+        if (!orbitWorker) orbitWorker = std::make_unique<OrbitWorker>();
+        if (orbitThumbnail.empty()) buildOrbitThumbnail();
+        auto now = std::chrono::steady_clock::now();
+        if (lastOrbitRequest.time_since_epoch().count()) {
+            double ms = std::chrono::duration<double, std::milli>(
+                now - lastOrbitRequest).count();
+            if (ms < 12.0 && std::abs(x - lastOrbitX) < 2 && std::abs(y - lastOrbitY) < 2)
+                return;
+        }
+        POINT p = mapToRender(x, y);
+        if (applyBoundary) {
+            auto boundary = nav->GetBoundary();
+            double fx = boundary[0][0] + (boundary[2][0] - boundary[0][0]) *
+                        (p.x + 0.5) / renderW;
+            double fy = boundary[0][1] + (boundary[2][1] - boundary[0][1]) *
+                        ((renderH - 1 - p.y) + 0.5) / renderH;
+            int sourceX = std::clamp((int)(fx * renderW), 0, renderW - 1);
+            int sourceYUp = std::clamp((int)(fy * renderH), 0, renderH - 1);
+            p = { sourceX, renderH - 1 - sourceYUp };
+        }
+        mp_bitcnt_t precision = nav->GetViewPrecision();
+        mpf_t re, im, scale;
+        mpf_init2(re, precision); mpf_init2(im, precision); mpf_init2(scale, precision);
+        nav->GetView(re, im, scale);
+        orbitWorker->request(re, im, scale, p.x, p.y, renderW, renderH, maxIter,
+                             MandelNavigator::GetFormulaContext());
+        mpf_clear(re); mpf_clear(im); mpf_clear(scale);
+        lastOrbitRequest = now; lastOrbitX = x; lastOrbitY = y;
+    }
 
     // Set the palette phase from a phase-slider x (0..colP over the track).
     void setPhaseFromX(int x) {
@@ -365,6 +497,14 @@ public:
         rcSpeedTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         // Unlabeled toggle: box sits at y (no label above), then a uniform 14px gap.
         rcSS  = { px, y, px + w, y + bh }; y += bh + S(14);
+        rcOrbitToggle = { px, y, px + w, y + bh }; y += bh + S(14);
+        if (orbitOn) {
+            int oh = (int)((double)w * ORBIT_H / ORBIT_W);
+            rcOrbitThumb = { px, y + S(20), px + w, y + S(20) + oh };
+            y += S(20) + oh + S(14);
+        } else {
+            rcOrbitThumb = RECT{};
+        }
         // Labeled dropdowns reserve S(24) at the top for their caption (drawn at
         // box.top-S(20)) -- the same rhythm as the sliders and the gradient bar -- so
         // the gap to the next control stays uniform instead of double-gapping after a
@@ -406,7 +546,8 @@ public:
             RECT* all[] = { &rcReset, &rcRender, &rcSave, &rcCopy, &rcPaste,
                             &rcLocation, &rcMaxTrack, &rcDensTrack, &rcPhaseTrack, &rcSpeedTrack,
                             &rcReliefAz, &rcReliefEl, &rcReliefStr,
-                            &rcSS, &rcColoringDD, &rcPaletteDD, &rcGradient, &rcColor, &rcGalleryDD };
+                            &rcSS, &rcOrbitToggle, &rcOrbitThumb,
+                            &rcColoringDD, &rcPaletteDD, &rcGradient, &rcColor, &rcGalleryDD };
             for (RECT* r : all) OffsetRect(r, 0, -panelScroll);
         }
     }
@@ -512,6 +653,10 @@ public:
         }
         nav->UpdateCoords();
         startRender();
+        if (orbitOn && inRect(viewRect(), lastOrbitX, lastOrbitY)) {
+            lastOrbitRequest = {};
+            requestOrbit(lastOrbitX, lastOrbitY, false);
+        }
     }
     void startRender() {
         renderStart = std::chrono::steady_clock::now();
@@ -1065,6 +1210,8 @@ public:
                    speedSnaps, 1);
 
         drawToggle(dc, rcSS, L"5x supersampling", ssOn, H_SS);
+        drawToggle(dc, rcOrbitToggle, L"Show orbit", orbitOn, H_ORBIT);
+        if (orbitOn) drawOrbitThumbnail(dc);
         label(dc, rcColoringDD.left, rcColoringDD.top - S(20), L"Coloring");
         drawColoringDD(dc);
 
@@ -1156,12 +1303,18 @@ public:
         if (full) {
             BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
         } else {
+            if (orbitOn) drawOrbitThumbnail(dc);
             // Fractal-only tick: only the view and the status bar changed; the panel
             // is unchanged on screen, so skip re-blitting it (saves a big copy when
             // the window is large).
             BitBlt(wdc, vr.left, vr.top, vW, vH, dc, vr.left, vr.top, SRCCOPY);
             BitBlt(wdc, status.left, status.top, status.right - status.left,
                    status.bottom - status.top, dc, status.left, status.top, SRCCOPY);
+            if (orbitOn) {
+                RECT orb = rcOrbitThumb; orb.top -= S(20);
+                BitBlt(wdc, orb.left, orb.top, orb.right - orb.left, orb.bottom - orb.top,
+                       dc, orb.left, orb.top, SRCCOPY);
+            }
         }
         EndPaint(hwnd, &ps);
         lastPresentMs = std::chrono::duration<double, std::milli>(
@@ -1186,6 +1339,7 @@ public:
             RECT rs = rcReliefStr; rs.top -= S(8); rs.bottom += S(8); if (inRect(rs,x,y)) return H_RELSTR;
         }
         if (inRect(rcSS,x,y)) return H_SS;
+        if (inRect(rcOrbitToggle,x,y)) return H_ORBIT;
         if (inRect(rcColoringDD,x,y)) return H_EDE;
         if (inRect(rcPaletteDD,x,y)) return H_PALETTE_DD;
         if (inRect(rcColor,x,y)) return H_COLOR;
@@ -1291,6 +1445,26 @@ public:
     }
 
     void timer() {
+        if (orbitOn && orbitWorker) {
+            OrbitResult latest;
+            if (orbitWorker->takeLatest(latest)) {
+                orbitResult = std::move(latest);
+                if (orbitBench) {
+                    FILE* f = nullptr; fopen_s(&f, "build\\orbit_bench.txt", "a");
+                    if (f) {
+                        fprintf(f, "orbit=%.3f ms iterations=%d points=%zu escaped=%d c=(%.17g,%.17g)\n",
+                                orbitResult.computeMs, orbitResult.iterations,
+                                orbitResult.points.size(), orbitResult.escaped ? 1 : 0,
+                                orbitResult.cRe, orbitResult.cIm);
+                        fclose(f);
+                    }
+                    PostQuitMessage(0);
+                }
+                fractalOnlyTick = true;
+                RECT dirty = rcOrbitThumb; dirty.top -= S(20);
+                InvalidateRect(hwnd, &dirty, FALSE);
+            }
+        }
         bool computing = nav->IsComputing();
         if (benchMode && !fpsLogMode && !computing) { runRecolorBench(); return; }
         bool anim = std::fabs(animSpeed) > 1e-4f;
@@ -1408,22 +1582,36 @@ public:
             nav->SetCMethod(coloringIdx == 1 ? ColoringMethod::EXTERIOR_DIST_EST
                           : coloringIdx == 2 ? ColoringMethod::STRIPE_AVERAGE : 0);
             nav->BindFixImageCallback(fixCallback);
+            if (const char* e = getenv("MANDEL_GUI_ORBIT")) orbitOn = atoi(e) != 0;
+            orbitBench = getenv("MANDEL_GUI_ORBIT_BENCH") != nullptr;
+            if (orbitBench) orbitOn = true;
+            if (orbitOn) {
+                orbitWorker = std::make_unique<OrbitWorker>();
+                buildOrbitThumbnail();
+            }
+            const bool anyBench = getenv("MANDEL_GUI_BENCH") || orbitBench;
+            if (anyBench) {
+                const char* gx = getenv("MANDEL_GUI_CX"), *gy = getenv("MANDEL_GUI_CY");
+                const char* gz = getenv("MANDEL_GUI_ZOOM");
+                if (gx && gy && gz) {
+                    std::string sc = expandSci(gz);
+                    if (!sc.empty()) nav->SetLocation(gx, gy, sc);
+                }
+                if (const char* ww = getenv("MANDEL_GUI_WINW")) {
+                    int winw = atoi(ww); const char* wh = getenv("MANDEL_GUI_WINH");
+                    int winh = wh ? atoi(wh) : (int)(winw * 0.66);
+                    if (winw > 200 && winh > 200)
+                        MoveWindow(hwnd, 40, 40, winw, winh, TRUE);
+                }
+            }
             if (getenv("MANDEL_GUI_BENCH")) {
                 benchMode = true;
                 const char* e = getenv("MANDEL_GUI_SS");
                 ssOn = !e || atoi(e);
                 if (ssOn) nav->SetCMethod(nav->GetCMethod() | ColoringMethod::SUPER_SAMPLING);
                 if (const char* cc = getenv("MANDEL_GUI_COLOR")) selectColoring(atoi(cc));
-                const char* gx = getenv("MANDEL_GUI_CX"), *gy = getenv("MANDEL_GUI_CY"), *gz = getenv("MANDEL_GUI_ZOOM");
-                if (gx && gy && gz) { std::string sc = expandSci(gz); if (!sc.empty()) nav->SetLocation(gx, gy, sc); }
                 if (const char* ds = getenv("MANDEL_GUI_DENS")) color_density = (float)atof(ds);
                 if (const char* pp = getenv("MANDEL_GUI_PAL")) { paletteIdx = atoi(pp); palette.load(paletteIdx); }
-                // Force a deterministic window size for reproducible perf measurement.
-                if (const char* ww = getenv("MANDEL_GUI_WINW")) {
-                    int winw = atoi(ww); const char* wh = getenv("MANDEL_GUI_WINH");
-                    int winh = wh ? atoi(wh) : (int)(winw * 0.66);
-                    if (winw > 200 && winh > 200) MoveWindow(hwnd, 40, 40, winw, winh, TRUE);
-                }
                 // Apply a gallery preset (e.g. 0 = Night City) for realistic testing.
                 if (const char* gi = getenv("MANDEL_GUI_GALLERY")) applyPreset(atoi(gi));
                 // Force the palette dropdown open (verify it scrolls fully into view).
@@ -1441,7 +1629,9 @@ public:
                 }
             }
             layout();
-            if (benchMode) {
+            if (orbitBench) {
+                // The orbit micro-benchmark must not compete with a full frame render.
+            } else if (benchMode) {
                 // A hidden benchmark window receives no initial WM_SIZE, so size the
                 // navigator explicitly instead of silently rendering at 900x600.
                 int oldW = renderW, oldH = renderH;
@@ -1449,6 +1639,10 @@ public:
                 if (renderW == oldW && renderH == oldH) startRender();
             } else {
                 startRender();
+            }
+            if (orbitOn) {
+                RECT vr = viewRect();
+                requestOrbit((vr.left + vr.right) / 2, (vr.top + vr.bottom) / 2);
             }
             // Fine timer period (~4 ms) so the ~60 fps redraw cap in timer() paces the
             // animation instead of the coarse 16 ms WM_TIMER, which coalesced a ~15 ms
@@ -1478,7 +1672,7 @@ public:
             // Maximize/restore/DPI changes arrive without ENTERSIZEMOVE; retarget them
             // immediately. Interactive border drags defer to WM_EXITSIZEMOVE (above),
             // painting a transient scaled preview until then.
-            if (wp != SIZE_MINIMIZED && !inSizeMove) retargetToView();
+            if (wp != SIZE_MINIMIZED && !inSizeMove && !orbitBench) retargetToView();
             InvalidateRect(hwnd, nullptr, FALSE); return 0;
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: paint(); return 0;
@@ -1505,6 +1699,7 @@ public:
             if (pressed == H_RELEL) { setReliefElFromX(x); return 0; }
             if (pressed == H_RELSTR) { setReliefStrFromX(x); return 0; }
             if (navDragging) { POINT p = mapToRender(x,y); nav->Drag(p.x,p.y); return 0; }
+            if (orbitOn && inRect(viewRect(), x, y)) requestOrbit(x, y);
             if (paletteOpen) { int it = paletteItemAt(x,y); if (it != paletteHover) { paletteHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
             if (coloringOpen) { int it = coloringItemAt(x,y); if (it != coloringHover) { coloringHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
             if (galleryOpen) { int it = galleryItemAt(x,y); if (it != galleryHover) { galleryHover = it; InvalidateRect(hwnd,nullptr,FALSE); } }
@@ -1573,6 +1768,17 @@ public:
                 case H_COPY: copyLocation(); break;
                 case H_PASTE: pasteLocation(); break;
                 case H_SS: ssOn = !ssOn; setMethodFlag(ColoringMethod::SUPER_SAMPLING, ssOn); break;
+                case H_ORBIT:
+                    orbitOn = !orbitOn;
+                    if (orbitOn) {
+                        if (!orbitWorker) orbitWorker = std::make_unique<OrbitWorker>();
+                        if (orbitThumbnail.empty()) buildOrbitThumbnail();
+                    } else if (orbitWorker) {
+                        orbitWorker->cancel();
+                    }
+                    orbitResult = OrbitResult{};
+                    layout(); needFull = true;
+                    break;
                 case H_COLOR: chooseSelectedColor(); break;
                 default: break;
                 }
@@ -1743,7 +1949,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     winH = std::min(winH, (int)(wa.bottom - wa.top));
     int wx = wa.left + ((wa.right - wa.left) - winW) / 2;
     int wy = wa.top + ((wa.bottom - wa.top) - winH) / 2;
-    const bool benchHeadless = getenv("MANDEL_GUI_BENCH") && !getenv("MANDEL_GUI_SHOW");
+    const bool benchHeadless =
+        (getenv("MANDEL_GUI_BENCH") || getenv("MANDEL_GUI_ORBIT_BENCH")) &&
+        !getenv("MANDEL_GUI_SHOW");
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"Mandelbrot Explorer",
         WS_OVERLAPPEDWINDOW | (benchHeadless ? 0 : WS_VISIBLE), wx, wy, winW, winH,
         nullptr, nullptr, instance, &app);

@@ -81,6 +81,7 @@ public:
     int GetMxit() const { return _mxit; }
     // Copy the current view: center (re/im) and scale into caller-owned mpf_t.
     void GetView(mpf_t re, mpf_t im, mpf_t scale) const;
+    mp_bitcnt_t GetViewPrecision() const { return mpf_get_prec(_scale); }
     static constexpr FormulaContext GetFormulaContext() { return quadraticMandelbrot(); }
     
     int GetCMethod();
