@@ -7,7 +7,8 @@
 // regression tracking. No libpng / OpenGL / GLUT dependencies.
 //
 // Usage: verify [case]
-//   case = shallow | deep | ticktock | flake | exterior1000 | parity1000 | all
+//   case = shallow | deep | ticktock | flake | exterior1000 | parity1000 |
+//          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 | gui875 | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
 
@@ -17,6 +18,8 @@
 #include <cmath>
 #include <string>
 #include <chrono>
+#include <algorithm>
+#include <vector>
 
 #include "mandel_perturbation.h"
 #include "test_cases.h"
@@ -33,7 +36,22 @@ struct TestCase {
     std::string scale;   // decimal magnitude, e.g. "1" or "1e30" expanded to digits
     int mxit;
     int step;            // brute-force oracle samples a (step x step) pixel grid
+    // Per-case pass tolerances and optional size override (0 => use main()'s W/H).
+    // Fully-exterior stress frames (a sub-pixel nucleus casts no real interior)
+    // set maxMisPct = 0 so ANY oracle classification disagreement fails.
+    double maxDiff = 0.5;
+    double maxMisPct = 1.0;
+    double maxMeanDiff = 1e300;
+    double maxP99Diff = 1e300;
+    int w = 0, h = 0;
+    const char* goldenPath = nullptr;
+    const char* centerShiftRe = nullptr;
 };
+
+// Set-interior pixels carry the exact sentinel -2 (EMPTYPIXEL is -10); exterior
+// smooth counts stay > -1.5. Testing "< 0" would misread a slightly-negative
+// exterior smooth as interior, so classify against the sentinel band instead.
+static inline bool isInterior(float v) { return v < -1.5f; }
 
 static uint32_t checksum(const float* v, int n) {
     // Order-independent-ish FNV over the raw float bits.
@@ -46,7 +64,30 @@ static uint32_t checksum(const float* v, int n) {
     return h;
 }
 
+static bool loadGolden(const char* path, float* out, size_t count) {
+    FILE* f = fopen(path, "rb");
+    std::string alternate;
+    if (!f) {
+        alternate = std::string("../") + path;   // verify.exe is normally run from build/
+        f = fopen(alternate.c_str(), "rb");
+    }
+    if (!f) {
+        fprintf(stderr, "Cannot open golden file: %s\n", path);
+        return false;
+    }
+    size_t got = fread(out, sizeof(float), count, f);
+    int extra = fgetc(f);
+    fclose(f);
+    if (got != count || extra != EOF) {
+        fprintf(stderr, "Golden file has wrong size: %s (expected %zu floats)\n", path, count);
+        return false;
+    }
+    return true;
+}
+
 static int runCase(const TestCase& tc, int W, int H) {
+    if (tc.w > 0) W = tc.w;
+    if (tc.h > 0) H = tc.h;
     // Precision follows the visible scale; 64 guard bits retain center digits
     // beyond the last visible decimal without making shallow tests use the full
     // textual coordinate length.
@@ -57,6 +98,12 @@ static int runCase(const TestCase& tc, int W, int H) {
     mpf_init_set_str(cre, tc.cx.c_str(), 10);
     mpf_init_set_str(cim, tc.cy.c_str(), 10);
     mpf_init_set_str(scale, tc.scale.c_str(), 10);
+    if (tc.centerShiftRe) {
+        mpf_t shift;
+        mpf_init_set_str(shift, tc.centerShiftRe, 10);
+        mpf_add(cre, cre, shift);
+        mpf_clear(shift);
+    }
 
     float* itp = new float[W * H];
     float* itd = new float[W * H];
@@ -78,14 +125,25 @@ static int runCase(const TestCase& tc, int W, int H) {
     mandel.Compute(cre, cim, scale, tc.mxit, c_method);
     double t_pert = since(t0);
 
-    bool run_oracle = (getenv("MANDEL_NOORACLE") == nullptr);
     t0 = Clock::now();
-    if (run_oracle) mandel.ComputeDirect(tc.mxit, itd, tc.step, c_method);
+    const bool useGolden = tc.goldenPath && getenv("MANDEL_FORCE_ORACLE") == nullptr;
+    if (useGolden) {
+        if (!loadGolden(tc.goldenPath, itd, (size_t)W * H)) {
+            delete[] itp; delete[] itd;
+            mpf_clear(cre); mpf_clear(cim); mpf_clear(scale);
+            return 2;
+        }
+    } else if (getenv("MANDEL_NOORACLE") == nullptr) {
+        mandel.ComputeDirect(tc.mxit, itd, tc.step, c_method);
+    }
     double t_direct = since(t0);
 
     // Compare only pixels the (possibly sparse) oracle actually computed.
     long n_int_both = 0, n_ext_both = 0, n_class_mismatch = 0, n_sampled = 0;
+    long n_engine_empty = 0;
     double max_diff = 0, sum_diff = 0;
+    std::vector<double> diffs;
+    diffs.reserve((size_t)W * H);
     int worst_i = -1, worst_j = -1;
     int first_class_i = -1, first_class_j = -1;
     for (int i = 0; i < H; ++i) {
@@ -94,8 +152,14 @@ static int runCase(const TestCase& tc, int W, int H) {
             if (d == EMPTYPIXEL) continue;      // not sampled by the oracle
             float p = itp[i * W + j];
             ++n_sampled;
-            bool p_int = (p < 0);
-            bool d_int = (d < 0);
+            if (p == EMPTYPIXEL) {
+                if (first_class_i < 0) { first_class_i = i; first_class_j = j; }
+                ++n_engine_empty;
+                ++n_class_mismatch;
+                continue;
+            }
+            bool p_int = isInterior(p);
+            bool d_int = isInterior(d);
             if (p_int != d_int) {
                 if (first_class_i < 0) { first_class_i = i; first_class_j = j; }
                 ++n_class_mismatch;
@@ -105,16 +169,24 @@ static int runCase(const TestCase& tc, int W, int H) {
             ++n_ext_both;
             double diff = std::fabs((double)p - (double)d);
             sum_diff += diff;
+            diffs.push_back(diff);
             if (diff > max_diff) { max_diff = diff; worst_i = i; worst_j = j; }
         }
     }
 
     double mean_diff = n_ext_both ? sum_diff / n_ext_both : 0.0;
+    double p99_diff = 0.0;
+    if (!diffs.empty()) {
+        size_t q = (size_t)std::ceil(0.99 * diffs.size()) - 1;
+        std::nth_element(diffs.begin(), diffs.begin() + q, diffs.end());
+        p99_diff = diffs[q];
+    }
     // Interior cost estimate over the FULL image: interior pixels (iter < 0)
     // each ran ~mxit iterations; exterior escape-iteration ~ the smooth value.
     long n_interior = 0; double ext_iters = 0;
     for (int q = 0; q < W * H; ++q) {
-        if (itp[q] < 0) ++n_interior;
+        if (itp[q] == EMPTYPIXEL) continue;
+        if (isInterior(itp[q])) ++n_interior;
         else ext_iters += itp[q];
     }
     double int_iters = (double)n_interior * tc.mxit;
@@ -122,25 +194,37 @@ static int runCase(const TestCase& tc, int W, int H) {
     printf("  perturbation : %8.3f s   (full %dx%d image)\n", t_pert, W, H);
     printf("  interior px  : %ld / %d (%.1f%%)   est. iters interior/exterior = %.3g / %.3g  (interior = %.1f%% of all iters)\n",
            n_interior, W * H, 100.0 * n_interior / (W * H), int_iters, ext_iters, 100.0 * frac_int);
-    printf("  direct (ref) : %8.3f s   (%ld pixels sampled, step=%d)\n",
-           t_direct, n_sampled, tc.step);
+    if (useGolden)
+        printf("  golden load  : %8.3f s   (%ld pixels from %s)\n", t_direct, n_sampled, tc.goldenPath);
+    else
+        printf("  direct (ref) : %8.3f s   (%ld pixels sampled, step=%d)\n",
+               t_direct, n_sampled, tc.step);
     printf("  interior both: %ld   exterior both: %ld   class mismatch: %ld (%.3f%% of sampled)\n",
            n_int_both, n_ext_both, n_class_mismatch,
            n_sampled ? 100.0 * n_class_mismatch / n_sampled : 0.0);
+    if (n_engine_empty)
+        printf("  ERROR: engine left %ld sampled pixels EMPTY\n", n_engine_empty);
     if (first_class_i >= 0) {
         int q = first_class_i * W + first_class_j;
         printf("  first class mismatch @ %d,%d: pert=%.4f ref=%.4f\n",
                first_class_i, first_class_j, itp[q], itd[q]);
     }
-    printf("  escape-time diff vs reference:  max %.6g  mean %.6g", max_diff, mean_diff);
+    printf("  escape-time diff vs reference:  max %.6g  mean %.6g  p99 %.6g",
+           max_diff, mean_diff, p99_diff);
     if (worst_i >= 0)
         printf("   (worst @ %d,%d: pert=%.4f ref=%.4f)",
                worst_i, worst_j, itp[worst_i * W + worst_j], itd[worst_i * W + worst_j]);
     printf("\n  checksum(pert)=0x%08x\n", checksum(itp, W * H));
 
     // Boundary pixels can legitimately disagree, but the bulk must match.
+    // Fully-exterior stress frames use maxMisPct = 0: a sub-pixel nucleus casts
+    // no true interior, so ANY false-interior pixel (e.g. the periodic-reference
+    // "black star") or garbage smooth value (an escaping reference never
+    // re-referenced) is a real glitch, not a boundary rounding.
     double mismatch_pct = n_sampled ? 100.0 * n_class_mismatch / n_sampled : 0.0;
-    bool ok = (max_diff < 0.5) && (mismatch_pct < 1.0);
+    bool ok = n_engine_empty == 0 &&
+              (max_diff <= tc.maxDiff) && (mean_diff <= tc.maxMeanDiff) &&
+              (p99_diff <= tc.maxP99Diff) && (mismatch_pct <= tc.maxMisPct);
     printf("  => %s\n\n", ok ? "PASS" : "CHECK (see mismatches above)");
 
     delete[] itp;
@@ -148,6 +232,80 @@ static int runCase(const TestCase& tc, int W, int H) {
     mpf_clear(cre);
     mpf_clear(cim);
     mpf_clear(scale);
+    return ok ? 0 : 1;
+}
+
+static int runAdaptiveGuiCase() {
+    constexpr int W = 4, H = 4, SUB = 5, MXIT = 300000;
+    std::string scaleText = "1";
+    scaleText.append(875, '0');
+    int precision = static_cast<int>(scaleText.size() * log(10) / log(2)) + 64;
+    mpf_set_default_prec(precision);
+
+    mpf_t cre, cim, scale;
+    mpf_init_set_str(cre, testcases::deep1_x, 10);
+    mpf_init_set_str(cim, testcases::deep1_y, 10);
+    mpf_init_set_str(scale, scaleText.c_str(), 10);
+
+    const size_t count = (size_t)W * H * SUB * SUB;
+    std::vector<float> engine(count, EMPTYPIXEL), golden(count, EMPTYPIXEL);
+    Mandel mandel(W, H, MXIT, SUB, engine.data());
+    mandel.setPrecision(precision);
+
+    printf("=== gui875 (production GUI adaptive SS5, resolved minibrot875)  "
+           "(%dx%d, sub=%d, %zu sample slots)\n", W, H, SUB, count);
+    auto t0 = Clock::now();
+    mandel.Compute(cre, cim, scale, MXIT, ColoringMethod::SUPER_SAMPLING);
+    double elapsed = since(t0);
+    if (!loadGolden("tests/golden/minibrot875_gui_ss5.f32", golden.data(), count)) {
+        mpf_clear(cre); mpf_clear(cim); mpf_clear(scale);
+        return 2;
+    }
+
+    long computed = 0, base = 0, sub = 0, classMismatch = 0;
+    int firstEmptyX = -1, firstEmptyY = -1;
+    double maxDiff = 0.0, sumDiff = 0.0;
+    std::vector<double> diffs;
+    for (int y = 0; y < H * SUB; ++y) {
+        for (int x = 0; x < W * SUB; ++x) {
+            size_t q = (size_t)y * W * SUB + x;
+            if (engine[q] == EMPTYPIXEL) {
+                if (firstEmptyX < 0) { firstEmptyX = x; firstEmptyY = y; }
+                continue;   // adaptive SS intentionally leaves unflagged subpixels empty
+            }
+            ++computed;
+            bool isBase = (x % SUB == SUB / 2) && (y % SUB == SUB / 2);
+            if (isBase) ++base; else ++sub;
+            bool ei = isInterior(engine[q]), gi = isInterior(golden[q]);
+            if (ei != gi) { ++classMismatch; continue; }
+            if (!ei) {
+                double d = std::fabs((double)engine[q] - golden[q]);
+                maxDiff = std::max(maxDiff, d);
+                sumDiff += d;
+                diffs.push_back(d);
+            }
+        }
+    }
+    double meanDiff = diffs.empty() ? 0.0 : sumDiff / diffs.size();
+    double p99Diff = 0.0;
+    if (!diffs.empty()) {
+        size_t q = (size_t)std::ceil(0.99 * diffs.size()) - 1;
+        std::nth_element(diffs.begin(), diffs.begin() + q, diffs.end());
+        p99Diff = diffs[q];
+    }
+    bool ok = base == W * H && sub > 0 && classMismatch == 0 && maxDiff <= 1.0;
+    printf("  GUI engine   : %8.3f s   base=%ld/%d adaptive-subpixels=%ld\n",
+           elapsed, base, W * H, sub);
+    printf("  computed     : %ld/%zu   class mismatch: %ld\n", computed, count, classMismatch);
+    if (firstEmptyX >= 0)
+        printf("  first empty  : sample (%d,%d), base=%d\n",
+               firstEmptyX, firstEmptyY,
+               (firstEmptyX % SUB == SUB / 2) && (firstEmptyY % SUB == SUB / 2));
+    printf("  escape-time diff vs golden: max %.6g  mean %.6g  p99 %.6g\n",
+           maxDiff, meanDiff, p99Diff);
+    printf("  => %s\n\n", ok ? "PASS" : "CHECK (GUI adaptive path mismatch)");
+
+    mpf_clear(cre); mpf_clear(cim); mpf_clear(scale);
     return ok ? 0 : 1;
 }
 
@@ -192,6 +350,65 @@ int main(int argc, char** argv) {
     // stress with a different reference orbit than the 1e1000 cases.
     TestCase deep876{ "deep876 (1e876 needle, floatexp)", testcases::deep1_x, testcases::deep1_y, pow10(876), 300000, 24 };
 
+    // Sub-pixel-nucleus stress (regression for the exterior-reference glitch):
+    // the deep1 period-14164 minibrot is ~1e-876 wide, so at 1e737 it is ~139
+    // orders of magnitude sub-pixel. The whole frame is therefore genuinely
+    // EXTERIOR (mpmath confirms the centre escapes at n=41351 at this precision).
+    // A full-image oracle catches both failure modes this exposed: a periodic
+    // reference that renders the sub-pixel nucleus as a false-interior "black
+    // star", and an escaping reference (periodic off / EDE / SAC) that is never
+    // re-referenced and returns garbage smooth values. maxMisPct = 0 => any
+    // false-interior pixel fails; step = 1 => every pixel is checked.
+    TestCase subpixel{ "subpixel (deep1 nucleus 1e-876 @ 1e737, all-exterior)",
+                       testcases::deep1_x, testcases::deep1_y, pow10(737), 60000, 1 };
+    subpixel.maxMisPct = 0.0; subpixel.maxDiff = 0.5; subpixel.w = 48; subpixel.h = 36;
+
+    // Acceptance gate for the real, resolved period-14164 minibrot at its natural
+    // depth. The saved full-image oracle was generated at 1100 decimal digits and
+    // its 81-interior / 351-exterior classification was stable at 1000 and 1100
+    // digits. A render-precision oracle falsely reports the whole frame interior,
+    // so this case MUST use the saved high-precision golden rather than ComputeDirect.
+    TestCase minibrot875{ "minibrot875 (resolved period-14164 body + exterior)",
+                         testcases::deep1_x, testcases::deep1_y, pow10(875), 300000, 1 };
+    minibrot875.maxMisPct = 0.0; minibrot875.maxDiff = 1.0;
+    minibrot875.w = 24; minibrot875.h = 18;
+    minibrot875.goldenPath = "tests/golden/minibrot875.f32";
+
+    // Shift the 1e875 frame right by 0.55 screen widths. The period-14164 nucleus
+    // sits just outside the left edge, so findNucleus returns 0 and the exact view
+    // centre is an EXTERIOR full reference (escapes near iteration 161971), while
+    // the minibrot body remains visible along the left edge (27/432 interior).
+    // This guards the full-reference/deep-zero path independently of the interior
+    // periodic-nucleus reference used by minibrot875.
+    TestCase extref875{ "extref875 (exterior full reference, visible minibrot)",
+                        testcases::deep1_x, testcases::deep1_y, pow10(875), 300000, 1 };
+    extref875.maxMisPct = 0.0; extref875.maxDiff = 1.0;
+    extref875.w = 24; extref875.h = 18;
+    extref875.goldenPath = "tests/golden/minibrot875_extref.f32";
+    extref875.centerShiftRe = "2.2e-875";
+
+    // Moderate-zoom high-iteration stress: BLA is ineffective and ~39% of pixels
+    // are interior, so SIMD perturbation/interior detection dominates. The current
+    // double perturbation has known smooth-value drift on a small chaotic tail; lock
+    // classification exactly and bound max/mean/p99 so performance work cannot worsen it.
+    TestCase slowpoint{ "slowpoint (7.826796e8, interior-detector stress)",
+                        "-1.1758621450236620370", "-0.2447677973532398022",
+                        "782679600", 500000, 1 };
+    slowpoint.maxMisPct = 0.0; slowpoint.maxDiff = 90000.0;
+    slowpoint.maxMeanDiff = 300.0; slowpoint.maxP99Diff = 3000.0;
+    slowpoint.w = 48; slowpoint.h = 32;
+    slowpoint.goldenPath = "tests/golden/slowpoint_7e8.f32";
+
+    std::string point31Scale = "7354177"; point31Scale.append(25, '0');
+    TestCase point31{ "point31 (7.354177e31, SA+BLA+SIMD stress)",
+                      "-0.749139567333446841955467474699747367338762518832278501811",
+                      "0.040823298514634751035521346975478853963578400940553676068",
+                      point31Scale, 500000, 1 };
+    point31.maxMisPct = 0.0; point31.maxDiff = 12000.0;
+    point31.maxMeanDiff = 200.0; point31.maxP99Diff = 4000.0;
+    point31.w = 48; point31.h = 32;
+    point31.goldenPath = "tests/golden/point_7e31.f32";
+
     // Optional reference-footprint sweep: override mxit for all cases.
     if (const char* e = getenv("MANDEL_MXIT")) {
         int m = atoi(e);
@@ -200,6 +417,8 @@ int main(int argc, char** argv) {
     if (const char* e = getenv("MANDEL_ORACLE_STEP")) {
         int step = std::max(1, atoi(e));
         shallow.step = deep.step = ticktock.step = flake.step = exterior1000.step = parity1000.step = step;
+        deep876.step = subpixel.step = minibrot875.step = extref875.step =
+            slowpoint.step = point31.step = step;
     }
     // Optional scale override (decimal exponent) to find interior-containing frames.
     if (const char* e = getenv("MANDEL_SCALE_EXP")) {
@@ -215,5 +434,11 @@ int main(int argc, char** argv) {
     if (which == "exterior1000")               rc |= runCase(exterior1000, W, H);
     if (which == "parity1000")                 rc |= runCase(parity1000, W, H);
     if (which == "deep876")                    rc |= runCase(deep876, W, H);
+    if (which == "subpixel")                   rc |= runCase(subpixel, W, H);
+    if (which == "minibrot875")                rc |= runCase(minibrot875, W, H);
+    if (which == "extref875")                  rc |= runCase(extref875, W, H);
+    if (which == "slowpoint")                  rc |= runCase(slowpoint, W, H);
+    if (which == "point31")                    rc |= runCase(point31, W, H);
+    if (which == "gui875")                     rc |= runAdaptiveGuiCase();
     return rc;
 }

@@ -144,7 +144,12 @@ int main(int argc, char** argv) {
         scale = "1"; for (int i = 0; i < scaleExp; ++i) scale += "0";
     }
     int precision = (int)(scale.size() * log(10) / log(2)) + 64;
+    // MANDEL_PREC=<decimal digits> overrides the pixel-spacing-derived precision. Some
+    // locations (a high-period nucleus rendered far shallower than its natural depth)
+    // need more ORBIT precision than the pixel spacing implies to classify correctly.
+    if (const char* e = getenv("MANDEL_PREC")) precision = (int)(atol(e) * 3.3219281 + 64.0);
     mpf_set_default_prec(precision);
+    printf("precision = %d bits (~%d digits)\n", precision, (int)(precision / 3.3219281));
 
     colorMapInit();
     if (getenv("MANDEL_DENS")) color_density = (float)atof(getenv("MANDEL_DENS"));

@@ -91,7 +91,9 @@ private:
     void progressBegin(int total, double begin, double span);
     void progressAdvance();
     inline void markDone(int i);
-    void stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mxit, int c_method = 0);
+    void stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mxit,
+                      int c_method = 0,
+                      const std::vector<std::array<int, 4>>* contiguous = nullptr);
     // AVX2 kernel: iterate a group of up to 4 pixels (non-EDE path). Mirrors the
     // scalar delta loop op-for-op so results are bit-identical. lanes<=4.
     void solveSimd4(const std::array<int, 4>* v, int g, int lanes,
@@ -107,15 +109,15 @@ private:
                               float* out, int mxit, int c_method) const;
 
     // Bivariate Linear Approximation (Zhuoran / Fraktaler-3). A BLA skips l
-    // reference iterations via dz -> A*dz + B*dc when |dz| < R. The hot entry
-    // (A, B, r2, l) is what every tryBLA/tryBLAfe lookup reads; splitting it from
-    // the EDE-only derivative couplings (C, E in a parallel _blaD) shrinks the
-    // per-entry footprint ~40% (80->48 B) so the large table streams from cache
-    // better in the memory-bound delta loop.
-    struct BLAEntry { double ar, ai, br, bi, r2; int l; };
+    // reference iterations via dz -> A*dz + B*dc when |dz| < R. Searches touch
+    // only the compact validity metadata; A/B coefficients are fetched after a
+    // candidate passes, avoiding 32 B of cache traffic per rejected level.
+    struct BLAEntry { double r2; int l; };
+    struct BLACoeff { double ar, ai, br, bi; };
     // Derivative deltas carried through a skip under EDE: dd -> C*dz + A*dd + E*dc.
     struct BLADeriv { double cr, ci, er, ei; };
     std::vector<std::vector<BLAEntry>> _bla;
+    std::vector<std::vector<BLACoeff>> _blaCoeff;
     std::vector<std::vector<BLADeriv>> _blaD;   // parallel to _bla; only built under EDE
     double _bla_eps = 0.0;
     double _bla_rmax2 = 0.0;      // largest BLA validity radius^2 (gate for tryBLA)
@@ -152,6 +154,12 @@ private:
     // effective reference length (mxit). Only the Z orbit is periodic (no EDE
     // derivative), so this is non-EDE only.
     int createPeriodicRef(int period, int mxit, int c_method);
+    // Minibrot linear size estimate (Heiland-Allen / Kalles-Fraktaler) for the
+    // just-built period-_ref_period nucleus orbit, read from the floatexp shadow
+    // _z*_fe. Returns |size| in c-space; the island is "sub-pixel" (unresolvable,
+    // glitch-prone under a bounded reference) when this is below ~one pixel. Pure
+    // FloatExp over the existing orbit, so essentially free.
+    FloatExp nucleusSizeMag() const;
     bool calCoefficient(int i, int pr_it, int c_method = 0);
     // Deep-zoom rescaled perturbation (Zhuoran z = S w): the delta w stays an
     // O(1) double while the floatexp scale S carries the deep exponent, so the
@@ -248,6 +256,15 @@ private:
     // nucleus and the floatexp delta loop indexes it modulo p (only p entries are
     // built, not mxit). 0 = normal (full) reference.
     int _ref_period = 0;
+    // Set when a periodic-nucleus reference is used but the nucleus's minibrot body is
+    // smaller than a pixel. The BLA skip then damps the near-nucleus ("atom domain")
+    // pixels' divergence and paints them as a false-interior body, so BLA is disabled
+    // for such references (Compute). Detected from the nucleus-size estimate.
+    bool _ref_subpixel = false;
+    // A full escaping reference whose orbit passes below double's exponent range.
+    // Its double BLA shadow cannot safely represent the deep-zero crossing; use the
+    // exact rescaled AVX2 path without BLA instead.
+    bool _ref_deep_zero = false;
     // Sub-pixel offset of the nucleus from its nearest pixel (_ref), so the double
     // path's integer-pixel dc can be corrected to dc = pixel_c - nucleus.
     Float _ref_frac_re = 0.0, _ref_frac_im = 0.0;

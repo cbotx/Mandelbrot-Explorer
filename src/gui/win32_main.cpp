@@ -1440,7 +1440,16 @@ public:
                     lastAnimTick = std::chrono::steady_clock::now();
                 }
             }
-            layout(); startRender();
+            layout();
+            if (benchMode) {
+                // A hidden benchmark window receives no initial WM_SIZE, so size the
+                // navigator explicitly instead of silently rendering at 900x600.
+                int oldW = renderW, oldH = renderH;
+                retargetToView();
+                if (renderW == oldW && renderH == oldH) startRender();
+            } else {
+                startRender();
+            }
             // Fine timer period (~4 ms) so the ~60 fps redraw cap in timer() paces the
             // animation instead of the coarse 16 ms WM_TIMER, which coalesced a ~15 ms
             // handler to the next tick (~31 ms => ~32 fps). The cap prevents over-render.
@@ -1734,12 +1743,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     winH = std::min(winH, (int)(wa.bottom - wa.top));
     int wx = wa.left + ((wa.right - wa.left) - winW) / 2;
     int wy = wa.top + ((wa.bottom - wa.top) - winH) / 2;
+    const bool benchHeadless = getenv("MANDEL_GUI_BENCH") && !getenv("MANDEL_GUI_SHOW");
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"Mandelbrot Explorer",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE, wx, wy, winW, winH,
+        WS_OVERLAPPEDWINDOW | (benchHeadless ? 0 : WS_VISIBLE), wx, wy, winW, winH,
         nullptr, nullptr, instance, &app);
     if (!hwnd) return 1;
-    ShowWindow(hwnd, show); UpdateWindow(hwnd);
-    if (getenv("MANDEL_GUI_MAX")) ShowWindow(hwnd, SW_MAXIMIZE);
+    ShowWindow(hwnd, benchHeadless ? SW_HIDE : show); UpdateWindow(hwnd);
+    if (!benchHeadless && getenv("MANDEL_GUI_MAX")) ShowWindow(hwnd, SW_MAXIMIZE);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
