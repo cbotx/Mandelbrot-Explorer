@@ -8,7 +8,8 @@
 //
 // Usage: verify [case]
 //   case = shallow | deep | ticktock | flake | exterior1000 | parity1000 |
-//          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 | gui875 | all
+//          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
+//          gui875 | julia | julia-ede | julia-dendrite | julia-critical | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
 
@@ -309,6 +310,78 @@ static int runAdaptiveGuiCase() {
     return ok ? 0 : 1;
 }
 
+static int runJuliaCase(bool ede, bool dendrite = false, bool critical = false) {
+    const int W = critical ? 32 : 96, H = critical ? 24 : 64;
+    const int mxit = dendrite ? 1000 : 500;
+    mpf_set_default_prec(256);
+    mpf_t centerRe, centerIm, scale, fixedRe, fixedIm;
+    mpf_init_set_ui(centerRe, 0); mpf_init_set_ui(centerIm, 0);
+    mpf_init_set_ui(scale, critical ? 1000000 : 1);
+    mpf_init_set_str(fixedRe, dendrite ? "-0.8" : "0", 10);
+    mpf_init_set_str(fixedIm, dendrite ? "0.156" : "0", 10);
+    std::vector<float> engine((size_t)W * H, EMPTYPIXEL);
+    std::vector<float> oracle((size_t)W * H, EMPTYPIXEL);
+    Mandel julia(W, H, mxit, 1, engine.data());
+    const int method = ede ? ColoringMethod::EXTERIOR_DIST_EST : 0;
+
+    auto t0 = Clock::now();
+    // Build the exact viewport grid, then run the oracle before the SIMD engine so
+    // memory-safety regressions in either path cannot silently bless each other.
+    julia.ComputeJulia(centerRe, centerIm, scale, fixedRe, fixedIm, 1, method);
+    julia.ComputeJuliaDirect(fixedRe, fixedIm, mxit, oracle.data(), 1, method);
+    double oracleTime = since(t0);
+    t0 = Clock::now();
+    julia.ComputeJulia(centerRe, centerIm, scale, fixedRe, fixedIm, mxit, method);
+    double engineTime = since(t0);
+
+    int mismatch = 0, exterior = 0;
+    int firstMismatch = -1;
+    double maxDiff = 0.0, sumDiff = 0.0;
+    std::vector<double> diffs;
+    for (int i = 0; i < W * H; ++i) {
+        bool a = isInterior(engine[i]), b = isInterior(oracle[i]);
+        if (a != b) {
+            if (firstMismatch < 0) firstMismatch = i;
+            ++mismatch;
+            continue;
+        }
+        if (!a) {
+            ++exterior;
+            double diff = std::fabs((double)engine[i] - oracle[i]);
+            maxDiff = std::max(maxDiff, diff);
+            sumDiff += diff;
+            diffs.push_back(diff);
+        }
+    }
+    double meanDiff = exterior ? sumDiff / exterior : 0.0;
+    double p99Diff = 0.0;
+    if (!diffs.empty()) {
+        size_t q = (size_t)std::ceil(0.99 * diffs.size()) - 1;
+        std::nth_element(diffs.begin(), diffs.begin() + q, diffs.end());
+        p99Diff = diffs[q];
+    }
+    bool ok = mismatch == 0 &&
+              (dendrite ? (maxDiff <= 100.0 && meanDiff <= 0.1 && p99Diff <= 0.5)
+                        : (maxDiff <= (ede ? 1e-3 : 0.01)));
+    if (critical) ok = ok && exterior == W * H;
+    printf("=== quadratic Julia z0-plane (c=%s%s%s)  (%dx%d, mxit=%d)\n",
+           dendrite ? "-0.8+0.156i" : "0", critical ? ", critical zoom" : "",
+           ede ? ", EDE" : "", W, H, mxit);
+    printf("  engine/direct: %.3f / %.3f s\n", engineTime, oracleTime);
+    printf("  class mismatch: %d   max diff: %.6g   mean diff: %.6g   p99: %.6g\n",
+           mismatch, maxDiff, meanDiff, p99Diff);
+    if (critical) printf("  independently expected exterior: %d/%d\n", exterior, W * H);
+    if (firstMismatch >= 0)
+        printf("  first mismatch: (%d,%d) engine=%.6g oracle=%.6g\n",
+               firstMismatch % W, firstMismatch / W,
+               engine[firstMismatch], oracle[firstMismatch]);
+    printf("  checksum=0x%08x\n", checksum(engine.data(), W * H));
+    printf("  => %s\n\n", ok ? "PASS" : "CHECK (Julia direct/oracle mismatch)");
+
+    mpf_clears(centerRe, centerIm, scale, fixedRe, fixedIm, (mpf_ptr)0);
+    return ok ? 0 : 1;
+}
+
 static std::string pow10(int n) {
     std::string s = "1";
     s.append(n, '0');
@@ -440,5 +513,9 @@ int main(int argc, char** argv) {
     if (which == "slowpoint")                  rc |= runCase(slowpoint, W, H);
     if (which == "point31")                    rc |= runCase(point31, W, H);
     if (which == "gui875")                     rc |= runAdaptiveGuiCase();
+    if (which == "julia")                      rc |= runJuliaCase(false);
+    if (which == "julia-ede")                  rc |= runJuliaCase(true);
+    if (which == "julia-dendrite")             rc |= runJuliaCase(false, true);
+    if (which == "julia-critical")             rc |= runJuliaCase(false, true, true);
     return rc;
 }

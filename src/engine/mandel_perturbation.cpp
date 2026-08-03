@@ -463,6 +463,160 @@ void Mandel::solveShallowSimdList(const double* cre, const double* cim, int coun
     }
 }
 
+void Mandel::solveJuliaShallowSimdList(const double* z0re, const double* z0im,
+                                       int count, double cre, double cim,
+                                       float* out, int mxit, bool ede) const {
+    const double ESC2 = (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS;
+    const double LG2 = log(2.0);
+    const __m256d two = _mm256_set1_pd(2.0), one = _mm256_set1_pd(1.0);
+    const __m256d cr = _mm256_set1_pd(cre), ci = _mm256_set1_pd(cim);
+    const __m256d ESC2v = _mm256_set1_pd(ESC2);
+    const __m256d mxitv = _mm256_set1_pd((double)mxit);
+
+    alignas(32) double zr_[4], zi_[4], dr_[4], di_[4], jv_[4];
+    int lanePix[4]; int next = 0, activeCount = 0;
+    auto loadLane = [&](int l) {
+        lanePix[l] = -1;
+        while (next < count) {
+            int pixel = next++;
+            double zr = z0re[pixel], zi = z0im[pixel];
+            double zrad = zr * zr + zi * zi;
+            if (zrad > ESC2) {
+                out[pixel] = ede
+                    ? (float)(sqrt(zrad) * log(zrad))   // D0=1
+                    : (float)(-log(log(zrad) / 2 / LG2) / LG2);
+                continue;
+            }
+            zr_[l] = zr; zi_[l] = zi;
+            dr_[l] = 1.0; di_[l] = 0.0; jv_[l] = 0.0;
+            lanePix[l] = pixel; ++activeCount;
+            return;
+        }
+        zr_[l] = zi_[l] = di_[l] = jv_[l] = 0.0;
+        dr_[l] = 1.0;
+    };
+    for (int l = 0; l < 4; ++l) loadLane(l);
+
+    __m256d zr = _mm256_load_pd(zr_), zi = _mm256_load_pd(zi_);
+    __m256d dr = _mm256_load_pd(dr_), di = _mm256_load_pd(di_);
+    __m256d jv = _mm256_load_pd(jv_);
+    while (activeCount > 0) {
+        // Julia: D_0=1, D'=2*z*D; z'=z^2+c (fixed c, varying z0).
+        __m256d ndr = dr, ndi = di;
+        if (ede) {
+            ndr = _mm256_mul_pd(two, _mm256_sub_pd(_mm256_mul_pd(dr, zr), _mm256_mul_pd(di, zi)));
+            ndi = _mm256_mul_pd(two, _mm256_add_pd(_mm256_mul_pd(dr, zi), _mm256_mul_pd(di, zr)));
+        }
+        __m256d nzr = _mm256_add_pd(_mm256_sub_pd(_mm256_mul_pd(zr, zr), _mm256_mul_pd(zi, zi)), cr);
+        __m256d nzi = _mm256_add_pd(_mm256_mul_pd(two, _mm256_mul_pd(zr, zi)), ci);
+        zr = nzr; zi = nzi; dr = ndr; di = ndi;
+
+        __m256d zrad = _mm256_add_pd(_mm256_mul_pd(zr, zr), _mm256_mul_pd(zi, zi));
+        __m256d jnext = _mm256_add_pd(jv, one);
+        int em = _mm256_movemask_pd(_mm256_cmp_pd(zrad, ESC2v, _CMP_GT_OQ));
+        int jm = _mm256_movemask_pd(_mm256_cmp_pd(jnext, mxitv, _CMP_GE_OQ));
+        int actmask = (lanePix[0] >= 0) | ((lanePix[1] >= 0) << 1) |
+                      ((lanePix[2] >= 0) << 2) | ((lanePix[3] >= 0) << 3);
+        int need = (em | jm) & actmask;
+        if (need == 0) { jv = jnext; continue; }
+
+        alignas(32) double zrad_[4], dr2_[4], di2_[4];
+        _mm256_store_pd(zrad_, zrad); _mm256_store_pd(dr2_, dr); _mm256_store_pd(di2_, di);
+        _mm256_store_pd(zr_, zr); _mm256_store_pd(zi_, zi);
+        _mm256_store_pd(dr_, dr); _mm256_store_pd(di_, di); _mm256_store_pd(jv_, jv);
+        for (int l = 0; l < 4; ++l) {
+            if (lanePix[l] < 0) continue;
+            bool finished = false;
+            float result = -2.0f;
+            if (em & (1 << l)) {
+                if (ede) {
+                    double denom = sqrt(dr2_[l] * dr2_[l] + di2_[l] * di2_[l]);
+                    result = denom > 0.0
+                        ? (float)(sqrt(zrad_[l]) * log(zrad_[l]) / denom)
+                        : 0.0f;
+                } else {
+                    result = (float)(jv_[l] + 1 - log(log(zrad_[l]) / 2 / LG2) / LG2);
+                }
+                finished = true;
+            } else if (jm & (1 << l)) {
+                finished = true;
+            }
+            if (finished) {
+                out[lanePix[l]] = result;
+                --activeCount;
+                loadLane(l);
+            } else {
+                jv_[l] += 1.0;
+            }
+        }
+        zr = _mm256_load_pd(zr_); zi = _mm256_load_pd(zi_);
+        dr = _mm256_load_pd(dr_); di = _mm256_load_pd(di_);
+        jv = _mm256_load_pd(jv_);
+    }
+}
+
+float Mandel::accurateJuliaPoint(mpf_t z0_re, mpf_t z0_im, mpf_t c_re, mpf_t c_im,
+                                 int mxit, bool ede) const {
+    const mp_bitcnt_t precision = std::max({ mpf_get_prec(z0_re), mpf_get_prec(z0_im),
+                                             mpf_get_prec(c_re), mpf_get_prec(c_im) });
+    mpf_t zr, zi, dr, di, t1, t2, nzr, nzi, ndr, ndi, mag, dmag;
+    mpf_init2(zr, precision); mpf_set(zr, z0_re);
+    mpf_init2(zi, precision); mpf_set(zi, z0_im);
+    mpf_init2(dr, precision); mpf_set_ui(dr, 1);
+    mpf_init2(di, precision);
+    mpf_init2(t1, precision); mpf_init2(t2, precision);
+    mpf_init2(nzr, precision); mpf_init2(nzi, precision);
+    mpf_init2(ndr, precision); mpf_init2(ndi, precision);
+    mpf_init2(mag, precision); mpf_init2(dmag, precision);
+
+    float result = -2.0f;
+    mpf_mul(t1, zr, zr); mpf_mul(t2, zi, zi); mpf_add(mag, t1, t2);
+    // For c=0 the Julia set is exactly the closed unit disk. Besides being exact,
+    // this avoids Windows GMP's 32-bit mp_exp_t wrapping after ~38 consecutive
+    // squarings of a tiny interior value.
+    if (mpf_sgn(c_re) == 0 && mpf_sgn(c_im) == 0 && mpf_cmp_ui(mag, 1) <= 0) {
+        result = -2.0f;
+    } else if (mpf_cmp_d(mag, (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS) > 0) {
+        double zrad = mpf_get_d(mag);
+        result = ede
+            ? (float)(sqrt(zrad) * log(zrad))   // D0=1
+            : (float)(-log(log(zrad) / 2 / log(2.0)) / log(2.0));
+    } else {
+        for (int i = 0; i < mxit; ++i) {
+            if (ede) {
+                mpf_mul(t1, dr, zr); mpf_mul(t2, di, zi);
+                mpf_sub(ndr, t1, t2); mpf_mul_ui(ndr, ndr, 2);
+                mpf_mul(t1, dr, zi); mpf_mul(t2, di, zr);
+                mpf_add(ndi, t1, t2); mpf_mul_ui(ndi, ndi, 2);
+            }
+
+            mpf_mul(t1, zr, zr); mpf_mul(t2, zi, zi);
+            mpf_sub(nzr, t1, t2); mpf_add(nzr, nzr, c_re);
+            mpf_mul(nzi, zr, zi); mpf_mul_ui(nzi, nzi, 2); mpf_add(nzi, nzi, c_im);
+
+            mpf_set(zr, nzr); mpf_set(zi, nzi);
+            if (ede) { mpf_set(dr, ndr); mpf_set(di, ndi); }
+            mpf_mul(t1, zr, zr); mpf_mul(t2, zi, zi); mpf_add(mag, t1, t2);
+            if (mpf_cmp_d(mag, (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS) > 0) {
+                double zrad = mpf_get_d(mag);
+                if (ede) {
+                    mpf_mul(t1, dr, dr); mpf_mul(t2, di, di); mpf_add(dmag, t1, t2);
+                    double denom = sqrt(mpf_get_d(dmag));
+                    result = denom > 0.0
+                        ? (float)(sqrt(zrad) * log(zrad) / denom)
+                        : 0.0f;
+                } else {
+                    result = (float)(i + 1 - log(log(zrad) / 2 / log(2.0)) / log(2.0));
+                }
+                break;
+            }
+        }
+    }
+    mpf_clears(zr, zi, dr, di, t1, t2, nzr, nzi, ndr, ndi, mag, dmag,
+               (mpf_ptr)0);
+    return result;
+}
+
 float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_method) const {
     // Oracle WORKING precision. Brute-force iteration accumulates rounding error, so
     // near a boundary / a nucleus the ground truth needs MORE precision than the
@@ -654,6 +808,77 @@ void Mandel::ComputeDirect(int mxit, float* out, int step, int c_method) {
         mpf_clear(cre);
         mpf_clear(cim);
         mpf_clear(tmp);
+    }
+}
+
+void Mandel::ComputeJulia(mpf_t z0_re, mpf_t z0_im, mpf_t scale,
+                          mpf_t fixed_c_re, mpf_t fixed_c_im,
+                          int mxit, int c_method) {
+    assert(_sub == 1);
+    assert((c_method & ~ColoringMethod::EXTERIOR_DIST_EST) == 0);
+    _flag_halt = false;
+    progressSet(0.0);
+    std::fill(_iter, _iter + (size_t)_w * _h, EMPTYPIXEL);
+    mpf_set(_scale, scale);
+
+    mpf_t dw, dh;
+    mpf_init_set_ui(dw, 2);
+    mpf_div(dw, dw, scale);
+    mpf_init_set(dh, dw);
+    mpf_mul_ui(dh, dh, _h);
+    mpf_div_ui(dh, dh, _w);
+    mpf_sub(_c0_re, z0_re, dw);
+    mpf_sub(_c0_im, z0_im, dh);
+    mpf_mul_ui(_dx, dw, 2); mpf_div_ui(_dx, _dx, _w - 1);
+    mpf_mul_ui(_dy, dh, 2); mpf_div_ui(_dy, _dy, _h - 1);
+    mpf_clear(dw); mpf_clear(dh);
+
+    const double cRe = mpf_get_ld(fixed_c_re), cIm = mpf_get_ld(fixed_c_im);
+    const double z0Re = mpf_get_ld(_c0_re), z0Im = mpf_get_ld(_c0_im);
+    const double dx = mpf_get_ld(_dx), dy = mpf_get_ld(_dy);
+    const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
+    progressBegin(_h, 0.0, 1.0);
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int i = 0; i < _h; ++i) {
+        if (_flag_halt) continue;
+        std::vector<double> zr(_w), zi(_w);
+        std::vector<float> row(_w);
+        double imag = z0Im + dy * i;
+        for (int j = 0; j < _w; ++j) {
+            zr[j] = z0Re + dx * j;
+            zi[j] = imag;
+        }
+        solveJuliaShallowSimdList(zr.data(), zi.data(), _w, cRe, cIm,
+                                  row.data(), mxit, ede);
+        for (int j = 0; j < _w; ++j) {
+            float value = row[j];
+            if (ede && value >= 0.0f) value /= (float)dx;
+            _iter[i * _w + j] = value;
+        }
+        progressAdvance();
+    }
+    progressSet(1.0);
+}
+
+void Mandel::ComputeJuliaDirect(mpf_t fixed_c_re, mpf_t fixed_c_im, int mxit,
+                                float* out, int step, int c_method) {
+    assert(_sub == 1);
+    assert((c_method & ~ColoringMethod::EXTERIOR_DIST_EST) == 0);
+    if (step < 1) step = 1;
+    const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int i = 0; i < _h; i += step) {
+        mpf_t z0r, z0i, cr, ci, tmp;
+        mpf_init(z0r); mpf_init(z0i); mpf_init_set(cr, fixed_c_re);
+        mpf_init_set(ci, fixed_c_im); mpf_init(tmp);
+        for (int j = 0; j < _w; j += step) {
+            mpf_mul_ui(tmp, _dx, j); mpf_add(z0r, _c0_re, tmp);
+            mpf_mul_ui(tmp, _dy, i); mpf_add(z0i, _c0_im, tmp);
+            float value = accurateJuliaPoint(z0r, z0i, cr, ci, mxit, ede);
+            if (ede && value >= 0.0f) value /= (float)mpf_get_d(_dx);
+            out[i * _w + j] = value;
+        }
+        mpf_clears(z0r, z0i, cr, ci, tmp, (mpf_ptr)0);
     }
 }
 

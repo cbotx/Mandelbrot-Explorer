@@ -66,7 +66,7 @@ constexpr FormulaContext quadraticMandelbrot() {
 constexpr FormulaContext quadraticJulia() {
     FormulaContext context{};
     context.slice.pixel = FormulaParameter::InitialZ;
-    context.enabledCapabilities = 0;
+    context.enabledCapabilities = FORMULA_DISTANCE_ESTIMATE;
     return context;
 }
 

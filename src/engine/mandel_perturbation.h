@@ -51,12 +51,20 @@ public:
 
     void Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method = 0,
                  int full_h = 0, int row_base = 0);
+    // Quadratic Julia z0-plane: each pixel supplies z0 while fixedC is constant.
+    // Phase 1 is a dedicated direct AVX2 kernel (sub==1, Smooth/EDE); advanced
+    // perturbation/SA/BLA capabilities remain disabled in quadraticJulia().
+    void ComputeJulia(mpf_t z0_re, mpf_t z0_im, mpf_t scale,
+                      mpf_t fixed_c_re, mpf_t fixed_c_im,
+                      int mxit, int c_method = 0);
     // Verification helper: brute-force high-precision escape time into out[],
     // reusing the grid (_c0/_dx/_dy) set by the most recent Compute() call.
     // step>1 samples only pixels on a (step x step) grid (others left untouched)
     // so the O(mxit) full-precision oracle stays feasible at extreme depth.
     // Requires sub == 1.
     void ComputeDirect(int mxit, float* out, int step = 1, int c_method = 0);
+    void ComputeJuliaDirect(mpf_t fixed_c_re, mpf_t fixed_c_im, int mxit,
+                            float* out, int step = 1, int c_method = 0);
     void Output(char fname[]) const;
     void setPrecision(int precision);
     HPComp getHighIterationPoint() const;
@@ -107,6 +115,11 @@ private:
     // and the adaptive supersample sub-pixels.
     void solveShallowSimdList(const double* cre, const double* cim, int count,
                               float* out, int mxit, int c_method) const;
+    void solveJuliaShallowSimdList(const double* z0re, const double* z0im,
+                                   int count, double cre, double cim,
+                                   float* out, int mxit, bool ede) const;
+    float accurateJuliaPoint(mpf_t z0_re, mpf_t z0_im, mpf_t c_re, mpf_t c_im,
+                             int mxit, bool ede) const;
 
     // Bivariate Linear Approximation (Zhuoran / Fraktaler-3). A BLA skips l
     // reference iterations via dz -> A*dz + B*dc when |dz| < R. Searches touch
