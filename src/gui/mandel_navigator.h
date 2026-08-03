@@ -15,9 +15,14 @@
 
 class MandelNavigator : public Navigator {
 private:
+    FormulaContext _formula = quadraticMandelbrot();
     Mandel* _mandel;
     float* _iter;
     mpf_t _z_re, _z_im, _scale;
+    mpf_t _julia_c_re, _julia_c_im;
+    mpf_t _saved_mandel_re, _saved_mandel_im, _saved_mandel_scale;
+    bool _has_saved_mandel_view = false;
+    int _saved_mandel_method = 0;
     mpf_t _t;
     int _mxit;
     int _sub;
@@ -82,7 +87,11 @@ public:
     // Copy the current view: center (re/im) and scale into caller-owned mpf_t.
     void GetView(mpf_t re, mpf_t im, mpf_t scale) const;
     mp_bitcnt_t GetViewPrecision() const { return mpf_get_prec(_scale); }
-    static constexpr FormulaContext GetFormulaContext() { return quadraticMandelbrot(); }
+    FormulaContext GetFormulaContext() const { return _formula; }
+    bool IsJulia() const { return _formula.slice.pixel == FormulaParameter::InitialZ; }
+    void SetJuliaMode(bool enabled);
+    bool SetJuliaC(const std::string& re, const std::string& im);
+    void GetJuliaC(mpf_t re, mpf_t im) const;
     
     int GetCMethod();
 

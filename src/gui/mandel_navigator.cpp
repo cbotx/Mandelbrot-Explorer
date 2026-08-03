@@ -34,6 +34,11 @@ MandelNavigator::MandelNavigator(int width, int height, int sub, int max_iterati
     mpf_init_set_d(_z_re, -0.5);
     mpf_init_set_d(_z_im, 0.0);
     mpf_init_set_d(_scale, 1.0);
+    mpf_init_set_d(_julia_c_re, 0.0);
+    mpf_init_set_d(_julia_c_im, 0.0);
+    mpf_init(_saved_mandel_re);
+    mpf_init(_saved_mandel_im);
+    mpf_init(_saved_mandel_scale);
     mpf_init(_t);
 }
 
@@ -45,11 +50,16 @@ MandelNavigator::~MandelNavigator() {
     mpf_clear(_z_re);
     mpf_clear(_z_im);
     mpf_clear(_scale);
+    mpf_clear(_julia_c_re);
+    mpf_clear(_julia_c_im);
+    mpf_clear(_saved_mandel_re);
+    mpf_clear(_saved_mandel_im);
+    mpf_clear(_saved_mandel_scale);
     mpf_clear(_t);
 }
 
 void MandelNavigator::Reset() {
-    mpf_set_d(_z_re, -0.5);
+    mpf_set_d(_z_re, IsJulia() ? 0.0 : -0.5);
     mpf_set_d(_z_im, 0.0);
     mpf_set_d(_scale, 1.0);
     StartCompute();
@@ -80,14 +90,15 @@ void MandelNavigator::Resize(int width, int height) {
 }
 
 void MandelNavigator::ConfigureSampling() {
-    bool want_uniform = (_c_method & ColoringMethod::SUPER_SAMPLING)
+    bool want_uniform = !IsJulia() && (_c_method & ColoringMethod::SUPER_SAMPLING)
                      && (_c_method & ColoringMethod::STRIPE_AVERAGE);
-    if (want_uniform == _uniform_feather) return;
+    int wanted_sub = IsJulia() ? 1 : (want_uniform ? 2 : _adaptive_sub);
+    if (want_uniform == _uniform_feather && wanted_sub == _sub) return;
 
     delete[] _iter;
     delete _mandel;
     _uniform_feather = want_uniform;
-    _sub = want_uniform ? 2 : _adaptive_sub;
+    _sub = wanted_sub;
     size_t count = (size_t)_w * _h * _sub * _sub;
     _iter = new float[count];
     delete[] _normal;
@@ -118,7 +129,12 @@ void MandelNavigator::StartCompute() {
         this->_mandel->setDensity(color_density);   // for the SAC adaptive-SS detector
         int method = this->_uniform_feather
             ? (this->_c_method & ~ColoringMethod::SUPER_SAMPLING) : this->_c_method;
-        this->_mandel->Compute(this->_z_re, this->_z_im, this->_scale, this->_mxit, method);
+        if (this->IsJulia())
+            this->_mandel->ComputeJulia(this->_z_re, this->_z_im, this->_scale,
+                                        this->_julia_c_re, this->_julia_c_im,
+                                        this->_mxit, method & ColoringMethod::EXTERIOR_DIST_EST);
+        else
+            this->_mandel->Compute(this->_z_re, this->_z_im, this->_scale, this->_mxit, method);
         this->_require_update = true;
     };
     // _task = std::async(&Mandel::Compute, _mandel, _z_re, _z_im, _scale, _mxit, _c_method);
@@ -141,40 +157,75 @@ bool MandelNavigator::IsComputing() {
 }
 
 std::string MandelNavigator::GetLocationText() const {
-    int digits = std::max(18, (int)(mpf_get_prec(_z_re) * log(2.0) / log(10.0)));
-    std::vector<char> buf((size_t)digits * 2 + 256);
-    gmp_snprintf(buf.data(), buf.size(), "x: %.*Ff\r\ny: %.*Ff\r\nzoom: %.6Fe",
-                 digits, _z_re, digits, _z_im, _scale);
+    int precision = (int)mpf_get_prec(_z_re);
+    if (IsJulia())
+        precision = std::max(precision, (int)std::max(mpf_get_prec(_julia_c_re),
+                                                       mpf_get_prec(_julia_c_im)));
+    int digits = std::max(18, (int)(precision * log(2.0) / log(10.0)));
+    std::vector<char> buf((size_t)digits * 5 + 512);
+    if (IsJulia())
+        gmp_snprintf(buf.data(), buf.size(),
+                     "mode: julia\r\nx: %.*Ff\r\ny: %.*Ff\r\nzoom: %.6Fe\r\n"
+                     "c_re: %.*Ff\r\nc_im: %.*Ff",
+                     digits, _z_re, digits, _z_im, _scale,
+                     digits, _julia_c_re, digits, _julia_c_im);
+    else
+        gmp_snprintf(buf.data(), buf.size(), "x: %.*Ff\r\ny: %.*Ff\r\nzoom: %.6Fe",
+                     digits, _z_re, digits, _z_im, _scale);
     return std::string(buf.data());
 }
 
 bool MandelNavigator::SetLocation(const std::string& xs, const std::string& ys, const std::string& ss) {
     int prec = (int)(std::max(xs.size(), ys.size()) * 3.3219) + 40;
     if (prec < 64) prec = 64;
-    mpf_set_prec(_scale, prec); mpf_set_prec(_z_re, prec);
-    mpf_set_prec(_z_im, prec); mpf_set_prec(_t, prec);
+    mpf_t newScale, newRe, newIm;
+    mpf_init2(newScale, prec); mpf_init2(newRe, prec); mpf_init2(newIm, prec);
+    bool ok = mpf_set_str(newScale, ss.c_str(), 10) == 0 && mpf_sgn(newScale) > 0 &&
+              mpf_set_str(newRe, xs.c_str(), 10) == 0 &&
+              mpf_set_str(newIm, ys.c_str(), 10) == 0;
+    if (!ok) {
+        mpf_clears(newScale, newRe, newIm, (mpf_ptr)0);
+        return false;
+    }
+    if (IsJulia() && mpf_cmp_d(newScale, 1e12) > 0) mpf_set_d(newScale, 1e12);
+    mpf_set_prec(_scale, prec); mpf_set(_scale, newScale);
+    mpf_set_prec(_z_re, prec); mpf_set(_z_re, newRe);
+    mpf_set_prec(_z_im, prec); mpf_set(_z_im, newIm);
+    mpf_set_prec(_t, prec);
     _mandel->setPrecision(prec);
-    if (mpf_set_str(_scale, ss.c_str(), 10) != 0 || mpf_sgn(_scale) <= 0) return false;
-    if (mpf_set_str(_z_re, xs.c_str(), 10) != 0) return false;
-    if (mpf_set_str(_z_im, ys.c_str(), 10) != 0) return false;
+    mpf_clears(newScale, newRe, newIm, (mpf_ptr)0);
     JumpReset();
     return true;
 }
 
 void MandelNavigator::UpdateCoords() {
-    mpf_set_d(_t, _k);
+    double effectiveK = _k;
+    if (IsJulia() && _k > 1.0) {
+        double scale = mpf_get_d(_scale);
+        if (scale > 0.0) effectiveK = std::min(_k, 1e12 / scale);
+    }
+    double effectiveDisplayDx = _display_dx, effectiveDisplayDy = _display_dy;
+    if (effectiveK != _k && _k != 1.0) {
+        double zoomX = _dx - (_display_dx - _dx) / (_k - 1.0);
+        double zoomY = _dy - (_display_dy - _dy) / (_k - 1.0);
+        effectiveDisplayDx = _dx - (zoomX - _dx) * (effectiveK - 1.0);
+        effectiveDisplayDy = _dy - (zoomY - _dy) * (effectiveK - 1.0);
+    }
+    mpf_set_d(_t, effectiveK);
     mpf_mul(_scale, _scale, _t);
+    if (IsJulia() && mpf_cmp_d(_scale, 1e12) > 0) mpf_set_d(_scale, 1e12);
     int precision = std::abs(get_exp(_scale)) + 30;
     mpf_set_prec(_scale, precision);
     mpf_set_prec(_z_re, precision);
     mpf_set_prec(_z_im, precision);
     mpf_set_prec(_t, precision);
     _mandel->setPrecision(precision);
-    mpf_set_d(_t, 2.0 * (_k - 1.0 + 2.0 * _display_dx / _w));
+    mpf_set_d(_t, 2.0 * (effectiveK - 1.0 + 2.0 * effectiveDisplayDx / _w));
     mpf_div(_t, _t, _scale);
     mpf_sub(_z_re, _z_re, _t);
 
-    mpf_set_d(_t, 2.0 * _h / _w * (_k - 1.0 + 2.0 * _display_dy / _h));
+    mpf_set_d(_t, 2.0 * _h / _w *
+                  (effectiveK - 1.0 + 2.0 * effectiveDisplayDy / _h));
     mpf_div(_t, _t, _scale);
     mpf_sub(_z_im, _z_im, _t);
     gmp_printf("\nx: %.*Ff\ny: %.*Ff\nzoom: %.2Fe\n", (int)(precision * log(2) / log(10)), _z_re, (int)(precision * log(2) / log(10)), _z_im, _scale);
@@ -467,12 +518,74 @@ void MandelNavigator::GetView(mpf_t re, mpf_t im, mpf_t scale) const {
     mpf_set_prec(scale, mpf_get_prec(_scale)); mpf_set(scale, _scale);
 }
 
+void MandelNavigator::GetJuliaC(mpf_t re, mpf_t im) const {
+    mpf_set_prec(re, mpf_get_prec(_julia_c_re)); mpf_set(re, _julia_c_re);
+    mpf_set_prec(im, mpf_get_prec(_julia_c_im)); mpf_set(im, _julia_c_im);
+}
+
+bool MandelNavigator::SetJuliaC(const std::string& re, const std::string& im) {
+    int precision = (int)(std::max(re.size(), im.size()) * 3.3219) + 40;
+    precision = std::max(64, precision);
+    mpf_t parsedRe, parsedIm;
+    mpf_init2(parsedRe, precision); mpf_init2(parsedIm, precision);
+    bool ok = mpf_set_str(parsedRe, re.c_str(), 10) == 0 &&
+              mpf_set_str(parsedIm, im.c_str(), 10) == 0;
+    if (ok) {
+        mpf_set_prec(_julia_c_re, precision); mpf_set(_julia_c_re, parsedRe);
+        mpf_set_prec(_julia_c_im, precision); mpf_set(_julia_c_im, parsedIm);
+    }
+    mpf_clear(parsedRe); mpf_clear(parsedIm);
+    return ok;
+}
+
+void MandelNavigator::SetJuliaMode(bool enabled) {
+    if (enabled == IsJulia()) return;
+    InterruptCompute();
+    if (enabled) {
+        mp_bitcnt_t precision = std::max({ mpf_get_prec(_z_re), mpf_get_prec(_z_im),
+                                           mpf_get_prec(_scale) });
+        for (mpf_ptr value : { _saved_mandel_re, _saved_mandel_im, _saved_mandel_scale,
+                               _julia_c_re, _julia_c_im })
+            mpf_set_prec(value, precision);
+        mpf_set(_saved_mandel_re, _z_re);
+        mpf_set(_saved_mandel_im, _z_im);
+        mpf_set(_saved_mandel_scale, _scale);
+        mpf_set(_julia_c_re, _z_re);
+        mpf_set(_julia_c_im, _z_im);
+        _has_saved_mandel_view = true;
+        _saved_mandel_method = _c_method;
+        _formula = quadraticJulia();
+        _c_method &= ColoringMethod::EXTERIOR_DIST_EST;
+        mpf_set_ui(_z_re, 0); mpf_set_ui(_z_im, 0); mpf_set_ui(_scale, 1);
+    } else {
+        _formula = quadraticMandelbrot();
+        if (_has_saved_mandel_view) {
+            mpf_set_prec(_z_re, mpf_get_prec(_saved_mandel_re));
+            mpf_set_prec(_z_im, mpf_get_prec(_saved_mandel_im));
+            mpf_set_prec(_scale, mpf_get_prec(_saved_mandel_scale));
+            mpf_set(_z_re, _saved_mandel_re);
+            mpf_set(_z_im, _saved_mandel_im);
+            mpf_set(_scale, _saved_mandel_scale);
+            _c_method = _saved_mandel_method;
+        } else {
+            mpf_set_d(_z_re, -0.5); mpf_set_ui(_z_im, 0); mpf_set_ui(_scale, 1);
+        }
+    }
+    JumpReset();
+    mpf_set_prec(_t, mpf_get_prec(_scale));
+    ConfigureSampling();
+    _cache_valid = false;
+    _require_update = true;
+}
+
 int MandelNavigator::GetCMethod() {
     return _c_method;
 }
 
 void MandelNavigator::SetCMethod(int c_method) {
-    _c_method = c_method;
+    _c_method = IsJulia()
+        ? (c_method & ColoringMethod::EXTERIOR_DIST_EST)
+        : c_method;
 }
 
 void MandelNavigator::SetRedisplay() {

@@ -55,7 +55,7 @@ enum Hit {
     H_RESET, H_RENDER, H_SAVE, H_COPY, H_PASTE,
     H_MAXTRACK, H_DENSTRACK, H_PHASETRACK, H_SPEEDTRACK,
     H_RELAZ, H_RELEL, H_RELSTR,
-    H_SS, H_ORBIT, H_EDE, H_PALETTE_DD, H_COLOR, H_GALLERY_DD, H_PANELSB
+    H_SS, H_JULIA, H_ORBIT, H_EDE, H_PALETTE_DD, H_COLOR, H_GALLERY_DD, H_PANELSB
 };
 
 // Gallery demo presets: a saved location plus the exact render settings used to
@@ -235,7 +235,7 @@ public:
     RECT rcReset{}, rcRender{}, rcSave{}, rcCopy{}, rcPaste{};
     RECT rcLocation{}, rcMaxTrack{}, rcDensTrack{}, rcPhaseTrack{}, rcSpeedTrack{};
     RECT rcReliefAz{}, rcReliefEl{}, rcReliefStr{};
-    RECT rcSS{}, rcColoringDD{}, rcPaletteDD{}, rcColor{}, rcGradient{};
+    RECT rcSS{}, rcJulia{}, rcColoringDD{}, rcPaletteDD{}, rcColor{}, rcGradient{};
     RECT rcGalleryDD{};
     RECT rcOrbitToggle{}, rcOrbitThumb{};
 
@@ -247,6 +247,8 @@ public:
     int coloringHover = -1;                 // hovered item while open (-1 none)
     int paletteIdx = 0;                    // index into palettePresets()
     bool orbitOn = false;
+    int savedColoringIdx = 0;
+    bool savedSsOn = false, savedOrbitOn = false;
     std::unique_ptr<OrbitWorker> orbitWorker;
     OrbitResult orbitResult;
     std::vector<uint8_t> orbitThumbnail;
@@ -416,7 +418,7 @@ public:
         mpf_init2(re, precision); mpf_init2(im, precision); mpf_init2(scale, precision);
         nav->GetView(re, im, scale);
         orbitWorker->request(re, im, scale, p.x, p.y, renderW, renderH, maxIter,
-                             MandelNavigator::GetFormulaContext());
+                             nav->GetFormulaContext());
         mpf_clear(re); mpf_clear(im); mpf_clear(scale);
         lastOrbitRequest = now; lastOrbitX = x; lastOrbitY = y;
     }
@@ -490,13 +492,15 @@ public:
         rcCopy    = { px + 3*(bw+g),   y, px + 4*bw + 3*g,  y + bh };
         rcPaste   = { px + 4*(bw+g),   y, px + 5*bw + 4*g,  y + bh };
         y += bh + S(14);
-        rcLocation = { px, y, px + w, y + S(100) }; y += S(100) + S(16);
+        int locationH = nav && nav->IsJulia() ? S(126) : S(100);
+        rcLocation = { px, y, px + w, y + locationH }; y += locationH + S(16);
         rcMaxTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         rcDensTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         rcPhaseTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         rcSpeedTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         // Unlabeled toggle: box sits at y (no label above), then a uniform 14px gap.
         rcSS  = { px, y, px + w, y + bh }; y += bh + S(14);
+        rcJulia = { px, y, px + w, y + bh }; y += bh + S(14);
         rcOrbitToggle = { px, y, px + w, y + bh }; y += bh + S(14);
         if (orbitOn) {
             int oh = (int)((double)w * ORBIT_H / ORBIT_W);
@@ -546,7 +550,7 @@ public:
             RECT* all[] = { &rcReset, &rcRender, &rcSave, &rcCopy, &rcPaste,
                             &rcLocation, &rcMaxTrack, &rcDensTrack, &rcPhaseTrack, &rcSpeedTrack,
                             &rcReliefAz, &rcReliefEl, &rcReliefStr,
-                            &rcSS, &rcOrbitToggle, &rcOrbitThumb,
+                            &rcSS, &rcJulia, &rcOrbitToggle, &rcOrbitThumb,
                             &rcColoringDD, &rcPaletteDD, &rcGradient, &rcColor, &rcGalleryDD };
             for (RECT* r : all) OffsetRect(r, 0, -panelScroll);
         }
@@ -558,6 +562,36 @@ public:
         int ns = std::clamp(panelScroll + dyDevice, 0, maxs);
         if (ns == panelScroll) return;
         panelScroll = ns; layout(); needFull = true; InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
+    void switchJuliaMode(bool enable, bool render = true) {
+        if (enable == nav->IsJulia()) {
+            if (render) startRender();
+            return;
+        }
+        if (enable) {
+            savedColoringIdx = coloringIdx;
+            savedSsOn = ssOn;
+            savedOrbitOn = orbitOn;
+            if (orbitWorker) orbitWorker->cancel();
+            orbitOn = false;
+            orbitResult = OrbitResult{};
+            ssOn = false;
+            coloringIdx = coloringIdx == 1 ? 1 : 0;
+            relief_on = normal_light_on = de_overlay_on = 0;
+        }
+        nav->SetJuliaMode(enable);
+        if (!enable) {
+            coloringIdx = savedColoringIdx;
+            ssOn = savedSsOn;
+            orbitOn = savedOrbitOn;
+            relief_on = coloringIdx == 3;
+            normal_light_on = coloringIdx == 4;
+            de_overlay_on = coloringIdx == 6;
+        }
+        layout();
+        needFull = true;
+        if (render) startRender();
     }
     // Scrollbar thumb rect on the panel's right edge (empty if nothing to scroll).
     RECT panelScrollbarRect() const {
@@ -808,10 +842,40 @@ public:
             while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
             return v;
         };
+        std::string mode = val("mode:");
         std::string xs = val("x:"), ys = val("y:"), zs = val("zoom:");
         if (xs.empty() || ys.empty() || zs.empty()) return;
         std::string scale = expandSci(zs);
         if (scale.empty()) return;
+        auto validNumbers = [](const std::vector<std::string>& values,
+                               int positiveIndex = -1) {
+            size_t chars = 0; for (const std::string& value : values) chars = std::max(chars, value.size());
+            mp_bitcnt_t precision = std::max<mp_bitcnt_t>(64, (mp_bitcnt_t)(chars * 3.3219) + 40);
+            mpf_t parsed; mpf_init2(parsed, precision);
+            bool ok = true;
+            for (int i = 0; i < (int)values.size(); ++i) {
+                if (mpf_set_str(parsed, values[i].c_str(), 10) != 0 ||
+                    (i == positiveIndex && mpf_sgn(parsed) <= 0)) {
+                    ok = false; break;
+                }
+            }
+            mpf_clear(parsed);
+            return ok;
+        };
+        if (!validNumbers({ xs, ys, scale }, 2)) return;
+        if (mode == "julia") {
+            std::string cr = val("c_re:"), ci = val("c_im:");
+            if (cr.empty() || ci.empty()) return;
+            if (!validNumbers({ cr, ci })) return;
+            bool wasJulia = nav->IsJulia();
+            switchJuliaMode(true, false);
+            if (!nav->SetJuliaC(cr, ci)) {
+                if (!wasJulia) switchJuliaMode(false, false);
+                return;
+            }
+        } else if (nav->IsJulia()) {
+            switchJuliaMode(false, false);
+        }
         if (nav->SetLocation(xs, ys, scale)) startRender();
     }
     void saveImage() {
@@ -986,11 +1050,14 @@ public:
             RECT ir = { lr.left, lr.top + i * ih, lr.right, lr.top + (i + 1) * ih };
             if (i == coloringHover) fillRect(dc, { ir.left + S(3), ir.top, ir.right - S(3), ir.bottom }, CLR_CARD_HOV);
             RECT tr = ir; tr.left += S(14);
-            drawText(dc, tr, coloringName(i), i == coloringIdx ? CLR_ACCENT : CLR_TEXT, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            COLORREF color = (nav->IsJulia() && i > 1)
+                ? CLR_TEXT_DIM : (i == coloringIdx ? CLR_ACCENT : CLR_TEXT);
+            drawText(dc, tr, coloringName(i), color, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
     }
     void selectColoring(int idx) {
         if (idx < 0 || idx > 6) return;
+        if (nav->IsJulia() && idx > 1) return;
         coloringIdx = idx;
         relief_on = (idx == 3) ? 1 : 0;
         normal_light_on = (idx == 4) ? 1 : 0;
@@ -1049,6 +1116,7 @@ public:
     void applyPreset(int idx) {
         const auto& gp = galleryPresets();
         if (idx < 0 || idx >= (int)gp.size()) return;
+        if (nav->IsJulia()) nav->SetJuliaMode(false);
         const Preset& p = gp[idx];
         // render settings first, then the location (which kicks off the render)
         maxIter = std::clamp(p.maxIter, 100, 5000000); nav->SetMxit(maxIter);
@@ -1210,6 +1278,7 @@ public:
                    speedSnaps, 1);
 
         drawToggle(dc, rcSS, L"5x supersampling", ssOn, H_SS);
+        drawToggle(dc, rcJulia, L"Julia set", nav->IsJulia(), H_JULIA);
         drawToggle(dc, rcOrbitToggle, L"Show orbit", orbitOn, H_ORBIT);
         if (orbitOn) drawOrbitThumbnail(dc);
         label(dc, rcColoringDD.left, rcColoringDD.top - S(20), L"Coloring");
@@ -1339,6 +1408,7 @@ public:
             RECT rs = rcReliefStr; rs.top -= S(8); rs.bottom += S(8); if (inRect(rs,x,y)) return H_RELSTR;
         }
         if (inRect(rcSS,x,y)) return H_SS;
+        if (inRect(rcJulia,x,y)) return H_JULIA;
         if (inRect(rcOrbitToggle,x,y)) return H_ORBIT;
         if (inRect(rcColoringDD,x,y)) return H_EDE;
         if (inRect(rcPaletteDD,x,y)) return H_PALETTE_DD;
@@ -1604,10 +1674,13 @@ public:
                         MoveWindow(hwnd, 40, 40, winw, winh, TRUE);
                 }
             }
+            if (const char* e = getenv("MANDEL_GUI_JULIA"); e && atoi(e)) {
+                switchJuliaMode(true, false);
+            }
             if (getenv("MANDEL_GUI_BENCH")) {
                 benchMode = true;
                 const char* e = getenv("MANDEL_GUI_SS");
-                ssOn = !e || atoi(e);
+                ssOn = !nav->IsJulia() && (!e || atoi(e));
                 if (ssOn) nav->SetCMethod(nav->GetCMethod() | ColoringMethod::SUPER_SAMPLING);
                 if (const char* cc = getenv("MANDEL_GUI_COLOR")) selectColoring(atoi(cc));
                 if (const char* ds = getenv("MANDEL_GUI_DENS")) color_density = (float)atof(ds);
@@ -1764,12 +1837,25 @@ public:
                 switch (h) {
                 case H_RESET: nav->Reset(); renderStart = std::chrono::steady_clock::now(); wasComputing = true; keepLive(); break;
                 case H_RENDER: startRender(); break;
-                case H_SAVE: showExportDialog(hwnd, nav.get()); break;
+                case H_SAVE:
+                    if (nav->IsJulia()) saveImage();
+                    else showExportDialog(hwnd, nav.get());
+                    break;
                 case H_COPY: copyLocation(); break;
                 case H_PASTE: pasteLocation(); break;
-                case H_SS: ssOn = !ssOn; setMethodFlag(ColoringMethod::SUPER_SAMPLING, ssOn); break;
+                case H_SS:
+                    if (!nav->IsJulia()) {
+                        ssOn = !ssOn;
+                        setMethodFlag(ColoringMethod::SUPER_SAMPLING, ssOn);
+                    }
+                    break;
+                case H_JULIA: {
+                    bool enable = !nav->IsJulia();
+                    switchJuliaMode(enable);
+                    break;
+                }
                 case H_ORBIT:
-                    orbitOn = !orbitOn;
+                    if (!nav->IsJulia()) orbitOn = !orbitOn;
                     if (orbitOn) {
                         if (!orbitWorker) orbitWorker = std::make_unique<OrbitWorker>();
                         if (orbitThumbnail.empty()) buildOrbitThumbnail();
