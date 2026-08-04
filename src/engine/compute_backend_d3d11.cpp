@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -31,8 +32,9 @@ namespace {
 
 constexpr UINT kThreadsPerGroup = 64;
 constexpr UINT kMaxGroups = 256;
-constexpr UINT kPixelsPerChunk = 32768;
+constexpr UINT kPixelsPerChunk = 262144;
 constexpr int kMaxGpuIterations = 100000;
+constexpr UINT kGpuIterationPrefix = 64;
 constexpr float kAnalyticInterior = -3.0f;
 constexpr float kCpuRefineIteration = 64.0f;
 
@@ -120,7 +122,8 @@ float solvePixel(uint pixel) {
     float dr = 2.0f;
     float di = 0.0f;
     uint i = 1;
-    while (i < maxIterations) {
+    uint iterationLimit = min(maxIterations, 64u);
+    while (i < iterationLimit) {
         precise float nextDr = 2.0f * (dr * zr.x - di * zi.x);
         precise float nextDi = 2.0f * (dr * zi.x + di * zr.x);
         float2 zr2 = dsMul(zr, zr);
@@ -141,7 +144,7 @@ float solvePixel(uint pixel) {
         if (dr * dr + di * di < 1.0e-9f) return -4.0f;
         ++i;
     }
-    return -2.0f;
+    return -5.0f;
 }
 
 [numthreads(64, 1, 1)]
@@ -456,6 +459,9 @@ private:
     }
 
     bool computeGpu(const ComputeRequest& request) {
+        using ProfileClock = std::chrono::steady_clock;
+        const auto totalStart = ProfileClock::now();
+        const bool profile = getenv("MANDEL_GPU_PROFILE") != nullptr;
         const uint64_t count64 =
             static_cast<uint64_t>(request.width) * request.height;
         if (count64 == 0 ||
@@ -529,6 +535,7 @@ private:
         _context->CSSetConstantBuffers(0, 1, constantBuffers);
         _context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
 
+        const auto dispatchStart = ProfileClock::now();
         const UINT clear[4] = {};
         for (UINT base = 0; base < count; base += kPixelsPerChunk) {
             if (_cancelRequested.load(std::memory_order_acquire)) {
@@ -547,10 +554,16 @@ private:
             _context->End(_completionQuery.Get());
             _context->Flush();
             HRESULT completed = S_FALSE;
+            unsigned spins = 0;
             do {
                 completed = _context->GetData(
                     _completionQuery.Get(), nullptr, 0, 0);
-                if (completed == S_FALSE) Sleep(1);
+                if (completed == S_FALSE) {
+                    if ((++spins & 255u) == 0)
+                        SwitchToThread();
+                    else
+                        YieldProcessor();
+                }
             } while (completed == S_FALSE);
             if (FAILED(completed)) {
                 unbind();
@@ -561,8 +574,10 @@ private:
                 return false;
             }
         }
+        const auto dispatchEnd = ProfileClock::now();
         unbind();
 
+        const auto readbackStart = ProfileClock::now();
         _context->CopyResource(_stagingBuffer.Get(), _outputBuffer.Get());
         D3D11_MAPPED_SUBRESOURCE mapped{};
         HRESULT hr = _context->Map(
@@ -572,12 +587,15 @@ private:
         std::memcpy(_readback.data(), mapped.pData, count * sizeof(float));
         _context->Unmap(_stagingBuffer.Get(), 0);
         if (_cancelRequested.load(std::memory_order_acquire)) return false;
+        const auto readbackEnd = ProfileClock::now();
 
-        // A 2xFP32 orbit has about 48 significant bits. That is ample for
-        // shallow coordinates, but chaotic long orbits can amplify the five-bit
-        // gap to FP64. Re-evaluate only long/ambiguous tails with the engine's
-        // exact scalar semantics; the bulk of the frame remains GPU-only.
-#pragma omp parallel for schedule(dynamic, 64)
+        // The GPU resolves robust short escapes only. Long or bounded trajectories
+        // are sparse and numerically sensitive, so finish those with the engine's
+        // exact FP64 scalar semantics instead of letting divergent GPU lanes run
+        // to the full iteration limit.
+        const auto refineStart = ProfileClock::now();
+        long long refined = 0, analytic = 0;
+#pragma omp parallel for schedule(dynamic, 64) reduction(+:refined,analytic)
         for (int pixel = 0; pixel < static_cast<int>(count); ++pixel) {
             if (_cancelRequested.load(std::memory_order_relaxed)) continue;
             float value = _readback[pixel];
@@ -588,6 +606,7 @@ private:
             if (value == kAnalyticInterior) {
                 if (inMainCardioidOrBulb(cr, ci)) {
                     _readback[pixel] = -2.0f;
+                    ++analytic;
                     continue;
                 }
             } else if (value >= 0.0f && value < kCpuRefineIteration) {
@@ -596,8 +615,10 @@ private:
             _readback[pixel] =
                 request.cpuEngine->ComputeShallowPoint(
                     cr, ci, request.maxIterations);
+            ++refined;
         }
         if (_cancelRequested.load(std::memory_order_acquire)) return false;
+        const auto refineEnd = ProfileClock::now();
 
         if (request.sub == 1) {
             std::memcpy(
@@ -616,6 +637,24 @@ private:
                     request.iterations[destination +
                         static_cast<size_t>(x) * request.sub] = source[x];
             }
+        }
+        if (profile) {
+            auto milliseconds = [](auto begin, auto end) {
+                return std::chrono::duration<double, std::milli>(
+                    end - begin).count();
+            };
+            const auto totalEnd = ProfileClock::now();
+            fprintf(stderr,
+                    "  gpu phases: dispatch=%.3f ms readback=%.3f ms "
+                    "refine=%.3f ms total=%.3f ms "
+                    "gpu-only=%lld analytic=%lld refined=%lld prefix=%u\n",
+                    milliseconds(dispatchStart, dispatchEnd),
+                    milliseconds(readbackStart, readbackEnd),
+                    milliseconds(refineStart, refineEnd),
+                    milliseconds(totalStart, totalEnd),
+                    static_cast<long long>(count) - analytic - refined,
+                    analytic, refined, kGpuIterationPrefix);
+            fflush(stderr);
         }
         return true;
     }

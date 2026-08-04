@@ -2120,11 +2120,13 @@ static int runGpuBenchmarkCase(int width, int height) {
     bool warmupOk = gpu->compute(request);
     bool warmupUsedGpu = gpu->lastComputeUsedGpuPath();
     std::fill(gpuOutput.begin(), gpuOutput.end(), EMPTYPIXEL);
+    _putenv_s("MANDEL_GPU_PROFILE", "1");
     gpu->resetCancellation();
     auto start = Clock::now();
     bool gpuOk = gpu->compute(request);
     bool measuredUsedGpu = gpu->lastComputeUsedGpuPath();
     double gpuSeconds = since(start);
+    _putenv_s("MANDEL_GPU_PROFILE", "");
 
     _putenv_s("MANDEL_COARSE", "0");
     start = Clock::now();
