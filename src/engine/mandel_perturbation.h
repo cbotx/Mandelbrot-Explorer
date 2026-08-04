@@ -73,6 +73,15 @@ public:
                            formula::ExpressionColoring coloring =
                                formula::ExpressionColoring::Raw,
                            const formula::ExpressionJit4* jit = nullptr);
+    // Exact residual perturbation prototype:
+    // dz' = F(Z + dz, pixel parameters) - Z'. Falls back to the direct
+    // expression renderer when the center reference escapes before mxit.
+    bool ComputeExpressionResidual(mpf_t center_re, mpf_t center_im, mpf_t scale,
+                                   const formula::ExpressionProgram& program,
+                                   const formula::ExpressionContext& fixed,
+                                   FormulaParameter pixelParameter,
+                                   int mxit, double bailout,
+                                   bool* usedPerturbation = nullptr);
     // Verification helper: brute-force high-precision escape time into out[],
     // reusing the grid (_c0/_dx/_dy) set by the most recent Compute() call.
     // step>1 samples only pixels on a (step x step) grid (others left untouched)

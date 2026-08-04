@@ -22,7 +22,6 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
         return false;
 
     if (_flag_halt) return false;
-    progressSet(0.0);
     std::fill(_iter, _iter + (size_t)_w * _h, EMPTYPIXEL);
     mpf_set(_scale, scale);
 
@@ -199,6 +198,112 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                             result = (float)(n + 1);
                             break;
                         }
+                    }
+                }
+            }
+            _iter[i * _w + j] = result;
+        }
+        if (rowCompleted) progressAdvance();
+    }
+    bool completed = !_flag_halt;
+    if (completed) progressSet(1.0);
+    return completed;
+}
+
+bool Mandel::ComputeExpressionResidual(
+        mpf_t center_re, mpf_t center_im, mpf_t scale,
+        const formula::ExpressionProgram& program,
+        const formula::ExpressionContext& fixed,
+        FormulaParameter pixelParameter, int mxit, double bailout,
+        bool* usedPerturbation) {
+    if (usedPerturbation) *usedPerturbation = false;
+    if (_sub != 1 || !program.valid() || mxit < 1 || !(bailout > 0.0) ||
+        !std::isfinite(bailout) ||
+        (pixelParameter != FormulaParameter::C &&
+         pixelParameter != FormulaParameter::InitialZ))
+        return false;
+    if (_flag_halt) return false;
+
+    mpf_t dw, dh;
+    mpf_init_set_ui(dw, 2);
+    mpf_div(dw, dw, scale);
+    mpf_init_set(dh, dw);
+    mpf_mul_ui(dh, dh, _h);
+    mpf_div_ui(dh, dh, _w);
+    mpf_sub(_c0_re, center_re, dw);
+    mpf_sub(_c0_im, center_im, dh);
+    mpf_mul_ui(_dx, dw, 2); mpf_div_ui(_dx, _dx, _w - 1);
+    mpf_mul_ui(_dy, dh, 2); mpf_div_ui(_dy, _dy, _h - 1);
+    mpf_set(_scale, scale);
+    mpf_clear(dw); mpf_clear(dh);
+
+    formula::ExpressionContext reference = fixed;
+    formula::Complex center{ mpf_get_ld(center_re), mpf_get_ld(center_im) };
+    if (pixelParameter == FormulaParameter::C) reference.c = center;
+    else reference.z0 = center;
+    reference.z = reference.z0;
+    std::vector<formula::Complex> orbit((size_t)mxit + 1);
+    orbit[0] = reference.z;
+    std::array<formula::Complex, formula::ExpressionProgram::MAX_STACK> refStack;
+    progressBegin(mxit + _h + 1, 0.0, 1.0);
+    bool boundedReference =
+        std::isfinite(reference.z.real()) && std::isfinite(reference.z.imag()) &&
+        std::hypot(reference.z.real(), reference.z.imag()) <= bailout;
+    for (int n = 0; n < mxit && boundedReference; ++n) {
+        if (_flag_halt) return false;
+        reference.iteration = n;
+        reference.z = orbit[n];
+        orbit[n + 1] = program.evaluate(reference, refStack.data(),
+                                        program.stackDepth());
+        boundedReference =
+            std::isfinite(orbit[n + 1].real()) &&
+            std::isfinite(orbit[n + 1].imag()) &&
+            std::hypot(orbit[n + 1].real(), orbit[n + 1].imag()) <= bailout;
+        progressAdvance();
+    }
+    if (!boundedReference) {
+        return ComputeExpression(center_re, center_im, scale, program, fixed,
+                                 pixelParameter, mxit, bailout,
+                                 formula::ExpressionColoring::Raw, nullptr);
+    }
+    if (usedPerturbation) *usedPerturbation = true;
+
+    progressSet(0.0);
+    std::fill(_iter, _iter + (size_t)_w * _h, EMPTYPIXEL);
+    const double startRe = mpf_get_ld(_c0_re), startIm = mpf_get_ld(_c0_im);
+    const double dx = mpf_get_ld(_dx), dy = mpf_get_ld(_dy);
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int i = 0; i < _h; ++i) {
+        if (_flag_halt) continue;
+        bool rowCompleted = true;
+        double pixelIm = startIm + dy * i;
+        for (int j = 0; j < _w; ++j) {
+            if (_flag_halt) { rowCompleted = false; break; }
+            formula::ExpressionContext context = fixed;
+            formula::Complex pixel{ startRe + dx * j, pixelIm };
+            if (pixelParameter == FormulaParameter::C) context.c = pixel;
+            else context.z0 = pixel;
+            formula::Complex delta = context.z0 - orbit[0];
+            float result = -2.0f;
+            formula::Complex absolute = orbit[0] + delta;
+            if (!std::isfinite(absolute.real()) ||
+                !std::isfinite(absolute.imag()) ||
+                std::hypot(absolute.real(), absolute.imag()) > bailout) {
+                result = 0.0f;
+            } else {
+                std::array<formula::Complex,
+                           formula::ExpressionProgram::MAX_STACK> stack;
+                for (int n = 0; n < mxit; ++n) {
+                    context.iteration = n;
+                    context.z = orbit[n] + delta;
+                    formula::Complex next = program.evaluate(
+                        context, stack.data(), program.stackDepth());
+                    delta = next - orbit[n + 1];
+                    if (!std::isfinite(next.real()) ||
+                        !std::isfinite(next.imag()) ||
+                        std::hypot(next.real(), next.imag()) > bailout) {
+                        result = (float)(n + 1);
+                        break;
                     }
                 }
             }

@@ -10,7 +10,8 @@
 //   case = shallow | deep | ticktock | flake | exterior1000 | parity1000 |
 //          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
-//          expression | expression-oracle | expression-suite | all
+//          expression | expression-oracle | expression-suite |
+//          expression-residual | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
 
@@ -1621,6 +1622,100 @@ static int runFormulaRegressionSuite() {
     return result;
 }
 
+static int runExpressionResidualSuite() {
+    struct ResidualCase {
+        const char* name;
+        const char* source;
+        FormulaParameter pixel;
+        formula::Complex center;
+        double scale;
+        formula::Complex fixedZ0;
+        formula::Complex fixedC;
+        formula::Complex p0;
+        int mxit;
+        double bailout;
+        bool expectResidual;
+    };
+    const ResidualCase cases[] = {
+        { "quadratic-c", "z*z+c", FormulaParameter::C,
+          { -0.75, 0.0 }, 1e4, {}, {}, {}, 1000, 4.0, true },
+        { "sine-c", "sin(z)+c", FormulaParameter::C,
+          {}, 4.0, {}, {}, {}, 200, 8.0, true },
+        { "burning-c", "sqr(complex(abs(re(z)),abs(im(z))))+c",
+          FormulaParameter::C, {}, 4.0, {}, {}, {}, 200, 4.0, true },
+        { "parameter-c", "z*z+c+p0*z", FormulaParameter::C,
+          {}, 4.0, {}, {}, { 0.15, -0.05 }, 300, 4.0, true },
+        { "quadratic-z0", "z*z+c", FormulaParameter::InitialZ,
+          {}, 1.0, {}, {}, {}, 500, 4.0, true },
+        { "escaping-reference-fallback", "z*z+c", FormulaParameter::C,
+          { 0.5, 0.5 }, 10.0, {}, {}, {}, 300, 4.0, false }
+    };
+
+    int failures = 0;
+    for (const ResidualCase& test : cases) {
+        formula::ExpressionProgram program;
+        formula::ExpressionError error;
+        if (!program.compile(test.source, &error)) {
+            ++failures;
+            continue;
+        }
+        formula::ExpressionContext fixed;
+        fixed.z0 = test.fixedZ0;
+        fixed.c = test.fixedC;
+        fixed.parameters[0] = test.p0;
+        constexpr int W = 64, H = 44;
+        std::vector<float> output((size_t)W * H, EMPTYPIXEL);
+        std::vector<float> direct;
+        Mandel renderer(W, H, test.mxit, 1, output.data());
+        mpf_t centerRe, centerIm, scale;
+        mpf_init_set_d(centerRe, test.center.real());
+        mpf_init_set_d(centerIm, test.center.imag());
+        mpf_init_set_d(scale, test.scale);
+        auto begin = Clock::now();
+        bool ok = renderer.ComputeExpression(
+            centerRe, centerIm, scale, program, fixed, test.pixel,
+            test.mxit, test.bailout);
+        double directTime = since(begin);
+        direct = output;
+        bool usedResidual = false;
+        begin = Clock::now();
+        ok = ok && renderer.ComputeExpressionResidual(
+            centerRe, centerIm, scale, program, fixed, test.pixel,
+            test.mxit, test.bailout, &usedResidual);
+        double residualTime = since(begin);
+        mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+
+        int classMismatch = 0, iterationMismatch = 0, empty = 0;
+        int maxDifference = 0;
+        for (size_t i = 0; i < output.size(); ++i) {
+            if (direct[i] == EMPTYPIXEL || output[i] == EMPTYPIXEL) {
+                ++empty;
+                continue;
+            }
+            if (isInterior(direct[i]) != isInterior(output[i])) {
+                ++classMismatch;
+            } else if (!isInterior(direct[i])) {
+                int difference = (int)std::fabs(direct[i] - output[i]);
+                if (difference) ++iterationMismatch;
+                maxDifference = std::max(maxDifference, difference);
+            }
+        }
+        bool passed = ok && empty == 0 &&
+                      usedResidual == test.expectResidual &&
+                      classMismatch == 0 && iterationMismatch == 0 &&
+                      maxDifference == 0;
+        if (!passed) ++failures;
+        printf("=== residual %s\n", test.name);
+        printf("  direct/residual %.3f/%.3f s used=%d expected=%d\n",
+               directTime, residualTime, usedResidual ? 1 : 0,
+               test.expectResidual ? 1 : 0);
+        printf("  empty=%d class mismatch=%d iteration mismatch=%d max=%d\n",
+               empty, classMismatch, iterationMismatch, maxDifference);
+        printf("  => %s\n\n", passed ? "PASS" : "CHECK (residual mismatch)");
+    }
+    return failures == 0 ? 0 : 1;
+}
+
 static std::string pow10(int n) {
     std::string s = "1";
     s.append(n, '0');
@@ -1759,5 +1854,6 @@ int main(int argc, char** argv) {
     if (which == "expression")                 rc |= runExpressionCoreCase();
     if (which == "expression-oracle")          rc |= runExpressionOracleCase();
     if (which == "expression-suite")           rc |= runFormulaRegressionSuite();
+    if (which == "expression-residual")        rc |= runExpressionResidualSuite();
     return rc;
 }
