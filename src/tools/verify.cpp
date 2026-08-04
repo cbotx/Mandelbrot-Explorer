@@ -10,7 +10,7 @@
 //   case = shallow | deep | ticktock | flake | exterior1000 | parity1000 |
 //          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
-//          expression | expression-oracle | all
+//          expression | expression-oracle | expression-suite | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
 
@@ -75,6 +75,7 @@ static bool loadGolden(const char* path, float* out, size_t count) {
         alternate = std::string("../") + path;   // verify.exe is normally run from build/
         f = fopen(alternate.c_str(), "rb");
     }
+
     if (!f) {
         fprintf(stderr, "Cannot open golden file: %s\n", path);
         return false;
@@ -87,6 +88,23 @@ static bool loadGolden(const char* path, float* out, size_t count) {
         return false;
     }
     return true;
+}
+
+static bool saveGolden(const char* path, const float* values, size_t count) {
+    FILE* file = fopen(path, "wb");
+    std::string alternate;
+    if (!file) {
+        alternate = std::string("../") + path;
+        file = fopen(alternate.c_str(), "wb");
+    }
+    if (!file) {
+        fprintf(stderr, "Cannot create golden file: %s\n", path);
+        return false;
+    }
+    size_t written = fwrite(values, sizeof(float), count, file);
+    bool ok = written == count && fclose(file) == 0;
+    if (!ok) fprintf(stderr, "Failed writing golden file: %s\n", path);
+    return ok;
 }
 
 static int runCase(const TestCase& tc, int W, int H) {
@@ -1260,6 +1278,246 @@ static int runExpressionOracleCase() {
     return failures == 0 ? 0 : 1;
 }
 
+struct FormulaRegressionCase {
+    const char* name;
+    const char* source;
+    FormulaParameter pixel;
+    double centerRe;
+    double centerIm;
+    double scale;
+    formula::Complex fixedZ0;
+    formula::Complex fixedC;
+    std::array<formula::Complex, 8> parameters{};
+    double bailout = 4.0;
+    int mxit = 500;
+    int width = 64;
+    int height = 44;
+    const char* goldenPath = nullptr;
+    int maxClassMismatch = 0;
+    double maxDiff = 0.0;
+    double maxMeanDiff = 0.0;
+    double maxP99Diff = 0.0;
+};
+
+static bool renderExpressionOracle(const FormulaRegressionCase& test,
+                                   const formula::ExpressionProgram& program,
+                                   std::vector<float>& output) {
+    using formula::ExpressionOracle;
+    using formula::ExpressionOracleContext;
+    using formula::MpfrComplex;
+    output.assign((size_t)test.width * test.height, -2.0f);
+    mpfr_prec_t precision = 512;
+    if (const char* value = getenv("MANDEL_FORMULA_ORACLE_BITS"))
+        precision = std::max<mpfr_prec_t>(128, (mpfr_prec_t)atol(value));
+    const double halfWidth = 2.0 / test.scale;
+    const double halfHeight = halfWidth * test.height / test.width;
+    const double dx = 2.0 * halfWidth / (test.width - 1);
+    const double dy = 2.0 * halfHeight / (test.height - 1);
+    mpfr_t magnitude;
+    mpfr_init2(magnitude, precision);
+    for (int y = 0; y < test.height; ++y) {
+        for (int x = 0; x < test.width; ++x) {
+            formula::Complex pixel{
+                test.centerRe - halfWidth + dx * x,
+                test.centerIm - halfHeight + dy * y
+            };
+            ExpressionOracleContext context(precision);
+            context.z0.set(test.fixedZ0.real(), test.fixedZ0.imag());
+            context.c.set(test.fixedC.real(), test.fixedC.imag());
+            for (int p = 0; p < 8; ++p)
+                context.parameters[p].set(test.parameters[p].real(),
+                                          test.parameters[p].imag());
+            if (test.pixel == FormulaParameter::C)
+                context.c.set(pixel.real(), pixel.imag());
+            else
+                context.z0.set(pixel.real(), pixel.imag());
+            context.z.set(context.z0);
+
+            mpfr_hypot(magnitude, context.z.re, context.z.im, MPFR_RNDN);
+            if (mpfr_cmp_d(magnitude, test.bailout) > 0) {
+                output[(size_t)y * test.width + x] = 0.0f;
+                continue;
+            }
+            MpfrComplex next(precision);
+            for (int n = 0; n < test.mxit; ++n) {
+                context.iteration = n;
+                std::string error;
+                if (!ExpressionOracle::evaluate(program, context, next, &error)) {
+                    fprintf(stderr,
+                            "Formula oracle domain error in %s @ pixel %d,%d iter %d: %s\n",
+                            test.name, x, y, n, error.c_str());
+                    mpfr_clear(magnitude);
+                    return false;
+                }
+                context.z.set(next);
+                mpfr_hypot(magnitude, context.z.re, context.z.im, MPFR_RNDN);
+                if (mpfr_cmp_d(magnitude, test.bailout) > 0) {
+                    output[(size_t)y * test.width + x] = (float)(n + 1);
+                    break;
+                }
+            }
+        }
+    }
+    mpfr_clear(magnitude);
+    return true;
+}
+
+static int runFormulaRegressionCase(const FormulaRegressionCase& test,
+                                    bool updateGoldens) {
+    formula::ExpressionProgram program;
+    formula::ExpressionError compileError;
+    if (!program.compile(test.source, &compileError)) {
+        printf("=== formula %s\n  compile error @ %zu: %s\n  => CHECK\n\n",
+               test.name, compileError.position, compileError.message.c_str());
+        return 1;
+    }
+
+    formula::ExpressionContext fixed;
+    fixed.z0 = test.fixedZ0;
+    fixed.c = test.fixedC;
+    fixed.parameters = test.parameters;
+    std::vector<float> engine((size_t)test.width * test.height, EMPTYPIXEL);
+    std::vector<float> golden(engine.size(), EMPTYPIXEL);
+    Mandel renderer(test.width, test.height, test.mxit, 1, engine.data());
+    mpf_t centerRe, centerIm, scale;
+    mpf_init_set_d(centerRe, test.centerRe);
+    mpf_init_set_d(centerIm, test.centerIm);
+    mpf_init_set_d(scale, test.scale);
+    auto begin = Clock::now();
+    bool rendered = renderer.ComputeExpression(
+        centerRe, centerIm, scale, program, fixed, test.pixel,
+        test.mxit, test.bailout);
+    double engineTime = since(begin);
+    mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+    if (!rendered) return 1;
+
+    double oracleTime = 0.0;
+    if (updateGoldens) {
+        begin = Clock::now();
+        if (!renderExpressionOracle(test, program, golden)) return 2;
+        oracleTime = since(begin);
+        if (!saveGolden(test.goldenPath, golden.data(), golden.size())) return 2;
+    } else if (!loadGolden(test.goldenPath, golden.data(), golden.size())) {
+        return 2;
+    }
+
+    int classMismatch = 0, exteriorBoth = 0, emptyPixels = 0;
+    double maxDiff = 0.0, sumDiff = 0.0;
+    std::vector<double> differences;
+    for (size_t i = 0; i < engine.size(); ++i) {
+        if (engine[i] == EMPTYPIXEL || golden[i] == EMPTYPIXEL) {
+            ++emptyPixels;
+            continue;
+        }
+        bool engineInterior = isInterior(engine[i]);
+        bool goldenInterior = isInterior(golden[i]);
+        if (engineInterior != goldenInterior) {
+            ++classMismatch;
+            continue;
+        }
+        if (!engineInterior) {
+            ++exteriorBoth;
+            double difference = std::fabs((double)engine[i] - golden[i]);
+            maxDiff = std::max(maxDiff, difference);
+            sumDiff += difference;
+            differences.push_back(difference);
+        }
+    }
+    double meanDiff = exteriorBoth ? sumDiff / exteriorBoth : 0.0;
+    double p99Diff = 0.0;
+    if (!differences.empty()) {
+        size_t index = (size_t)std::ceil(0.99 * differences.size()) - 1;
+        std::nth_element(differences.begin(), differences.begin() + index,
+                         differences.end());
+        p99Diff = differences[index];
+    }
+    bool ok = emptyPixels == 0 &&
+              classMismatch <= test.maxClassMismatch &&
+              maxDiff <= test.maxDiff &&
+              meanDiff <= test.maxMeanDiff && p99Diff <= test.maxP99Diff;
+    printf("=== formula %s  (%dx%d, mxit=%d, %s-plane)\n",
+           test.name, test.width, test.height, test.mxit,
+           test.pixel == FormulaParameter::C ? "c" : "z0");
+    printf("  expression: %s\n", test.source);
+    printf("  engine %.3fs%s", engineTime,
+           updateGoldens ? "  oracle " : "  golden load");
+    if (updateGoldens) printf("%.3fs", oracleTime);
+    printf("\n  empty=%d class mismatch=%d  max=%.6g mean=%.6g p99=%.6g"
+           "  checksum=0x%08x\n",
+           emptyPixels, classMismatch, maxDiff, meanDiff, p99Diff,
+           checksum(engine.data(), (int)engine.size()));
+    printf("  => %s\n\n", ok ? "PASS" : "CHECK (formula golden mismatch)");
+    return ok ? 0 : 1;
+}
+
+static int runFormulaRegressionSuite() {
+    std::vector<FormulaRegressionCase> cases;
+    FormulaRegressionCase quadratic{
+        "quadratic-c", "z*z+c", FormulaParameter::C,
+        -0.5, 0.0, 1.0, {}, {}, {}, 4.0, 500, 64, 44,
+        "tests/golden/formula_quadratic_c.f32"
+    };
+    cases.push_back(quadratic);
+    FormulaRegressionCase julia = quadratic;
+    julia.name = "quadratic-z0";
+    julia.pixel = FormulaParameter::InitialZ;
+    julia.centerRe = 0.0;
+    julia.fixedC = { -0.8, 0.156 };
+    julia.goldenPath = "tests/golden/formula_quadratic_z0.f32";
+    cases.push_back(julia);
+    FormulaRegressionCase cubic = quadratic;
+    cubic.name = "cubic-c";
+    cubic.source = "z*z*z+c";
+    cubic.centerRe = 0.0;
+    cubic.goldenPath = "tests/golden/formula_cubic_c.f32";
+    cases.push_back(cubic);
+    FormulaRegressionCase burning = quadratic;
+    burning.name = "burning-ship";
+    burning.source = "sqr(complex(abs(re(z)),abs(im(z))))+c";
+    burning.centerIm = -0.5;
+    burning.mxit = 300;
+    burning.goldenPath = "tests/golden/formula_burning_ship.f32";
+    burning.maxClassMismatch = 11;
+    burning.maxDiff = 100.0;
+    burning.maxMeanDiff = 0.25;
+    burning.maxP99Diff = 0.0;
+    cases.push_back(burning);
+    FormulaRegressionCase sine = quadratic;
+    sine.name = "sine-c";
+    sine.source = "sin(z)+c";
+    sine.centerRe = 0.0;
+    sine.bailout = 8.0;
+    sine.mxit = 200;
+    sine.goldenPath = "tests/golden/formula_sine_c.f32";
+    cases.push_back(sine);
+    FormulaRegressionCase parameter = quadratic;
+    parameter.name = "parameter-polynomial";
+    parameter.source = "z*z+c+p0*z";
+    parameter.parameters[0] = { 0.15, -0.05 };
+    parameter.goldenPath = "tests/golden/formula_parameter_poly.f32";
+    cases.push_back(parameter);
+    FormulaRegressionCase branch = quadratic;
+    branch.name = "branch-power";
+    branch.source = "exp(p0*log(z))+c";
+    branch.fixedZ0 = { 0.3, 0.2 };
+    branch.parameters[0] = { 2.5, 0.0 };
+    branch.mxit = 150;
+    branch.goldenPath = "tests/golden/formula_branch_power.f32";
+    cases.push_back(branch);
+    FormulaRegressionCase iteration = quadratic;
+    iteration.name = "iteration-dependent";
+    iteration.source = "z*z+c+0.0001*n";
+    iteration.mxit = 200;
+    iteration.goldenPath = "tests/golden/formula_iteration.f32";
+    cases.push_back(iteration);
+
+    bool update = getenv("MANDEL_UPDATE_FORMULA_GOLDENS") != nullptr;
+    int result = 0;
+    for (const FormulaRegressionCase& test : cases)
+        result |= runFormulaRegressionCase(test, update);
+    return result;
+}
+
 static std::string pow10(int n) {
     std::string s = "1";
     s.append(n, '0');
@@ -1397,5 +1655,6 @@ int main(int argc, char** argv) {
     if (which == "julia-critical")             rc |= runJuliaCase(false, true, true);
     if (which == "expression")                 rc |= runExpressionCoreCase();
     if (which == "expression-oracle")          rc |= runExpressionOracleCase();
+    if (which == "expression-suite")           rc |= runFormulaRegressionSuite();
     return rc;
 }
