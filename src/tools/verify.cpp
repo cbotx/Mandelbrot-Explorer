@@ -67,7 +67,6 @@ struct TestCase {
 // smooth counts stay > -1.5. Testing "< 0" would misread a slightly-negative
 // exterior smooth as interior, so classify against the sentinel band instead.
 static inline bool isInterior(float v) { return v < -1.5f; }
-static constexpr double GPU_SMOOTH_TOLERANCE = 0.125;
 
 static uint32_t checksum(const float* v, int n) {
     // Order-independent-ish FNV over the raw float bits.
@@ -1884,8 +1883,7 @@ static int runBackendCase() {
             }
         }
         if (gpuEmpty != 0 || gpuClassMismatch != 0 ||
-            gpuFloorMismatch != 0 ||
-            gpuMaxDifference > GPU_SMOOTH_TOLERANCE)
+            gpuFloorMismatch != 0 || gpuMaxDifference > 0.01)
             ++failures;
 
         // Precision-limit shallow view (the GPU gate is scale <= 1e6).
@@ -1916,7 +1914,7 @@ static int runBackendCase() {
                 }
             }
             if (gpuStressClass != 0 || gpuStressFloor != 0 ||
-                gpuStressMaxDifference > GPU_SMOOTH_TOLERANCE)
+                gpuStressMaxDifference > 0.01)
                 ++failures;
         }
 
@@ -1954,8 +1952,7 @@ static int runBackendCase() {
                 if (layoutCpu[i] != layoutGpu[i] &&
                     !(layoutCpu[i] >= 0.0f && layoutGpu[i] >= 0.0f &&
                       (int)layoutCpu[i] == (int)layoutGpu[i] &&
-                      std::fabs(layoutCpu[i] - layoutGpu[i]) <=
-                          GPU_SMOOTH_TOLERANCE))
+                      std::fabs(layoutCpu[i] - layoutGpu[i]) <= 0.01f))
                     ++gpuLayoutMismatch;
             if (gpuLayoutMismatch != 0) ++failures;
         }
@@ -2178,7 +2175,7 @@ static int runGpuBenchmarkCase(int width, int height) {
     bool accurate = warmupOk && warmupUsedGpu &&
                     gpuOk && measuredUsedGpu && empty == 0 &&
                     classMismatch == 0 && floorMismatch == 0 &&
-                    maxDifference <= GPU_SMOOTH_TOLERANCE;
+                    maxDifference <= 0.01;
     bool fastEnough = speedup >= 5.0;
     printf("  backend=%s  %s\n",
            gpu->info().name.c_str(), gpu->info().detail.c_str());

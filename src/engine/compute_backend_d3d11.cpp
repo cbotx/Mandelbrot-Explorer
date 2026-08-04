@@ -33,8 +33,8 @@ namespace {
 constexpr UINT kThreadsPerGroup = 64;
 constexpr UINT kPixelsPerChunk = 524288;
 constexpr int kMaxGpuIterations = 100000;
-constexpr UINT kGpuLongPrefix = 256;
-constexpr int kCpuRefineBlock = 128;
+constexpr UINT kGpuIterationPrefix = 64;
+constexpr int kCpuRefineBlock = 32;
 constexpr float kAnalyticInterior = -3.0f;
 constexpr float kCpuRefineIteration = 64.0f;
 
@@ -109,7 +109,7 @@ bool inMainCardioidOrBulb(float2 x, float2 y) {
     return cardioid || bulb;
 }
 
-float solvePixelDs(uint pixel, uint prefix) {
+float solvePixel(uint pixel) {
     uint y = pixel / width;
     uint x = pixel - y * width;
     float2 cr = dsAdd(c0Re, dsScale(dx, (float)x));
@@ -121,7 +121,7 @@ float solvePixelDs(uint pixel, uint prefix) {
     float dr = 2.0f;
     float di = 0.0f;
     uint i = 1;
-    uint iterationLimit = min(maxIterations, prefix);
+    uint iterationLimit = min(maxIterations, 64u);
     while (i < iterationLimit) {
         precise float nextDr = 2.0f * (dr * zr.x - di * zi.x);
         precise float nextDi = 2.0f * (dr * zi.x + di * zr.x);
@@ -146,82 +146,12 @@ float solvePixelDs(uint pixel, uint prefix) {
     return -5.0f;
 }
 
-bool inMainCardioidOrBulbFast(float x, float y) {
-    precise float y2 = y * y;
-    precise float xm = x - 0.25f;
-    precise float q = xm * xm + y2;
-    bool cardioid = q * (q + xm) < 0.25f * y2;
-    precise float xp = x + 1.0f;
-    bool bulb = xp * xp + y2 < 0.0625f;
-    return cardioid || bulb;
-}
-
-float solvePixelFast(uint pixel) {
-    uint y = pixel / width;
-    uint x = pixel - y * width;
-    precise float fx = (float)x;
-    precise float fy = (float)y;
-    precise float cr = c0Re.x + dx.x * fx;
-    cr = cr + (c0Re.y + dx.y * fx);
-    precise float ci = c0Im.x + dy.x * fy;
-    ci = ci + (c0Im.y + dy.y * fy);
-    if (inMainCardioidOrBulbFast(cr, ci)) return -3.0f;
-
-    precise float zr = cr;
-    precise float zi = ci;
-    precise float dr = 2.0f;
-    precise float di = 0.0f;
-    float threshold = escapeSquared.x + escapeSquared.y;
-    uint i = 1;
-    uint iterationLimit = min(maxIterations, 64u);
-    while (i < iterationLimit) {
-        precise float nextDr = 2.0f * (dr * zr - di * zi);
-        precise float nextDi = 2.0f * (dr * zi + di * zr);
-        precise float nextZr = zr * zr - zi * zi + cr;
-        precise float nextZi = 2.0f * zr * zi + ci;
-        zr = nextZr;
-        zi = nextZi;
-        dr = nextDr;
-        di = nextDi;
-
-        precise float radiusSquared = zr * zr + zi * zi;
-        if (radiusSquared > threshold) {
-            const float invLog2 = 1.4426950408889634f;
-            return (float)(i + 1) -
-                   log(log(radiusSquared) * (0.5f * invLog2)) * invLog2;
-        }
-        if (dr * dr + di * di < 1.0e-9f) return -4.0f;
-        ++i;
-    }
-    return -5.0f;
-}
-
 [numthreads(64, 1, 1)]
 void main(uint3 dispatchThreadId : SV_DispatchThreadID) {
     uint localPixel = dispatchThreadId.x;
     if (localPixel >= pixelCount) return;
     uint pixel = basePixel + localPixel;
-    Output[pixel] = solvePixelDs(pixel, 64u);
-}
-
-[numthreads(64, 1, 1)]
-void mainFast(uint3 dispatchThreadId : SV_DispatchThreadID) {
-    uint localPixel = dispatchThreadId.x;
-    if (localPixel >= pixelCount) return;
-    uint pixel = basePixel + localPixel;
-    Output[pixel] = solvePixelFast(pixel);
-}
-
-[numthreads(64, 1, 1)]
-void mainLong(uint3 dispatchThreadId : SV_DispatchThreadID) {
-    uint localPixel = dispatchThreadId.x;
-    if (localPixel >= pixelCount) return;
-    uint pixel = basePixel + localPixel;
-    float previous = Output[pixel];
-    if (previous == -3.0f ||
-        (previous >= 0.0f && previous < 64.0f))
-        return;
-    Output[pixel] = solvePixelDs(pixel, 256u);
+    Output[pixel] = solvePixel(pixel);
 }
 )";
 
@@ -320,41 +250,32 @@ public:
             return false;
         }
 
+        ComPtr<ID3DBlob> shaderBlob;
+        ComPtr<ID3DBlob> errors;
         const UINT compileFlags =
             D3DCOMPILE_ENABLE_STRICTNESS |
             D3DCOMPILE_IEEE_STRICTNESS |
             D3DCOMPILE_OPTIMIZATION_LEVEL3;
-        auto compileShader = [&](const char* entry,
-                                 ComPtr<ID3D11ComputeShader>& shader) {
-            ComPtr<ID3DBlob> shaderBlob;
-            ComPtr<ID3DBlob> errors;
-            HRESULT result = D3DCompile(
-                kShaderSource, sizeof(kShaderSource) - 1,
-                "mandelbrot_shallow.hlsl", nullptr, nullptr, entry, "cs_5_0",
-                compileFlags, 0, &shaderBlob, &errors);
-            if (FAILED(result)) {
-                if (error) {
-                    if (errors && errors->GetBufferPointer())
-                        *error = static_cast<const char*>(errors->GetBufferPointer());
-                    else
-                        *error = std::string(entry) +
-                                 " shader compilation failed (" +
-                                 hresultText(result) + ")";
-                }
-                return false;
+        hr = D3DCompile(
+            kShaderSource, sizeof(kShaderSource) - 1, "mandelbrot_shallow.hlsl",
+            nullptr, nullptr, "main", "cs_5_0", compileFlags, 0,
+            &shaderBlob, &errors);
+        if (FAILED(hr)) {
+            if (error) {
+                if (errors && errors->GetBufferPointer())
+                    *error = static_cast<const char*>(errors->GetBufferPointer());
+                else
+                    *error = "compute shader compilation failed (" + hresultText(hr) + ")";
             }
-            result = _device->CreateComputeShader(
-                shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize(),
-                nullptr, &shader);
-            if (FAILED(result) && error)
-                *error = std::string(entry) + " shader creation failed (" +
-                         hresultText(result) + ")";
-            return SUCCEEDED(result);
-        };
-        if (!compileShader("main", _shader) ||
-            !compileShader("mainFast", _shaderFast) ||
-            !compileShader("mainLong", _shaderLong))
             return false;
+        }
+        hr = _device->CreateComputeShader(
+            shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize(),
+            nullptr, &_shader);
+        if (FAILED(hr)) {
+            if (error) *error = "compute shader creation failed (" + hresultText(hr) + ")";
+            return false;
+        }
 
         D3D11_BUFFER_DESC constants{};
         constants.ByteWidth = sizeof(ShaderParams);
@@ -377,9 +298,8 @@ public:
         std::string adapterName =
             haveAdapter ? narrow(adapter.Description) : std::string();
         _info.name = _warp ? "D3D11 WARP" : "D3D11 GPU";
-        _info.detail = adapterName.empty()
-            ? "FP32/2xFP32 bounded-prefix compute"
-            : adapterName + "; FP32/2xFP32 bounded-prefix compute";
+        _info.detail = adapterName.empty() ? "2xFP32 bounded-prefix compute"
+                                           : adapterName + "; 2xFP32 bounded-prefix compute";
         _info.detail += "; max 100k iterations";
         _info.hardwareAccelerated = !_warp;
         _info.fallback = false;
@@ -444,8 +364,6 @@ private:
     ComPtr<ID3D11Device> _device;
     ComPtr<ID3D11DeviceContext> _context;
     ComPtr<ID3D11ComputeShader> _shader;
-    ComPtr<ID3D11ComputeShader> _shaderFast;
-    ComPtr<ID3D11ComputeShader> _shaderLong;
     ComPtr<ID3D11Buffer> _constantBuffer;
     ComPtr<ID3D11Query> _completionQuery;
     ComPtr<ID3D11Buffer> _outputBuffer;
@@ -477,22 +395,6 @@ private:
                request.maxIterations <= kMaxGpuIterations &&
                request.iterations &&
                request.coloringMethod == 0;
-    }
-
-    static bool fastFloatSafe(const double* values, int width, int height) {
-        const double lastRe = values[0] + values[2] * (width - 1);
-        const double lastIm = values[1] + values[3] * (height - 1);
-        const double maxCoordinate = std::max({
-            std::fabs(values[0]), std::fabs(values[1]),
-            std::fabs(lastRe), std::fabs(lastIm), 1.0
-        });
-        float coordinate = static_cast<float>(maxCoordinate);
-        float next = std::nextafter(
-            coordinate, std::numeric_limits<float>::infinity());
-        double ulp = static_cast<double>(next) - coordinate;
-        double pixelStep =
-            std::min(std::fabs(values[2]), std::fabs(values[3]));
-        return std::isfinite(next) && pixelStep >= ulp * 16.0;
     }
 
     bool ensureOutput(UINT count) {
@@ -602,16 +504,9 @@ private:
             !std::isfinite(params.escapeSquared.lo))
             return false;
 
-        const bool fastFloat =
-            fastFloatSafe(values, request.width, request.height);
-        const float cpuRefineIteration =
-            static_cast<float>(kGpuLongPrefix);
-        const UINT gpuIterationPrefix = kGpuLongPrefix;
-
         ID3D11Buffer* constantBuffers[] = {_constantBuffer.Get()};
         ID3D11UnorderedAccessView* uavs[] = {_outputUav.Get()};
-        _context->CSSetShader(
-            fastFloat ? _shaderFast.Get() : _shader.Get(), nullptr, 0);
+        _context->CSSetShader(_shader.Get(), nullptr, 0);
         _context->CSSetConstantBuffers(0, 1, constantBuffers);
         _context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
 
@@ -627,8 +522,6 @@ private:
                 _constantBuffer.Get(), 0, nullptr, &params, 0, 0);
             UINT groups =
                 (params.pixelCount + kThreadsPerGroup - 1) / kThreadsPerGroup;
-            _context->Dispatch(groups, 1, 1);
-            _context->CSSetShader(_shaderLong.Get(), nullptr, 0);
             _context->Dispatch(groups, 1, 1);
             _context->End(_completionQuery.Get());
             _context->Flush();
@@ -652,8 +545,6 @@ private:
                 unbind();
                 return false;
             }
-            _context->CSSetShader(
-                fastFloat ? _shaderFast.Get() : _shader.Get(), nullptr, 0);
         }
         const auto dispatchEnd = ProfileClock::now();
         unbind();
@@ -677,9 +568,8 @@ private:
         const auto refineStart = ProfileClock::now();
         _refinePixels.resize(count);
         std::atomic<int> refineCount{0};
-        long long analytic = 0, derivativeInterior = 0;
-        long long prefixTail = 0, longEscape = 0;
-#pragma omp parallel for schedule(static) reduction(+:analytic,derivativeInterior,prefixTail,longEscape)
+        long long analytic = 0;
+#pragma omp parallel for schedule(static) reduction(+:analytic)
         for (int pixel = 0; pixel < static_cast<int>(count); ++pixel) {
             if (_cancelRequested.load(std::memory_order_relaxed)) continue;
             float value = _readback[pixel];
@@ -693,12 +583,9 @@ private:
                     ++analytic;
                     continue;
                 }
-            } else if (value >= 0.0f && value < cpuRefineIteration) {
+            } else if (value >= 0.0f && value < kCpuRefineIteration) {
                 continue;
             }
-            if (value == -4.0f) ++derivativeInterior;
-            else if (value == -5.0f) ++prefixTail;
-            else ++longEscape;
             int slot = refineCount.fetch_add(1, std::memory_order_relaxed);
             _refinePixels[slot] = pixel;
         }
@@ -760,17 +647,14 @@ private:
             fprintf(stderr,
                     "  gpu phases: dispatch=%.3f ms readback=%.3f ms "
                     "refine=%.3f ms total=%.3f ms "
-                    "gpu-only=%lld analytic=%lld refined=%lld "
-                    "(deriv=%lld tail=%lld escape=%lld) prefix=%u mode=%s\n",
+                    "gpu-only=%lld analytic=%lld refined=%lld prefix=%u\n",
                     milliseconds(dispatchStart, dispatchEnd),
                     milliseconds(readbackStart, readbackEnd),
                     milliseconds(refineStart, refineEnd),
                     milliseconds(totalStart, totalEnd),
                     static_cast<long long>(count) - analytic - refined,
                     analytic, static_cast<long long>(refined),
-                    derivativeInterior, prefixTail, longEscape,
-                    gpuIterationPrefix,
-                    fastFloat ? "fp32+2xfp32" : "2xfp32");
+                    kGpuIterationPrefix);
             fflush(stderr);
         }
         return true;
