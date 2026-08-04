@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cstdlib>
 
 #include "navigator.h"
 #include "mandel_perturbation.h"
@@ -40,6 +41,7 @@ MandelNavigator::MandelNavigator(int width, int height, int sub, int max_iterati
     mpf_init(_saved_mandel_im);
     mpf_init(_saved_mandel_scale);
     mpf_init(_t);
+    _backend = createComputeBackend(getenv("MANDEL_BACKEND"));
 }
 
 MandelNavigator::~MandelNavigator() {
@@ -115,6 +117,7 @@ void MandelNavigator::ConfigureSampling() {
 
 void MandelNavigator::StartCompute() {
     InterruptCompute();
+    _backend->resetCancellation();
     ConfigureSampling();
     _cache_valid = false;                       // fractal changing -> phase cache stale
     // Clear BOTH buffers. _iter marks pixels unresolved; _normal (the DE / normal-map
@@ -129,27 +132,42 @@ void MandelNavigator::StartCompute() {
         this->_mandel->setDensity(color_density);   // for the SAC adaptive-SS detector
         int method = this->_uniform_feather
             ? (this->_c_method & ~ColoringMethod::SUPER_SAMPLING) : this->_c_method;
-        if (this->IsExpression())
-        {
-            formula::ExpressionColoring coloring =
+        ComputeRequest request;
+        request.cpuEngine = this->_mandel;
+        request.centerRe = this->_z_re;
+        request.centerIm = this->_z_im;
+        request.scale = this->_scale;
+        request.width = this->_uniform_feather ? this->_w * this->_sub : this->_w;
+        request.height = this->_uniform_feather ? this->_h * this->_sub : this->_h;
+        request.sub = this->_uniform_feather ? 1 : this->_sub;
+        request.maxIterations = this->_mxit;
+        request.coloringMethod = method;
+        request.iterations = this->_iter;
+        request.normal = this->_normal;
+        if (this->IsExpression()) {
+            request.mode = ComputeMode::Expression;
+            request.expression = &this->_expressionProgram;
+            request.expressionFixed = &this->_expressionFixed;
+#if defined(MANDEL_ENABLE_ASMJIT)
+            request.expressionJit = this->_expressionUseJit
+                ? &this->_expressionJit : nullptr;
+#endif
+            request.expressionPixel = this->_expressionPixel;
+            request.expressionBailout = this->_expressionBailout;
+            request.expressionColoring =
                 this->_expressionProgram.fastIntegerPower() >= 2
                     ? ((method & ColoringMethod::EXTERIOR_DIST_EST)
                         ? formula::ExpressionColoring::Distance
                         : formula::ExpressionColoring::Smooth)
                     : formula::ExpressionColoring::Raw;
-            this->_mandel->ComputeExpression(this->_z_re, this->_z_im, this->_scale,
-                                             this->_expressionProgram, this->_expressionFixed,
-                                             this->_expressionPixel, this->_mxit,
-                                             this->_expressionBailout,
-                                             coloring,
-                                             &this->_expressionJit);
+        } else if (this->IsJulia()) {
+            request.mode = ComputeMode::Julia;
+            request.fixedCRe = this->_julia_c_re;
+            request.fixedCIm = this->_julia_c_im;
+            request.coloringMethod =
+                method & ColoringMethod::EXTERIOR_DIST_EST;
         }
-        else if (this->IsJulia())
-            this->_mandel->ComputeJulia(this->_z_re, this->_z_im, this->_scale,
-                                        this->_julia_c_re, this->_julia_c_im,
-                                        this->_mxit, method & ColoringMethod::EXTERIOR_DIST_EST);
-        else
-            this->_mandel->Compute(this->_z_re, this->_z_im, this->_scale, this->_mxit, method);
+        this->_backend->compute(request);
         this->_require_update = true;
     };
     // _task = std::async(&Mandel::Compute, _mandel, _z_re, _z_im, _scale, _mxit, _c_method);
@@ -158,9 +176,9 @@ void MandelNavigator::StartCompute() {
 
 void MandelNavigator::InterruptCompute() {
     if (_task.valid()) {
-        _mandel->SetHalt(true);
+        _backend->cancel();
         _task.wait();
-        _mandel->SetHalt(false);
+        _backend->resetCancellation();
     }
 }
 
@@ -596,6 +614,10 @@ void MandelNavigator::SaveMandelbrotState() {
 
 void MandelNavigator::RestoreMandelbrotMode() {
     InterruptCompute();
+#if defined(MANDEL_ENABLE_ASMJIT)
+    _expressionUseJit = false;
+    _expressionJit.reset();
+#endif
     _formula = quadraticMandelbrot();
     if (_has_saved_mandel_view) {
         mpf_set_prec(_z_re, mpf_get_prec(_saved_mandel_re));
@@ -631,7 +653,14 @@ bool MandelNavigator::SetExpressionFormula(
     if (!IsExpression()) SaveMandelbrotState();
     bool planeChanged = IsExpression() && _expressionPixel != pixel;
     _expressionProgram = std::move(compiled);
-    _expressionJit.compile(_expressionProgram);
+#if defined(MANDEL_ENABLE_ASMJIT)
+    _expressionUseJit = false;
+    _expressionJit.reset();
+    if (_expressionProgram.fastPath() ==
+            formula::ExpressionProgram::FastPath::None &&
+        _expressionJit.compile(_expressionProgram))
+        _expressionUseJit = true;
+#endif
     _expressionFixed = {};
     _expressionFixed.z0 = fixedZ0;
     _expressionFixed.c = fixedC;
@@ -651,6 +680,20 @@ bool MandelNavigator::SetExpressionFormula(
     _cache_valid = false;
     _require_update = true;
     return true;
+}
+
+std::string MandelNavigator::GetExpressionAccelerationText() const {
+    if (!IsExpression()) return {};
+    if (_expressionProgram.fastPath() !=
+        formula::ExpressionProgram::FastPath::None)
+        return "integer-power kernel";
+#if defined(MANDEL_ENABLE_ASMJIT)
+    if (_expressionUseJit)
+        return "W^X JIT";
+    return _expressionProgram.avx2Compatible() ? "AVX2" : "scalar";
+#else
+    return _expressionProgram.avx2Compatible() ? "AVX2" : "scalar";
+#endif
 }
 
 int MandelNavigator::GetCMethod() {

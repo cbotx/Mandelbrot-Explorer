@@ -9,16 +9,23 @@
 #include <vector>
 
 #include "navigator.h"
-#include "mandel_perturbation.h"
+#include "compute_backend.h"
+#if defined(MANDEL_ENABLE_ASMJIT)
 #include "formula_expression_jit.h"
+#endif
+#include "mandel_perturbation.h"
 #include "formula_spec.h"
 #include "float_math.h"
 
 class MandelNavigator : public Navigator {
 private:
     FormulaContext _formula = quadraticMandelbrot();
+    std::unique_ptr<IComputeBackend> _backend;
     formula::ExpressionProgram _expressionProgram;
+#if defined(MANDEL_ENABLE_ASMJIT)
     formula::ExpressionJit4 _expressionJit;
+    bool _expressionUseJit = false;
+#endif
     formula::ExpressionContext _expressionFixed;
     FormulaParameter _expressionPixel = FormulaParameter::C;
     double _expressionBailout = 4.0;
@@ -90,6 +97,7 @@ public:
 
     void SetMxit(int mxit);
     int GetMxit() const { return _mxit; }
+    const ComputeBackendInfo& GetBackendInfo() const { return _backend->info(); }
     // Copy the current view: center (re/im) and scale into caller-owned mpf_t.
     void GetView(mpf_t re, mpf_t im, mpf_t scale) const;
     mp_bitcnt_t GetViewPrecision() const { return mpf_get_prec(_scale); }
@@ -102,6 +110,7 @@ public:
         return IsExpression() && _expressionProgram.fastIntegerPower() >= 2 &&
                _expressionBailout >= 1.0;
     }
+    std::string GetExpressionAccelerationText() const;
     void SetJuliaMode(bool enabled);
     bool SetExpressionFormula(const std::string& source, FormulaParameter pixel,
                               std::complex<double> fixedZ0, std::complex<double> fixedC,

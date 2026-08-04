@@ -10,11 +10,24 @@ namespace formula {
 using JitFunction = void (*)(const double*, double*);
 
 struct ExpressionJit4::Impl {
+    asmjit::JitAllocator::CreateParams params;
     asmjit::JitRuntime runtime;
     JitFunction function = nullptr;
 
+    Impl()
+        : params(makeParams()),
+          runtime(&params) {}
+
     ~Impl() {
         if (function) runtime.release(function);
+    }
+
+    static asmjit::JitAllocator::CreateParams makeParams() {
+        asmjit::JitAllocator::CreateParams result;
+        result.options = asmjit::JitAllocatorOptions::kUseDualMapping |
+                         asmjit::JitAllocatorOptions::kFillUnusedMemory |
+                         asmjit::JitAllocatorOptions::kImmediateRelease;
+        return result;
     }
 };
 
@@ -42,6 +55,15 @@ ExpressionJit4& ExpressionJit4::operator=(ExpressionJit4&&) noexcept = default;
 
 bool ExpressionJit4::valid() const {
     return _impl && _impl->function;
+}
+
+bool ExpressionJit4::usesDualMapping() const {
+    return _impl && _impl->runtime.allocator()->hasOption(
+        asmjit::JitAllocatorOptions::kUseDualMapping);
+}
+
+const void* ExpressionJit4::codeAddress() const {
+    return _impl ? reinterpret_cast<const void*>(_impl->function) : nullptr;
 }
 
 bool ExpressionJit4::compile(const ExpressionProgram& program, std::string* error) {
@@ -213,6 +235,13 @@ bool ExpressionJit4::compile(const ExpressionProgram& program, std::string* erro
         return false;
     }
     return true;
+}
+
+void ExpressionJit4::reset() {
+    if (_impl && _impl->function) {
+        _impl->runtime.release(_impl->function);
+        _impl->function = nullptr;
+    }
 }
 
 void ExpressionJit4::evaluate(const ExpressionJitInput4& input,

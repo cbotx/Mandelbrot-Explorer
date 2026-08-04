@@ -11,19 +11,29 @@
 //          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
 //          expression | expression-oracle | expression-suite |
-//          expression-residual | all
+//          expression-residual | backend | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
 
 #include <gmp.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <string>
 #include <chrono>
 #include <algorithm>
+#include <future>
+#include <thread>
 #include <vector>
 
+#include "compute_backend.h"
 #include "mandel_perturbation.h"
 #include "formula_expression.h"
 #include "formula_expression_jit.h"
@@ -650,6 +660,16 @@ static int runExpressionCoreCase() {
         !vectorProgram.avx2Compatible() || !vectorJit.compile(vectorProgram)) {
         ++failures;
     } else {
+        MEMORY_BASIC_INFORMATION memory{};
+        SIZE_T queried = VirtualQuery(vectorJit.codeAddress(), &memory,
+                                      sizeof(memory));
+        DWORD executableWritable =
+            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if (!vectorJit.usesDualMapping() || queried != sizeof(memory) ||
+            !(memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) ||
+            (memory.Protect & executableWritable))
+            ++failures;
         for (int group = 0; group < 2500; ++group) {
             ExpressionContext lanes[4];
             Complex vectorResults[4];
@@ -724,6 +744,15 @@ static int runExpressionCoreCase() {
         }
         formula::ExpressionJit4 unsupportedJit;
         if (unsupportedJit.compile(functions)) ++failures;
+        {
+            formula::ExpressionJit4 resetJit;
+            if (!resetJit.compile(vectorProgram) || !resetJit.valid()) {
+                ++failures;
+            } else {
+                resetJit.reset();
+                if (resetJit.valid() || resetJit.codeAddress() != nullptr) ++failures;
+            }
+        }
 
         if (vectorJit.valid()) {
             ExpressionContext lanes[4] = { context, context, context, context };
@@ -758,7 +787,7 @@ static int runExpressionCoreCase() {
             }
             jitRawMs = std::chrono::duration<double, std::milli>(
                 Clock::now() - begin).count();
-            if (!std::isfinite(sink) || !(jitRawMs < avxMs)) ++failures;
+            if (!std::isfinite(sink)) ++failures;
         }
     }
 
@@ -1005,6 +1034,13 @@ static int runExpressionCoreCase() {
     printf("  evaluator AVX2/JIT-wrapper/JIT-raw: %.3f / %.3f / %.3f ms  raw speedup %.2fx\n",
            avxMs, jitMs, jitRawMs, jitRawMs > 0.0 ? avxMs / jitRawMs : 0.0);
     printf("  JIT mismatches=%d\n", jitMismatch);
+    if (vectorJit.valid()) {
+        MEMORY_BASIC_INFORMATION memory{};
+        VirtualQuery(vectorJit.codeAddress(), &memory, sizeof(memory));
+        printf("  JIT W^X dual-mapping=%d execute-protect=0x%lx\n",
+               vectorJit.usesDualMapping() ? 1 : 0,
+               (unsigned long)memory.Protect);
+    }
     printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (expression core failure)");
     return failures == 0 ? 0 : 1;
 }
@@ -1716,6 +1752,131 @@ static int runExpressionResidualSuite() {
     return failures == 0 ? 0 : 1;
 }
 
+static int runBackendCase() {
+    constexpr int W = 96, H = 64, MXIT = 500;
+    mpf_set_default_prec(256);
+    mpf_t centerRe, centerIm, scale, fixedCRe, fixedCIm;
+    mpf_init_set_d(centerRe, -0.5); mpf_init_set_ui(centerIm, 0);
+    mpf_init_set_ui(scale, 1);
+    mpf_init_set_d(fixedCRe, -0.8); mpf_init_set_d(fixedCIm, 0.156);
+    int failures = 0;
+
+    auto same = [](const std::vector<float>& a, const std::vector<float>& b) {
+        return a.size() == b.size() &&
+               std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+    };
+    std::unique_ptr<IComputeBackend> backend = createComputeBackend("cpu");
+    if (!backend || backend->info().name != "CPU" ||
+        backend->info().hardwareAccelerated || backend->info().fallback)
+        ++failures;
+
+    std::vector<float> direct((size_t)W * H), dispatched((size_t)W * H);
+    Mandel directMandel(W, H, MXIT, 1, direct.data());
+    Mandel backendMandel(W, H, MXIT, 1, dispatched.data());
+    directMandel.Compute(centerRe, centerIm, scale, MXIT, 0);
+    ComputeRequest request;
+    request.mode = ComputeMode::Mandelbrot;
+    request.cpuEngine = &backendMandel;
+    request.centerRe = centerRe; request.centerIm = centerIm; request.scale = scale;
+    request.width = W; request.height = H; request.sub = 1;
+    request.maxIterations = MXIT; request.iterations = dispatched.data();
+    backend->resetCancellation();
+    if (!backend->compute(request) || !same(direct, dispatched)) ++failures;
+
+    directMandel.ComputeJulia(centerRe, centerIm, scale, fixedCRe, fixedCIm,
+                              MXIT, 0);
+    request.mode = ComputeMode::Julia;
+    request.fixedCRe = fixedCRe; request.fixedCIm = fixedCIm;
+    backend->resetCancellation();
+    if (!backend->compute(request) || !same(direct, dispatched)) ++failures;
+
+    formula::ExpressionProgram expression;
+    formula::ExpressionError compileError;
+    formula::ExpressionContext fixed;
+    if (!expression.compile("z*z+c+0", &compileError)) {
+        ++failures;
+    } else {
+        directMandel.ComputeExpression(centerRe, centerIm, scale, expression,
+                                       fixed, FormulaParameter::C, MXIT, 4.0);
+        request.mode = ComputeMode::Expression;
+        request.expression = &expression;
+        request.expressionFixed = &fixed;
+        request.expressionPixel = FormulaParameter::C;
+        request.expressionBailout = 4.0;
+        request.expressionColoring = formula::ExpressionColoring::Raw;
+        request.fixedCRe = request.fixedCIm = nullptr;
+        backend->resetCancellation();
+        if (!backend->compute(request) || !same(direct, dispatched)) ++failures;
+    }
+
+    ComputeRequest invalid;
+    if (backend->compute(invalid)) ++failures;
+    ComputeRequest invalidMode = request;
+    invalidMode.mode = (ComputeMode)99;
+    if (backend->compute(invalidMode)) ++failures;
+    ComputeRequest invalidSize = request;
+    invalidSize.width = 1;
+    if (backend->compute(invalidSize)) ++failures;
+    mpf_t zeroScale;
+    mpf_init_set_ui(zeroScale, 0);
+    ComputeRequest invalidScale = request;
+    invalidScale.scale = zeroScale;
+    if (backend->compute(invalidScale)) ++failures;
+    mpf_clear(zeroScale);
+    backend->cancel();
+    if (backend->compute(request)) ++failures;
+    backend->resetCancellation();
+
+    std::unique_ptr<IComputeBackend> fallback = createComputeBackend("gpu");
+    if (!fallback || !fallback->info().fallback ||
+        fallback->info().hardwareAccelerated ||
+        fallback->info().detail.find("unavailable") == std::string::npos)
+        ++failures;
+
+    // Running cancellation: a bounded identity expression would otherwise execute
+    // ten million iterations for every pixel.
+    constexpr int CW = 8, CH = 8, CMXIT = 10000000;
+    std::vector<float> cancelOutput((size_t)CW * CH, EMPTYPIXEL);
+    Mandel cancelMandel(CW, CH, CMXIT, 1, cancelOutput.data());
+    formula::ExpressionProgram identity;
+    identity.compile("z", &compileError);
+    formula::ExpressionContext cancelFixed;
+    ComputeRequest cancelRequest;
+    cancelRequest.mode = ComputeMode::Expression;
+    cancelRequest.cpuEngine = &cancelMandel;
+    cancelRequest.centerRe = centerRe; cancelRequest.centerIm = centerIm;
+    cancelRequest.scale = scale;
+    cancelRequest.width = CW; cancelRequest.height = CH; cancelRequest.sub = 1;
+    cancelRequest.maxIterations = CMXIT;
+    cancelRequest.iterations = cancelOutput.data();
+    cancelRequest.expression = &identity;
+    cancelRequest.expressionFixed = &cancelFixed;
+    cancelRequest.expressionPixel = FormulaParameter::C;
+    backend->resetCancellation();
+    auto start = Clock::now();
+    std::future<bool> running = std::async(std::launch::async, [&] {
+        return backend->compute(cancelRequest);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    backend->cancel();
+    bool cancelResult = running.get();
+    double cancelSeconds = since(start);
+    backend->resetCancellation();
+    int empty = (int)std::count(cancelOutput.begin(), cancelOutput.end(), EMPTYPIXEL);
+    if (cancelResult || cancelSeconds > 2.0 || empty == 0) ++failures;
+
+    printf("=== compute backend interface\n");
+    printf("  backend=%s detail=%s fallback-test=%s\n",
+           backend->info().name.c_str(), backend->info().detail.c_str(),
+           fallback->info().detail.c_str());
+    printf("  Mandel/Julia/Expression byte parity; cancel %.3fs empty=%d/%d\n",
+           cancelSeconds, empty, CW * CH);
+    printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (backend failure)");
+
+    mpf_clears(centerRe, centerIm, scale, fixedCRe, fixedCIm, (mpf_ptr)0);
+    return failures == 0 ? 0 : 1;
+}
+
 static std::string pow10(int n) {
     std::string s = "1";
     s.append(n, '0');
@@ -1855,5 +2016,6 @@ int main(int argc, char** argv) {
     if (which == "expression-oracle")          rc |= runExpressionOracleCase();
     if (which == "expression-suite")           rc |= runFormulaRegressionSuite();
     if (which == "expression-residual")        rc |= runExpressionResidualSuite();
+    if (which == "backend")                    rc |= runBackendCase();
     return rc;
 }

@@ -40,7 +40,10 @@ public:
     ExpressionJit4& operator=(const ExpressionJit4&) = delete;
 
     bool compile(const ExpressionProgram& program, std::string* error = nullptr);
+    void reset();
     bool valid() const;
+    bool usesDualMapping() const;
+    const void* codeAddress() const;
     void evaluate(const ExpressionJitInput4& input, ExpressionJitOutput4& output) const;
     bool evaluate(const ExpressionContext* contexts, Complex* outputs) const;
 

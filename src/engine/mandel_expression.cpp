@@ -6,7 +6,9 @@
 #include <limits>
 
 #include "float_math.h"
+#if defined(MANDEL_ENABLE_ASMJIT)
 #include "formula_expression_jit.h"
+#endif
 
 bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                                const formula::ExpressionProgram& program,
@@ -76,13 +78,20 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                         ++activeCount;
                     }
                 }
+#if defined(MANDEL_ENABLE_ASMJIT)
                 formula::ExpressionJitInput4 jitInput;
                 formula::ExpressionJitOutput4 jitOutput;
                 const bool useJit = jit && jit->valid();
                 if (useJit) jitInput.setContexts(contexts);
+#endif
                 for (int n = 0; n < mxit && activeCount > 0; ++n) {
+                    if ((n & 255) == 0 && _flag_halt) {
+                        rowCompleted = false;
+                        break;
+                    }
                     for (int lane = 0; lane < 4; ++lane)
                         contexts[lane].iteration = n;
+#if defined(MANDEL_ENABLE_ASMJIT)
                     if (useJit) {
                         for (int lane = 0; lane < 4; ++lane) {
                             jitInput.vectors[formula::ExpressionJitInput4::Z_RE][lane] =
@@ -95,7 +104,9 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                         jit->evaluate(jitInput, jitOutput);
                         for (int lane = 0; lane < 4; ++lane)
                             outputs[lane] = { jitOutput.re[lane], jitOutput.im[lane] };
-                    } else {
+                    } else
+#endif
+                    {
                         if (!program.evaluate4(contexts, outputs)) {
                             rowCompleted = false;
                             break;
@@ -113,9 +124,9 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                         }
                     }
                 }
+                if (!rowCompleted) break;
                 for (int lane = 0; lane < lanes; ++lane)
                     _iter[i * _w + j + lane] = results[lane];
-                if (!rowCompleted) break;
             }
             if (rowCompleted) progressAdvance();
             continue;
@@ -152,6 +163,10 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                         pixelParameter == FormulaParameter::InitialZ
                             ? formula::Complex{ 1.0, 0.0 } : formula::Complex{};
                     for (int n = 0; n < mxit; ++n) {
+                        if ((n & 255) == 0 && _flag_halt) {
+                            rowCompleted = false;
+                            break;
+                        }
                         formula::Complex powerMinusOne = z;
                         for (int power = 1; power < integerPower - 1; ++power)
                             powerMinusOne *= z;
@@ -189,6 +204,10 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                     }
                 } else {
                     for (int n = 0; n < mxit; ++n) {
+                        if ((n & 255) == 0 && _flag_halt) {
+                            rowCompleted = false;
+                            break;
+                        }
                         context.iteration = n;
                         context.z = program.evaluate(context, stack.data(),
                                                      program.stackDepth());
@@ -201,6 +220,7 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                     }
                 }
             }
+            if (!rowCompleted) break;
             _iter[i * _w + j] = result;
         }
         if (rowCompleted) progressAdvance();
@@ -294,6 +314,10 @@ bool Mandel::ComputeExpressionResidual(
                 std::array<formula::Complex,
                            formula::ExpressionProgram::MAX_STACK> stack;
                 for (int n = 0; n < mxit; ++n) {
+                    if ((n & 255) == 0 && _flag_halt) {
+                        rowCompleted = false;
+                        break;
+                    }
                     context.iteration = n;
                     context.z = orbit[n] + delta;
                     formula::Complex next = program.evaluate(
@@ -307,6 +331,7 @@ bool Mandel::ComputeExpressionResidual(
                     }
                 }
             }
+            if (!rowCompleted) break;
             _iter[i * _w + j] = result;
         }
         if (rowCompleted) progressAdvance();

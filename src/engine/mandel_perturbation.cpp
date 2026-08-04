@@ -816,7 +816,6 @@ void Mandel::ComputeJulia(mpf_t z0_re, mpf_t z0_im, mpf_t scale,
                           int mxit, int c_method) {
     assert(_sub == 1);
     assert((c_method & ~ColoringMethod::EXTERIOR_DIST_EST) == 0);
-    _flag_halt = false;
     progressSet(0.0);
     std::fill(_iter, _iter + (size_t)_w * _h, EMPTYPIXEL);
     mpf_set(_scale, scale);

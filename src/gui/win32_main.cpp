@@ -1499,6 +1499,15 @@ public:
             ? L"  Rendering..."
             : L"  Ready   last render " + std::to_wstring((int)lastRenderMs) + L" ms";
         st += L"   present " + std::to_wstring((int)(lastPresentMs + 0.5)) + L" ms";
+        {
+            const ComputeBackendInfo& backend = nav->GetBackendInfo();
+            st += L"   backend " + widen(backend.name);
+            if (backend.fallback) st += L" (fallback)";
+        }
+        if (nav->IsExpression()) {
+            std::string acceleration = nav->GetExpressionAccelerationText();
+            if (!acceleration.empty()) st += L"   formula " + widen(acceleration);
+        }
         if (animFps > 0) {
             wchar_t fb[64];
             swprintf_s(fb, L"   anim %.0f fps (recolor %.1f ms)", animFps, lastRecolorMs);

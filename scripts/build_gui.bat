@@ -5,12 +5,12 @@ if not exist build mkdir build
 call "%~dp0msvcenv.bat" || goto :err
 
 REM Static GMP (x64-windows-static, /MT) -> single-file exe, no gmp-10.dll.
-cl /nologo /O2 /EHsc /openmp /std:c++17 /arch:AVX2 /MT ^
+cl /nologo /O2 /EHsc /openmp /std:c++17 /arch:AVX2 /MT /DMANDEL_ENABLE_ASMJIT ^
    /DUNICODE /D_UNICODE ^
    /I "%VCPKG%\include" /I src\engine /I src\gui ^
    /Fo:build\ ^
    src\gui\win32_main.cpp src\gui\gui_color.cpp src\gui\gui_theme.cpp src\gui\gui_export.cpp src\gui\formula_dialog.cpp src\gui\mandel_navigator.cpp src\gui\navigator.cpp src\gui\orbit_overlay.cpp ^
-   src\engine\mandel_perturbation.cpp src\engine\mandel_expression.cpp src\engine\formula_expression.cpp src\engine\formula_expression_jit.cpp src\engine\float_math.cpp src\engine\interpolate.cpp src\engine\color.cpp ^
+   src\engine\compute_backend.cpp src\engine\mandel_perturbation.cpp src\engine\mandel_expression.cpp src\engine\formula_expression.cpp src\engine\formula_expression_jit.cpp src\engine\float_math.cpp src\engine\interpolate.cpp src\engine\color.cpp ^
    /Fe:build\mandel_gui.exe ^
    /link /SUBSYSTEM:WINDOWS /LIBPATH:"%VCPKG%\lib" ^
    asmjit.lib gmp.lib user32.lib gdi32.lib comctl32.lib comdlg32.lib windowscodecs.lib ole32.lib || goto :err
