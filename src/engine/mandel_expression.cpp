@@ -37,8 +37,9 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
 
     const double startRe = mpf_get_ld(_c0_re), startIm = mpf_get_ld(_c0_im);
     const double dx = mpf_get_ld(_dx), dy = mpf_get_ld(_dy);
-    const bool quadraticFast =
-        program.fastPath() == formula::ExpressionProgram::FastPath::QuadraticPlusC;
+    const int integerPower =
+        program.fastPath() == formula::ExpressionProgram::FastPath::IntegerPowerPlusC
+            ? program.fastIntegerPower() : 0;
     // Reserve the final progress slot for the successful completion commit.
     // Completed rows alone can therefore never publish exactly 100%.
     progressBegin(_h + 1, 0.0, 1.0);
@@ -61,15 +62,17 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                 std::hypot(context.z.real(), context.z.imag()) > bailout) {
                 result = 0.0f;
             } else {
-                if (quadraticFast) {
-                    double zr = context.z.real(), zi = context.z.imag();
-                    const double cr = context.c.real(), ci = context.c.imag();
+                if (integerPower >= 2) {
+                    formula::Complex z = context.z;
+                    const formula::Complex c = context.c;
                     for (int n = 0; n < mxit; ++n) {
-                        double nextRe = zr * zr - zi * zi + cr;
-                        zi = zr * zi + zi * zr + ci;
-                        zr = nextRe;
-                        bool escaped = !std::isfinite(zr) || !std::isfinite(zi) ||
-                                       std::hypot(zr, zi) > bailout;
+                        formula::Complex next = z * z;
+                        for (int power = 2; power < integerPower; ++power)
+                            next *= z;
+                        z = next + c;
+                        bool escaped = !std::isfinite(z.real()) ||
+                                       !std::isfinite(z.imag()) ||
+                                       std::hypot(z.real(), z.imag()) > bailout;
                         if (escaped) { result = (float)(n + 1); break; }
                     }
                 } else {

@@ -264,6 +264,7 @@ bool ExpressionProgram::compile(const std::string& source, ExpressionError* erro
     _code.clear();
     _stackDepth = 0;
     _fastPath = FastPath::None;
+    _fastIntegerPower = 0;
     if (error) *error = {};
     ExpressionParser parser(*this, source, error);
     if (!parser.parse()) {
@@ -274,12 +275,26 @@ bool ExpressionProgram::compile(const std::string& source, ExpressionError* erro
     const auto is = [&](size_t index, Op op) {
         return index < _code.size() && _code[index].op == op;
     };
-    if (_code.size() == 5 && is(0, Op::Z) && is(1, Op::Z) &&
-        is(2, Op::Multiply) && is(3, Op::C) && is(4, Op::Add)) {
-        _fastPath = FastPath::QuadraticPlusC;
+    int degree = 0;
+    if (_code.size() >= 5 && is(0, Op::Z) && is(1, Op::Z) &&
+        is(2, Op::Multiply)) {
+        degree = 2;
+        size_t cursor = 3;
+        while (degree < 16 && cursor + 1 < _code.size() &&
+               is(cursor, Op::Z) && is(cursor + 1, Op::Multiply)) {
+            ++degree;
+            cursor += 2;
+        }
+        if (!(cursor + 2 == _code.size() && is(cursor, Op::C) &&
+              is(cursor + 1, Op::Add)))
+            degree = 0;
     } else if (_code.size() == 4 && is(0, Op::Z) && is(1, Op::Square) &&
                is(2, Op::C) && is(3, Op::Add)) {
-        _fastPath = FastPath::QuadraticPlusC;
+        degree = 2;
+    }
+    if (degree >= 2) {
+        _fastPath = FastPath::IntegerPowerPlusC;
+        _fastIntegerPower = (uint8_t)degree;
     }
     _valid = true;
     return true;

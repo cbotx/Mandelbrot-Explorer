@@ -35,7 +35,7 @@ public:
 
     enum class FastPath : uint8_t {
         None,
-        QuadraticPlusC
+        IntegerPowerPlusC
     };
 
     bool compile(const std::string& source, ExpressionError* error = nullptr);
@@ -48,6 +48,7 @@ public:
     size_t instructionCount() const { return _code.size(); }
     size_t stackDepth() const { return _stackDepth; }
     FastPath fastPath() const { return _fastPath; }
+    int fastIntegerPower() const { return _fastIntegerPower; }
 
 private:
     enum class Op : uint8_t {
@@ -71,6 +72,7 @@ private:
     std::string _source;
     size_t _stackDepth = 0;
     FastPath _fastPath = FastPath::None;
+    uint8_t _fastIntegerPower = 0;
     bool _valid = false;
 
     friend class ExpressionParser;

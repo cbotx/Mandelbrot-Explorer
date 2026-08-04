@@ -416,13 +416,18 @@ static int runExpressionCoreCase() {
     if (compile(quadratic, "z*z + c") &&
         !close(quadratic.evaluate(context), Complex{ -2.5, 3.75 }))
         ++failures;
-    if (quadratic.fastPath() != ExpressionProgram::FastPath::QuadraticPlusC)
+    if (quadratic.fastPath() != ExpressionProgram::FastPath::IntegerPowerPlusC ||
+        quadratic.fastIntegerPower() != 2)
         ++failures;
-    ExpressionProgram quadraticSquare, quadraticPower;
+    ExpressionProgram quadraticSquare, quadraticPower, cubicProduct;
     if (!compile(quadraticSquare, "sqr(z)+c") ||
         !compile(quadraticPower, "z^2+c") ||
-        quadraticSquare.fastPath() != ExpressionProgram::FastPath::QuadraticPlusC ||
-        quadraticPower.fastPath() != ExpressionProgram::FastPath::None)
+        !compile(cubicProduct, "z*z*z+c") ||
+        quadraticSquare.fastPath() != ExpressionProgram::FastPath::IntegerPowerPlusC ||
+        quadraticSquare.fastIntegerPower() != 2 ||
+        quadraticPower.fastPath() != ExpressionProgram::FastPath::None ||
+        cubicProduct.fastPath() != ExpressionProgram::FastPath::IntegerPowerPlusC ||
+        cubicProduct.fastIntegerPower() != 3)
         ++failures;
 
     ExpressionProgram precedence;
@@ -554,6 +559,23 @@ static int runExpressionCoreCase() {
     } else {
         for (size_t i = 0; i < rendered.size(); ++i)
             if (rendered[i] != specialized[i]) ++renderMismatch;
+    }
+    ExpressionProgram genericCubic;
+    if (!expressionRenderer.ComputeExpression(
+            centerRe, centerIm, renderScale, cubicProduct, fixed,
+            FormulaParameter::C, RMIT, 4.0)) {
+        ++failures;
+    } else {
+        specialized = rendered;
+        if (!compile(genericCubic, "z*z*z+c+0") ||
+            !expressionRenderer.ComputeExpression(
+                centerRe, centerIm, renderScale, genericCubic, fixed,
+                FormulaParameter::C, RMIT, 4.0)) {
+            ++failures;
+        } else {
+            for (size_t i = 0; i < rendered.size(); ++i)
+                if (rendered[i] != specialized[i]) ++renderMismatch;
+        }
     }
 
     fixed.c = { -0.8, 0.156 };
