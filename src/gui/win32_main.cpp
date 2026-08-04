@@ -33,6 +33,7 @@
 #include "gui_theme.h"
 #include "gui_export.h"
 #include "formula_dialog.h"
+#include "formula_editor_panel.h"
 #include "interpolate.h"
 #include "mandel_navigator.h"
 #include "mandel_perturbation.h"
@@ -252,6 +253,8 @@ public:
     bool orbitOn = false;
     bool juliaUiEnabled = false;           // internal-only until parameters/perf are production ready
     FormulaDialogConfig formulaConfig;
+    std::unique_ptr<FormulaEditorPanel> formulaEditor;
+    int formulaEditorExpansion = 0;
     int savedColoringIdx = 0;
     bool savedSsOn = false, savedOrbitOn = false;
     bool hasSavedMandelUi = false;
@@ -475,9 +478,17 @@ public:
     }
 
     // ---- geometry ----
+    int formulaDockWidth() const {
+        return formulaEditor && formulaEditor->visible()
+            ? S(FormulaEditorPanel::DESIGN_WIDTH) : 0;
+    }
+    int panelRight() const {
+        RECT rc{}; GetClientRect(hwnd, &rc);
+        return rc.right - formulaDockWidth();
+    }
     RECT viewRect() const {
         RECT rc; GetClientRect(hwnd, &rc);
-        int aw = std::max(1, (int)rc.right - S(PANEL_W));
+        int aw = std::max(1, panelRight() - S(PANEL_W));
         int ah = std::max(1, (int)rc.bottom - S(STATUS_H));
         double s = std::min((double)aw / RENDER_W, (double)ah / RENDER_H);
         int w = std::max(4, (int)(RENDER_W * s)), h = std::max(1, (int)(RENDER_H * s));
@@ -489,7 +500,11 @@ public:
 
     void layout() {
         RECT rc; GetClientRect(hwnd, &rc);
-        int px = rc.right - S(PANEL_W) + S(18), w = S(PANEL_W) - S(36), y = S(18);
+        int dockW = formulaDockWidth();
+        int panelR = rc.right - dockW;
+        if (formulaEditor && formulaEditor->visible())
+            formulaEditor->move({ panelR, 0, rc.right, rc.bottom });
+        int px = panelR - S(PANEL_W) + S(18), w = S(PANEL_W) - S(36), y = S(18);
         int g = S(8), bh = S(30);
         int bw = (w - 4 * g) / 5;
         rcReset   = { px,              y, px + bw,          y + bh };
@@ -647,6 +662,8 @@ public:
             nav->SetMxit(maxIter);
         }
         formulaConfig = candidate;
+        if (formulaEditor && formulaEditor->visible())
+            formulaEditor->setConfig(formulaConfig);
         if (orbitWorker) orbitWorker->cancel();
         orbitOn = false;
         orbitResult = OrbitResult{};
@@ -659,15 +676,68 @@ public:
         return true;
     }
 
-    void showFormulaEditor() {
-        FormulaDialogConfig candidate = formulaConfig;
-        FormulaDialogResult result = showFormulaDialog(hwnd, candidate);
-        if (result == FormulaDialogResult::Cancel) return;
-        if (result == FormulaDialogResult::UseMandelbrot) {
-            restoreMandelbrotUi();
-            return;
+    void expandWindowForFormulaEditor() {
+        if (formulaEditorExpansion > 0 || IsZoomed(hwnd)) return;
+        RECT wr{}; GetWindowRect(hwnd, &wr);
+        HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{ sizeof(mi) };
+        if (!GetMonitorInfoW(monitor, &mi)) return;
+        int desired = S(FormulaEditorPanel::DESIGN_WIDTH);
+        int currentW = wr.right - wr.left;
+        int grow = std::min(desired,
+            std::max(0, (int)(mi.rcWork.right - mi.rcWork.left) - currentW));
+        if (grow <= 0) return;
+        int newW = currentW + grow;
+        int newX = std::clamp(
+            wr.left - grow / 2, mi.rcWork.left, mi.rcWork.right - newW);
+        SetWindowPos(hwnd, nullptr, newX, wr.top, newW, wr.bottom - wr.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        formulaEditorExpansion = grow;
+    }
+
+    void closeFormulaEditor() {
+        if (!formulaEditor) return;
+        formulaEditor->hide();
+        if (formulaEditorExpansion > 0 && !IsZoomed(hwnd)) {
+            RECT wr{}; GetWindowRect(hwnd, &wr);
+            HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi{ sizeof(mi) };
+            if (GetMonitorInfoW(monitor, &mi)) {
+                int width = wr.right - wr.left;
+                int shrink = std::min(
+                    formulaEditorExpansion,
+                    std::max(0, width - S(900)));
+                if (shrink > 0) {
+                    int newWidth = width - shrink;
+                    int newX = std::clamp(
+                        wr.left + shrink / 2,
+                        mi.rcWork.left, mi.rcWork.right - newWidth);
+                    SetWindowPos(hwnd, nullptr, newX, wr.top, newWidth,
+                                 wr.bottom - wr.top,
+                                 SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            }
         }
-        applyFormulaConfig(candidate);
+        formulaEditorExpansion = 0;
+        layout();
+        if (!inSizeMove && !orbitBench) retargetToView();
+        needFull = true;
+        InvalidateRect(hwnd, nullptr, TRUE);
+    }
+
+    void showFormulaEditor() {
+        if (!formulaEditor) return;
+        bool opening = !formulaEditor->visible();
+        if (opening) {
+            formulaEditor->show(formulaConfig);
+            expandWindowForFormulaEditor();
+            layout();
+            if (!inSizeMove && !orbitBench) retargetToView();
+            needFull = true;
+            InvalidateRect(hwnd, nullptr, TRUE);
+        } else {
+            closeFormulaEditor();
+        }
     }
     // Scrollbar thumb rect on the panel's right edge (empty if nothing to scroll).
     RECT panelScrollbarRect() const {
@@ -675,7 +745,7 @@ public:
         if (maxs <= 0 || panelContentH <= 0) return RECT{};
         RECT rc; GetClientRect(hwnd, &rc);
         int sbw = S(7);
-        int trackX = rc.right - sbw - S(2);
+        int trackX = panelRight() - sbw - S(2);
         int trackTop = S(2), trackBot = rc.bottom - S(2);
         int trackH = std::max(1, trackBot - trackTop);
         int thumbH = std::max(S(28), (int)((double)trackH * panelViewH / panelContentH));
@@ -1364,7 +1434,8 @@ public:
         // compute/drag ticks the panel persists in the cached buffer.
         if (full) {
         // panel
-        RECT panel = { rc.right - S(PANEL_W), 0, rc.right, rc.bottom };
+        int panelR = panelRight();
+        RECT panel = { panelR - S(PANEL_W), 0, panelR, rc.bottom };
         fillRect(dc, panel, CLR_PANEL);
         HPEN sep = CreatePen(PS_SOLID, 1, CLR_BORDER);
         HGDIOBJ osep = SelectObject(dc, sep);
@@ -1414,9 +1485,12 @@ public:
                    speedSnaps, 1);
 
         drawToggle(dc, rcSS, L"5x supersampling", ssOn, H_SS);
+        bool editorOpen = formulaEditor && formulaEditor->visible();
         drawButton(dc, rcFormula,
-                   nav->IsExpression() ? L"Formula: custom" : L"Formula...",
-                   H_FORMULA, nav->IsExpression());
+                   editorOpen ? L"Formula editor: open"
+                              : (nav->IsExpression() ? L"Formula: custom"
+                                                     : L"Formula..."),
+                   H_FORMULA, editorOpen || nav->IsExpression());
         if (juliaUiEnabled)
             drawToggle(dc, rcJulia, L"Julia set (experimental)", nav->IsJulia(), H_JULIA);
         drawToggle(dc, rcOrbitToggle, L"Show orbit", orbitOn, H_ORBIT);
@@ -1493,7 +1567,10 @@ public:
         } // end panel (full paints only)
 
         // status bar (always -- text changes with compute state / timings)
-        RECT status = { 0, rc.bottom - S(STATUS_H), rc.right - S(PANEL_W), rc.bottom };
+        RECT status = {
+            0, rc.bottom - S(STATUS_H),
+            panelRight() - S(PANEL_W), rc.bottom
+        };
         fillRect(dc, status, CLR_PANEL);
         std::wstring st = nav->IsComputing()
             ? L"  Rendering..."
@@ -1805,6 +1882,19 @@ public:
             nav->SetCMethod(coloringIdx == 1 ? ColoringMethod::EXTERIOR_DIST_EST
                           : coloringIdx == 2 ? ColoringMethod::STRIPE_AVERAGE : 0);
             nav->BindFixImageCallback(fixCallback);
+            formulaEditor = std::make_unique<FormulaEditorPanel>();
+            FormulaEditorCallbacks editorCallbacks;
+            editorCallbacks.apply = [this](const FormulaDialogConfig& config) {
+                return applyFormulaConfig(config);
+            };
+            editorCallbacks.useMandelbrot = [this]() {
+                restoreMandelbrotUi();
+            };
+            editorCallbacks.close = [this]() {
+                closeFormulaEditor();
+            };
+            if (!formulaEditor->create(hwnd, dpi, std::move(editorCallbacks)))
+                formulaEditor.reset();
             juliaUiEnabled = getenv("MANDEL_EXPERIMENTAL_JULIA") != nullptr ||
                              getenv("MANDEL_GUI_JULIA") != nullptr;
             if (const char* e = getenv("MANDEL_GUI_ORBIT")) orbitOn = atoi(e) != 0;
@@ -1916,6 +2006,7 @@ public:
         case WM_DPICHANGED: {
             dpi = HIWORD(wp);
             createFonts();
+            if (formulaEditor) formulaEditor->setDpi(dpi);
             RECT* sug = (RECT*)lp;
             SetWindowPos(hwnd, nullptr, sug->left, sug->top,
                          sug->right - sug->left, sug->bottom - sug->top,
@@ -2151,7 +2242,9 @@ public:
             }
             // Anywhere else over the panel: scroll the control stack (if it overflows).
             RECT rcC; GetClientRect(hwnd, &rcC);
-            if (q.x >= rcC.right - S(PANEL_W) && panelMaxScroll() > 0)
+            int panelR = panelRight();
+            if (q.x >= panelR - S(PANEL_W) && q.x < panelR &&
+                panelMaxScroll() > 0)
                 panelScrollBy(wd > 0 ? -S(48) : S(48));
             return 0;
         }
@@ -2166,11 +2259,14 @@ public:
             return 0;
         case WM_GETMINMAXINFO: {
             auto* m = (MINMAXINFO*)lp;
-            m->ptMinTrackSize.x = S(900); m->ptMinTrackSize.y = S(640);
+            m->ptMinTrackSize.x =
+                S(formulaEditor && formulaEditor->visible() ? 1100 : 900);
+            m->ptMinTrackSize.y = S(640);
             return 0;
         }
         case WM_DESTROY:
             KillTimer(hwnd, TIMER_ID);
+            formulaEditor.reset();
             nav.reset();
             if (memDC) { SelectObject(memDC, memOld); DeleteObject(memBmp); DeleteDC(memDC); memDC = nullptr; }
             DeleteObject(fUi); DeleteObject(fBold); DeleteObject(fSmall); DeleteObject(fMono);
@@ -2231,7 +2327,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         (getenv("MANDEL_GUI_BENCH") || getenv("MANDEL_GUI_ORBIT_BENCH")) &&
         !getenv("MANDEL_GUI_SHOW");
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"Mandelbrot Explorer",
-        WS_OVERLAPPEDWINDOW | (benchHeadless ? 0 : WS_VISIBLE), wx, wy, winW, winH,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | (benchHeadless ? 0 : WS_VISIBLE),
+        wx, wy, winW, winH,
         nullptr, nullptr, instance, &app);
     if (!hwnd) return 1;
     ShowWindow(hwnd, benchHeadless ? SW_HIDE : show); UpdateWindow(hwnd);

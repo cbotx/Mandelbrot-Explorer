@@ -21,12 +21,4 @@ struct FormulaDialogConfig {
     double bailout = 4.0;
 };
 
-enum class FormulaDialogResult {
-    Cancel,
-    Apply,
-    UseMandelbrot
-};
-
-FormulaDialogResult showFormulaDialog(HWND owner, FormulaDialogConfig& config);
-
 #endif

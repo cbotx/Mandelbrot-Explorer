@@ -50,6 +50,10 @@ Controls:
 - Side panel: max iterations, color density, 3x supersampling, exterior distance
   estimation, palette preset, per-stop color (double-click a gradient marker;
   left-drag to move, right-click to delete, click the bar to add).
+- `Formula`: opens a separate dock beside the scrollable side panel. The formula
+  field is a native text editor with selection and clipboard shortcuts; presets,
+  variable/function insertion buttons, c/z0 plane selection, and a synchronized
+  complex-plane picker configure fixed values and p0..p7 parameters.
 - `Export`: high-resolution PNG (monitor-aware resolution presets or custom size,
   live preview, progress, cancel; coordinate range matches the view).
 
