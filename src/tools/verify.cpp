@@ -388,6 +388,7 @@ static int runJuliaCase(bool ede, bool dendrite = false, bool critical = false) 
 static int runExpressionCoreCase() {
     using formula::Complex;
     using formula::ExpressionContext;
+    using formula::ExpressionDerivativeSeed;
     using formula::ExpressionError;
     using formula::ExpressionProgram;
 
@@ -454,6 +455,133 @@ static int runExpressionCoreCase() {
         Complex folded{ std::abs(context.z.real()), std::abs(context.z.imag()) };
         if (!close(burningShip.evaluate(context), folded * folded + context.c))
             ++failures;
+        if (burningShip.derivativeCompatible()) ++failures;
+        ExpressionDerivativeSeed seed;
+        Complex value, derivative;
+        if (burningShip.evaluateWithDerivative(context, seed, value, derivative))
+            ++failures;
+    }
+
+    ExpressionDerivativeSeed quadraticSeed;
+    quadraticSeed.z = { 0.3, -0.2 };
+    quadraticSeed.c = { -0.1, 0.4 };
+    Complex dualValue, dualDerivative;
+    if (!quadratic.derivativeCompatible() ||
+        !quadratic.evaluateWithDerivative(context, quadraticSeed,
+                                          dualValue, dualDerivative) ||
+        dualValue != context.z * context.z + context.c ||
+        dualDerivative != quadraticSeed.z * context.z +
+                          context.z * quadraticSeed.z + quadraticSeed.c)
+        ++failures;
+
+    ExpressionProgram analytic;
+    if (!compile(analytic, "sin(z*z+c)+exp(p0*z0)+log(z+2)") ||
+        !analytic.derivativeCompatible()) {
+        ++failures;
+    } else {
+        double maxDerivativeError = 0.0;
+        for (int sample = 0; sample < 1000; ++sample) {
+            ExpressionContext base = context;
+            base.z = { 0.2 + sample * 1e-5, -0.15 + sample * 2e-6 };
+            base.c = { 0.4 - sample * 3e-6, 0.12 };
+            base.z0 = { -0.3, 0.25 + sample * 1e-6 };
+            base.parameters[0] = { 0.6, -0.2 };
+            ExpressionDerivativeSeed direction;
+            direction.z = { 0.3, -0.1 };
+            direction.c = { -0.2, 0.25 };
+            direction.z0 = { 0.1, 0.2 };
+            direction.parameters[0] = { -0.15, 0.05 };
+            Complex value, derivative;
+            if (!analytic.evaluateWithDerivative(base, direction, value, derivative)) {
+                ++failures;
+                break;
+            }
+            const double h = 1e-6;
+            auto shifted = [&](double sign) {
+                ExpressionContext shifted = base;
+                shifted.z += sign * h * direction.z;
+                shifted.c += sign * h * direction.c;
+                shifted.z0 += sign * h * direction.z0;
+                shifted.parameters[0] += sign * h * direction.parameters[0];
+                return analytic.evaluate(shifted);
+            };
+            Complex finiteDifference = (shifted(1.0) - shifted(-1.0)) / (2.0 * h);
+            double relative = std::abs(derivative - finiteDifference) /
+                              std::max(1.0, std::abs(derivative));
+            maxDerivativeError = std::max(maxDerivativeError, relative);
+        }
+        if (!(maxDerivativeError < 2e-9)) {
+            printf("  derivative finite-difference max error=%.6g\n",
+                   maxDerivativeError);
+            ++failures;
+        }
+    }
+    ExpressionProgram derivativeDomain;
+    if (!compile(derivativeDomain, "log(z)") ||
+        !derivativeDomain.derivativeCompatible()) {
+        ++failures;
+    } else {
+        ExpressionContext zero;
+        ExpressionDerivativeSeed seed; seed.z = 1.0;
+        Complex value, derivative;
+        if (derivativeDomain.evaluateWithDerivative(zero, seed, value, derivative))
+            ++failures;
+    }
+    auto derivativeCase = [&](const char* source, Complex z, Complex seedValue,
+                              Complex expectedValue, Complex expectedDerivative,
+                              bool shouldSucceed) {
+        ExpressionProgram program;
+        if (!compile(program, source)) return;
+        ExpressionContext dc; dc.z = z;
+        ExpressionDerivativeSeed seed; seed.z = seedValue;
+        Complex value, derivative;
+        bool succeeded = program.evaluateWithDerivative(dc, seed, value, derivative);
+        if (succeeded != shouldSucceed) { ++failures; return; }
+        if (succeeded &&
+            (!close(value, expectedValue, 1e-12) ||
+             !close(derivative, expectedDerivative, 1e-12)))
+            ++failures;
+    };
+    derivativeCase("z^2+c", {}, 1.0, {}, {}, true);
+    {
+        ExpressionProgram powerAtZero;
+        if (!compile(powerAtZero, "z^2+c")) {
+            ++failures;
+        } else {
+            ExpressionContext dc; dc.z = {}; dc.c = { 0.3, -0.2 };
+            ExpressionDerivativeSeed seed; seed.z = 1.0; seed.c = 1.0;
+            Complex value, derivative;
+            if (!powerAtZero.evaluateWithDerivative(dc, seed, value, derivative) ||
+                value != dc.c || derivative != Complex{ 1.0, 0.0 })
+                ++failures;
+        }
+    }
+    derivativeCase("log(z)", { -1.0, 0.0 }, 1.0, {}, {}, false);
+    derivativeCase("sqrt(z)", { -1.0, 0.0 }, 1.0, {}, {}, false);
+    derivativeCase("z^0.5", { -1.0, 0.0 }, 1.0, {}, {}, false);
+    derivativeCase("z^(-1)", { -1.0, 0.0 }, 1.0,
+                   { -1.0, 0.0 }, { -1.0, 0.0 }, true);
+    derivativeCase("z/z", { 1e-200, 0.0 }, 1.0,
+                   { 1.0, 0.0 }, {}, true);
+    derivativeCase("tan(z)", { 0.0, 1000.0 }, 1.0,
+                   { 0.0, 1.0 }, {}, true);
+    derivativeCase("tanh(z)", { 1000.0, 0.0 }, 1.0,
+                   { 1.0, 0.0 }, {}, true);
+    {
+        Complex z{ 0.0, 20.0 };
+        Complex expected = 1.0 / (std::cos(z) * std::cos(z));
+        derivativeCase("tan(z)", z, 1.0, std::tan(z), expected, true);
+        z = { 20.0, 0.0 };
+        expected = 1.0 / (std::cosh(z) * std::cosh(z));
+        derivativeCase("tanh(z)", z, 1.0, std::tanh(z), expected, true);
+        double q = std::exp(-600.0);
+        double saturatedDerivative = 4.0 * q / ((1.0 + q) * (1.0 + q));
+        derivativeCase("tan(z)", { 0.0, 300.0 }, 1.0,
+                       std::tan(Complex{ 0.0, 300.0 }),
+                       { saturatedDerivative, 0.0 }, true);
+        derivativeCase("tanh(z)", { 300.0, 0.0 }, 1.0,
+                       std::tanh(Complex{ 300.0, 0.0 }),
+                       { saturatedDerivative, 0.0 }, true);
     }
 
     ExpressionProgram invalid;

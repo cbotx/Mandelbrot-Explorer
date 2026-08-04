@@ -267,6 +267,7 @@ bool ExpressionProgram::compile(const std::string& source, ExpressionError* erro
     _fastPath = FastPath::None;
     _fastIntegerPower = 0;
     _avx2Compatible = false;
+    _derivativeCompatible = false;
     if (error) *error = {};
     ExpressionParser parser(*this, source, error);
     if (!parser.parse()) {
@@ -316,6 +317,37 @@ bool ExpressionProgram::compile(const std::string& source, ExpressionError* erro
             case Op::Real:
             case Op::Imaginary:
             case Op::MakeComplex:
+                return true;
+            default:
+                return false;
+            }
+        });
+    _derivativeCompatible = std::all_of(_code.begin(), _code.end(),
+        [](const Instruction& instruction) {
+            switch (instruction.op) {
+            case Op::Constant:
+            case Op::Z:
+            case Op::C:
+            case Op::Z0:
+            case Op::Iteration:
+            case Op::Parameter:
+            case Op::Negate:
+            case Op::Add:
+            case Op::Subtract:
+            case Op::Multiply:
+            case Op::Divide:
+            case Op::Power:
+            case Op::Square:
+            case Op::Sin:
+            case Op::Cos:
+            case Op::Tan:
+            case Op::Sinh:
+            case Op::Cosh:
+            case Op::Tanh:
+            case Op::Exp:
+            case Op::Log:
+            case Op::Log10:
+            case Op::Sqrt:
                 return true;
             default:
                 return false;
@@ -508,6 +540,215 @@ bool ExpressionProgram::evaluate4(const ExpressionContext* contexts,
     _mm256_store_pd(im, stack[0].im);
     for (int lane = 0; lane < 4; ++lane) outputs[lane] = { re[lane], im[lane] };
     return true;
+}
+
+bool ExpressionProgram::evaluateWithDerivative(
+        const ExpressionContext& context, const ExpressionDerivativeSeed& seed,
+        Complex& value, Complex& derivative) const {
+    value = derivative = {
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::quiet_NaN()
+    };
+    if (!_valid || !_derivativeCompatible) return false;
+    struct Dual { Complex value, derivative; };
+    std::array<Dual, MAX_STACK> stack;
+    size_t top = 0;
+    auto push = [&](Complex v, Complex d = {}) { stack[top++] = { v, d }; };
+    auto unary = [&](auto function) {
+        Dual input = stack[top - 1];
+        stack[top - 1] = function(input);
+    };
+    auto binary = [&](auto function) {
+        Dual right = stack[--top];
+        Dual left = stack[top - 1];
+        stack[top - 1] = function(left, right);
+    };
+    bool domain = true;
+    const double ln10 = std::log(10.0);
+
+    for (const Instruction& instruction : _code) {
+        switch (instruction.op) {
+        case Op::Constant: push(instruction.value); break;
+        case Op::Z: push(context.z, seed.z); break;
+        case Op::C: push(context.c, seed.c); break;
+        case Op::Z0: push(context.z0, seed.z0); break;
+        case Op::Iteration: push({ (double)context.iteration, 0.0 }); break;
+        case Op::Parameter:
+            push(context.parameters[instruction.argument],
+                 seed.parameters[instruction.argument]);
+            break;
+        case Op::Negate:
+            unary([](Dual a) { return Dual{ -a.value, -a.derivative }; });
+            break;
+        case Op::Add:
+            binary([](Dual a, Dual b) {
+                return Dual{ a.value + b.value, a.derivative + b.derivative };
+            });
+            break;
+        case Op::Subtract:
+            binary([](Dual a, Dual b) {
+                return Dual{ a.value - b.value, a.derivative - b.derivative };
+            });
+            break;
+        case Op::Multiply:
+            binary([](Dual a, Dual b) {
+                return Dual{ a.value * b.value,
+                             a.derivative * b.value + a.value * b.derivative };
+            });
+            break;
+        case Op::Divide:
+            binary([&](Dual a, Dual b) {
+                if (b.value == Complex{}) {
+                    domain = false;
+                    return Dual{};
+                }
+                Complex result = a.value / b.value;
+                return Dual{ result,
+                             (a.derivative - result * b.derivative) / b.value };
+            });
+            break;
+        case Op::Power:
+            binary([&](Dual a, Dual b) {
+                bool constantInteger =
+                    b.derivative == Complex{} && b.value.imag() == 0.0 &&
+                    std::isfinite(b.value.real()) &&
+                    std::trunc(b.value.real()) == b.value.real();
+                if (constantInteger && a.value == Complex{} &&
+                    b.value.real() >= 0.0) {
+                    if (b.value.real() == 0.0)
+                        return Dual{ Complex{ 1.0, 0.0 }, {} };
+                    int exponent = b.value.real() <= 1.0 ? 1 : 2;
+                    return Dual{ {},
+                        exponent == 1 ? a.derivative : Complex{} };
+                }
+                if (a.value == Complex{}) {
+                    domain = false;
+                    return Dual{};
+                }
+                Complex result = std::pow(a.value, b.value);
+                Complex d;
+                if (constantInteger) {
+                    d = b.value * std::pow(a.value, b.value - Complex{ 1.0, 0.0 }) *
+                        a.derivative;
+                } else {
+                    if (a.value.imag() == 0.0 && a.value.real() < 0.0) {
+                        domain = false;
+                        return Dual{};
+                    }
+                    d = result * (b.derivative * std::log(a.value) +
+                                  b.value * a.derivative / a.value);
+                }
+                return Dual{ result, d };
+            });
+            break;
+        case Op::Square:
+            unary([](Dual a) {
+                return Dual{ a.value * a.value,
+                             a.derivative * a.value + a.value * a.derivative };
+            });
+            break;
+        case Op::Sin:
+            unary([](Dual a) {
+                return Dual{ std::sin(a.value), std::cos(a.value) * a.derivative };
+            });
+            break;
+        case Op::Cos:
+            unary([](Dual a) {
+                return Dual{ std::cos(a.value), -std::sin(a.value) * a.derivative };
+            });
+            break;
+        case Op::Tan:
+            unary([](Dual a) {
+                Complex result = std::tan(a.value);
+                Complex factor;
+                if (std::abs(a.value.imag()) < 300.0) {
+                    Complex c = std::cos(a.value);
+                    factor = 1.0 / (c * c);
+                } else {
+                    double q = std::exp(-2.0 * std::abs(a.value.imag()));
+                    double sign = std::signbit(a.value.imag()) ? -1.0 : 1.0;
+                    Complex scaled{
+                        std::cos(a.value.real()) * (1.0 + q),
+                        -sign * std::sin(a.value.real()) * (1.0 - q)
+                    };
+                    factor = q == 0.0 ? Complex{} : 4.0 * q / (scaled * scaled);
+                }
+                return Dual{ result, factor * a.derivative };
+            });
+            break;
+        case Op::Sinh:
+            unary([](Dual a) {
+                return Dual{ std::sinh(a.value), std::cosh(a.value) * a.derivative };
+            });
+            break;
+        case Op::Cosh:
+            unary([](Dual a) {
+                return Dual{ std::cosh(a.value), std::sinh(a.value) * a.derivative };
+            });
+            break;
+        case Op::Tanh:
+            unary([](Dual a) {
+                Complex result = std::tanh(a.value);
+                Complex factor;
+                if (std::abs(a.value.real()) < 300.0) {
+                    Complex c = std::cosh(a.value);
+                    factor = 1.0 / (c * c);
+                } else {
+                    double q = std::exp(-2.0 * std::abs(a.value.real()));
+                    double sign = std::signbit(a.value.real()) ? -1.0 : 1.0;
+                    Complex scaled{
+                        std::cos(a.value.imag()) * (1.0 + q),
+                        sign * std::sin(a.value.imag()) * (1.0 - q)
+                    };
+                    factor = q == 0.0 ? Complex{} : 4.0 * q / (scaled * scaled);
+                }
+                return Dual{ result, factor * a.derivative };
+            });
+            break;
+        case Op::Exp:
+            unary([](Dual a) {
+                Complex result = std::exp(a.value);
+                return Dual{ result, result * a.derivative };
+            });
+            break;
+        case Op::Log:
+            unary([&](Dual a) {
+                if (a.value == Complex{} ||
+                    (a.value.imag() == 0.0 && a.value.real() < 0.0)) {
+                    domain = false; return Dual{};
+                }
+                return Dual{ std::log(a.value), a.derivative / a.value };
+            });
+            break;
+        case Op::Log10:
+            unary([&](Dual a) {
+                if (a.value == Complex{} ||
+                    (a.value.imag() == 0.0 && a.value.real() < 0.0)) {
+                    domain = false; return Dual{};
+                }
+                return Dual{ std::log10(a.value),
+                             a.derivative / (a.value * ln10) };
+            });
+            break;
+        case Op::Sqrt:
+            unary([&](Dual a) {
+                if (a.value.imag() == 0.0 && a.value.real() < 0.0) {
+                    domain = false; return Dual{};
+                }
+                Complex result = std::sqrt(a.value);
+                if (result == Complex{}) { domain = false; return Dual{}; }
+                return Dual{ result, a.derivative / (2.0 * result) };
+            });
+            break;
+        default:
+            return false;
+        }
+        if (!domain) return false;
+    }
+    value = stack[0].value;
+    derivative = stack[0].derivative;
+    return std::isfinite(value.real()) && std::isfinite(value.imag()) &&
+           std::isfinite(derivative.real()) && std::isfinite(derivative.imag());
 }
 
 } // namespace formula

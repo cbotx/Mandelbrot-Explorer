@@ -27,6 +27,13 @@ struct ExpressionContext {
     int iteration = 0;
 };
 
+struct ExpressionDerivativeSeed {
+    Complex z{};
+    Complex c{};
+    Complex z0{};
+    std::array<Complex, 8> parameters{};
+};
+
 class ExpressionProgram {
 public:
     static constexpr size_t MAX_SOURCE = 4096;
@@ -44,6 +51,9 @@ public:
     Complex evaluate(const ExpressionContext& context, Complex* stack,
                      size_t capacity) const;
     bool evaluate4(const ExpressionContext* contexts, Complex* outputs) const;
+    bool evaluateWithDerivative(const ExpressionContext& context,
+                                const ExpressionDerivativeSeed& seed,
+                                Complex& value, Complex& derivative) const;
 
     bool valid() const { return _valid; }
     const std::string& source() const { return _source; }
@@ -52,6 +62,7 @@ public:
     FastPath fastPath() const { return _fastPath; }
     int fastIntegerPower() const { return _fastIntegerPower; }
     bool avx2Compatible() const { return _avx2Compatible; }
+    bool derivativeCompatible() const { return _derivativeCompatible; }
 
 private:
     enum class Op : uint8_t {
@@ -77,6 +88,7 @@ private:
     FastPath _fastPath = FastPath::None;
     uint8_t _fastIntegerPower = 0;
     bool _avx2Compatible = false;
+    bool _derivativeCompatible = false;
     bool _valid = false;
 
     friend class ExpressionParser;
