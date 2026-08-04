@@ -1,7 +1,9 @@
 #include "mandel_perturbation.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <limits>
 
 #include "float_math.h"
 
@@ -35,6 +37,8 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
 
     const double startRe = mpf_get_ld(_c0_re), startIm = mpf_get_ld(_c0_im);
     const double dx = mpf_get_ld(_dx), dy = mpf_get_ld(_dy);
+    const bool quadraticFast =
+        program.fastPath() == formula::ExpressionProgram::FastPath::QuadraticPlusC;
     // Reserve the final progress slot for the successful completion commit.
     // Completed rows alone can therefore never publish exactly 100%.
     progressBegin(_h + 1, 0.0, 1.0);
@@ -50,20 +54,35 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
             if (pixelParameter == FormulaParameter::C) context.c = pixel;
             else context.z0 = pixel;
             context.z = context.z0;
+            std::array<formula::Complex, formula::ExpressionProgram::MAX_STACK> stack;
 
             float result = -2.0f;
             if (!std::isfinite(context.z.real()) || !std::isfinite(context.z.imag()) ||
                 std::hypot(context.z.real(), context.z.imag()) > bailout) {
                 result = 0.0f;
             } else {
-                for (int n = 0; n < mxit; ++n) {
-                    context.iteration = n;
-                    context.z = program.evaluate(context);
-                    double re = context.z.real(), im = context.z.imag();
-                    if (!std::isfinite(re) || !std::isfinite(im) ||
-                        std::hypot(re, im) > bailout) {
-                        result = (float)(n + 1);
-                        break;
+                if (quadraticFast) {
+                    double zr = context.z.real(), zi = context.z.imag();
+                    const double cr = context.c.real(), ci = context.c.imag();
+                    for (int n = 0; n < mxit; ++n) {
+                        double nextRe = zr * zr - zi * zi + cr;
+                        zi = zr * zi + zi * zr + ci;
+                        zr = nextRe;
+                        bool escaped = !std::isfinite(zr) || !std::isfinite(zi) ||
+                                       std::hypot(zr, zi) > bailout;
+                        if (escaped) { result = (float)(n + 1); break; }
+                    }
+                } else {
+                    for (int n = 0; n < mxit; ++n) {
+                        context.iteration = n;
+                        context.z = program.evaluate(context, stack.data(),
+                                                     program.stackDepth());
+                        double re = context.z.real(), im = context.z.imag();
+                        if (!std::isfinite(re) || !std::isfinite(im) ||
+                            std::hypot(re, im) > bailout) {
+                            result = (float)(n + 1);
+                            break;
+                        }
                     }
                 }
             }

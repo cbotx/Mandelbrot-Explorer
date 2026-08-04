@@ -416,6 +416,14 @@ static int runExpressionCoreCase() {
     if (compile(quadratic, "z*z + c") &&
         !close(quadratic.evaluate(context), Complex{ -2.5, 3.75 }))
         ++failures;
+    if (quadratic.fastPath() != ExpressionProgram::FastPath::QuadraticPlusC)
+        ++failures;
+    ExpressionProgram quadraticSquare, quadraticPower;
+    if (!compile(quadraticSquare, "sqr(z)+c") ||
+        !compile(quadraticPower, "z^2+c") ||
+        quadraticSquare.fastPath() != ExpressionProgram::FastPath::QuadraticPlusC ||
+        quadraticPower.fastPath() != ExpressionProgram::FastPath::None)
+        ++failures;
 
     ExpressionProgram precedence;
     if (compile(precedence, "-2^2 + 2^3^2") &&
@@ -430,6 +438,7 @@ static int runExpressionCoreCase() {
                            Complex{ std::abs(context.c.real()), std::abs(context.c.imag()) } +
                            Complex{ 0.7, 0.0 };
         if (!close(functions.evaluate(context), expected)) ++failures;
+        if (functions.fastPath() != ExpressionProgram::FastPath::None) ++failures;
     }
 
     ExpressionProgram burningShip;
@@ -471,8 +480,11 @@ static int runExpressionCoreCase() {
         ExpressionContext local = context;
         local.z = { i * 1e-4, -i * 2e-4 };
         Complex interpreted = quadratic.evaluate(local);
+        std::array<Complex, ExpressionProgram::MAX_STACK> scratch;
+        Complex reused = quadratic.evaluate(local, scratch.data(), quadratic.stackDepth());
         Complex expected = local.z * local.z + local.c;
-        if (!close(interpreted, expected)) ++parallelFailures;
+        if (!close(interpreted, expected) || !close(reused, expected))
+            ++parallelFailures;
     }
     failures += parallelFailures.load();
 
@@ -524,11 +536,24 @@ static int runExpressionCoreCase() {
                 float expected = -2.0f;
                 for (int n = 0; n < RMIT; ++n) {
                     z = z * z + c;
-                    if (std::norm(z) > 16.0) { expected = (float)(n + 1); break; }
+                    if (std::hypot(z.real(), z.imag()) > 4.0) {
+                        expected = (float)(n + 1); break;
+                    }
                 }
                 if (rendered[(size_t)y * RW + x] != expected) ++renderMismatch;
             }
         }
+    }
+    std::vector<float> specialized = rendered;
+    ExpressionProgram genericQuadratic;
+    if (!compile(genericQuadratic, "z*z+c+0") ||
+        !expressionRenderer.ComputeExpression(
+            centerRe, centerIm, renderScale, genericQuadratic, fixed,
+            FormulaParameter::C, RMIT, 4.0)) {
+        ++failures;
+    } else {
+        for (size_t i = 0; i < rendered.size(); ++i)
+            if (rendered[i] != specialized[i]) ++renderMismatch;
     }
 
     fixed.c = { -0.8, 0.156 };
@@ -544,11 +569,13 @@ static int runExpressionCoreCase() {
         for (int y = 0; y < RH; ++y) {
             for (int x = 0; x < RW; ++x) {
                 Complex z{ -halfW + dx * x, -halfH + dy * y };
-                float expected = std::norm(z) > 16.0 ? 0.0f : -2.0f;
+                float expected = std::hypot(z.real(), z.imag()) > 4.0 ? 0.0f : -2.0f;
                 if (expected < 0.0f) {
                     for (int n = 0; n < RMIT; ++n) {
                         z = z * z + fixed.c;
-                        if (std::norm(z) > 16.0) { expected = (float)(n + 1); break; }
+                        if (std::hypot(z.real(), z.imag()) > 4.0) {
+                            expected = (float)(n + 1); break;
+                        }
                     }
                 }
                 if (rendered[(size_t)y * RW + x] != expected) ++renderMismatch;

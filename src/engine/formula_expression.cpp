@@ -263,6 +263,7 @@ bool ExpressionProgram::compile(const std::string& source, ExpressionError* erro
     _source.clear();
     _code.clear();
     _stackDepth = 0;
+    _fastPath = FastPath::None;
     if (error) *error = {};
     ExpressionParser parser(*this, source, error);
     if (!parser.parse()) {
@@ -270,16 +271,35 @@ bool ExpressionProgram::compile(const std::string& source, ExpressionError* erro
         return false;
     }
     _source = source;
+    const auto is = [&](size_t index, Op op) {
+        return index < _code.size() && _code[index].op == op;
+    };
+    if (_code.size() == 5 && is(0, Op::Z) && is(1, Op::Z) &&
+        is(2, Op::Multiply) && is(3, Op::C) && is(4, Op::Add)) {
+        _fastPath = FastPath::QuadraticPlusC;
+    } else if (_code.size() == 4 && is(0, Op::Z) && is(1, Op::Square) &&
+               is(2, Op::C) && is(3, Op::Add)) {
+        _fastPath = FastPath::QuadraticPlusC;
+    }
     _valid = true;
     return true;
 }
 
 Complex ExpressionProgram::evaluate(const ExpressionContext& context) const {
+    std::array<Complex, MAX_STACK> stack;
+    return evaluate(context, stack.data(), stack.size());
+}
+
+Complex ExpressionProgram::evaluate(const ExpressionContext& context,
+                                    Complex* stack, size_t capacity) const {
     if (!_valid) return {
         std::numeric_limits<double>::quiet_NaN(),
         std::numeric_limits<double>::quiet_NaN()
     };
-    std::array<Complex, MAX_STACK> stack{};
+    if (!stack || capacity < _stackDepth) return {
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::quiet_NaN()
+    };
     size_t top = 0;
     auto unary = [&](auto function) { stack[top - 1] = function(stack[top - 1]); };
     auto binary = [&](auto function) {

@@ -33,13 +33,21 @@ public:
     static constexpr size_t MAX_STACK = 128;
     static constexpr size_t MAX_PARSE_DEPTH = 64;
 
+    enum class FastPath : uint8_t {
+        None,
+        QuadraticPlusC
+    };
+
     bool compile(const std::string& source, ExpressionError* error = nullptr);
     Complex evaluate(const ExpressionContext& context) const;
+    Complex evaluate(const ExpressionContext& context, Complex* stack,
+                     size_t capacity) const;
 
     bool valid() const { return _valid; }
     const std::string& source() const { return _source; }
     size_t instructionCount() const { return _code.size(); }
     size_t stackDepth() const { return _stackDepth; }
+    FastPath fastPath() const { return _fastPath; }
 
 private:
     enum class Op : uint8_t {
@@ -62,6 +70,7 @@ private:
     std::vector<Instruction> _code;
     std::string _source;
     size_t _stackDepth = 0;
+    FastPath _fastPath = FastPath::None;
     bool _valid = false;
 
     friend class ExpressionParser;
