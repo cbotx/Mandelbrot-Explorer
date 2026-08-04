@@ -12,6 +12,7 @@ namespace formula {
 
 using Complex = std::complex<double>;
 class ExpressionOracle;
+class ExpressionJit4;
 
 struct ExpressionError {
     size_t position = 0;
@@ -80,6 +81,7 @@ private:
 
     friend class ExpressionParser;
     friend class ExpressionOracle;
+    friend class ExpressionJit4;
 };
 
 } // namespace formula

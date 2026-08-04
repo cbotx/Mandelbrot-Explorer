@@ -10,6 +10,7 @@
 
 #include "navigator.h"
 #include "mandel_perturbation.h"
+#include "formula_expression_jit.h"
 #include "formula_spec.h"
 #include "float_math.h"
 
@@ -17,6 +18,7 @@ class MandelNavigator : public Navigator {
 private:
     FormulaContext _formula = quadraticMandelbrot();
     formula::ExpressionProgram _expressionProgram;
+    formula::ExpressionJit4 _expressionJit;
     formula::ExpressionContext _expressionFixed;
     FormulaParameter _expressionPixel = FormulaParameter::C;
     double _expressionBailout = 4.0;

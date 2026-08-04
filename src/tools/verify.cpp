@@ -25,6 +25,7 @@
 
 #include "mandel_perturbation.h"
 #include "formula_expression.h"
+#include "formula_expression_jit.h"
 #include "formula_expression_oracle.h"
 #include "test_cases.h"
 
@@ -495,13 +496,17 @@ static int runExpressionCoreCase() {
     failures += parallelFailures.load();
 
     ExpressionProgram vectorProgram;
+    formula::ExpressionJit4 vectorJit;
+    double avxMs = 0.0, jitMs = 0.0, jitRawMs = 0.0;
+    int jitMismatch = 0;
     if (!compile(vectorProgram, "z*z+c+p0*z+complex(re(z0),im(c))") ||
-        !vectorProgram.avx2Compatible()) {
+        !vectorProgram.avx2Compatible() || !vectorJit.compile(vectorProgram)) {
         ++failures;
     } else {
         for (int group = 0; group < 2500; ++group) {
             ExpressionContext lanes[4];
             Complex vectorResults[4];
+            Complex jitResults[4];
             for (int lane = 0; lane < 4; ++lane) {
                 int index = group * 4 + lane;
                 lanes[lane] = context;
@@ -513,11 +518,22 @@ static int runExpressionCoreCase() {
                 ++failures;
                 break;
             }
+            if (!vectorJit.evaluate(lanes, jitResults)) {
+                ++failures;
+                break;
+            }
             for (int lane = 0; lane < 4; ++lane) {
                 Complex scalar = vectorProgram.evaluate(lanes[lane]);
                 if (scalar.real() != vectorResults[lane].real() ||
                     scalar.imag() != vectorResults[lane].imag())
                     ++failures;
+                if (scalar.real() != jitResults[lane].real() ||
+                    scalar.imag() != jitResults[lane].imag()) {
+                    if (jitMismatch++ == 0)
+                        printf("  first JIT mismatch scalar=(%.17g,%.17g) jit=(%.17g,%.17g)\n",
+                               scalar.real(), scalar.imag(),
+                               jitResults[lane].real(), jitResults[lane].imag());
+                }
             }
         }
         auto sameDoubleBits = [](double a, double b) {
@@ -538,7 +554,13 @@ static int runExpressionCoreCase() {
             lanes[2].z = { 0.0, -0.0 };
             lanes[3].z = { -0.0, -0.0 };
             Complex vectorResults[4];
+            Complex jitResults[4];
+            formula::ExpressionJit4 signJit;
             if (!signProgram.evaluate4(lanes, vectorResults)) {
+                ++failures;
+                continue;
+            }
+            if (!signJit.compile(signProgram) || !signJit.evaluate(lanes, jitResults)) {
                 ++failures;
                 continue;
             }
@@ -547,7 +569,49 @@ static int runExpressionCoreCase() {
                 if (!sameDoubleBits(scalar.real(), vectorResults[lane].real()) ||
                     !sameDoubleBits(scalar.imag(), vectorResults[lane].imag()))
                     ++failures;
+                if (!sameDoubleBits(scalar.real(), jitResults[lane].real()) ||
+                    !sameDoubleBits(scalar.imag(), jitResults[lane].imag()))
+                    ++jitMismatch;
             }
+            failures += jitMismatch;
+        }
+        formula::ExpressionJit4 unsupportedJit;
+        if (unsupportedJit.compile(functions)) ++failures;
+
+        if (vectorJit.valid()) {
+            ExpressionContext lanes[4] = { context, context, context, context };
+            Complex outputs[4];
+            const int iterations = 300000;
+            volatile double sink = 0.0;
+            auto begin = Clock::now();
+            for (int i = 0; i < iterations; ++i) {
+                lanes[0].iteration = i;
+                vectorProgram.evaluate4(lanes, outputs);
+                sink += outputs[0].real();
+            }
+            avxMs = std::chrono::duration<double, std::milli>(
+                Clock::now() - begin).count();
+            begin = Clock::now();
+            for (int i = 0; i < iterations; ++i) {
+                lanes[0].iteration = i;
+                vectorJit.evaluate(lanes, outputs);
+                sink += outputs[0].real();
+            }
+            jitMs = std::chrono::duration<double, std::milli>(
+                Clock::now() - begin).count();
+            formula::ExpressionJitInput4 input;
+            formula::ExpressionJitOutput4 output;
+            input.setContexts(lanes);
+            begin = Clock::now();
+            for (int i = 0; i < iterations; ++i) {
+                for (int lane = 0; lane < 4; ++lane)
+                    input.vectors[formula::ExpressionJitInput4::N_RE][lane] = (double)i;
+                vectorJit.evaluate(input, output);
+                sink += output.re[0];
+            }
+            jitRawMs = std::chrono::duration<double, std::milli>(
+                Clock::now() - begin).count();
+            if (!std::isfinite(sink) || !(jitRawMs < avxMs)) ++failures;
         }
     }
 
@@ -688,6 +752,9 @@ static int runExpressionCoreCase() {
            quadratic.instructionCount(), quadratic.stackDepth());
     printf("  parallel failures=%d   classification mismatch=%d   render mismatch=%d\n",
            parallelFailures.load(), classificationMismatch, renderMismatch);
+    printf("  evaluator AVX2/JIT-wrapper/JIT-raw: %.3f / %.3f / %.3f ms  raw speedup %.2fx\n",
+           avxMs, jitMs, jitRawMs, jitRawMs > 0.0 ? avxMs / jitRawMs : 0.0);
+    printf("  JIT mismatches=%d\n", jitMismatch);
     printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (expression core failure)");
     return failures == 0 ? 0 : 1;
 }

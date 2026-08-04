@@ -133,7 +133,8 @@ void MandelNavigator::StartCompute() {
             this->_mandel->ComputeExpression(this->_z_re, this->_z_im, this->_scale,
                                              this->_expressionProgram, this->_expressionFixed,
                                              this->_expressionPixel, this->_mxit,
-                                             this->_expressionBailout);
+                                             this->_expressionBailout,
+                                             &this->_expressionJit);
         else if (this->IsJulia())
             this->_mandel->ComputeJulia(this->_z_re, this->_z_im, this->_scale,
                                         this->_julia_c_re, this->_julia_c_im,
@@ -621,6 +622,7 @@ bool MandelNavigator::SetExpressionFormula(
     if (!IsExpression()) SaveMandelbrotState();
     bool planeChanged = IsExpression() && _expressionPixel != pixel;
     _expressionProgram = std::move(compiled);
+    _expressionJit.compile(_expressionProgram);
     _expressionFixed = {};
     _expressionFixed.z0 = fixedZ0;
     _expressionFixed.c = fixedC;

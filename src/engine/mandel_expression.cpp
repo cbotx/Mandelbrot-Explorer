@@ -6,12 +6,14 @@
 #include <limits>
 
 #include "float_math.h"
+#include "formula_expression_jit.h"
 
 bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                                const formula::ExpressionProgram& program,
                                const formula::ExpressionContext& fixed,
                                FormulaParameter pixelParameter,
-                               int mxit, double bailout) {
+                               int mxit, double bailout,
+                               const formula::ExpressionJit4* jit) {
     if (_sub != 1 || !program.valid() || mxit < 1 || !(bailout > 0.0) ||
         !std::isfinite(bailout) ||
         (pixelParameter != FormulaParameter::C &&
@@ -72,12 +74,30 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                         ++activeCount;
                     }
                 }
+                formula::ExpressionJitInput4 jitInput;
+                formula::ExpressionJitOutput4 jitOutput;
+                const bool useJit = jit && jit->valid();
+                if (useJit) jitInput.setContexts(contexts);
                 for (int n = 0; n < mxit && activeCount > 0; ++n) {
                     for (int lane = 0; lane < 4; ++lane)
                         contexts[lane].iteration = n;
-                    if (!program.evaluate4(contexts, outputs)) {
-                        rowCompleted = false;
-                        break;
+                    if (useJit) {
+                        for (int lane = 0; lane < 4; ++lane) {
+                            jitInput.vectors[formula::ExpressionJitInput4::Z_RE][lane] =
+                                contexts[lane].z.real();
+                            jitInput.vectors[formula::ExpressionJitInput4::Z_IM][lane] =
+                                contexts[lane].z.imag();
+                            jitInput.vectors[formula::ExpressionJitInput4::N_RE][lane] =
+                                (double)n;
+                        }
+                        jit->evaluate(jitInput, jitOutput);
+                        for (int lane = 0; lane < 4; ++lane)
+                            outputs[lane] = { jitOutput.re[lane], jitOutput.im[lane] };
+                    } else {
+                        if (!program.evaluate4(contexts, outputs)) {
+                            rowCompleted = false;
+                            break;
+                        }
                     }
                     for (int lane = 0; lane < lanes; ++lane) {
                         if (!active[lane]) continue;

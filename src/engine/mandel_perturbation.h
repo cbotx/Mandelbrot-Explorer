@@ -15,6 +15,8 @@
 #include <array>
 #include <vector>
 
+namespace formula { class ExpressionJit4; }
+
 constexpr float EMPTYPIXEL = -10;
 
 struct HPComp {
@@ -67,7 +69,8 @@ public:
                            const formula::ExpressionProgram& program,
                            const formula::ExpressionContext& fixed,
                            FormulaParameter pixelParameter,
-                           int mxit, double bailout = 4.0);
+                           int mxit, double bailout = 4.0,
+                           const formula::ExpressionJit4* jit = nullptr);
     // Verification helper: brute-force high-precision escape time into out[],
     // reusing the grid (_c0/_dx/_dy) set by the most recent Compute() call.
     // step>1 samples only pixels on a (step x step) grid (others left untouched)
