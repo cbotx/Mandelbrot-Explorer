@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <limits>
 #include <string_view>
+#include <immintrin.h>
 
 namespace formula {
 
@@ -265,6 +266,7 @@ bool ExpressionProgram::compile(const std::string& source, ExpressionError* erro
     _stackDepth = 0;
     _fastPath = FastPath::None;
     _fastIntegerPower = 0;
+    _avx2Compatible = false;
     if (error) *error = {};
     ExpressionParser parser(*this, source, error);
     if (!parser.parse()) {
@@ -296,6 +298,29 @@ bool ExpressionProgram::compile(const std::string& source, ExpressionError* erro
         _fastPath = FastPath::IntegerPowerPlusC;
         _fastIntegerPower = (uint8_t)degree;
     }
+    _avx2Compatible = std::all_of(_code.begin(), _code.end(),
+        [](const Instruction& instruction) {
+            switch (instruction.op) {
+            case Op::Constant:
+            case Op::Z:
+            case Op::C:
+            case Op::Z0:
+            case Op::Iteration:
+            case Op::Parameter:
+            case Op::Negate:
+            case Op::Add:
+            case Op::Subtract:
+            case Op::Multiply:
+            case Op::Square:
+            case Op::Conjugate:
+            case Op::Real:
+            case Op::Imaginary:
+            case Op::MakeComplex:
+                return true;
+            default:
+                return false;
+            }
+        });
     _valid = true;
     return true;
 }
@@ -369,6 +394,120 @@ Complex ExpressionProgram::evaluate(const ExpressionContext& context,
         }
     }
     return stack[0];
+}
+
+bool ExpressionProgram::evaluate4(const ExpressionContext* contexts,
+                                  Complex* outputs) const {
+    if (!_valid || !_avx2Compatible || !contexts || !outputs) return false;
+    struct VecComplex { __m256d re, im; };
+    std::array<VecComplex, MAX_STACK> stack;
+    size_t top = 0;
+    auto real = [&](auto getter) {
+        return _mm256_set_pd(getter(contexts[3]).real(), getter(contexts[2]).real(),
+                             getter(contexts[1]).real(), getter(contexts[0]).real());
+    };
+    auto imag = [&](auto getter) {
+        return _mm256_set_pd(getter(contexts[3]).imag(), getter(contexts[2]).imag(),
+                             getter(contexts[1]).imag(), getter(contexts[0]).imag());
+    };
+    for (const Instruction& instruction : _code) {
+        switch (instruction.op) {
+        case Op::Constant:
+            stack[top++] = {
+                _mm256_set1_pd(instruction.value.real()),
+                _mm256_set1_pd(instruction.value.imag())
+            };
+            break;
+        case Op::Z:
+            stack[top++] = { real([](const ExpressionContext& c) { return c.z; }),
+                             imag([](const ExpressionContext& c) { return c.z; }) };
+            break;
+        case Op::C:
+            stack[top++] = { real([](const ExpressionContext& c) { return c.c; }),
+                             imag([](const ExpressionContext& c) { return c.c; }) };
+            break;
+        case Op::Z0:
+            stack[top++] = { real([](const ExpressionContext& c) { return c.z0; }),
+                             imag([](const ExpressionContext& c) { return c.z0; }) };
+            break;
+        case Op::Iteration:
+            stack[top++] = {
+                _mm256_set_pd((double)contexts[3].iteration, (double)contexts[2].iteration,
+                              (double)contexts[1].iteration, (double)contexts[0].iteration),
+                _mm256_setzero_pd()
+            };
+            break;
+        case Op::Parameter: {
+            int p = instruction.argument;
+            stack[top++] = {
+                _mm256_set_pd(contexts[3].parameters[p].real(),
+                              contexts[2].parameters[p].real(),
+                              contexts[1].parameters[p].real(),
+                              contexts[0].parameters[p].real()),
+                _mm256_set_pd(contexts[3].parameters[p].imag(),
+                              contexts[2].parameters[p].imag(),
+                              contexts[1].parameters[p].imag(),
+                              contexts[0].parameters[p].imag())
+            };
+            break;
+        }
+        case Op::Negate:
+            stack[top - 1].re = _mm256_xor_pd(stack[top - 1].re, _mm256_set1_pd(-0.0));
+            stack[top - 1].im = _mm256_xor_pd(stack[top - 1].im, _mm256_set1_pd(-0.0));
+            break;
+        case Op::Add:
+        case Op::Subtract:
+        case Op::Multiply: {
+            VecComplex right = stack[--top];
+            VecComplex& left = stack[top - 1];
+            if (instruction.op == Op::Add) {
+                left.re = _mm256_add_pd(left.re, right.re);
+                left.im = _mm256_add_pd(left.im, right.im);
+            } else if (instruction.op == Op::Subtract) {
+                left.re = _mm256_sub_pd(left.re, right.re);
+                left.im = _mm256_sub_pd(left.im, right.im);
+            } else {
+                __m256d re = _mm256_sub_pd(_mm256_mul_pd(left.re, right.re),
+                                           _mm256_mul_pd(left.im, right.im));
+                __m256d im = _mm256_add_pd(_mm256_mul_pd(left.re, right.im),
+                                           _mm256_mul_pd(left.im, right.re));
+                left.re = re; left.im = im;
+            }
+            break;
+        }
+        case Op::Square: {
+            VecComplex& value = stack[top - 1];
+            __m256d re = _mm256_sub_pd(_mm256_mul_pd(value.re, value.re),
+                                       _mm256_mul_pd(value.im, value.im));
+            __m256d im = _mm256_add_pd(_mm256_mul_pd(value.re, value.im),
+                                       _mm256_mul_pd(value.im, value.re));
+            value.re = re; value.im = im;
+            break;
+        }
+        case Op::Conjugate:
+            stack[top - 1].im = _mm256_xor_pd(stack[top - 1].im, _mm256_set1_pd(-0.0));
+            break;
+        case Op::Real:
+            stack[top - 1].im = _mm256_setzero_pd();
+            break;
+        case Op::Imaginary:
+            stack[top - 1].re = stack[top - 1].im;
+            stack[top - 1].im = _mm256_setzero_pd();
+            break;
+        case Op::MakeComplex: {
+            VecComplex right = stack[--top];
+            stack[top - 1].im = right.re;
+            break;
+        }
+        default:
+            return false;
+        }
+    }
+    alignas(32) double re[4], im[4];
+    _mm256_store_pd(re, stack[0].re);
+    _mm256_store_pd(im, stack[0].im);
+    for (int lane = 0; lane < 4; ++lane) outputs[lane] = { re[lane], im[lane] };
+    return true;
 }
 
 } // namespace formula

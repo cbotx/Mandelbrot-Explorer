@@ -42,6 +42,7 @@ public:
     Complex evaluate(const ExpressionContext& context) const;
     Complex evaluate(const ExpressionContext& context, Complex* stack,
                      size_t capacity) const;
+    bool evaluate4(const ExpressionContext* contexts, Complex* outputs) const;
 
     bool valid() const { return _valid; }
     const std::string& source() const { return _source; }
@@ -49,6 +50,7 @@ public:
     size_t stackDepth() const { return _stackDepth; }
     FastPath fastPath() const { return _fastPath; }
     int fastIntegerPower() const { return _fastIntegerPower; }
+    bool avx2Compatible() const { return _avx2Compatible; }
 
 private:
     enum class Op : uint8_t {
@@ -73,6 +75,7 @@ private:
     size_t _stackDepth = 0;
     FastPath _fastPath = FastPath::None;
     uint8_t _fastIntegerPower = 0;
+    bool _avx2Compatible = false;
     bool _valid = false;
 
     friend class ExpressionParser;

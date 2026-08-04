@@ -444,6 +444,7 @@ static int runExpressionCoreCase() {
                            Complex{ 0.7, 0.0 };
         if (!close(functions.evaluate(context), expected)) ++failures;
         if (functions.fastPath() != ExpressionProgram::FastPath::None) ++failures;
+        if (functions.avx2Compatible()) ++failures;
     }
 
     ExpressionProgram burningShip;
@@ -492,6 +493,63 @@ static int runExpressionCoreCase() {
             ++parallelFailures;
     }
     failures += parallelFailures.load();
+
+    ExpressionProgram vectorProgram;
+    if (!compile(vectorProgram, "z*z+c+p0*z+complex(re(z0),im(c))") ||
+        !vectorProgram.avx2Compatible()) {
+        ++failures;
+    } else {
+        for (int group = 0; group < 2500; ++group) {
+            ExpressionContext lanes[4];
+            Complex vectorResults[4];
+            for (int lane = 0; lane < 4; ++lane) {
+                int index = group * 4 + lane;
+                lanes[lane] = context;
+                lanes[lane].z = { index * 1e-4, -index * 3e-5 };
+                lanes[lane].c = { 0.2 + lane * 0.01, -0.3 + group * 1e-6 };
+                lanes[lane].z0 = { -0.5 + lane * 0.02, 0.1 };
+            }
+            if (!vectorProgram.evaluate4(lanes, vectorResults)) {
+                ++failures;
+                break;
+            }
+            for (int lane = 0; lane < 4; ++lane) {
+                Complex scalar = vectorProgram.evaluate(lanes[lane]);
+                if (scalar.real() != vectorResults[lane].real() ||
+                    scalar.imag() != vectorResults[lane].imag())
+                    ++failures;
+            }
+        }
+        auto sameDoubleBits = [](double a, double b) {
+            uint64_t aa, bb;
+            std::memcpy(&aa, &a, sizeof(a));
+            std::memcpy(&bb, &b, sizeof(b));
+            return aa == bb;
+        };
+        for (const char* source : { "-z", "conj(z)" }) {
+            ExpressionProgram signProgram;
+            if (!compile(signProgram, source) || !signProgram.avx2Compatible()) {
+                ++failures;
+                continue;
+            }
+            ExpressionContext lanes[4]{};
+            lanes[0].z = { 0.0, 0.0 };
+            lanes[1].z = { -0.0, 0.0 };
+            lanes[2].z = { 0.0, -0.0 };
+            lanes[3].z = { -0.0, -0.0 };
+            Complex vectorResults[4];
+            if (!signProgram.evaluate4(lanes, vectorResults)) {
+                ++failures;
+                continue;
+            }
+            for (int lane = 0; lane < 4; ++lane) {
+                Complex scalar = signProgram.evaluate(lanes[lane]);
+                if (!sameDoubleBits(scalar.real(), vectorResults[lane].real()) ||
+                    !sameDoubleBits(scalar.imag(), vectorResults[lane].imag()))
+                    ++failures;
+            }
+        }
+    }
 
     // Canonical recurrence through the interpreter must classify the same pixels
     // as a hand-written quadratic Julia loop.

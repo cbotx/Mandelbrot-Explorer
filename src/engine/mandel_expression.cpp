@@ -48,6 +48,56 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
         if (_flag_halt) continue;
         bool rowCompleted = true;
         const double pixelIm = startIm + dy * i;
+        if (integerPower == 0 && program.avx2Compatible()) {
+            for (int j = 0; j < _w; j += 4) {
+                if (_flag_halt) { rowCompleted = false; break; }
+                int lanes = std::min(4, _w - j);
+                formula::ExpressionContext contexts[4] = { fixed, fixed, fixed, fixed };
+                formula::Complex outputs[4]{};
+                bool active[4] = { false, false, false, false };
+                float results[4] = { -2.0f, -2.0f, -2.0f, -2.0f };
+                int activeCount = 0;
+                for (int lane = 0; lane < lanes; ++lane) {
+                    formula::Complex pixel{ startRe + dx * (j + lane), pixelIm };
+                    if (pixelParameter == FormulaParameter::C) contexts[lane].c = pixel;
+                    else contexts[lane].z0 = pixel;
+                    contexts[lane].z = contexts[lane].z0;
+                    if (!std::isfinite(contexts[lane].z.real()) ||
+                        !std::isfinite(contexts[lane].z.imag()) ||
+                        std::hypot(contexts[lane].z.real(),
+                                   contexts[lane].z.imag()) > bailout) {
+                        results[lane] = 0.0f;
+                    } else {
+                        active[lane] = true;
+                        ++activeCount;
+                    }
+                }
+                for (int n = 0; n < mxit && activeCount > 0; ++n) {
+                    for (int lane = 0; lane < 4; ++lane)
+                        contexts[lane].iteration = n;
+                    if (!program.evaluate4(contexts, outputs)) {
+                        rowCompleted = false;
+                        break;
+                    }
+                    for (int lane = 0; lane < lanes; ++lane) {
+                        if (!active[lane]) continue;
+                        contexts[lane].z = outputs[lane];
+                        double re = outputs[lane].real(), im = outputs[lane].imag();
+                        if (!std::isfinite(re) || !std::isfinite(im) ||
+                            std::hypot(re, im) > bailout) {
+                            results[lane] = (float)(n + 1);
+                            active[lane] = false;
+                            --activeCount;
+                        }
+                    }
+                }
+                for (int lane = 0; lane < lanes; ++lane)
+                    _iter[i * _w + j + lane] = results[lane];
+                if (!rowCompleted) break;
+            }
+            if (rowCompleted) progressAdvance();
+            continue;
+        }
         for (int j = 0; j < _w; ++j) {
             if (_flag_halt) { rowCompleted = false; break; }
             formula::ExpressionContext context = fixed;
