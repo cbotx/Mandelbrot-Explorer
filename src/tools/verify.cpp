@@ -872,6 +872,109 @@ static int runExpressionCoreCase() {
             }
         }
     }
+    // Degree-aware Smooth/EDE must agree with the generic automatic derivative.
+    fixed = {};
+    mpf_set_d(centerRe, -0.5); mpf_set_ui(centerIm, 0); mpf_set_ui(renderScale, 1);
+    auto checkExpressionColoring = [&](formula::ExpressionColoring coloring) {
+        int mismatches = 0;
+        if (!expressionRenderer.ComputeExpression(
+                centerRe, centerIm, renderScale, cubicProduct, fixed,
+                FormulaParameter::C, RMIT, 4.0, coloring))
+            return RW * RH;
+        const double halfW = 2.0, halfH = halfW * RH / RW;
+        const double dx = 2.0 * halfW / (RW - 1);
+        const double dy = 2.0 * halfH / (RH - 1);
+        for (int y = 0; y < RH; ++y) {
+            for (int x = 0; x < RW; ++x) {
+                ExpressionContext dc;
+                dc.z = dc.z0 = {};
+                dc.c = { -0.5 - halfW + dx * x, -halfH + dy * y };
+                Complex derivative{};
+                float expected = -2.0f;
+                for (int n = 0; n < RMIT; ++n) {
+                    ExpressionDerivativeSeed seed;
+                    seed.z = derivative;
+                    seed.c = 1.0;
+                    Complex next, nextDerivative;
+                    if (!cubicProduct.evaluateWithDerivative(
+                            dc, seed, next, nextDerivative)) {
+                        expected = 0.0f;
+                        break;
+                    }
+                    dc.z = next;
+                    derivative = nextDerivative;
+                    double magnitude = std::hypot(next.real(), next.imag());
+                    if (!std::isfinite(magnitude) || magnitude > 4.0) {
+                        if (coloring == formula::ExpressionColoring::Smooth &&
+                            std::isfinite(magnitude)) {
+                            expected = (float)(n + 1 -
+                                std::log(std::log(magnitude)) / std::log(3.0));
+                        } else if (coloring == formula::ExpressionColoring::Distance &&
+                                   std::isfinite(magnitude)) {
+                            double denominator = std::abs(derivative) * dx;
+                            expected = denominator > 0.0 && std::isfinite(denominator)
+                                ? (float)(magnitude * std::log(magnitude) / denominator)
+                                : 0.0f;
+                        } else {
+                            expected = (float)(n + 1);
+                        }
+                        break;
+                    }
+                }
+                float actual = rendered[(size_t)y * RW + x];
+                bool sameClass = isInterior(actual) == isInterior(expected);
+                double tolerance = coloring == formula::ExpressionColoring::Distance
+                    ? 2e-3 * std::max(1.0, std::fabs((double)expected))
+                    : 2e-4;
+                if (!sameClass || (!isInterior(expected) &&
+                                   std::fabs((double)actual - expected) > tolerance))
+                    ++mismatches;
+            }
+        }
+        return mismatches;
+    };
+    renderMismatch += checkExpressionColoring(formula::ExpressionColoring::Smooth);
+    renderMismatch += checkExpressionColoring(formula::ExpressionColoring::Distance);
+    fixed.c = { -0.8, 0.156 };
+    mpf_set_ui(centerRe, 0); mpf_set_ui(centerIm, 0); mpf_set_d(renderScale, 0.4);
+    const double z0HalfWidth = 5.0;
+    const double z0HalfHeight = z0HalfWidth * RH / RW;
+    const double firstMagnitude = std::hypot(z0HalfWidth, z0HalfHeight);
+    if (!expressionRenderer.ComputeExpression(
+            centerRe, centerIm, renderScale, cubicProduct, fixed,
+            FormulaParameter::InitialZ, RMIT, 4.0,
+            formula::ExpressionColoring::Smooth)) {
+        ++failures;
+    } else {
+        float expected = (float)(-std::log(std::log(firstMagnitude)) /
+                                 std::log(3.0));
+        if (rendered[0] != expected) ++renderMismatch;
+    }
+    if (!expressionRenderer.ComputeExpression(
+            centerRe, centerIm, renderScale, cubicProduct, fixed,
+            FormulaParameter::InitialZ, RMIT, 4.0,
+            formula::ExpressionColoring::Distance)) {
+        ++failures;
+    } else {
+        double pixelDx = 2.0 * z0HalfWidth / (RW - 1);
+        float expected = (float)(firstMagnitude * std::log(firstMagnitude) /
+                                 pixelDx);
+        if (rendered[0] != expected) ++renderMismatch;
+    }
+    // Coloring requests with bailout<1 must safely downgrade to raw counts.
+    fixed = {};
+    mpf_set_d(centerRe, -0.5); mpf_set_ui(centerIm, 0); mpf_set_ui(renderScale, 1);
+    if (!expressionRenderer.ComputeExpression(
+            centerRe, centerIm, renderScale, cubicProduct, fixed,
+            FormulaParameter::C, 1, 0.5,
+            formula::ExpressionColoring::Distance)) {
+        ++failures;
+    } else {
+        for (float value : rendered)
+            if (value >= 0.0f && value != 0.0f && value != 1.0f)
+                ++renderMismatch;
+    }
+
     // Extreme finite bailout values must use overflow-safe magnitude tests.
     ExpressionProgram identity;
     if (compile(identity, "z")) {

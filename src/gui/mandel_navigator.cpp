@@ -130,11 +130,20 @@ void MandelNavigator::StartCompute() {
         int method = this->_uniform_feather
             ? (this->_c_method & ~ColoringMethod::SUPER_SAMPLING) : this->_c_method;
         if (this->IsExpression())
+        {
+            formula::ExpressionColoring coloring =
+                this->_expressionProgram.fastIntegerPower() >= 2
+                    ? ((method & ColoringMethod::EXTERIOR_DIST_EST)
+                        ? formula::ExpressionColoring::Distance
+                        : formula::ExpressionColoring::Smooth)
+                    : formula::ExpressionColoring::Raw;
             this->_mandel->ComputeExpression(this->_z_re, this->_z_im, this->_scale,
                                              this->_expressionProgram, this->_expressionFixed,
                                              this->_expressionPixel, this->_mxit,
                                              this->_expressionBailout,
+                                             coloring,
                                              &this->_expressionJit);
+        }
         else if (this->IsJulia())
             this->_mandel->ComputeJulia(this->_z_re, this->_z_im, this->_scale,
                                         this->_julia_c_re, this->_julia_c_im,
@@ -652,7 +661,9 @@ void MandelNavigator::SetCMethod(int c_method) {
     _c_method = !IsMandelbrot()
         ? (c_method & ColoringMethod::EXTERIOR_DIST_EST)
         : c_method;
-    if (IsExpression()) _c_method = 0;
+    if (IsExpression())
+        _c_method = ExpressionSupportsDistance()
+            ? (c_method & ColoringMethod::EXTERIOR_DIST_EST) : 0;
 }
 
 void MandelNavigator::SetRedisplay() {

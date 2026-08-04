@@ -70,6 +70,8 @@ public:
                            const formula::ExpressionContext& fixed,
                            FormulaParameter pixelParameter,
                            int mxit, double bailout = 4.0,
+                           formula::ExpressionColoring coloring =
+                               formula::ExpressionColoring::Raw,
                            const formula::ExpressionJit4* jit = nullptr);
     // Verification helper: brute-force high-precision escape time into out[],
     // reusing the grid (_c0/_dx/_dy) set by the most recent Compute() call.

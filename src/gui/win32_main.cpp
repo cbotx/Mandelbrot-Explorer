@@ -1164,7 +1164,11 @@ public:
         fillRound(dc, rcColoringDD, hov ? CLR_CARD_HOV : CLR_CARD,
                   coloringOpen ? CLR_ACCENT : CLR_BORDER, S(8));
         RECT tr = rcColoringDD; tr.left += S(12); tr.right -= S(28);
-        drawText(dc, tr, coloringName(coloringIdx), CLR_TEXT, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        const wchar_t* currentName =
+            nav->IsExpression() && !nav->ExpressionSupportsDistance()
+                ? L"Iteration (raw)" : coloringName(coloringIdx);
+        drawText(dc, tr, currentName, CLR_TEXT, fUi,
+                 DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         RECT cr = rcColoringDD; cr.right -= S(12);
         drawText(dc, cr, coloringOpen ? L"\u25B2" : L"\u25BC", CLR_TEXT_DIM, fSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
@@ -1177,7 +1181,9 @@ public:
             if (i == coloringHover) fillRect(dc, { ir.left + S(3), ir.top, ir.right - S(3), ir.bottom }, CLR_CARD_HOV);
             RECT tr = ir; tr.left += S(14);
             COLORREF color = ((nav->IsJulia() && i > 1) ||
-                              (nav->IsExpression() && i > 0))
+                              (nav->IsExpression() &&
+                               (i > 1 || (i == 1 &&
+                                          !nav->ExpressionSupportsDistance()))))
                 ? CLR_TEXT_DIM : (i == coloringIdx ? CLR_ACCENT : CLR_TEXT);
             drawText(dc, tr, coloringName(i), color, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
@@ -1185,7 +1191,9 @@ public:
     void selectColoring(int idx) {
         if (idx < 0 || idx > 6) return;
         if (nav->IsJulia() && idx > 1) return;
-        if (nav->IsExpression() && idx > 0) return;
+        if (nav->IsExpression() &&
+            (idx > 1 || (idx == 1 && !nav->ExpressionSupportsDistance())))
+            return;
         coloringIdx = idx;
         relief_on = (idx == 3) ? 1 : 0;
         normal_light_on = (idx == 4) ? 1 : 0;

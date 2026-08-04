@@ -13,6 +13,7 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                                const formula::ExpressionContext& fixed,
                                FormulaParameter pixelParameter,
                                int mxit, double bailout,
+                               formula::ExpressionColoring coloring,
                                const formula::ExpressionJit4* jit) {
     if (_sub != 1 || !program.valid() || mxit < 1 || !(bailout > 0.0) ||
         !std::isfinite(bailout) ||
@@ -42,6 +43,8 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
     const int integerPower =
         program.fastPath() == formula::ExpressionProgram::FastPath::IntegerPowerPlusC
             ? program.fastIntegerPower() : 0;
+    if (integerPower < 2 || bailout < 1.0)
+        coloring = formula::ExpressionColoring::Raw;
     // Reserve the final progress slot for the successful completion commit.
     // Completed rows alone can therefore never publish exactly 100%.
     progressBegin(_h + 1, 0.0, 1.0);
@@ -130,20 +133,60 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
             float result = -2.0f;
             if (!std::isfinite(context.z.real()) || !std::isfinite(context.z.imag()) ||
                 std::hypot(context.z.real(), context.z.imag()) > bailout) {
-                result = 0.0f;
+                double magnitude = std::hypot(context.z.real(), context.z.imag());
+                if (coloring == formula::ExpressionColoring::Distance &&
+                    pixelParameter == FormulaParameter::InitialZ) {
+                    result = (float)(magnitude * std::log(magnitude) /
+                                     std::fabs(dx));
+                } else if (coloring == formula::ExpressionColoring::Smooth &&
+                           std::isfinite(magnitude) && magnitude > 1.0) {
+                    result = (float)(-std::log(std::log(magnitude)) /
+                                     std::log((double)integerPower));
+                } else {
+                    result = 0.0f;
+                }
             } else {
                 if (integerPower >= 2) {
                     formula::Complex z = context.z;
                     const formula::Complex c = context.c;
+                    formula::Complex derivative =
+                        pixelParameter == FormulaParameter::InitialZ
+                            ? formula::Complex{ 1.0, 0.0 } : formula::Complex{};
                     for (int n = 0; n < mxit; ++n) {
-                        formula::Complex next = z * z;
-                        for (int power = 2; power < integerPower; ++power)
-                            next *= z;
+                        formula::Complex powerMinusOne = z;
+                        for (int power = 1; power < integerPower - 1; ++power)
+                            powerMinusOne *= z;
+                        formula::Complex next = powerMinusOne * z;
+                        formula::Complex nextDerivative =
+                            (double)integerPower * powerMinusOne * derivative;
+                        if (pixelParameter == FormulaParameter::C)
+                            nextDerivative += 1.0;
                         z = next + c;
+                        derivative = nextDerivative;
                         bool escaped = !std::isfinite(z.real()) ||
                                        !std::isfinite(z.imag()) ||
                                        std::hypot(z.real(), z.imag()) > bailout;
-                        if (escaped) { result = (float)(n + 1); break; }
+                        if (escaped) {
+                            double magnitude = std::hypot(z.real(), z.imag());
+                            if (coloring == formula::ExpressionColoring::Smooth &&
+                                std::isfinite(magnitude) && magnitude > 1.0) {
+                                result = (float)(n + 1 -
+                                    std::log(std::log(magnitude)) /
+                                    std::log((double)integerPower));
+                            } else if (coloring == formula::ExpressionColoring::Distance &&
+                                       std::isfinite(magnitude)) {
+                                double denominator = std::abs(derivative) *
+                                                     std::fabs(dx);
+                                result = denominator > 0.0 &&
+                                         std::isfinite(denominator)
+                                    ? (float)(magnitude * std::log(magnitude) /
+                                              denominator)
+                                    : 0.0f;
+                            } else {
+                                result = (float)(n + 1);
+                            }
+                            break;
+                        }
                     }
                 } else {
                     for (int n = 0; n < mxit; ++n) {

@@ -34,6 +34,12 @@ struct ExpressionDerivativeSeed {
     std::array<Complex, 8> parameters{};
 };
 
+enum class ExpressionColoring : uint8_t {
+    Raw,
+    Smooth,
+    Distance
+};
+
 class ExpressionProgram {
 public:
     static constexpr size_t MAX_SOURCE = 4096;

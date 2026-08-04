@@ -98,6 +98,10 @@ public:
                                       _formula.slice.pixel == FormulaParameter::C; }
     bool IsJulia() const { return _formula.slice.pixel == FormulaParameter::InitialZ; }
     bool IsExpression() const { return _formula.formula.id == FormulaId::Expression; }
+    bool ExpressionSupportsDistance() const {
+        return IsExpression() && _expressionProgram.fastIntegerPower() >= 2 &&
+               _expressionBailout >= 1.0;
+    }
     void SetJuliaMode(bool enabled);
     bool SetExpressionFormula(const std::string& source, FormulaParameter pixel,
                               std::complex<double> fixedZ0, std::complex<double> fixedC,
