@@ -10,7 +10,7 @@
 //   case = shallow | deep | ticktock | flake | exterior1000 | parity1000 |
 //          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
-//          expression | all
+//          expression | expression-oracle | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
 
@@ -25,13 +25,13 @@
 
 #include "mandel_perturbation.h"
 #include "formula_expression.h"
+#include "formula_expression_oracle.h"
 #include "test_cases.h"
 
 using Clock = std::chrono::high_resolution_clock;
 static double since(Clock::time_point t) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t).count() / 1000.0;
 }
-
 struct TestCase {
     const char* name;
     std::string cx;
@@ -585,6 +585,379 @@ static int runExpressionCoreCase() {
     return failures == 0 ? 0 : 1;
 }
 
+static int runExpressionOracleCase() {
+    using formula::Complex;
+    using formula::ExpressionContext;
+    using formula::ExpressionError;
+    using formula::ExpressionOracle;
+    using formula::ExpressionOracleContext;
+    using formula::ExpressionProgram;
+    using formula::MpfrComplex;
+
+    ExpressionContext direct;
+    direct.z = { 0.7, 0.2 };
+    direct.c = { 1.2, 0.3 };
+    direct.z0 = { 0.9, -0.4 };
+    direct.parameters[0] = { 0.6, 0.1 };
+    direct.parameters[1] = { 0.8, 0.25 };
+    direct.iteration = 7;
+
+    ExpressionOracleContext hp256(256), hp512(512);
+    auto configure = [](ExpressionOracleContext& context) {
+        context.z.set("0.7", "0.2");
+        context.c.set("1.2", "0.3");
+        context.z0.set("0.9", "-0.4");
+        context.parameters[0].set("0.6", "0.1");
+        context.parameters[1].set("0.8", "0.25");
+        context.iteration = 7;
+    };
+    configure(hp256);
+    configure(hp512);
+
+    const char* expressions[] = {
+        "z*z+c+p0*n/10",
+        "sin(z)+cos(c)+sinh(p0)-tanh(z0)",
+        "exp(z/3)+log(c)+log10(p0)+sqrt(z0)",
+        "pow(z,c)+conj(p0)+complex(real(z),imag(c))+polar(abs(p1),arg(p1))",
+        "abs(z)+norm(c)+arg(p0)"
+    };
+
+    int failures = 0;
+    double maxDoubleError = 0.0;
+    double maxPrecisionDelta = 0.0;
+    mpfr_t delta;
+    mpfr_init2(delta, 512);
+    for (const char* source : expressions) {
+        ExpressionProgram program;
+        ExpressionError compileError;
+        if (!program.compile(source, &compileError)) {
+            printf("  oracle compile failed @ %zu: %s [%s]\n",
+                   compileError.position, compileError.message.c_str(), source);
+            ++failures;
+            continue;
+        }
+        MpfrComplex result256(256), result512(512);
+        std::string error256, error512;
+        bool ok256 = ExpressionOracle::evaluate(program, hp256, result256, &error256);
+        bool ok512 = ExpressionOracle::evaluate(program, hp512, result512, &error512);
+        if (!ok256 || !ok512) {
+            printf("  oracle domain failure: %s / %s [%s]\n",
+                   error256.c_str(), error512.c_str(), source);
+            ++failures;
+            continue;
+        }
+
+        mpfr_sub(delta, result512.re, result256.re, MPFR_RNDN);
+        mpfr_abs(delta, delta, MPFR_RNDN);
+        double reDelta = mpfr_get_d(delta, MPFR_RNDU);
+        mpfr_sub(delta, result512.im, result256.im, MPFR_RNDN);
+        mpfr_abs(delta, delta, MPFR_RNDN);
+        double imDelta = mpfr_get_d(delta, MPFR_RNDU);
+        maxPrecisionDelta = std::max({ maxPrecisionDelta, reDelta, imDelta });
+        if (reDelta > 1e-60 || imDelta > 1e-60) ++failures;
+
+        Complex expected = result512.toDouble();
+        Complex actual = program.evaluate(direct);
+        double relative = std::abs(actual - expected) / std::max(1.0, std::abs(expected));
+        maxDoubleError = std::max(maxDoubleError, relative);
+        if (!(relative <= 2e-13)) ++failures;
+    }
+    struct DomainCase { const char* source; };
+    const DomainCase invalid[] = { { "log(0)" }, { "1/0" }, { "polar(-1,0)" } };
+    int domainAccepted = 0;
+    for (const DomainCase& item : invalid) {
+        ExpressionProgram program;
+        ExpressionError compileError;
+        if (!program.compile(item.source, &compileError)) {
+            ++failures;
+            continue;
+        }
+        MpfrComplex result(256);
+        std::string error;
+        if (ExpressionOracle::evaluate(program, hp256, result, &error) ||
+            !mpfr_nan_p(result.re) || !mpfr_nan_p(result.im) || error.empty())
+            ++domainAccepted;
+    }
+    failures += domainAccepted;
+
+    ExpressionProgram zeroPower;
+    ExpressionError zeroPowerError;
+    if (!zeroPower.compile("0^2 + 0^0", &zeroPowerError)) {
+        ++failures;
+    } else {
+        MpfrComplex result(256);
+        std::string error;
+        if (!ExpressionOracle::evaluate(zeroPower, hp256, result, &error) ||
+            std::abs(result.toDouble() - Complex{ 1.0, 0.0 }) > 1e-15)
+            ++failures;
+    }
+
+    auto evaluateSpecial = [&](const char* source, ExpressionOracleContext& context,
+                               Complex expected, double tolerance) {
+        ExpressionProgram program;
+        ExpressionError compileError;
+        if (!program.compile(source, &compileError)) { ++failures; return; }
+        MpfrComplex result(context.z.precision());
+        std::string error;
+        if (!ExpressionOracle::evaluate(program, context, result, &error)) {
+            printf("  special domain failure: %s [%s]\n", error.c_str(), source);
+            ++failures; return;
+        }
+        Complex actual = result.toDouble();
+        if (std::abs(actual - expected) > tolerance * std::max(1.0, std::abs(expected))) {
+            printf("  special mismatch [%s]: actual=(%.17g,%.17g) expected=(%.17g,%.17g)\n",
+                   source, actual.real(), actual.imag(), expected.real(), expected.imag());
+            ++failures;
+        }
+    };
+
+    ExpressionOracleContext sqrtContext(256);
+    sqrtContext.z.set("-1", "1e-40");
+    evaluateSpecial("sqrt(z)", sqrtContext, { 5e-41, 1.0 }, 1e-14);
+
+    ExpressionOracleContext tinyDivision(256);
+    mpfr_set_ui_2exp(tinyDivision.z.re, 1, -600000000, MPFR_RNDN);
+    mpfr_set_zero(tinyDivision.z.im, 0);
+    mpfr_set_ui_2exp(tinyDivision.c.re, 1, -600000000, MPFR_RNDN);
+    mpfr_set_zero(tinyDivision.c.im, 0);
+    evaluateSpecial("z/c", tinyDivision, { 1.0, 0.0 }, 1e-15);
+
+    ExpressionOracleContext hugeDivision(256);
+    mpfr_set_ui(hugeDivision.z.re, 1, MPFR_RNDN);
+    mpfr_set_exp(hugeDivision.z.re, mpfr_get_emax() - 1);
+    mpfr_set(hugeDivision.z.im, hugeDivision.z.re, MPFR_RNDN);
+    hugeDivision.c.set(hugeDivision.z);
+    evaluateSpecial("z/c", hugeDivision, { 1.0, 0.0 }, 1e-15);
+
+    ExpressionOracleContext tinyQuotient(256);
+    mpfr_set_ui(tinyQuotient.z.re, 1, MPFR_RNDN);
+    mpfr_set_exp(tinyQuotient.z.re, mpfr_get_emin());
+    mpfr_set_zero(tinyQuotient.z.im, 0);
+    tinyQuotient.c.set(0.5, 0.0);
+    ExpressionProgram quotientProgram;
+    ExpressionError quotientError;
+    if (!quotientProgram.compile("z/c", &quotientError)) {
+        ++failures;
+    } else {
+        MpfrComplex actual(256);
+        std::string error;
+        if (!ExpressionOracle::evaluate(quotientProgram, tinyQuotient, actual, &error)) {
+            ++failures;
+        } else {
+            mpfr_div(delta, tinyQuotient.z.re, tinyQuotient.c.re, MPFR_RNDN);
+            if (!mpfr_equal_p(actual.re, delta) || !mpfr_zero_p(actual.im))
+                ++failures;
+        }
+
+        ExpressionOracleContext mixedQuotient(256);
+        mixedQuotient.z.set(1.0, 0.0625);
+        mpfr_set_ui(mixedQuotient.c.re, 1, MPFR_RNDN);
+        mpfr_set_exp(mixedQuotient.c.re, mpfr_get_emax() - 1);
+        mpfr_set_zero(mixedQuotient.c.im, 0);
+        if (!quotientProgram.valid()) {
+            ++failures;
+        } else {
+            MpfrComplex actual(256);
+            std::string error;
+            if (!ExpressionOracle::evaluate(quotientProgram, mixedQuotient, actual, &error) ||
+                !mpfr_number_p(actual.re) || mpfr_zero_p(actual.re) ||
+                !mpfr_zero_p(actual.im))
+                ++failures;
+        }
+    }
+
+    ExpressionOracleContext hugeSqrt(256);
+    mpfr_set_ui(hugeSqrt.z.re, 1, MPFR_RNDN);
+    mpfr_set_exp(hugeSqrt.z.re, mpfr_get_emax() - 1);
+    mpfr_set_zero(hugeSqrt.z.im, 0);
+    ExpressionProgram hugeSqrtProgram;
+    ExpressionError hugeSqrtError;
+    if (!hugeSqrtProgram.compile("sqrt(z)", &hugeSqrtError)) {
+        ++failures;
+    } else {
+        MpfrComplex actual(256);
+        std::string error;
+        if (!ExpressionOracle::evaluate(hugeSqrtProgram, hugeSqrt, actual, &error)) {
+            printf("  huge sqrt domain failure: %s\n", error.c_str());
+            ++failures;
+        } else {
+            mpfr_sqrt(delta, hugeSqrt.z.re, MPFR_RNDN);
+            if (!mpfr_equal_p(actual.re, delta) || !mpfr_zero_p(actual.im)) {
+                mpfr_t difference, ulp;
+                mpfr_init2(difference, 256); mpfr_init2(ulp, 256);
+                mpfr_sub(difference, actual.re, delta, MPFR_RNDN);
+                mpfr_abs(difference, difference, MPFR_RNDN);
+                mpfr_set_ui(ulp, 1, MPFR_RNDN);
+                mpfr_exp_t ulpExponent = mpfr_get_exp(actual.re) -
+                    (mpfr_exp_t)mpfr_get_prec(actual.re) + 1;
+                mpfr_set_exp(ulp, ulpExponent);
+                if (mpfr_cmp(difference, ulp) > 0 || !mpfr_zero_p(actual.im)) {
+                    printf("  huge sqrt exceeds 1 ulp; diff-exp=%ld expected-exp=%ld\n",
+                           mpfr_zero_p(difference) ? 0L : (long)mpfr_get_exp(difference),
+                           (long)mpfr_get_exp(delta));
+                    ++failures;
+                }
+
+                ExpressionOracleContext skewSqrt(256);
+                mpfr_set_ui(skewSqrt.z.re, 1, MPFR_RNDN);
+                mpfr_set_exp(skewSqrt.z.re, mpfr_get_emax() - 1);
+                mpfr_set_d(skewSqrt.z.im, 0.25, MPFR_RNDN);
+                if (!hugeSqrtProgram.valid()) {
+                    ++failures;
+                } else {
+                    MpfrComplex actual(256);
+                    std::string error;
+                    if (!ExpressionOracle::evaluate(hugeSqrtProgram, skewSqrt, actual, &error) ||
+                        mpfr_zero_p(actual.im) || !mpfr_number_p(actual.re) ||
+                        !mpfr_number_p(actual.im))
+                        ++failures;
+                }
+                mpfr_clear(difference); mpfr_clear(ulp);
+            }
+        }
+    }
+
+    ExpressionOracleContext largeTan(256);
+    largeTan.z.set(1.0, 1e9);
+    evaluateSpecial("tan(z)", largeTan, { 0.0, 1.0 }, 1e-14);
+    largeTan.z.set(1e9, 1.0);
+    evaluateSpecial("tanh(z)", largeTan, { 1.0, 0.0 }, 1e-14);
+    ExpressionOracleContext tinyTan(2048);
+    mpfr_set_zero(tinyTan.z.re, 0);
+    mpfr_set_ui_2exp(tinyTan.z.im, 1, -1000, MPFR_RNDN);
+    ExpressionProgram tinyIdentityProgram, tinyTanProgram, tinyTanhProgram;
+    ExpressionError tinyError;
+    if (!tinyIdentityProgram.compile("z", &tinyError) ||
+        !tinyTanProgram.compile("tan(z)", &tinyError) ||
+        !tinyTanhProgram.compile("tanh(z)", &tinyError)) {
+        ++failures;
+    } else {
+        MpfrComplex identityResult(2048);
+        std::string identityError;
+        if (!ExpressionOracle::evaluate(tinyIdentityProgram, tinyTan, identityResult,
+                                        &identityError))
+            ++failures;
+        MpfrComplex tanResult(2048), tanhResult(2048);
+        std::string error;
+        if (!ExpressionOracle::evaluate(tinyTanProgram, tinyTan, tanResult, &error)) {
+            printf("  tiny tan domain failure: %s\n", error.c_str());
+            ++failures;
+        }
+        mpfr_set_ui_2exp(delta, 1, -1000, MPFR_RNDN);
+        mpfr_sub(delta, tanResult.im, delta, MPFR_RNDN);
+        mpfr_abs(delta, delta, MPFR_RNDN);
+        if (mpfr_cmp_ui_2exp(delta, 1, -1900) > 0) {
+            printf("  tiny tan error exponent=%ld\n", mpfr_get_exp(delta));
+            ++failures;
+        }
+        mpfr_set_ui_2exp(tinyTan.z.re, 1, -1000, MPFR_RNDN);
+        mpfr_set_zero(tinyTan.z.im, 0);
+        if (!ExpressionOracle::evaluate(tinyTanhProgram, tinyTan, tanhResult, &error)) {
+            printf("  tiny tanh domain failure: %s\n", error.c_str());
+            ++failures;
+        }
+        mpfr_set_ui_2exp(delta, 1, -1000, MPFR_RNDN);
+        mpfr_sub(delta, tanhResult.re, delta, MPFR_RNDN);
+        mpfr_abs(delta, delta, MPFR_RNDN);
+        if (mpfr_cmp_ui_2exp(delta, 1, -1900) > 0) {
+            printf("  tiny tanh error exponent=%ld\n", mpfr_get_exp(delta));
+            ++failures;
+        }
+    }
+    mpfr_clear(delta);
+
+    struct OrbitStats {
+        int classMismatch = 0;
+        int maxIterationDiff = 0;
+        int oracleDomainErrors = 0;
+    };
+    auto compareOrbitGrid = [&](const char* source, Complex parameter0,
+                                int width, int height, int maxIterations) {
+        OrbitStats stats;
+        ExpressionProgram program;
+        ExpressionError compileError;
+        if (!program.compile(source, &compileError)) {
+            ++stats.oracleDomainErrors;
+            return stats;
+        }
+        mpfr_t magnitude;
+        mpfr_init2(magnitude, 256);
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                Complex pixel{ -2.0 + 4.0 * x / (width - 1),
+                               -1.3 + 2.6 * y / (height - 1) };
+                ExpressionContext dc;
+                dc.z = dc.z0 = {};
+                dc.c = pixel;
+                dc.parameters[0] = parameter0;
+                bool doubleEscaped = false;
+                int doubleIteration = maxIterations;
+                for (int n = 0; n < maxIterations; ++n) {
+                    dc.iteration = n;
+                    dc.z = program.evaluate(dc);
+                    if (!std::isfinite(dc.z.real()) || !std::isfinite(dc.z.imag()) ||
+                        std::hypot(dc.z.real(), dc.z.imag()) > 4.0) {
+                        doubleEscaped = true;
+                        doubleIteration = n + 1;
+                        break;
+                    }
+                }
+
+                ExpressionOracleContext hc(256);
+                hc.z.set(0.0); hc.z0.set(0.0);
+                hc.c.set(pixel.real(), pixel.imag());
+                hc.parameters[0].set(parameter0.real(), parameter0.imag());
+                MpfrComplex next(256);
+                bool oracleEscaped = false;
+                int oracleIteration = maxIterations;
+                for (int n = 0; n < maxIterations; ++n) {
+                    hc.iteration = n;
+                    std::string error;
+                    if (!ExpressionOracle::evaluate(program, hc, next, &error)) {
+                        ++stats.oracleDomainErrors;
+                        oracleEscaped = true;
+                        oracleIteration = n + 1;
+                        break;
+                    }
+                    hc.z.set(next);
+                    mpfr_hypot(magnitude, hc.z.re, hc.z.im, MPFR_RNDN);
+                    if (mpfr_cmp_d(magnitude, 4.0) > 0) {
+                        oracleEscaped = true;
+                        oracleIteration = n + 1;
+                        break;
+                    }
+                }
+                if (doubleEscaped != oracleEscaped) ++stats.classMismatch;
+                if (doubleEscaped && oracleEscaped)
+                    stats.maxIterationDiff = std::max(
+                        stats.maxIterationDiff,
+                        std::abs(doubleIteration - oracleIteration));
+            }
+        }
+        mpfr_clear(magnitude);
+        return stats;
+    };
+
+    OrbitStats quadraticOrbit = compareOrbitGrid("z*z+c", {}, 30, 20, 300);
+    OrbitStats parameterOrbit =
+        compareOrbitGrid("z*z+c+p0*z*z*z", { 0.03, -0.02 }, 24, 16, 200);
+    failures += quadraticOrbit.classMismatch + quadraticOrbit.oracleDomainErrors;
+    failures += parameterOrbit.classMismatch + parameterOrbit.oracleDomainErrors;
+    if (quadraticOrbit.maxIterationDiff > 0 || parameterOrbit.maxIterationDiff > 1)
+        ++failures;
+
+    printf("=== MPFR expression oracle\n");
+    printf("  expressions=%zu max double relative error=%.6g\n",
+           sizeof(expressions) / sizeof(expressions[0]), maxDoubleError);
+    printf("  256-vs-512 max delta=%.6g domain accepted=%d\n",
+           maxPrecisionDelta, domainAccepted);
+    printf("  orbit quadratic mismatch=%d iter-diff=%d; parameter mismatch=%d iter-diff=%d\n",
+           quadraticOrbit.classMismatch, quadraticOrbit.maxIterationDiff,
+           parameterOrbit.classMismatch, parameterOrbit.maxIterationDiff);
+    printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (MPFR oracle failure)");
+    return failures == 0 ? 0 : 1;
+}
+
 static std::string pow10(int n) {
     std::string s = "1";
     s.append(n, '0');
@@ -721,5 +1094,6 @@ int main(int argc, char** argv) {
     if (which == "julia-dendrite")             rc |= runJuliaCase(false, true);
     if (which == "julia-critical")             rc |= runJuliaCase(false, true, true);
     if (which == "expression")                 rc |= runExpressionCoreCase();
+    if (which == "expression-oracle")          rc |= runExpressionOracleCase();
     return rc;
 }
