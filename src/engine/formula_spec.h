@@ -4,7 +4,8 @@
 #include <cstdint>
 
 enum class FormulaId : uint8_t {
-    PowerPlusC
+    PowerPlusC,
+    Expression
 };
 
 enum class FormulaParameter : uint8_t {
@@ -67,6 +68,14 @@ constexpr FormulaContext quadraticJulia() {
     FormulaContext context{};
     context.slice.pixel = FormulaParameter::InitialZ;
     context.enabledCapabilities = FORMULA_DISTANCE_ESTIMATE;
+    return context;
+}
+
+constexpr FormulaContext expressionFormula() {
+    FormulaContext context{};
+    context.formula.id = FormulaId::Expression;
+    context.formula.capabilities = 0;
+    context.enabledCapabilities = 0;
     return context;
 }
 

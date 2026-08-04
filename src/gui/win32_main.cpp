@@ -247,6 +247,7 @@ public:
     int coloringHover = -1;                 // hovered item while open (-1 none)
     int paletteIdx = 0;                    // index into palettePresets()
     bool orbitOn = false;
+    bool juliaUiEnabled = false;           // internal-only until parameters/perf are production ready
     int savedColoringIdx = 0;
     bool savedSsOn = false, savedOrbitOn = false;
     std::unique_ptr<OrbitWorker> orbitWorker;
@@ -500,7 +501,11 @@ public:
         rcSpeedTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         // Unlabeled toggle: box sits at y (no label above), then a uniform 14px gap.
         rcSS  = { px, y, px + w, y + bh }; y += bh + S(14);
-        rcJulia = { px, y, px + w, y + bh }; y += bh + S(14);
+        if (juliaUiEnabled) {
+            rcJulia = { px, y, px + w, y + bh }; y += bh + S(14);
+        } else {
+            rcJulia = RECT{};
+        }
         rcOrbitToggle = { px, y, px + w, y + bh }; y += bh + S(14);
         if (orbitOn) {
             int oh = (int)((double)w * ORBIT_H / ORBIT_W);
@@ -864,6 +869,7 @@ public:
         };
         if (!validNumbers({ xs, ys, scale }, 2)) return;
         if (mode == "julia") {
+            if (!juliaUiEnabled) return;
             std::string cr = val("c_re:"), ci = val("c_im:");
             if (cr.empty() || ci.empty()) return;
             if (!validNumbers({ cr, ci })) return;
@@ -1278,7 +1284,8 @@ public:
                    speedSnaps, 1);
 
         drawToggle(dc, rcSS, L"5x supersampling", ssOn, H_SS);
-        drawToggle(dc, rcJulia, L"Julia set", nav->IsJulia(), H_JULIA);
+        if (juliaUiEnabled)
+            drawToggle(dc, rcJulia, L"Julia set (experimental)", nav->IsJulia(), H_JULIA);
         drawToggle(dc, rcOrbitToggle, L"Show orbit", orbitOn, H_ORBIT);
         if (orbitOn) drawOrbitThumbnail(dc);
         label(dc, rcColoringDD.left, rcColoringDD.top - S(20), L"Coloring");
@@ -1408,7 +1415,7 @@ public:
             RECT rs = rcReliefStr; rs.top -= S(8); rs.bottom += S(8); if (inRect(rs,x,y)) return H_RELSTR;
         }
         if (inRect(rcSS,x,y)) return H_SS;
-        if (inRect(rcJulia,x,y)) return H_JULIA;
+        if (juliaUiEnabled && inRect(rcJulia,x,y)) return H_JULIA;
         if (inRect(rcOrbitToggle,x,y)) return H_ORBIT;
         if (inRect(rcColoringDD,x,y)) return H_EDE;
         if (inRect(rcPaletteDD,x,y)) return H_PALETTE_DD;
@@ -1652,6 +1659,8 @@ public:
             nav->SetCMethod(coloringIdx == 1 ? ColoringMethod::EXTERIOR_DIST_EST
                           : coloringIdx == 2 ? ColoringMethod::STRIPE_AVERAGE : 0);
             nav->BindFixImageCallback(fixCallback);
+            juliaUiEnabled = getenv("MANDEL_EXPERIMENTAL_JULIA") != nullptr ||
+                             getenv("MANDEL_GUI_JULIA") != nullptr;
             if (const char* e = getenv("MANDEL_GUI_ORBIT")) orbitOn = atoi(e) != 0;
             orbitBench = getenv("MANDEL_GUI_ORBIT_BENCH") != nullptr;
             if (orbitBench) orbitOn = true;

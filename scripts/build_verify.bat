@@ -8,7 +8,7 @@ call "%~dp0msvcenv.bat" || goto :err
 cl /nologo /O2 /EHsc /openmp /std:c++17 /arch:AVX2 /MT ^
    /I "%VCPKG%\include" /I src\engine ^
    /Fo:build\ ^
-   src\tools\verify.cpp src\engine\mandel_perturbation.cpp src\engine\float_math.cpp ^
+   src\tools\verify.cpp src\engine\mandel_perturbation.cpp src\engine\mandel_expression.cpp src\engine\float_math.cpp src\engine\formula_expression.cpp ^
    /Fe:build\verify.exe ^
    /link /LIBPATH:"%VCPKG%\lib" gmp.lib || goto :err
 

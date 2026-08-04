@@ -6,6 +6,8 @@
 
 #include "floatexp.h"
 #include "bigfixed.h"
+#include "formula_spec.h"
+#include "formula_expression.h"
 
 #include <set>
 #include <algorithm>
@@ -57,6 +59,15 @@ public:
     void ComputeJulia(mpf_t z0_re, mpf_t z0_im, mpf_t scale,
                       mpf_t fixed_c_re, mpf_t fixed_c_im,
                       int mxit, int c_method = 0);
+    // Generic direct-expression backend. Each pixel can bind either c or z0;
+    // other context values/parameters stay fixed. Returns false for invalid
+    // bytecode/bindings. Output is raw escape iteration (no formula-specific
+    // smoothing/DE/perturbation claims).
+    bool ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
+                           const formula::ExpressionProgram& program,
+                           const formula::ExpressionContext& fixed,
+                           FormulaParameter pixelParameter,
+                           int mxit, double bailout = 4.0);
     // Verification helper: brute-force high-precision escape time into out[],
     // reusing the grid (_c0/_dx/_dy) set by the most recent Compute() call.
     // step>1 samples only pixels on a (step x step) grid (others left untouched)

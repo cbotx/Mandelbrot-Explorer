@@ -9,7 +9,8 @@
 // Usage: verify [case]
 //   case = shallow | deep | ticktock | flake | exterior1000 | parity1000 |
 //          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
-//          gui875 | julia | julia-ede | julia-dendrite | julia-critical | all
+//          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
+//          expression | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
 
@@ -23,6 +24,7 @@
 #include <vector>
 
 #include "mandel_perturbation.h"
+#include "formula_expression.h"
 #include "test_cases.h"
 
 using Clock = std::chrono::high_resolution_clock;
@@ -382,6 +384,207 @@ static int runJuliaCase(bool ede, bool dendrite = false, bool critical = false) 
     return ok ? 0 : 1;
 }
 
+static int runExpressionCoreCase() {
+    using formula::Complex;
+    using formula::ExpressionContext;
+    using formula::ExpressionError;
+    using formula::ExpressionProgram;
+
+    int failures = 0;
+    auto close = [](Complex a, Complex b, double eps = 1e-12) {
+        return std::abs(a - b) <= eps * std::max(1.0, std::abs(b));
+    };
+    auto compile = [&](ExpressionProgram& program, const char* source) {
+        ExpressionError error;
+        if (!program.compile(source, &error)) {
+            printf("  compile failed @ %zu: %s  [%s]\n",
+                   error.position, error.message.c_str(), source);
+            ++failures;
+            return false;
+        }
+        return true;
+    };
+
+    ExpressionContext context;
+    context.z = { 1.0, 2.0 };
+    context.c = { 0.5, -0.25 };
+    context.z0 = { -0.75, 0.1 };
+    context.parameters[0] = { 0.2, -0.3 };
+    context.iteration = 7;
+
+    ExpressionProgram quadratic;
+    if (compile(quadratic, "z*z + c") &&
+        !close(quadratic.evaluate(context), Complex{ -2.5, 3.75 }))
+        ++failures;
+
+    ExpressionProgram precedence;
+    if (compile(precedence, "-2^2 + 2^3^2") &&
+        !close(precedence.evaluate(context), Complex{ 508.0, 0.0 }, 1e-10))
+        ++failures;
+
+    ExpressionProgram functions;
+    const char* functionSource =
+        "sin(z) + conj(p0) + complex(abs(re(c)), abs(im(c))) + n/10";
+    if (compile(functions, functionSource)) {
+        Complex expected = std::sin(context.z) + std::conj(context.parameters[0]) +
+                           Complex{ std::abs(context.c.real()), std::abs(context.c.imag()) } +
+                           Complex{ 0.7, 0.0 };
+        if (!close(functions.evaluate(context), expected)) ++failures;
+    }
+
+    ExpressionProgram burningShip;
+    if (compile(burningShip,
+                "sqr(complex(abs(re(z)), abs(im(z)))) + c")) {
+        Complex folded{ std::abs(context.z.real()), std::abs(context.z.imag()) };
+        if (!close(burningShip.evaluate(context), folded * folded + context.c))
+            ++failures;
+    }
+
+    ExpressionProgram invalid;
+    ExpressionError invalidError;
+    if (invalid.compile("z + * c", &invalidError) || invalidError.message.empty())
+        ++failures;
+    std::string tooLong(ExpressionProgram::MAX_SOURCE + 1, '1');
+    if (invalid.compile(tooLong, &invalidError)) ++failures;
+    std::string tooMany = "z";
+    for (size_t i = 0; i < ExpressionProgram::MAX_INSTRUCTIONS; ++i)
+        tooMany += "+z";
+    if (invalid.compile(tooMany, &invalidError)) ++failures;
+    std::string deepPower = "z";
+    for (size_t i = 0; i <= ExpressionProgram::MAX_PARSE_DEPTH; ++i)
+        deepPower += "^z";
+    if (invalid.compile(deepPower, &invalidError)) ++failures;
+    std::string unaryChain(ExpressionProgram::MAX_SOURCE - 1, '-');
+    unaryChain += "z";
+    if (!invalid.compile(unaryChain, &invalidError)) ++failures;
+
+    ExpressionProgram invalidPolar;
+    if (compile(invalidPolar, "polar(-1, 0)")) {
+        Complex result = invalidPolar.evaluate(context);
+        if (!std::isnan(result.real()) || !std::isnan(result.imag())) ++failures;
+    }
+
+    // The immutable bytecode must be safe to evaluate concurrently.
+    std::atomic<int> parallelFailures{0};
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < 10000; ++i) {
+        ExpressionContext local = context;
+        local.z = { i * 1e-4, -i * 2e-4 };
+        Complex interpreted = quadratic.evaluate(local);
+        Complex expected = local.z * local.z + local.c;
+        if (!close(interpreted, expected)) ++parallelFailures;
+    }
+    failures += parallelFailures.load();
+
+    // Canonical recurrence through the interpreter must classify the same pixels
+    // as a hand-written quadratic Julia loop.
+    int classificationMismatch = 0;
+    for (int y = 0; y < 40; ++y) {
+        for (int x = 0; x < 60; ++x) {
+            Complex z0{ -2.0 + 4.0 * x / 59.0, -1.3 + 2.6 * y / 39.0 };
+            Complex fixedC{ -0.8, 0.156 };
+            ExpressionContext ec; ec.z = ec.z0 = z0; ec.c = fixedC;
+            Complex handwritten = z0;
+            bool exprEscape = false, handwrittenEscape = false;
+            for (int n = 0; n < 1000; ++n) {
+                ec.iteration = n;
+                ec.z = quadratic.evaluate(ec);
+                handwritten = handwritten * handwritten + fixedC;
+                exprEscape = std::norm(ec.z) > 16.0;
+                handwrittenEscape = std::norm(handwritten) > 16.0;
+                if (exprEscape || handwrittenEscape) break;
+            }
+            if (exprEscape != handwrittenEscape) ++classificationMismatch;
+        }
+    }
+    failures += classificationMismatch;
+
+    // Exercise the actual generic render backend for both supported pixel bindings.
+    int renderMismatch = 0;
+    const int RW = 60, RH = 40, RMIT = 500;
+    std::vector<float> rendered((size_t)RW * RH, EMPTYPIXEL);
+    Mandel expressionRenderer(RW, RH, RMIT, 1, rendered.data());
+    mpf_t centerRe, centerIm, renderScale;
+    mpf_init_set_d(centerRe, -0.5); mpf_init_set_ui(centerIm, 0);
+    mpf_init_set_ui(renderScale, 1);
+    ExpressionContext fixed;
+    fixed.z0 = { 0.0, 0.0 };
+    if (!expressionRenderer.ComputeExpression(
+            centerRe, centerIm, renderScale, quadratic, fixed,
+            FormulaParameter::C, RMIT, 4.0)) {
+        ++failures;
+    } else {
+        const double halfW = 2.0, halfH = halfW * RH / RW;
+        const double dx = 2.0 * halfW / (RW - 1);
+        const double dy = 2.0 * halfH / (RH - 1);
+        for (int y = 0; y < RH; ++y) {
+            for (int x = 0; x < RW; ++x) {
+                Complex c{ -0.5 - halfW + dx * x, -halfH + dy * y };
+                Complex z{};
+                float expected = -2.0f;
+                for (int n = 0; n < RMIT; ++n) {
+                    z = z * z + c;
+                    if (std::norm(z) > 16.0) { expected = (float)(n + 1); break; }
+                }
+                if (rendered[(size_t)y * RW + x] != expected) ++renderMismatch;
+            }
+        }
+    }
+
+    fixed.c = { -0.8, 0.156 };
+    mpf_set_ui(centerRe, 0);
+    if (!expressionRenderer.ComputeExpression(
+            centerRe, centerIm, renderScale, quadratic, fixed,
+            FormulaParameter::InitialZ, RMIT, 4.0)) {
+        ++failures;
+    } else {
+        const double halfW = 2.0, halfH = halfW * RH / RW;
+        const double dx = 2.0 * halfW / (RW - 1);
+        const double dy = 2.0 * halfH / (RH - 1);
+        for (int y = 0; y < RH; ++y) {
+            for (int x = 0; x < RW; ++x) {
+                Complex z{ -halfW + dx * x, -halfH + dy * y };
+                float expected = std::norm(z) > 16.0 ? 0.0f : -2.0f;
+                if (expected < 0.0f) {
+                    for (int n = 0; n < RMIT; ++n) {
+                        z = z * z + fixed.c;
+                        if (std::norm(z) > 16.0) { expected = (float)(n + 1); break; }
+                    }
+                }
+                if (rendered[(size_t)y * RW + x] != expected) ++renderMismatch;
+            }
+        }
+    }
+    // Extreme finite bailout values must use overflow-safe magnitude tests.
+    ExpressionProgram identity;
+    if (compile(identity, "z")) {
+        fixed = {};
+        fixed.z0 = { 1e308, 1e308 };
+        mpf_set_ui(centerRe, 0); mpf_set_ui(centerIm, 0);
+        if (!expressionRenderer.ComputeExpression(
+                centerRe, centerIm, renderScale, identity, fixed,
+                FormulaParameter::C, 1, 1e308) ||
+            rendered[0] != 0.0f)
+            ++failures;
+    }
+    expressionRenderer.SetHalt(true);
+    if (expressionRenderer.ComputeExpression(
+            centerRe, centerIm, renderScale, quadratic, fixed,
+            FormulaParameter::C, RMIT, 4.0))
+        ++failures;
+    expressionRenderer.SetHalt(false);
+    mpf_clears(centerRe, centerIm, renderScale, (mpf_ptr)0);
+    failures += renderMismatch;
+
+    printf("=== arbitrary expression core\n");
+    printf("  quadratic instructions=%zu stack=%zu\n",
+           quadratic.instructionCount(), quadratic.stackDepth());
+    printf("  parallel failures=%d   classification mismatch=%d   render mismatch=%d\n",
+           parallelFailures.load(), classificationMismatch, renderMismatch);
+    printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (expression core failure)");
+    return failures == 0 ? 0 : 1;
+}
+
 static std::string pow10(int n) {
     std::string s = "1";
     s.append(n, '0');
@@ -517,5 +720,6 @@ int main(int argc, char** argv) {
     if (which == "julia-ede")                  rc |= runJuliaCase(true);
     if (which == "julia-dendrite")             rc |= runJuliaCase(false, true);
     if (which == "julia-critical")             rc |= runJuliaCase(false, true, true);
+    if (which == "expression")                 rc |= runExpressionCoreCase();
     return rc;
 }
