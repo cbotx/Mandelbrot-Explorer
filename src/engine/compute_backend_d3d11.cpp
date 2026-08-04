@@ -173,7 +173,7 @@ float solvePixelFast(uint pixel) {
     precise float di = 0.0f;
     float threshold = escapeSquared.x + escapeSquared.y;
     uint i = 1;
-    uint iterationLimit = min(maxIterations, 256u);
+    uint iterationLimit = min(maxIterations, 64u);
     while (i < iterationLimit) {
         precise float nextDr = 2.0f * (dr * zr - di * zi);
         precise float nextDi = 2.0f * (dr * zi + di * zr);
@@ -221,18 +221,7 @@ void mainLong(uint3 dispatchThreadId : SV_DispatchThreadID) {
     if (previous == -3.0f ||
         (previous >= 0.0f && previous < 64.0f))
         return;
-    float candidate = solvePixelDs(pixel, 256u);
-    if (previous == -4.0f && candidate == -4.0f) {
-        Output[pixel] = -7.0f;
-    } else if (previous >= 0.0f && candidate >= 0.0f &&
-               (uint)previous == (uint)candidate &&
-               abs(previous - candidate) <= 0.125f) {
-        Output[pixel] = candidate;
-    } else if (previous == -5.0f && candidate == -5.0f) {
-        Output[pixel] = -5.0f;
-    } else {
-        Output[pixel] = -6.0f;
-    }
+    Output[pixel] = solvePixelDs(pixel, 256u);
 }
 )";
 
@@ -688,10 +677,9 @@ private:
         const auto refineStart = ProfileClock::now();
         _refinePixels.resize(count);
         std::atomic<int> refineCount{0};
-        long long analytic = 0, trustedInterior = 0;
-        long long derivativeInterior = 0, prefixTail = 0;
-        long long unstable = 0, longEscape = 0;
-#pragma omp parallel for schedule(static) reduction(+:analytic,trustedInterior,derivativeInterior,prefixTail,unstable,longEscape)
+        long long analytic = 0, derivativeInterior = 0;
+        long long prefixTail = 0, longEscape = 0;
+#pragma omp parallel for schedule(static) reduction(+:analytic,derivativeInterior,prefixTail,longEscape)
         for (int pixel = 0; pixel < static_cast<int>(count); ++pixel) {
             if (_cancelRequested.load(std::memory_order_relaxed)) continue;
             float value = _readback[pixel];
@@ -705,16 +693,11 @@ private:
                     ++analytic;
                     continue;
                 }
-            } else if (value == -7.0f) {
-                _readback[pixel] = -2.0f;
-                ++trustedInterior;
-                continue;
             } else if (value >= 0.0f && value < cpuRefineIteration) {
                 continue;
             }
             if (value == -4.0f) ++derivativeInterior;
             else if (value == -5.0f) ++prefixTail;
-            else if (value == -6.0f) ++unstable;
             else ++longEscape;
             int slot = refineCount.fetch_add(1, std::memory_order_relaxed);
             _refinePixels[slot] = pixel;
@@ -777,18 +760,15 @@ private:
             fprintf(stderr,
                     "  gpu phases: dispatch=%.3f ms readback=%.3f ms "
                     "refine=%.3f ms total=%.3f ms "
-                    "gpu-only=%lld analytic=%lld trusted=%lld refined=%lld "
-                    "(deriv=%lld tail=%lld unstable=%lld escape=%lld) "
-                    "prefix=%u mode=%s\n",
+                    "gpu-only=%lld analytic=%lld refined=%lld "
+                    "(deriv=%lld tail=%lld escape=%lld) prefix=%u mode=%s\n",
                     milliseconds(dispatchStart, dispatchEnd),
                     milliseconds(readbackStart, readbackEnd),
                     milliseconds(refineStart, refineEnd),
                     milliseconds(totalStart, totalEnd),
-                    static_cast<long long>(count) - analytic -
-                        trustedInterior - refined,
-                    analytic, trustedInterior,
-                    static_cast<long long>(refined),
-                    derivativeInterior, prefixTail, unstable, longEscape,
+                    static_cast<long long>(count) - analytic - refined,
+                    analytic, static_cast<long long>(refined),
+                    derivativeInterior, prefixTail, longEscape,
                     gpuIterationPrefix,
                     fastFloat ? "fp32+2xfp32" : "2xfp32");
             fflush(stderr);
