@@ -61,3 +61,16 @@ Controls:
 ### Verify / benchmark
 
     build\verify.exe [shallow|deep|ticktock|flake|exterior1000|parity1000|all] [W] [H]
+
+### Compute backend
+
+The CPU backend remains the default. Set `MANDEL_BACKEND=gpu` to use the D3D11
+2xFP32 shallow Mandelbrot compute backend; unsupported modes and device failures
+fall back to CPU. Stage 1 handles basic Smooth frames at scale <= 1e6 and at most
+100,000 iterations; other frames remain on CPU. `MANDEL_BACKEND=warp` runs the
+same shader through Microsoft's software rasterizer for diagnostics.
+
+Run `build\verify.exe backend` for CPU/WARP correctness gates. On a machine with
+a physical D3D11 GPU, `build\verify.exe gpu` runs the 1920x1080 correctness and
+performance acceptance gate; the GPU backend must be at least 5x faster than the
+full CPU renderer.

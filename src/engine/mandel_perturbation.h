@@ -82,6 +82,9 @@ public:
                                    FormulaParameter pixelParameter,
                                    int mxit, double bailout,
                                    bool* usedPerturbation = nullptr);
+    // Exact shallow scalar used to resolve the small set of numerically
+    // sensitive GPU pixels without re-running the full frame on the CPU.
+    float ComputeShallowPoint(double cRe, double cIm, int mxit) const;
     // Verification helper: brute-force high-precision escape time into out[],
     // reusing the grid (_c0/_dx/_dy) set by the most recent Compute() call.
     // step>1 samples only pixels on a (step x step) grid (others left untouched)
@@ -99,6 +102,7 @@ public:
 
     void SetHalt(bool flag);
     void SetProgress(std::atomic<float>* progress, float offset = 0.0f, float scale = 1.0f);
+    double escapeRadius() const { return _ESCAPE_RADIUS; }
 
     // Palette density, used only by the SAC/Feather adaptive-supersampling
     // detector to flag pixels by their actual colour change (colour-index change

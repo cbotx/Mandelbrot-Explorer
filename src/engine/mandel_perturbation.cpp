@@ -378,6 +378,10 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method,
 
 }
 
+float Mandel::ComputeShallowPoint(double cRe, double cIm, int mxit) const {
+    return static_cast<float>(floatPointCompute(cRe, cIm, mxit, 0));
+}
+
 // AVX2 shallow Mandelbrot with lane refilling: processes a LIST of `count` pixels
 // (arbitrary c = cre[k] + i*cim[k]) 4-wide, and the moment a lane escapes/goes
 // interior/hits mxit it is immediately reloaded with the next pending pixel, so no

@@ -1503,6 +1503,9 @@ public:
             const ComputeBackendInfo& backend = nav->GetBackendInfo();
             st += L"   backend " + widen(backend.name);
             if (backend.fallback) st += L" (fallback)";
+            else if (backend.hardwareAccelerated && !nav->IsComputing() &&
+                     !nav->LastComputeUsedGpuPath())
+                st += L" (CPU frame)";
         }
         if (nav->IsExpression()) {
             std::string acceleration = nav->GetExpressionAccelerationText();

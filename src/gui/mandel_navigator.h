@@ -98,6 +98,9 @@ public:
     void SetMxit(int mxit);
     int GetMxit() const { return _mxit; }
     const ComputeBackendInfo& GetBackendInfo() const { return _backend->info(); }
+    bool LastComputeUsedGpuPath() const {
+        return _backend->lastComputeUsedGpuPath();
+    }
     // Copy the current view: center (re/im) and scale into caller-owned mpf_t.
     void GetView(mpf_t re, mpf_t im, mpf_t scale) const;
     mp_bitcnt_t GetViewPrecision() const { return mpf_get_prec(_scale); }

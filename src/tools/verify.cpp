@@ -11,7 +11,7 @@
 //          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
 //          expression | expression-oracle | expression-suite |
-//          expression-residual | backend | all
+//          expression-residual | backend | gpu | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
 
@@ -1827,11 +1827,204 @@ static int runBackendCase() {
     if (backend->compute(request)) ++failures;
     backend->resetCancellation();
 
-    std::unique_ptr<IComputeBackend> fallback = createComputeBackend("gpu");
+    std::unique_ptr<IComputeBackend> fallback =
+        createComputeBackend("not-a-backend");
     if (!fallback || !fallback->info().fallback ||
         fallback->info().hardwareAccelerated ||
-        fallback->info().detail.find("unavailable") == std::string::npos)
+        fallback->info().detail.find("unknown backend") == std::string::npos)
         ++failures;
+
+    // WARP runs the exact D3D11 compute shader even on CI/VM hosts without a
+    // physical GPU. GPU smooth values use 2xFP32 orbit arithmetic and FP32
+    // transcendentals, so require exact classification and escape-iteration
+    // floors rather than byte identity with the CPU's FP64 smooth values.
+    std::unique_ptr<IComputeBackend> warp = createComputeBackend("warp");
+    int gpuEmpty = 0, gpuClassMismatch = 0, gpuFloorMismatch = 0;
+    double gpuMaxDifference = 0.0;
+    int gpuWorst = -1;
+    float gpuWorstCpu = 0.0f, gpuWorstGpu = 0.0f;
+    int gpuStressClass = 0, gpuStressFloor = 0, gpuLayoutMismatch = 0;
+    double gpuStressMaxDifference = 0.0;
+    if (!warp || warp->info().fallback ||
+        warp->info().name != "D3D11 WARP" ||
+        warp->info().hardwareAccelerated) {
+        ++failures;
+    } else {
+        std::vector<float> gpu((size_t)W * H, EMPTYPIXEL);
+        Mandel gpuMandel(W, H, MXIT, 1, gpu.data());
+        directMandel.Compute(centerRe, centerIm, scale, MXIT, 0);
+        request.mode = ComputeMode::Mandelbrot;
+        request.cpuEngine = &gpuMandel;
+        request.iterations = gpu.data();
+        request.expression = nullptr;
+        request.expressionFixed = nullptr;
+        warp->resetCancellation();
+        bool gpuOk = warp->compute(request);
+        if (!gpuOk || !warp->lastComputeUsedGpuPath()) ++failures;
+        for (size_t i = 0; i < gpu.size(); ++i) {
+            if (gpu[i] == EMPTYPIXEL) {
+                ++gpuEmpty;
+                continue;
+            }
+            bool cpuInterior = isInterior(direct[i]);
+            bool gpuInterior = isInterior(gpu[i]);
+            if (cpuInterior != gpuInterior) {
+                ++gpuClassMismatch;
+            } else if (!cpuInterior) {
+                if ((int)direct[i] != (int)gpu[i]) ++gpuFloorMismatch;
+                double difference =
+                    std::fabs((double)direct[i] - (double)gpu[i]);
+                if (difference > gpuMaxDifference) {
+                    gpuMaxDifference = difference;
+                    gpuWorst = static_cast<int>(i);
+                    gpuWorstCpu = direct[i];
+                    gpuWorstGpu = gpu[i];
+                }
+            }
+        }
+        if (gpuEmpty != 0 || gpuClassMismatch != 0 ||
+            gpuFloorMismatch != 0 || gpuMaxDifference > 0.01)
+            ++failures;
+
+        // Precision-limit shallow view (the GPU gate is scale <= 1e6).
+        mpf_set_str(centerRe, "-0.743643887037151", 10);
+        mpf_set_str(centerIm, "0.13182590420533", 10);
+        mpf_set_ui(scale, 1000000);
+        directMandel.Compute(centerRe, centerIm, scale, MXIT, 0);
+        std::fill(gpu.begin(), gpu.end(), EMPTYPIXEL);
+        request.centerRe = centerRe;
+        request.centerIm = centerIm;
+        request.scale = scale;
+        warp->resetCancellation();
+        if (!warp->compute(request)) {
+            ++failures;
+        } else if (!warp->lastComputeUsedGpuPath()) {
+            ++failures;
+        } else {
+            for (size_t i = 0; i < gpu.size(); ++i) {
+                bool cpuInterior = isInterior(direct[i]);
+                bool gpuInterior = isInterior(gpu[i]);
+                if (cpuInterior != gpuInterior) {
+                    ++gpuStressClass;
+                } else if (!cpuInterior) {
+                    if ((int)direct[i] != (int)gpu[i]) ++gpuStressFloor;
+                    gpuStressMaxDifference = std::max(
+                        gpuStressMaxDifference,
+                        std::fabs((double)direct[i] - (double)gpu[i]));
+                }
+            }
+            if (gpuStressClass != 0 || gpuStressFloor != 0 ||
+                gpuStressMaxDifference > 0.01)
+                ++failures;
+        }
+
+        // The GUI normally keeps an odd adaptive-AA backing grid even when AA is
+        // off. The GPU writes only each pixel's center sample and must preserve
+        // every unresolved subpixel as EMPTYPIXEL.
+        constexpr int LW = 32, LH = 24, LSUB = 5;
+        const size_t layoutCount = (size_t)LW * LH * LSUB * LSUB;
+        std::vector<float> layoutCpu(layoutCount, EMPTYPIXEL);
+        std::vector<float> layoutGpu(layoutCount, EMPTYPIXEL);
+        Mandel layoutCpuMandel(LW, LH, MXIT, LSUB, layoutCpu.data());
+        Mandel layoutGpuMandel(LW, LH, MXIT, LSUB, layoutGpu.data());
+        mpf_set_d(centerRe, -0.5);
+        mpf_set_ui(centerIm, 0);
+        mpf_set_ui(scale, 1);
+        layoutCpuMandel.Compute(centerRe, centerIm, scale, MXIT, 0);
+        ComputeRequest layoutRequest;
+        layoutRequest.mode = ComputeMode::Mandelbrot;
+        layoutRequest.cpuEngine = &layoutGpuMandel;
+        layoutRequest.centerRe = centerRe;
+        layoutRequest.centerIm = centerIm;
+        layoutRequest.scale = scale;
+        layoutRequest.width = LW;
+        layoutRequest.height = LH;
+        layoutRequest.sub = LSUB;
+        layoutRequest.maxIterations = MXIT;
+        layoutRequest.iterations = layoutGpu.data();
+        warp->resetCancellation();
+        if (!warp->compute(layoutRequest)) {
+            ++failures;
+        } else if (!warp->lastComputeUsedGpuPath()) {
+            ++failures;
+        } else {
+            for (size_t i = 0; i < layoutCount; ++i)
+                if (layoutCpu[i] != layoutGpu[i] &&
+                    !(layoutCpu[i] >= 0.0f && layoutGpu[i] >= 0.0f &&
+                      (int)layoutCpu[i] == (int)layoutGpu[i] &&
+                      std::fabs(layoutCpu[i] - layoutGpu[i]) <= 0.01f))
+                    ++gpuLayoutMismatch;
+            if (gpuLayoutMismatch != 0) ++failures;
+        }
+
+        // Unsupported modes must remain byte-identical through the owned CPU
+        // fallback instead of returning a partially rendered GPU frame.
+        directMandel.ComputeJulia(
+            centerRe, centerIm, scale, fixedCRe, fixedCIm, MXIT, 0);
+        request.mode = ComputeMode::Julia;
+        request.fixedCRe = fixedCRe;
+        request.fixedCIm = fixedCIm;
+        warp->resetCancellation();
+        if (!warp->compute(request) || !same(direct, gpu) ||
+            warp->lastComputeUsedGpuPath())
+            ++failures;
+
+        // Analytic cardioid/bulb membership is valid only for the conventional
+        // escape radius >= 2. A smaller custom bailout must use CPU semantics.
+        _putenv_s("MANDEL_BAILOUT", "1.1");
+        std::vector<float> bailoutCpu(64, EMPTYPIXEL);
+        std::vector<float> bailoutGpu(64, EMPTYPIXEL);
+        Mandel bailoutCpuMandel(8, 8, MXIT, 1, bailoutCpu.data());
+        Mandel bailoutGpuMandel(8, 8, MXIT, 1, bailoutGpu.data());
+        mpf_set_d(centerRe, -1.24);
+        mpf_set_ui(centerIm, 0);
+        mpf_set_ui(scale, 100);
+        bailoutCpuMandel.Compute(centerRe, centerIm, scale, MXIT, 0);
+        ComputeRequest bailoutRequest;
+        bailoutRequest.mode = ComputeMode::Mandelbrot;
+        bailoutRequest.cpuEngine = &bailoutGpuMandel;
+        bailoutRequest.centerRe = centerRe;
+        bailoutRequest.centerIm = centerIm;
+        bailoutRequest.scale = scale;
+        bailoutRequest.width = 8;
+        bailoutRequest.height = 8;
+        bailoutRequest.sub = 1;
+        bailoutRequest.maxIterations = MXIT;
+        bailoutRequest.iterations = bailoutGpu.data();
+        warp->resetCancellation();
+        if (!warp->compute(bailoutRequest) ||
+            warp->lastComputeUsedGpuPath() ||
+            !same(bailoutCpu, bailoutGpu))
+            ++failures;
+        _putenv_s("MANDEL_BAILOUT", "");
+
+        // The split c0/dx values can each fit while a far endpoint does not.
+        // Reject before dispatch rather than feeding an overflowing dsMul.
+        std::vector<float> rangeOutput((size_t)W * H, EMPTYPIXEL);
+        Mandel rangeMandel(W, H, MXIT, 1, rangeOutput.data());
+        mpf_set_d(centerRe, 4.0e9);
+        mpf_set_d(centerIm, 2.666666666666667e9);
+        mpf_set_d(scale, 5.0e-10);
+        ComputeRequest rangeRequest;
+        rangeRequest.mode = ComputeMode::Mandelbrot;
+        rangeRequest.cpuEngine = &rangeMandel;
+        rangeRequest.centerRe = centerRe;
+        rangeRequest.centerIm = centerIm;
+        rangeRequest.scale = scale;
+        rangeRequest.width = W;
+        rangeRequest.height = H;
+        rangeRequest.sub = 1;
+        rangeRequest.maxIterations = MXIT;
+        rangeRequest.iterations = rangeOutput.data();
+        warp->resetCancellation();
+        if (!warp->compute(rangeRequest) ||
+            warp->lastComputeUsedGpuPath())
+            ++failures;
+
+        mpf_set_d(centerRe, -0.5);
+        mpf_set_ui(centerIm, 0);
+        mpf_set_ui(scale, 1);
+    }
 
     // Running cancellation: a bounded identity expression would otherwise execute
     // ten million iterations for every pixel.
@@ -1871,10 +2064,111 @@ static int runBackendCase() {
            fallback->info().detail.c_str());
     printf("  Mandel/Julia/Expression byte parity; cancel %.3fs empty=%d/%d\n",
            cancelSeconds, empty, CW * CH);
+    printf("  D3D11 WARP: empty=%d class=%d floor=%d max smooth diff=%.6g\n",
+           gpuEmpty, gpuClassMismatch, gpuFloorMismatch, gpuMaxDifference);
+    if (gpuWorst >= 0)
+        printf("    worst=(%d,%d) cpu=%.9g gpu=%.9g\n",
+               gpuWorst % W, gpuWorst / W, gpuWorstCpu, gpuWorstGpu);
+    printf("    scale1e6 class=%d floor=%d max diff=%.6g; sub5 layout=%d\n",
+           gpuStressClass, gpuStressFloor, gpuStressMaxDifference,
+           gpuLayoutMismatch);
     printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (backend failure)");
 
     mpf_clears(centerRe, centerIm, scale, fixedCRe, fixedCIm, (mpf_ptr)0);
     return failures == 0 ? 0 : 1;
+}
+
+static int runGpuBenchmarkCase(int width, int height) {
+    std::unique_ptr<IComputeBackend> gpu = createComputeBackend("gpu");
+    printf("=== D3D11 hardware GPU benchmark\n");
+    if (!gpu || gpu->info().fallback || !gpu->info().hardwareAccelerated) {
+        printf("  SKIP: %s\n\n",
+               gpu ? gpu->info().detail.c_str() : "backend creation failed");
+        return 0;
+    }
+
+    const int mxit = [] {
+        const char* value = getenv("MANDEL_GPU_MXIT");
+        return value ? std::clamp(atoi(value), 2, 100000) : 5000;
+    }();
+    mpf_set_default_prec(128);
+    mpf_t centerRe, centerIm, scale;
+    mpf_init_set_d(centerRe, -0.5);
+    mpf_init_set_ui(centerIm, 0);
+    mpf_init_set_ui(scale, 1);
+
+    const size_t count = (size_t)width * height;
+    std::vector<float> cpuOutput(count, EMPTYPIXEL);
+    std::vector<float> gpuOutput(count, EMPTYPIXEL);
+    Mandel cpuMandel(width, height, mxit, 1, cpuOutput.data());
+    Mandel gpuMandel(width, height, mxit, 1, gpuOutput.data());
+    ComputeRequest request;
+    request.mode = ComputeMode::Mandelbrot;
+    request.cpuEngine = &gpuMandel;
+    request.centerRe = centerRe;
+    request.centerIm = centerIm;
+    request.scale = scale;
+    request.width = width;
+    request.height = height;
+    request.sub = 1;
+    request.maxIterations = mxit;
+    request.iterations = gpuOutput.data();
+
+    // Warm resource allocation, shader execution, and the graphics driver's
+    // pipeline cache before measuring a steady-state interactive frame.
+    gpu->resetCancellation();
+    bool warmupOk = gpu->compute(request);
+    bool warmupUsedGpu = gpu->lastComputeUsedGpuPath();
+    std::fill(gpuOutput.begin(), gpuOutput.end(), EMPTYPIXEL);
+    gpu->resetCancellation();
+    auto start = Clock::now();
+    bool gpuOk = gpu->compute(request);
+    bool measuredUsedGpu = gpu->lastComputeUsedGpuPath();
+    double gpuSeconds = since(start);
+
+    _putenv_s("MANDEL_COARSE", "0");
+    start = Clock::now();
+    cpuMandel.Compute(centerRe, centerIm, scale, mxit, 0);
+    double cpuSeconds = since(start);
+
+    int empty = 0, classMismatch = 0, floorMismatch = 0;
+    double maxDifference = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        if (gpuOutput[i] == EMPTYPIXEL) {
+            ++empty;
+            continue;
+        }
+        bool cpuInterior = isInterior(cpuOutput[i]);
+        bool gpuInterior = isInterior(gpuOutput[i]);
+        if (cpuInterior != gpuInterior) {
+            ++classMismatch;
+        } else if (!cpuInterior) {
+            if ((int)cpuOutput[i] != (int)gpuOutput[i]) ++floorMismatch;
+            maxDifference = std::max(
+                maxDifference,
+                std::fabs((double)cpuOutput[i] - (double)gpuOutput[i]));
+        }
+    }
+    double speedup = gpuSeconds > 0.0 ? cpuSeconds / gpuSeconds : 0.0;
+    bool accurate = warmupOk && warmupUsedGpu &&
+                    gpuOk && measuredUsedGpu && empty == 0 &&
+                    classMismatch == 0 && floorMismatch == 0 &&
+                    maxDifference <= 0.01;
+    bool fastEnough = speedup >= 5.0;
+    printf("  backend=%s  %s\n",
+           gpu->info().name.c_str(), gpu->info().detail.c_str());
+    printf("  frame=%dx%d mxit=%d CPU/GPU=%.3f/%.3f s speedup=%.2fx\n",
+           width, height, mxit, cpuSeconds, gpuSeconds, speedup);
+    printf("  empty=%d class=%d floor=%d max smooth diff=%.6g\n",
+           empty, classMismatch, floorMismatch, maxDifference);
+    printf("  => %s\n\n",
+           accurate && fastEnough
+               ? "PASS"
+               : (!accurate ? "CHECK (accuracy failure)"
+                            : "CHECK (below 5x acceptance threshold)"));
+
+    mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+    return accurate && fastEnough ? 0 : 1;
 }
 
 static std::string pow10(int n) {
@@ -2017,5 +2311,8 @@ int main(int argc, char** argv) {
     if (which == "expression-suite")           rc |= runFormulaRegressionSuite();
     if (which == "expression-residual")        rc |= runExpressionResidualSuite();
     if (which == "backend")                    rc |= runBackendCase();
+    if (which == "gpu")
+        rc |= runGpuBenchmarkCase(
+            argc > 2 ? W : 1920, argc > 3 ? H : 1080);
     return rc;
 }

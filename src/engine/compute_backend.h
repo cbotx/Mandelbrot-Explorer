@@ -55,6 +55,7 @@ class IComputeBackend {
 public:
     virtual ~IComputeBackend() = default;
     virtual const ComputeBackendInfo& info() const = 0;
+    virtual bool lastComputeUsedGpuPath() const = 0;
     virtual bool compute(const ComputeRequest& request) = 0;
     virtual void cancel() = 0;
     virtual void resetCancellation() = 0;

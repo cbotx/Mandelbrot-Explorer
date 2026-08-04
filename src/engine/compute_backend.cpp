@@ -4,6 +4,7 @@
 #include <cstring>
 #include <mutex>
 
+#include "compute_backend_d3d11.h"
 #include "formula_expression_jit.h"
 #include "mandel_perturbation.h"
 
@@ -11,18 +12,25 @@ namespace {
 
 class CpuComputeBackend final : public IComputeBackend {
 public:
-    explicit CpuComputeBackend(bool fallback, const char* requested) {
+    explicit CpuComputeBackend(bool fallback, const char* requested,
+                               const std::string& reason = {}) {
         _info.name = "CPU";
         _info.detail = "OpenMP + AVX2";
         _info.fallback = fallback;
         if (fallback) {
             _info.detail += " (requested ";
             _info.detail += requested ? requested : "unknown";
-            _info.detail += "; unavailable)";
+            _info.detail += "; unavailable";
+            if (!reason.empty()) {
+                _info.detail += ": ";
+                _info.detail += reason;
+            }
+            _info.detail += ")";
         }
     }
 
     const ComputeBackendInfo& info() const override { return _info; }
+    bool lastComputeUsedGpuPath() const override { return false; }
 
     bool compute(const ComputeRequest& request) override {
         if (!valid(request)) return false;
@@ -125,5 +133,19 @@ private:
 std::unique_ptr<IComputeBackend> createComputeBackend(const char* requested) {
     bool cpu = !requested || !*requested || _stricmp(requested, "cpu") == 0 ||
                _stricmp(requested, "auto") == 0;
-    return std::make_unique<CpuComputeBackend>(!cpu, requested);
+    if (cpu) return std::make_unique<CpuComputeBackend>(false, requested);
+
+    const bool gpu = _stricmp(requested, "gpu") == 0 ||
+                     _stricmp(requested, "d3d11") == 0;
+    const bool warp = _stricmp(requested, "warp") == 0 ||
+                      _stricmp(requested, "d3d11-warp") == 0;
+    if (gpu || warp) {
+        std::string error;
+        auto backend = createD3D11ComputeBackend(
+            warp, std::make_unique<CpuComputeBackend>(false, "cpu"), &error);
+        if (backend) return backend;
+        return std::make_unique<CpuComputeBackend>(true, requested, error);
+    }
+    return std::make_unique<CpuComputeBackend>(
+        true, requested, "unknown backend name");
 }
