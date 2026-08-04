@@ -31,10 +31,10 @@ using Microsoft::WRL::ComPtr;
 namespace {
 
 constexpr UINT kThreadsPerGroup = 64;
-constexpr UINT kMaxGroups = 256;
-constexpr UINT kPixelsPerChunk = 262144;
+constexpr UINT kPixelsPerChunk = 524288;
 constexpr int kMaxGpuIterations = 100000;
 constexpr UINT kGpuIterationPrefix = 64;
+constexpr int kCpuRefineBlock = 32;
 constexpr float kAnalyticInterior = -3.0f;
 constexpr float kCpuRefineIteration = 64.0f;
 
@@ -54,7 +54,6 @@ cbuffer Params : register(b0) {
 };
 
 RWStructuredBuffer<float> Output : register(u0);
-RWByteAddressBuffer Counter : register(u1);
 
 float2 dsAdd(float2 a, float2 b) {
     precise float s = a.x + b.x;
@@ -149,13 +148,10 @@ float solvePixel(uint pixel) {
 
 [numthreads(64, 1, 1)]
 void main(uint3 dispatchThreadId : SV_DispatchThreadID) {
-    uint localPixel;
-    Counter.InterlockedAdd(0, 1, localPixel);
-    while (localPixel < pixelCount) {
-        uint pixel = basePixel + localPixel;
-        Output[pixel] = solvePixel(pixel);
-        Counter.InterlockedAdd(0, 1, localPixel);
-    }
+    uint localPixel = dispatchThreadId.x;
+    if (localPixel >= pixelCount) return;
+    uint pixel = basePixel + localPixel;
+    Output[pixel] = solvePixel(pixel);
 }
 )";
 
@@ -291,27 +287,6 @@ public:
             return false;
         }
 
-        D3D11_BUFFER_DESC counter{};
-        counter.ByteWidth = sizeof(UINT);
-        counter.Usage = D3D11_USAGE_DEFAULT;
-        counter.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-        counter.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-        hr = _device->CreateBuffer(&counter, nullptr, &_counterBuffer);
-        if (FAILED(hr)) {
-            if (error) *error = "work counter creation failed (" + hresultText(hr) + ")";
-            return false;
-        }
-        D3D11_UNORDERED_ACCESS_VIEW_DESC counterView{};
-        counterView.Format = DXGI_FORMAT_R32_TYPELESS;
-        counterView.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-        counterView.Buffer.NumElements = 1;
-        counterView.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
-        hr = _device->CreateUnorderedAccessView(
-            _counterBuffer.Get(), &counterView, &_counterUav);
-        if (FAILED(hr)) {
-            if (error) *error = "work counter UAV creation failed (" + hresultText(hr) + ")";
-            return false;
-        }
         D3D11_QUERY_DESC query{};
         query.Query = D3D11_QUERY_EVENT;
         hr = _device->CreateQuery(&query, &_completionQuery);
@@ -323,8 +298,8 @@ public:
         std::string adapterName =
             haveAdapter ? narrow(adapter.Description) : std::string();
         _info.name = _warp ? "D3D11 WARP" : "D3D11 GPU";
-        _info.detail = adapterName.empty() ? "2xFP32 persistent compute"
-                                           : adapterName + "; 2xFP32 persistent compute";
+        _info.detail = adapterName.empty() ? "2xFP32 bounded-prefix compute"
+                                           : adapterName + "; 2xFP32 bounded-prefix compute";
         _info.detail += "; max 100k iterations";
         _info.hardwareAccelerated = !_warp;
         _info.fallback = false;
@@ -390,14 +365,16 @@ private:
     ComPtr<ID3D11DeviceContext> _context;
     ComPtr<ID3D11ComputeShader> _shader;
     ComPtr<ID3D11Buffer> _constantBuffer;
-    ComPtr<ID3D11Buffer> _counterBuffer;
-    ComPtr<ID3D11UnorderedAccessView> _counterUav;
     ComPtr<ID3D11Query> _completionQuery;
     ComPtr<ID3D11Buffer> _outputBuffer;
     ComPtr<ID3D11UnorderedAccessView> _outputUav;
     ComPtr<ID3D11Buffer> _stagingBuffer;
     UINT _outputCapacity = 0;
     std::vector<float> _readback;
+    std::vector<int> _refinePixels;
+    std::vector<double> _refineRe;
+    std::vector<double> _refineIm;
+    std::vector<float> _refineOutput;
 
     bool computeCpu(const ComputeRequest& request) {
         if (_cancelRequested.load(std::memory_order_acquire))
@@ -520,7 +497,7 @@ private:
         if (!std::isfinite(escapeRadius) || escapeRadius < 2.0 ||
             escapeRadius > 1.0e8)
             return false;
-        double escapeSquared = escapeRadius * escapeRadius;
+        double escapeSquared = request.cpuEngine->escapeRadiusSquared();
         if (!std::isfinite(escapeSquared)) return false;
         params.escapeSquared = splitDouble(escapeSquared);
         if (!std::isfinite(params.escapeSquared.hi) ||
@@ -528,15 +505,12 @@ private:
             return false;
 
         ID3D11Buffer* constantBuffers[] = {_constantBuffer.Get()};
-        ID3D11UnorderedAccessView* uavs[] = {
-            _outputUav.Get(), _counterUav.Get()
-        };
+        ID3D11UnorderedAccessView* uavs[] = {_outputUav.Get()};
         _context->CSSetShader(_shader.Get(), nullptr, 0);
         _context->CSSetConstantBuffers(0, 1, constantBuffers);
-        _context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+        _context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
 
         const auto dispatchStart = ProfileClock::now();
-        const UINT clear[4] = {};
         for (UINT base = 0; base < count; base += kPixelsPerChunk) {
             if (_cancelRequested.load(std::memory_order_acquire)) {
                 unbind();
@@ -546,10 +520,8 @@ private:
             params.pixelCount = std::min(kPixelsPerChunk, count - base);
             _context->UpdateSubresource(
                 _constantBuffer.Get(), 0, nullptr, &params, 0, 0);
-            _context->ClearUnorderedAccessViewUint(_counterUav.Get(), clear);
-            UINT groups = std::min(
-                kMaxGroups,
-                (params.pixelCount + kThreadsPerGroup - 1) / kThreadsPerGroup);
+            UINT groups =
+                (params.pixelCount + kThreadsPerGroup - 1) / kThreadsPerGroup;
             _context->Dispatch(groups, 1, 1);
             _context->End(_completionQuery.Get());
             _context->Flush();
@@ -594,8 +566,10 @@ private:
         // exact FP64 scalar semantics instead of letting divergent GPU lanes run
         // to the full iteration limit.
         const auto refineStart = ProfileClock::now();
-        long long refined = 0, analytic = 0;
-#pragma omp parallel for schedule(dynamic, 64) reduction(+:refined,analytic)
+        _refinePixels.resize(count);
+        std::atomic<int> refineCount{0};
+        long long analytic = 0;
+#pragma omp parallel for schedule(static) reduction(+:analytic)
         for (int pixel = 0; pixel < static_cast<int>(count); ++pixel) {
             if (_cancelRequested.load(std::memory_order_relaxed)) continue;
             float value = _readback[pixel];
@@ -612,10 +586,36 @@ private:
             } else if (value >= 0.0f && value < kCpuRefineIteration) {
                 continue;
             }
-            _readback[pixel] =
-                request.cpuEngine->ComputeShallowPoint(
-                    cr, ci, request.maxIterations);
-            ++refined;
+            int slot = refineCount.fetch_add(1, std::memory_order_relaxed);
+            _refinePixels[slot] = pixel;
+        }
+        const int refined = refineCount.load(std::memory_order_relaxed);
+        _refineRe.resize(refined);
+        _refineIm.resize(refined);
+        _refineOutput.resize(refined);
+#pragma omp parallel for schedule(static)
+        for (int slot = 0; slot < refined; ++slot) {
+            int pixel = _refinePixels[slot];
+            int y = pixel / request.width;
+            int x = pixel - y * request.width;
+            _refineRe[slot] = values[0] + values[2] * x;
+            _refineIm[slot] = values[1] + values[3] * y;
+        }
+        const int refineBlocks =
+            (refined + kCpuRefineBlock - 1) / kCpuRefineBlock;
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int block = 0; block < refineBlocks; ++block) {
+            if (_cancelRequested.load(std::memory_order_relaxed)) continue;
+            int base = block * kCpuRefineBlock;
+            int blockCount = std::min(kCpuRefineBlock, refined - base);
+            request.cpuEngine->ComputeShallowPoints(
+                _refineRe.data() + base, _refineIm.data() + base,
+                blockCount, _refineOutput.data() + base,
+                request.maxIterations);
+        }
+#pragma omp parallel for schedule(static)
+        for (int slot = 0; slot < refined; ++slot) {
+            _readback[_refinePixels[slot]] = _refineOutput[slot];
         }
         if (_cancelRequested.load(std::memory_order_acquire)) return false;
         const auto refineEnd = ProfileClock::now();
@@ -653,16 +653,17 @@ private:
                     milliseconds(refineStart, refineEnd),
                     milliseconds(totalStart, totalEnd),
                     static_cast<long long>(count) - analytic - refined,
-                    analytic, refined, kGpuIterationPrefix);
+                    analytic, static_cast<long long>(refined),
+                    kGpuIterationPrefix);
             fflush(stderr);
         }
         return true;
     }
 
     void unbind() {
-        ID3D11UnorderedAccessView* nullUavs[2] = {};
+        ID3D11UnorderedAccessView* nullUav = nullptr;
         ID3D11Buffer* nullBuffer = nullptr;
-        _context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+        _context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
         _context->CSSetConstantBuffers(0, 1, &nullBuffer);
         _context->CSSetShader(nullptr, nullptr, 0);
     }

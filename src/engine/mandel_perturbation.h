@@ -85,6 +85,10 @@ public:
     // Exact shallow scalar used to resolve the small set of numerically
     // sensitive GPU pixels without re-running the full frame on the CPU.
     float ComputeShallowPoint(double cRe, double cIm, int mxit) const;
+    // Batched equivalent used by the GPU tail: AVX2 lane refill preserves the
+    // shallow CPU result while avoiding one scalar call per unresolved pixel.
+    void ComputeShallowPoints(const double* cRe, const double* cIm,
+                              int count, float* output, int mxit) const;
     // Verification helper: brute-force high-precision escape time into out[],
     // reusing the grid (_c0/_dx/_dy) set by the most recent Compute() call.
     // step>1 samples only pixels on a (step x step) grid (others left untouched)
@@ -103,6 +107,9 @@ public:
     void SetHalt(bool flag);
     void SetProgress(std::atomic<float>* progress, float offset = 0.0f, float scale = 1.0f);
     double escapeRadius() const { return _ESCAPE_RADIUS; }
+    double escapeRadiusSquared() const {
+        return static_cast<double>(_ESCAPE_RADIUS * _ESCAPE_RADIUS);
+    }
 
     // Palette density, used only by the SAC/Feather adaptive-supersampling
     // detector to flag pixels by their actual colour change (colour-index change

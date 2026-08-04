@@ -1998,6 +1998,26 @@ static int runBackendCase() {
             ++failures;
         _putenv_s("MANDEL_BAILOUT", "");
 
+        // Batched AVX2 refinement must preserve the scalar renderer's float
+        // bailout-square rounding for custom radii.
+        _putenv_s("MANDEL_BAILOUT", "2.1");
+        float batchStorage[4] = {};
+        Mandel batchMandel(2, 2, 64, 1, batchStorage);
+        const double batchRe[] = {
+            0.2522435803501477, -0.75, 0.3, -1.2
+        };
+        const double batchIm[] = {0.0, 0.1, 0.5, 0.0};
+        float scalarPoints[4], batchPoints[4];
+        for (int i = 0; i < 4; ++i)
+            scalarPoints[i] =
+                batchMandel.ComputeShallowPoint(batchRe[i], batchIm[i], 64);
+        batchMandel.ComputeShallowPoints(
+            batchRe, batchIm, 4, batchPoints, 64);
+        if (std::memcmp(scalarPoints, batchPoints,
+                        sizeof(scalarPoints)) != 0)
+            ++failures;
+        _putenv_s("MANDEL_BAILOUT", "");
+
         // The split c0/dx values can each fit while a far endpoint does not.
         // Reject before dispatch rather than feeding an overflowing dsMul.
         std::vector<float> rangeOutput((size_t)W * H, EMPTYPIXEL);

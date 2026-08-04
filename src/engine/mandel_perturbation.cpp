@@ -382,6 +382,11 @@ float Mandel::ComputeShallowPoint(double cRe, double cIm, int mxit) const {
     return static_cast<float>(floatPointCompute(cRe, cIm, mxit, 0));
 }
 
+void Mandel::ComputeShallowPoints(const double* cRe, const double* cIm,
+                                  int count, float* output, int mxit) const {
+    solveShallowSimdList(cRe, cIm, count, output, mxit, 0);
+}
+
 // AVX2 shallow Mandelbrot with lane refilling: processes a LIST of `count` pixels
 // (arbitrary c = cre[k] + i*cim[k]) 4-wide, and the moment a lane escapes/goes
 // interior/hits mxit it is immediately reloaded with the next pending pixel, so no
@@ -392,7 +397,7 @@ float Mandel::ComputeShallowPoint(double cRe, double cIm, int mxit) const {
 void Mandel::solveShallowSimdList(const double* cre, const double* cim, int count,
                                   float* out, int mxit, int c_method) const {
     const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
-    const double ESC2 = (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS;
+    const double ESC2 = escapeRadiusSquared();
     const double LG2 = log(2.0);
     const __m256d two = _mm256_set1_pd(2.0), one = _mm256_set1_pd(1.0);
     const __m256d ESC2v = _mm256_set1_pd(ESC2), intEps = _mm256_set1_pd(1e-9);
@@ -470,7 +475,7 @@ void Mandel::solveShallowSimdList(const double* cre, const double* cim, int coun
 void Mandel::solveJuliaShallowSimdList(const double* z0re, const double* z0im,
                                        int count, double cre, double cim,
                                        float* out, int mxit, bool ede) const {
-    const double ESC2 = (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS;
+    const double ESC2 = escapeRadiusSquared();
     const double LG2 = log(2.0);
     const __m256d two = _mm256_set1_pd(2.0), one = _mm256_set1_pd(1.0);
     const __m256d cr = _mm256_set1_pd(cre), ci = _mm256_set1_pd(cim);
