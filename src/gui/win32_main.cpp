@@ -32,6 +32,7 @@
 #include "color.h"
 #include "gui_theme.h"
 #include "gui_export.h"
+#include "formula_dialog.h"
 #include "interpolate.h"
 #include "mandel_navigator.h"
 #include "mandel_perturbation.h"
@@ -46,6 +47,7 @@
 namespace {
 
 // Fixed render geometry + theme + self-drawn widget helpers live in gui_theme.h.
+constexpr UINT WM_OPEN_FORMULA_TEST = WM_APP + 17;
 
 
 
@@ -55,7 +57,7 @@ enum Hit {
     H_RESET, H_RENDER, H_SAVE, H_COPY, H_PASTE,
     H_MAXTRACK, H_DENSTRACK, H_PHASETRACK, H_SPEEDTRACK,
     H_RELAZ, H_RELEL, H_RELSTR,
-    H_SS, H_JULIA, H_ORBIT, H_EDE, H_PALETTE_DD, H_COLOR, H_GALLERY_DD, H_PANELSB
+    H_SS, H_FORMULA, H_JULIA, H_ORBIT, H_EDE, H_PALETTE_DD, H_COLOR, H_GALLERY_DD, H_PANELSB
 };
 
 // Gallery demo presets: a saved location plus the exact render settings used to
@@ -235,12 +237,13 @@ public:
     RECT rcReset{}, rcRender{}, rcSave{}, rcCopy{}, rcPaste{};
     RECT rcLocation{}, rcMaxTrack{}, rcDensTrack{}, rcPhaseTrack{}, rcSpeedTrack{};
     RECT rcReliefAz{}, rcReliefEl{}, rcReliefStr{};
-    RECT rcSS{}, rcJulia{}, rcColoringDD{}, rcPaletteDD{}, rcColor{}, rcGradient{};
+    RECT rcSS{}, rcFormula{}, rcJulia{}, rcColoringDD{}, rcPaletteDD{}, rcColor{}, rcGradient{};
     RECT rcGalleryDD{};
     RECT rcOrbitToggle{}, rcOrbitThumb{};
 
     // state
     int maxIter = 500000;
+    int savedMaxIter = 500000;
     bool ssOn = false;
     int coloringIdx = 0;                    // 0 Smooth, 1 Distance (EDE), 2 Feather (SAC)
     bool coloringOpen = false;              // coloring dropdown expanded
@@ -248,8 +251,10 @@ public:
     int paletteIdx = 0;                    // index into palettePresets()
     bool orbitOn = false;
     bool juliaUiEnabled = false;           // internal-only until parameters/perf are production ready
+    FormulaDialogConfig formulaConfig;
     int savedColoringIdx = 0;
     bool savedSsOn = false, savedOrbitOn = false;
+    bool hasSavedMandelUi = false;
     std::unique_ptr<OrbitWorker> orbitWorker;
     OrbitResult orbitResult;
     std::vector<uint8_t> orbitThumbnail;
@@ -393,7 +398,7 @@ public:
     }
 
     void requestOrbit(int x, int y, bool applyBoundary = true) {
-        if (!orbitOn || navDragging || !nav) return;
+        if (!orbitOn || navDragging || !nav || !nav->IsMandelbrot()) return;
         if (!orbitWorker) orbitWorker = std::make_unique<OrbitWorker>();
         if (orbitThumbnail.empty()) buildOrbitThumbnail();
         auto now = std::chrono::steady_clock::now();
@@ -493,7 +498,7 @@ public:
         rcCopy    = { px + 3*(bw+g),   y, px + 4*bw + 3*g,  y + bh };
         rcPaste   = { px + 4*(bw+g),   y, px + 5*bw + 4*g,  y + bh };
         y += bh + S(14);
-        int locationH = nav && nav->IsJulia() ? S(126) : S(100);
+        int locationH = nav && !nav->IsMandelbrot() ? S(126) : S(100);
         rcLocation = { px, y, px + w, y + locationH }; y += locationH + S(16);
         rcMaxTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         rcDensTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
@@ -501,6 +506,7 @@ public:
         rcSpeedTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
         // Unlabeled toggle: box sits at y (no label above), then a uniform 14px gap.
         rcSS  = { px, y, px + w, y + bh }; y += bh + S(14);
+        rcFormula = { px, y, px + w, y + bh }; y += bh + S(14);
         if (juliaUiEnabled) {
             rcJulia = { px, y, px + w, y + bh }; y += bh + S(14);
         } else {
@@ -555,7 +561,7 @@ public:
             RECT* all[] = { &rcReset, &rcRender, &rcSave, &rcCopy, &rcPaste,
                             &rcLocation, &rcMaxTrack, &rcDensTrack, &rcPhaseTrack, &rcSpeedTrack,
                             &rcReliefAz, &rcReliefEl, &rcReliefStr,
-                            &rcSS, &rcJulia, &rcOrbitToggle, &rcOrbitThumb,
+                            &rcSS, &rcFormula, &rcJulia, &rcOrbitToggle, &rcOrbitThumb,
                             &rcColoringDD, &rcPaletteDD, &rcGradient, &rcColor, &rcGalleryDD };
             for (RECT* r : all) OffsetRect(r, 0, -panelScroll);
         }
@@ -570,33 +576,98 @@ public:
     }
 
     void switchJuliaMode(bool enable, bool render = true) {
-        if (enable == nav->IsJulia()) {
+        if (!enable) {
+            if (!nav->IsMandelbrot()) restoreMandelbrotUi(render);
+            return;
+        }
+        if (nav->IsJulia()) {
             if (render) startRender();
             return;
         }
-        if (enable) {
+        if (nav->IsMandelbrot() && !hasSavedMandelUi) {
             savedColoringIdx = coloringIdx;
             savedSsOn = ssOn;
             savedOrbitOn = orbitOn;
-            if (orbitWorker) orbitWorker->cancel();
-            orbitOn = false;
-            orbitResult = OrbitResult{};
-            ssOn = false;
-            coloringIdx = coloringIdx == 1 ? 1 : 0;
-            relief_on = normal_light_on = de_overlay_on = 0;
+            savedMaxIter = maxIter;
+            hasSavedMandelUi = true;
         }
-        nav->SetJuliaMode(enable);
-        if (!enable) {
-            coloringIdx = savedColoringIdx;
-            ssOn = savedSsOn;
-            orbitOn = savedOrbitOn;
-            relief_on = coloringIdx == 3;
-            normal_light_on = coloringIdx == 4;
-            de_overlay_on = coloringIdx == 6;
-        }
+        if (orbitWorker) orbitWorker->cancel();
+        orbitOn = false;
+        orbitResult = OrbitResult{};
+        ssOn = false;
+        coloringIdx = coloringIdx == 1 ? 1 : 0;
+        relief_on = normal_light_on = de_overlay_on = 0;
+        nav->SetJuliaMode(true);
         layout();
         needFull = true;
         if (render) startRender();
+    }
+
+    void restoreMandelbrotUi(bool render = true) {
+        if (nav->IsMandelbrot()) return;
+        maxIter = savedMaxIter;
+        nav->SetMxit(maxIter);
+        nav->RestoreMandelbrotMode();
+        coloringIdx = savedColoringIdx;
+        ssOn = savedSsOn;
+        orbitOn = savedOrbitOn;
+        relief_on = coloringIdx == 3;
+        normal_light_on = coloringIdx == 4;
+        de_overlay_on = coloringIdx == 6;
+        hasSavedMandelUi = false;
+        layout();
+        needFull = true;
+        if (render) startRender();
+    }
+
+    bool applyFormulaConfig(const FormulaDialogConfig& candidate, bool render = true) {
+        formula::ExpressionError error;
+        bool entering = !nav->IsExpression();
+        bool capturedMandelUi = false;
+        if (entering && nav->IsMandelbrot() && !hasSavedMandelUi) {
+            savedColoringIdx = coloringIdx;
+            savedSsOn = ssOn;
+            savedOrbitOn = orbitOn;
+            savedMaxIter = maxIter;
+            hasSavedMandelUi = true;
+            capturedMandelUi = true;
+        }
+        if (!nav->SetExpressionFormula(candidate.source, candidate.pixelParameter,
+                                       candidate.fixedZ0, candidate.fixedC,
+                                       candidate.parameters, candidate.bailout, &error)) {
+            wchar_t message[384];
+            swprintf_s(message, L"Formula error at character %zu:\n%hs",
+                       error.position + 1, error.message.c_str());
+            MessageBoxW(hwnd, message, L"Invalid formula", MB_OK | MB_ICONERROR);
+            if (capturedMandelUi) hasSavedMandelUi = false;
+            return false;
+        }
+        if (entering) {
+            maxIter = std::min(maxIter, 2000);
+            nav->SetMxit(maxIter);
+        }
+        formulaConfig = candidate;
+        if (orbitWorker) orbitWorker->cancel();
+        orbitOn = false;
+        orbitResult = OrbitResult{};
+        ssOn = false;
+        coloringIdx = 0;
+        relief_on = normal_light_on = de_overlay_on = 0;
+        layout();
+        needFull = true;
+        if (render) startRender();
+        return true;
+    }
+
+    void showFormulaEditor() {
+        FormulaDialogConfig candidate = formulaConfig;
+        FormulaDialogResult result = showFormulaDialog(hwnd, candidate);
+        if (result == FormulaDialogResult::Cancel) return;
+        if (result == FormulaDialogResult::UseMandelbrot) {
+            restoreMandelbrotUi();
+            return;
+        }
+        applyFormulaConfig(candidate);
     }
     // Scrollbar thumb rect on the panel's right edge (empty if nothing to scroll).
     RECT panelScrollbarRect() const {
@@ -819,7 +890,27 @@ public:
     }
 
     void copyLocation() {
-        std::wstring t = widen(nav->GetLocationText());
+        std::string location = nav->GetLocationText();
+        if (nav->IsExpression()) {
+            char line[160];
+            location += "\r\npixel: ";
+            location += formulaConfig.pixelParameter == FormulaParameter::InitialZ ? "z0" : "c";
+            snprintf(line, sizeof(line),
+                     "\r\nfixed_z0_re: %.17g\r\nfixed_z0_im: %.17g"
+                     "\r\nfixed_c_re: %.17g\r\nfixed_c_im: %.17g"
+                     "\r\nbailout: %.17g",
+                     formulaConfig.fixedZ0.real(), formulaConfig.fixedZ0.imag(),
+                     formulaConfig.fixedC.real(), formulaConfig.fixedC.imag(),
+                     formulaConfig.bailout);
+            location += line;
+            for (int i = 0; i < 8; ++i) {
+                snprintf(line, sizeof(line), "\r\np%d_re: %.17g\r\np%d_im: %.17g",
+                         i, formulaConfig.parameters[i].real(),
+                         i, formulaConfig.parameters[i].imag());
+                location += line;
+            }
+        }
+        std::wstring t = widen(location);
         if (!OpenClipboard(hwnd)) return;
         EmptyClipboard();
         size_t bytes = (t.size() + 1) * sizeof(wchar_t);
@@ -868,7 +959,36 @@ public:
             return ok;
         };
         if (!validNumbers({ xs, ys, scale }, 2)) return;
-        if (mode == "julia") {
+        if (mode == "expression") {
+            FormulaDialogConfig candidate;
+            candidate.source = val("formula:");
+            std::string pixel = val("pixel:");
+            candidate.pixelParameter = pixel == "z0"
+                ? FormulaParameter::InitialZ : FormulaParameter::C;
+            std::vector<std::string> values = {
+                val("fixed_z0_re:"), val("fixed_z0_im:"),
+                val("fixed_c_re:"), val("fixed_c_im:"), val("bailout:")
+            };
+            for (int i = 0; i < 8; ++i) {
+                values.push_back(val(("p" + std::to_string(i) + "_re:").c_str()));
+                values.push_back(val(("p" + std::to_string(i) + "_im:").c_str()));
+            }
+            if (candidate.source.empty() ||
+                std::any_of(values.begin(), values.end(),
+                            [](const std::string& value) { return value.empty(); }) ||
+                !validNumbers(values))
+                return;
+            candidate.fixedZ0 = { atof(values[0].c_str()), atof(values[1].c_str()) };
+            candidate.fixedC = { atof(values[2].c_str()), atof(values[3].c_str()) };
+            candidate.bailout = atof(values[4].c_str());
+            if (!(candidate.bailout > 0.0)) return;
+            for (int i = 0; i < 8; ++i)
+                candidate.parameters[i] = {
+                    atof(values[5 + 2 * i].c_str()),
+                    atof(values[6 + 2 * i].c_str())
+                };
+            if (!applyFormulaConfig(candidate, false)) return;
+        } else if (mode == "julia") {
             if (!juliaUiEnabled) return;
             std::string cr = val("c_re:"), ci = val("c_im:");
             if (cr.empty() || ci.empty()) return;
@@ -879,8 +999,8 @@ public:
                 if (!wasJulia) switchJuliaMode(false, false);
                 return;
             }
-        } else if (nav->IsJulia()) {
-            switchJuliaMode(false, false);
+        } else if (!nav->IsMandelbrot()) {
+            restoreMandelbrotUi(false);
         }
         if (nav->SetLocation(xs, ys, scale)) startRender();
     }
@@ -1056,7 +1176,8 @@ public:
             RECT ir = { lr.left, lr.top + i * ih, lr.right, lr.top + (i + 1) * ih };
             if (i == coloringHover) fillRect(dc, { ir.left + S(3), ir.top, ir.right - S(3), ir.bottom }, CLR_CARD_HOV);
             RECT tr = ir; tr.left += S(14);
-            COLORREF color = (nav->IsJulia() && i > 1)
+            COLORREF color = ((nav->IsJulia() && i > 1) ||
+                              (nav->IsExpression() && i > 0))
                 ? CLR_TEXT_DIM : (i == coloringIdx ? CLR_ACCENT : CLR_TEXT);
             drawText(dc, tr, coloringName(i), color, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
@@ -1064,6 +1185,7 @@ public:
     void selectColoring(int idx) {
         if (idx < 0 || idx > 6) return;
         if (nav->IsJulia() && idx > 1) return;
+        if (nav->IsExpression() && idx > 0) return;
         coloringIdx = idx;
         relief_on = (idx == 3) ? 1 : 0;
         normal_light_on = (idx == 4) ? 1 : 0;
@@ -1122,7 +1244,7 @@ public:
     void applyPreset(int idx) {
         const auto& gp = galleryPresets();
         if (idx < 0 || idx >= (int)gp.size()) return;
-        if (nav->IsJulia()) nav->SetJuliaMode(false);
+        if (!nav->IsMandelbrot()) restoreMandelbrotUi(false);
         const Preset& p = gp[idx];
         // render settings first, then the location (which kicks off the render)
         maxIter = std::clamp(p.maxIter, 100, 5000000); nav->SetMxit(maxIter);
@@ -1284,6 +1406,9 @@ public:
                    speedSnaps, 1);
 
         drawToggle(dc, rcSS, L"5x supersampling", ssOn, H_SS);
+        drawButton(dc, rcFormula,
+                   nav->IsExpression() ? L"Formula: custom" : L"Formula...",
+                   H_FORMULA, nav->IsExpression());
         if (juliaUiEnabled)
             drawToggle(dc, rcJulia, L"Julia set (experimental)", nav->IsJulia(), H_JULIA);
         drawToggle(dc, rcOrbitToggle, L"Show orbit", orbitOn, H_ORBIT);
@@ -1415,6 +1540,7 @@ public:
             RECT rs = rcReliefStr; rs.top -= S(8); rs.bottom += S(8); if (inRect(rs,x,y)) return H_RELSTR;
         }
         if (inRect(rcSS,x,y)) return H_SS;
+        if (inRect(rcFormula,x,y)) return H_FORMULA;
         if (juliaUiEnabled && inRect(rcJulia,x,y)) return H_JULIA;
         if (inRect(rcOrbitToggle,x,y)) return H_ORBIT;
         if (inRect(rcColoringDD,x,y)) return H_EDE;
@@ -1686,10 +1812,39 @@ public:
             if (const char* e = getenv("MANDEL_GUI_JULIA"); e && atoi(e)) {
                 switchJuliaMode(true, false);
             }
+            if (const char* expression = getenv("MANDEL_GUI_FORMULA")) {
+                FormulaDialogConfig config = formulaConfig;
+                config.source = expression;
+                const char* plane = getenv("MANDEL_GUI_FORMULA_PIXEL");
+                config.pixelParameter = plane && strcmp(plane, "z0") == 0
+                    ? FormulaParameter::InitialZ : FormulaParameter::C;
+                if (const char* value = getenv("MANDEL_GUI_FIXED_Z0_RE")) config.fixedZ0.real(atof(value));
+                if (const char* value = getenv("MANDEL_GUI_FIXED_Z0_IM")) config.fixedZ0.imag(atof(value));
+                if (const char* value = getenv("MANDEL_GUI_FIXED_C_RE")) config.fixedC.real(atof(value));
+                if (const char* value = getenv("MANDEL_GUI_FIXED_C_IM")) config.fixedC.imag(atof(value));
+                if (const char* value = getenv("MANDEL_GUI_FORMULA_BAILOUT")) config.bailout = atof(value);
+                applyFormulaConfig(config, false);
+                // z0-plane activation intentionally resets its view; apply the
+                // requested benchmark location after selecting the binding.
+                if (anyBench) {
+                    const char* gx = getenv("MANDEL_GUI_CX"), *gy = getenv("MANDEL_GUI_CY");
+                    const char* gz = getenv("MANDEL_GUI_ZOOM");
+                    if (gx && gy && gz) {
+                        std::string sc = expandSci(gz);
+                        if (!sc.empty()) nav->SetLocation(gx, gy, sc);
+                    }
+                }
+                if (getenv("MANDEL_GUI_FORMULA_RESTORE"))
+                    restoreMandelbrotUi(false);
+                if (getenv("MANDEL_GUI_FORMULA_JULIA_RESTORE")) {
+                    switchJuliaMode(true, false);
+                    switchJuliaMode(false, false);
+                }
+            }
             if (getenv("MANDEL_GUI_BENCH")) {
                 benchMode = true;
                 const char* e = getenv("MANDEL_GUI_SS");
-                ssOn = !nav->IsJulia() && (!e || atoi(e));
+                ssOn = nav->IsMandelbrot() && (!e || atoi(e));
                 if (ssOn) nav->SetCMethod(nav->GetCMethod() | ColoringMethod::SUPER_SAMPLING);
                 if (const char* cc = getenv("MANDEL_GUI_COLOR")) selectColoring(atoi(cc));
                 if (const char* ds = getenv("MANDEL_GUI_DENS")) color_density = (float)atof(ds);
@@ -1731,8 +1886,13 @@ public:
             // handler to the next tick (~31 ms => ~32 fps). The cap prevents over-render.
             { int tms = 4; if (const char* t = getenv("MANDEL_GUI_TIMERMS")) { tms = atoi(t); if (tms < 1) tms = 1; }
               SetTimer(hwnd, TIMER_ID, tms, nullptr); }
+            if (getenv("MANDEL_GUI_OPEN_FORMULA"))
+                PostMessageW(hwnd, WM_OPEN_FORMULA_TEST, 0, 0);
             return 0;
         }
+        case WM_OPEN_FORMULA_TEST:
+            showFormulaEditor();
+            return 0;
         case WM_DPICHANGED: {
             dpi = HIWORD(wp);
             createFonts();
@@ -1847,16 +2007,19 @@ public:
                 case H_RESET: nav->Reset(); renderStart = std::chrono::steady_clock::now(); wasComputing = true; keepLive(); break;
                 case H_RENDER: startRender(); break;
                 case H_SAVE:
-                    if (nav->IsJulia()) saveImage();
+                    if (!nav->IsMandelbrot()) saveImage();
                     else showExportDialog(hwnd, nav.get());
                     break;
                 case H_COPY: copyLocation(); break;
                 case H_PASTE: pasteLocation(); break;
                 case H_SS:
-                    if (!nav->IsJulia()) {
+                    if (nav->IsMandelbrot()) {
                         ssOn = !ssOn;
                         setMethodFlag(ColoringMethod::SUPER_SAMPLING, ssOn);
                     }
+                    break;
+                case H_FORMULA:
+                    showFormulaEditor();
                     break;
                 case H_JULIA: {
                     bool enable = !nav->IsJulia();
@@ -1864,7 +2027,7 @@ public:
                     break;
                 }
                 case H_ORBIT:
-                    if (!nav->IsJulia()) orbitOn = !orbitOn;
+                    if (nav->IsMandelbrot()) orbitOn = !orbitOn;
                     if (orbitOn) {
                         if (!orbitWorker) orbitWorker = std::make_unique<OrbitWorker>();
                         if (orbitThumbnail.empty()) buildOrbitThumbnail();

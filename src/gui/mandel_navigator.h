@@ -16,6 +16,10 @@
 class MandelNavigator : public Navigator {
 private:
     FormulaContext _formula = quadraticMandelbrot();
+    formula::ExpressionProgram _expressionProgram;
+    formula::ExpressionContext _expressionFixed;
+    FormulaParameter _expressionPixel = FormulaParameter::C;
+    double _expressionBailout = 4.0;
     Mandel* _mandel;
     float* _iter;
     mpf_t _z_re, _z_im, _scale;
@@ -88,8 +92,16 @@ public:
     void GetView(mpf_t re, mpf_t im, mpf_t scale) const;
     mp_bitcnt_t GetViewPrecision() const { return mpf_get_prec(_scale); }
     FormulaContext GetFormulaContext() const { return _formula; }
+    bool IsMandelbrot() const { return _formula.formula.id == FormulaId::PowerPlusC &&
+                                      _formula.slice.pixel == FormulaParameter::C; }
     bool IsJulia() const { return _formula.slice.pixel == FormulaParameter::InitialZ; }
+    bool IsExpression() const { return _formula.formula.id == FormulaId::Expression; }
     void SetJuliaMode(bool enabled);
+    bool SetExpressionFormula(const std::string& source, FormulaParameter pixel,
+                              std::complex<double> fixedZ0, std::complex<double> fixedC,
+                              const std::array<std::complex<double>, 8>& parameters,
+                              double bailout, formula::ExpressionError* error = nullptr);
+    void RestoreMandelbrotMode();
     bool SetJuliaC(const std::string& re, const std::string& im);
     void GetJuliaC(mpf_t re, mpf_t im) const;
     
@@ -109,6 +121,7 @@ public:
     bool SetLocation(const std::string& x, const std::string& y, const std::string& scale);
 
 private:
+    void SaveMandelbrotState();
     void ConfigureSampling();
     void SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method);
     // SS phase cache: fill per-subpixel base palette indices for a SmoothColor
