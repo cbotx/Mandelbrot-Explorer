@@ -2062,6 +2062,8 @@ public:
         }
         case WM_LBUTTONDOWN: {
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+            if (formulaEditor && formulaEditor->visible())
+                formulaEditor->dismissPopups();
             if (paletteOpen) {   // a click while the list is open selects or dismisses it
                 int it = paletteItemAt(x,y);
                 if (it >= 0) selectPalette(it);

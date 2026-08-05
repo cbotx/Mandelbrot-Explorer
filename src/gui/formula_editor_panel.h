@@ -33,6 +33,7 @@ public:
     void move(const RECT& bounds);
     void setDpi(int dpi);
     void setConfig(const FormulaDialogConfig& config);
+    void dismissPopups();
     HWND hwnd() const;
 
 private:
