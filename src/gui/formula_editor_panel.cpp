@@ -22,6 +22,7 @@
 
 #include "formula_expression.h"
 #include "gui_theme.h"
+#include "ui_framework.h"
 
 namespace {
 
@@ -227,7 +228,9 @@ struct FormulaEditorPanel::Impl {
     InspectorValue selected = InspectorValue::Z0;
 
     int dpi = 96;
-    int scrollDip = 0;
+    ui::Resources resources;
+    ui::BackBuffer backBuffer;
+    ui::ScrollState scroll;
     double pickerRange = 2.0;
     bool syncing = false;
     bool draggingPoint = false;
@@ -315,8 +318,8 @@ struct FormulaEditorPanel::Impl {
 
     RECT toPixelRect(RECT rect, bool content) const {
         if (content) {
-            rect.top -= scrollDip;
-            rect.bottom -= scrollDip;
+            rect.top -= scroll.position();
+            rect.bottom -= scroll.position();
         }
         return {
             scale(rect.left), scale(rect.top),
@@ -440,7 +443,7 @@ struct FormulaEditorPanel::Impl {
             return HIT_NONE;
         }
 
-        int contentY = yDip + scrollDip;
+        int contentY = yDip + scroll.position();
         for (const ButtonSpec& button : contentButtons()) {
             if (containsPoint(button.rect, xDip, contentY)) return button.hit;
         }
@@ -499,51 +502,20 @@ struct FormulaEditorPanel::Impl {
         if (hwnd) InvalidateRect(hwnd, nullptr, FALSE);
     }
 
-    void deleteFont(HFONT font) {
-        if (!font) return;
-        HFONT defaultFont = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-        HFONT fixedFont = reinterpret_cast<HFONT>(GetStockObject(SYSTEM_FIXED_FONT));
-        if (font != defaultFont && font != fixedFont) DeleteObject(font);
-    }
-
     void deleteGdiObjects() {
-        deleteFont(uiFont);
-        deleteFont(boldFont);
-        deleteFont(smallFont);
-        deleteFont(monoFont);
+        resources.reset();
         uiFont = boldFont = smallFont = monoFont = nullptr;
-        if (panelBrush) DeleteObject(panelBrush);
-        if (cardBrush) DeleteObject(cardBrush);
         panelBrush = cardBrush = nullptr;
     }
 
-    HFONT createFont(int logicalHeight, int weight, const wchar_t* family,
-                     HGDIOBJ fallback) const {
-        HFONT font = CreateFontW(
-            -scale(logicalHeight), 0, 0, 0, weight, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, family);
-        return font ? font : reinterpret_cast<HFONT>(fallback);
-    }
-
-    void recreateFonts() {
-        HFONT newUi = createFont(14, FW_NORMAL, L"Segoe UI",
-                                 GetStockObject(DEFAULT_GUI_FONT));
-        HFONT newBold = createFont(16, FW_SEMIBOLD, L"Segoe UI",
-                                   GetStockObject(DEFAULT_GUI_FONT));
-        HFONT newSmall = createFont(12, FW_NORMAL, L"Segoe UI",
-                                    GetStockObject(DEFAULT_GUI_FONT));
-        HFONT newMono = createFont(15, FW_NORMAL, L"Consolas",
-                                   GetStockObject(SYSTEM_FIXED_FONT));
-
-        HFONT oldUi = uiFont;
-        HFONT oldBold = boldFont;
-        HFONT oldSmall = smallFont;
-        HFONT oldMono = monoFont;
-        uiFont = newUi;
-        boldFont = newBold;
-        smallFont = newSmall;
-        monoFont = newMono;
+    bool recreateFonts() {
+        if (!resources.create(dpi)) return false;
+        uiFont = resources.regular();
+        boldFont = resources.semibold();
+        smallFont = resources.small();
+        monoFont = resources.mono();
+        panelBrush = resources.panelBrush();
+        cardBrush = resources.cardBrush();
 
         if (sourceEdit) SendMessageW(sourceEdit, WM_SETFONT, reinterpret_cast<WPARAM>(monoFont), TRUE);
         if (presetCombo) SendMessageW(presetCombo, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont), TRUE);
@@ -555,10 +527,7 @@ struct FormulaEditorPanel::Impl {
             SendMessageW(presetCombo, CB_SETITEMHEIGHT, 0, scale(24));
             SendMessageW(presetCombo, CB_SETDROPPEDWIDTH, scale(530), 0);
         }
-        deleteFont(oldUi);
-        deleteFont(oldBold);
-        deleteFont(oldSmall);
-        deleteFont(oldMono);
+        return true;
     }
 
     HWND createControl(const wchar_t* className, const wchar_t* text,
@@ -613,14 +582,10 @@ struct FormulaEditorPanel::Impl {
                               reinterpret_cast<LONG_PTR>(&Impl::sourceWindowProc)));
         if (!sourceProc && GetLastError() != ERROR_SUCCESS) return false;
 
-        recreateFonts();
-        return true;
+        return recreateFonts();
     }
 
     bool onCreate() {
-        panelBrush = CreateSolidBrush(CLR_PANEL);
-        cardBrush = CreateSolidBrush(CLR_CARD);
-        if (!panelBrush || !cardBrush) return false;
         if (!createControls()) return false;
         syncAllControls();
         updateScrollInfo();
@@ -677,7 +642,7 @@ struct FormulaEditorPanel::Impl {
         if (dpi == newDpi && uiFont) return;
         dpi = newDpi;
         if (!hwnd) return;
-        recreateFonts();
+        if (!recreateFonts()) return;
         updateScrollInfo();
         layoutControls();
         InvalidateRect(hwnd, nullptr, TRUE);
@@ -709,38 +674,21 @@ struct FormulaEditorPanel::Impl {
     void updateScrollInfo() {
         if (!hwnd) return;
         int page = std::max(1, actionTopDip());
-        int maximumPosition = std::max(0, CONTENT_HEIGHT - page);
-        scrollDip = std::clamp(scrollDip, 0, maximumPosition);
-
-        SCROLLINFO info{};
-        info.cbSize = sizeof(info);
-        info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-        info.nMin = 0;
-        info.nMax = CONTENT_HEIGHT - 1;
-        info.nPage = static_cast<UINT>(page);
-        info.nPos = scrollDip;
-        SetScrollInfo(hwnd, SB_VERT, &info, TRUE);
+        scroll.configure(CONTENT_HEIGHT, page);
+        scroll.apply(hwnd);
         layoutControls();
     }
 
     void setScrollPosition(int position) {
-        int page = std::max(1, actionTopDip());
-        int maximumPosition = std::max(0, CONTENT_HEIGHT - page);
-        int clamped = std::clamp(position, 0, maximumPosition);
-        if (clamped == scrollDip) return;
-        scrollDip = clamped;
-        SCROLLINFO info{};
-        info.cbSize = sizeof(info);
-        info.fMask = SIF_POS;
-        info.nPos = scrollDip;
-        SetScrollInfo(hwnd, SB_VERT, &info, TRUE);
+        if (!scroll.setPosition(position)) return;
+        scroll.apply(hwnd);
         layoutControls();
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
     void ensureVisible(int top, int height) {
         int page = std::max(1, actionTopDip());
-        int position = scrollDip;
+        int position = scroll.position();
         if (top < position) position = top;
         else if (top + height > position + page) position = top + height - page;
         setScrollPosition(position);
@@ -826,7 +774,7 @@ struct FormulaEditorPanel::Impl {
         selected = config.pixelParameter == FormulaParameter::InitialZ
             ? InspectorValue::C : InspectorValue::Z0;
         pickerRange = 2.0;
-        scrollDip = 0;
+        scroll.setPosition(0);
         status.clear();
         statusError = false;
         syncAllControls();
@@ -1356,17 +1304,14 @@ struct FormulaEditorPanel::Impl {
         bool active = isButtonActive(button.hit);
         bool hovered = hoverHit == button.hit;
         bool pressed = pressedHit == button.hit;
-        COLORREF fill = active ? CLR_ACCENT :
-            (pressed || hovered ? CLR_CARD_HOV : CLR_CARD);
-        COLORREF border = active ? CLR_ACCENT_HI : CLR_BORDER;
-        COLORREF text = active ? RGB(255, 255, 255) : CLR_TEXT;
-        if (button.hit == HIT_MANDELBROT) {
-            border = CLR_GREEN;
-            if (hovered || pressed) fill = CLR_CARD_HOV;
-        }
-        fillRound(dc, rect, fill, border, scale(6));
-        drawText(dc, rect, button.label, text, uiFont,
-                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        ui::ButtonStyle style = active
+            ? ui::ButtonStyle::Accent : ui::ButtonStyle::Normal;
+        if (button.hit == HIT_MANDELBROT)
+            style = ui::ButtonStyle::Positive;
+        else if (button.hit == HIT_CLOSE)
+            style = ui::ButtonStyle::Subtle;
+        ui::drawButton(dc, rect, button.label, uiFont, style,
+                       hovered, pressed, true, scale(6));
     }
 
     void drawContentText(HDC dc, RECT rect, const std::wstring& text,
@@ -1536,21 +1481,16 @@ struct FormulaEditorPanel::Impl {
         HDC target = BeginPaint(hwnd, &paintStruct);
         RECT client{};
         GetClientRect(hwnd, &client);
-        int width = std::max(1L, client.right - client.left);
-        int height = std::max(1L, client.bottom - client.top);
+        int width = std::max(1, static_cast<int>(client.right - client.left));
+        int height = std::max(1, static_cast<int>(client.bottom - client.top));
 
-        HDC memory = CreateCompatibleDC(target);
-        HBITMAP bitmap = memory ? CreateCompatibleBitmap(target, width, height) : nullptr;
-        if (memory && bitmap) {
-            HGDIOBJ oldBitmap = SelectObject(memory, bitmap);
+        HDC memory = backBuffer.begin(target, width, height);
+        if (memory) {
             paintTo(memory, client);
-            BitBlt(target, 0, 0, width, height, memory, 0, 0, SRCCOPY);
-            SelectObject(memory, oldBitmap);
+            backBuffer.present(target, client);
         } else {
             paintTo(target, client);
         }
-        if (bitmap) DeleteObject(bitmap);
-        if (memory) DeleteDC(memory);
         EndPaint(hwnd, &paintStruct);
     }
 
@@ -1600,28 +1540,19 @@ struct FormulaEditorPanel::Impl {
     void onVerticalScroll(WPARAM wp) {
         SCROLLINFO info{};
         info.cbSize = sizeof(info);
-        info.fMask = SIF_ALL;
+        info.fMask = SIF_TRACKPOS;
         GetScrollInfo(hwnd, SB_VERT, &info);
-        int position = scrollDip;
-        switch (LOWORD(wp)) {
-        case SB_LINEUP: position -= 32; break;
-        case SB_LINEDOWN: position += 32; break;
-        case SB_PAGEUP: position -= static_cast<int>(info.nPage); break;
-        case SB_PAGEDOWN: position += static_cast<int>(info.nPage); break;
-        case SB_THUMBPOSITION:
-        case SB_THUMBTRACK: position = info.nTrackPos; break;
-        case SB_TOP: position = 0; break;
-        case SB_BOTTOM: position = CONTENT_HEIGHT; break;
-        default: return;
-        }
-        setScrollPosition(position);
+        if (!scroll.handleCommand(LOWORD(wp), info.nTrackPos)) return;
+        scroll.apply(hwnd);
+        layoutControls();
+        InvalidateRect(hwnd, nullptr, FALSE);
     }
 
     void onMouseMove(int xPixels, int yPixels) {
         int x = unscale(xPixels);
         int y = unscale(yPixels);
         if (draggingPoint) {
-            updatePointFromMouse(x, y + scrollDip);
+            updatePointFromMouse(x, y + scroll.position());
             SetCursor(LoadCursorW(nullptr, IDC_CROSS));
             return;
         }
@@ -1653,7 +1584,7 @@ struct FormulaEditorPanel::Impl {
             }
             draggingPoint = true;
             SetCapture(hwnd);
-            updatePointFromMouse(x, y + scrollDip);
+            updatePointFromMouse(x, y + scroll.position());
             return;
         }
         if (hit != HIT_NONE) {
@@ -1667,7 +1598,7 @@ struct FormulaEditorPanel::Impl {
         int x = unscale(xPixels);
         int y = unscale(yPixels);
         if (draggingPoint) {
-            updatePointFromMouse(x, y + scrollDip);
+            updatePointFromMouse(x, y + scroll.position());
             draggingPoint = false;
             if (GetCapture() == hwnd) ReleaseCapture();
             return;
@@ -1728,7 +1659,7 @@ struct FormulaEditorPanel::Impl {
             return 0;
         case WM_MOUSEWHEEL: {
             int steps = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
-            setScrollPosition(scrollDip - steps * 48);
+            setScrollPosition(scroll.position() - steps * 48);
             return 0;
         }
         case WM_MOUSEMOVE:
