@@ -11,7 +11,7 @@
 //          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
 //          expression | expression-oracle | expression-suite |
-//          expression-residual | backend | gpu | all
+//          expression-residual | multibrot | backend | gpu | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
 
@@ -1658,6 +1658,247 @@ static int runFormulaRegressionSuite() {
     return result;
 }
 
+static std::string integerPowerSource(int power) {
+    std::string source = "z";
+    for (int i = 1; i < power; ++i) source += "*z";
+    source += "+c";
+    return source;
+}
+
+static bool renderIntegerPowerFrame(
+        int power, FormulaParameter pixel,
+        formula::ExpressionColoring coloring,
+        int width, int height, int mxit,
+        bool simd, std::vector<float>& output,
+        double* elapsed = nullptr) {
+    formula::ExpressionProgram program;
+    formula::ExpressionError error;
+    if (!program.compile(integerPowerSource(power), &error) ||
+        program.fastIntegerPower() != power)
+        return false;
+
+    formula::ExpressionContext fixed;
+    if (pixel == FormulaParameter::InitialZ)
+        fixed.c = { -0.35, 0.62 };
+    output.assign((size_t)width * height, EMPTYPIXEL);
+    Mandel renderer(width, height, mxit, 1, output.data());
+    mpf_t centerRe, centerIm, scale;
+    mpf_init_set_d(centerRe, power == 2 && pixel == FormulaParameter::C
+        ? -0.5 : 0.0);
+    mpf_init_set_ui(centerIm, 0);
+    mpf_init_set_ui(scale, 1);
+    _putenv_s("MANDEL_EXPR_POWER_SIMD", simd ? "1" : "0");
+    auto begin = Clock::now();
+    bool okay = renderer.ComputeExpression(
+        centerRe, centerIm, scale, program, fixed, pixel,
+        mxit, 4.0, coloring);
+    if (elapsed) *elapsed = since(begin);
+    mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+    return okay;
+}
+
+static int runMultibrotCase() {
+    constexpr int W = 144, H = 96, MXIT = 1200;
+    int failures = 0;
+    int totalBitMismatches = 0;
+    int totalClassMismatches = 0;
+    double maximumDifference = 0.0;
+    const formula::ExpressionColoring colorings[] = {
+        formula::ExpressionColoring::Raw,
+        formula::ExpressionColoring::Smooth,
+        formula::ExpressionColoring::Distance
+    };
+    const char* coloringNames[] = { "raw", "smooth", "distance" };
+
+    printf("=== integer Multibrot AVX2 correctness\n");
+    for (int power = 2; power <= 8; ++power) {
+        for (FormulaParameter pixel :
+             { FormulaParameter::C, FormulaParameter::InitialZ }) {
+            for (int coloringIndex = 0; coloringIndex < 3; ++coloringIndex) {
+                std::vector<float> scalar;
+                std::vector<float> simd;
+                if (!renderIntegerPowerFrame(
+                        power, pixel, colorings[coloringIndex],
+                        W, H, MXIT, false, scalar) ||
+                    !renderIntegerPowerFrame(
+                        power, pixel, colorings[coloringIndex],
+                        W, H, MXIT, true, simd)) {
+                    ++failures;
+                    continue;
+                }
+                int bitMismatches = 0;
+                int classMismatches = 0;
+                double maxDifference = 0.0;
+                for (size_t i = 0; i < scalar.size(); ++i) {
+                    if (std::memcmp(&scalar[i], &simd[i], sizeof(float)) != 0)
+                        ++bitMismatches;
+                    if (isInterior(scalar[i]) != isInterior(simd[i]))
+                        ++classMismatches;
+                    else if (!isInterior(scalar[i]))
+                        maxDifference = std::max(
+                            maxDifference,
+                            std::fabs((double)scalar[i] - simd[i]));
+                }
+                totalBitMismatches += bitMismatches;
+                totalClassMismatches += classMismatches;
+                maximumDifference =
+                    std::max(maximumDifference, maxDifference);
+                if (bitMismatches || classMismatches) ++failures;
+                printf("  z^%d+c %-2s-plane %-8s bits=%d class=%d max=%.6g\n",
+                       power,
+                       pixel == FormulaParameter::C ? "c" : "z0",
+                       coloringNames[coloringIndex],
+                       bitMismatches, classMismatches, maxDifference);
+            }
+        }
+    }
+
+    constexpr int OW = 48, OH = 32, OMIT = 300;
+    printf("  MPFR raw-orbit gates:\n");
+    for (int power = 3; power <= 8; ++power) {
+        std::string source = integerPowerSource(power);
+        formula::ExpressionProgram program;
+        formula::ExpressionError error;
+        if (!program.compile(source, &error)) {
+            ++failures;
+            continue;
+        }
+        for (FormulaParameter pixel :
+             { FormulaParameter::C, FormulaParameter::InitialZ }) {
+            FormulaRegressionCase test{};
+            test.name = "multibrot-oracle";
+            test.source = source.c_str();
+            test.pixel = pixel;
+            test.centerRe = 0.0;
+            test.centerIm = 0.0;
+            test.scale = 1.0;
+            if (pixel == FormulaParameter::InitialZ)
+                test.fixedC = { -0.35, 0.62 };
+            test.bailout = 4.0;
+            test.mxit = OMIT;
+            test.width = OW;
+            test.height = OH;
+            std::vector<float> oracle;
+            std::vector<float> simd;
+            if (!renderExpressionOracle(test, program, oracle) ||
+                !renderIntegerPowerFrame(
+                    power, pixel, formula::ExpressionColoring::Raw,
+                    OW, OH, OMIT, true, simd)) {
+                ++failures;
+                continue;
+            }
+            int classMismatches = 0;
+            int iterationMismatches = 0;
+            for (size_t i = 0; i < oracle.size(); ++i) {
+                bool oracleInterior = isInterior(oracle[i]);
+                bool simdInterior = isInterior(simd[i]);
+                if (oracleInterior != simdInterior)
+                    ++classMismatches;
+                else if (!oracleInterior && oracle[i] != simd[i])
+                    ++iterationMismatches;
+            }
+            if (classMismatches || iterationMismatches) ++failures;
+            printf("    z^%d+c %-2s-plane class=%d iteration=%d\n",
+                   power,
+                   pixel == FormulaParameter::C ? "c" : "z0",
+                   classMismatches, iterationMismatches);
+        }
+    }
+
+    auto extremeParity = [&](const char* name, const char* centerText,
+                             const char* scaleText, double bailout,
+                             formula::ExpressionColoring coloring,
+                             int mxit) {
+        formula::ExpressionProgram program;
+        formula::ExpressionError error;
+        if (!program.compile("z*z+c", &error)) {
+            ++failures;
+            return;
+        }
+        constexpr int EW = 4, EH = 3;
+        std::vector<float> scalar((size_t)EW * EH, EMPTYPIXEL);
+        std::vector<float> simd((size_t)EW * EH, EMPTYPIXEL);
+        formula::ExpressionContext fixed;
+        mpf_t centerRe, centerIm, scale;
+        mpf_init_set_str(centerRe, centerText, 10);
+        mpf_init_set_ui(centerIm, 0);
+        mpf_init_set_str(scale, scaleText, 10);
+        _putenv_s("MANDEL_EXPR_POWER_SIMD", "0");
+        Mandel scalarRenderer(EW, EH, mxit, 1, scalar.data());
+        bool scalarOkay = scalarRenderer.ComputeExpression(
+            centerRe, centerIm, scale, program, fixed,
+            FormulaParameter::C, mxit, bailout, coloring);
+        _putenv_s("MANDEL_EXPR_POWER_SIMD", "1");
+        Mandel simdRenderer(EW, EH, mxit, 1, simd.data());
+        bool simdOkay = simdRenderer.ComputeExpression(
+            centerRe, centerIm, scale, program, fixed,
+            FormulaParameter::C, mxit, bailout, coloring);
+        mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+        int mismatches = scalar.size() == simd.size()
+            ? (int)!std::equal(
+                scalar.begin(), scalar.end(), simd.begin(),
+                [](float a, float b) {
+                    return std::memcmp(&a, &b, sizeof(float)) == 0;
+                })
+            : 1;
+        if (!scalarOkay || !simdOkay || mismatches) ++failures;
+        printf("  extreme %-18s parity=%s\n", name,
+               scalarOkay && simdOkay && !mismatches ? "exact" : "FAIL");
+    };
+    extremeParity(
+        "huge bailout", "1.5e200", "1", 1.0e200,
+        formula::ExpressionColoring::Raw, 1);
+    extremeParity(
+        "tiny bailout", "0", "1e200", 1.0e-200,
+        formula::ExpressionColoring::Raw, 8);
+    extremeParity(
+        "subnormal bailout", "1.0000000000000002e-160",
+        "1e170", 1.0e-160,
+        formula::ExpressionColoring::Raw, 1);
+    extremeParity(
+        "subnormal dx EDE", "2", "1e309", 4.0,
+        formula::ExpressionColoring::Distance, 8);
+
+    constexpr int BW = 960, BH = 540, BMIT = 3000, SAMPLES = 5;
+    std::vector<double> scalarTimes;
+    std::vector<double> simdTimes;
+    std::vector<float> benchmarkOutput;
+    for (int sample = 0; sample < SAMPLES; ++sample) {
+        double scalar = 0.0, simd = 0.0;
+        if (!renderIntegerPowerFrame(
+                3, FormulaParameter::C,
+                formula::ExpressionColoring::Smooth,
+                BW, BH, BMIT, false, benchmarkOutput, &scalar) ||
+            !renderIntegerPowerFrame(
+                3, FormulaParameter::C,
+                formula::ExpressionColoring::Smooth,
+                BW, BH, BMIT, true, benchmarkOutput, &simd)) {
+            ++failures;
+            break;
+        }
+        scalarTimes.push_back(scalar);
+        simdTimes.push_back(simd);
+    }
+    _putenv_s("MANDEL_EXPR_POWER_SIMD", "");
+    std::sort(scalarTimes.begin(), scalarTimes.end());
+    std::sort(simdTimes.begin(), simdTimes.end());
+    double scalarMedian = scalarTimes.empty()
+        ? 0.0 : scalarTimes[scalarTimes.size() / 2];
+    double simdMedian = simdTimes.empty()
+        ? 0.0 : simdTimes[simdTimes.size() / 2];
+    double speedup = simdMedian > 0.0 ? scalarMedian / simdMedian : 0.0;
+    if (speedup < 1.05) ++failures;
+
+    printf("  aggregate bits=%d class=%d max=%.6g\n",
+           totalBitMismatches, totalClassMismatches, maximumDifference);
+    printf("  cubic %dx%d mxit=%d scalar/AVX2 %.3f/%.3f s speedup %.2fx\n",
+           BW, BH, BMIT, scalarMedian, simdMedian, speedup);
+    printf("  => %s\n\n",
+           failures == 0 ? "PASS"
+                         : "CHECK (Multibrot correctness/performance)");
+    return failures == 0 ? 0 : 1;
+}
+
 static int runExpressionResidualSuite() {
     struct ResidualCase {
         const char* name;
@@ -2332,6 +2573,7 @@ int main(int argc, char** argv) {
     if (which == "expression-oracle")          rc |= runExpressionOracleCase();
     if (which == "expression-suite")           rc |= runFormulaRegressionSuite();
     if (which == "expression-residual")        rc |= runExpressionResidualSuite();
+    if (which == "multibrot")                  rc |= runMultibrotCase();
     if (which == "backend")                    rc |= runBackendCase();
     if (which == "gpu")
         rc |= runGpuBenchmarkCase(

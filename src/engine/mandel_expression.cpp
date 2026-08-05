@@ -2,13 +2,234 @@
 
 #include <algorithm>
 #include <array>
+#include <cfloat>
 #include <cmath>
+#include <cstdlib>
+#include <immintrin.h>
 #include <limits>
 
 #include "float_math.h"
 #if defined(MANDEL_ENABLE_ASMJIT)
 #include "formula_expression_jit.h"
 #endif
+
+namespace {
+
+float initialPowerResult(formula::Complex z, FormulaParameter pixelParameter,
+                         formula::ExpressionColoring coloring,
+                         int power, double bailout, double dx) {
+    double magnitude = std::hypot(z.real(), z.imag());
+    if (std::isfinite(z.real()) && std::isfinite(z.imag()) &&
+        magnitude <= bailout)
+        return EMPTYPIXEL;
+    if (coloring == formula::ExpressionColoring::Distance &&
+        pixelParameter == FormulaParameter::InitialZ) {
+        return (float)(magnitude * std::log(magnitude) / std::fabs(dx));
+    }
+    if (coloring == formula::ExpressionColoring::Smooth &&
+        std::isfinite(magnitude) && magnitude > 1.0) {
+        return (float)(-std::log(std::log(magnitude)) /
+                       std::log((double)power));
+    }
+    return 0.0f;
+}
+
+bool solveIntegerPowerSimdRow(
+        double startRe, double dx, double pixelIm, int count,
+        int power, FormulaParameter pixelParameter,
+        const formula::ExpressionContext& fixed, int mxit,
+        double bailout, formula::ExpressionColoring coloring,
+        float* output, volatile bool* halt) {
+    const bool distance = coloring == formula::ExpressionColoring::Distance;
+    const double bailoutSquared = bailout * bailout;
+    const double logPower = std::log((double)power);
+    const __m256d one = _mm256_set1_pd(1.0);
+    const __m256d powerVector = _mm256_set1_pd((double)power);
+    const __m256d bailoutVector = _mm256_set1_pd(bailoutSquared);
+    const __m256d maxDouble = _mm256_set1_pd(DBL_MAX);
+    const __m256d signMask = _mm256_set1_pd(-0.0);
+    const __m256d mxitVector = _mm256_set1_pd((double)mxit);
+
+    alignas(32) double cr_[4], ci_[4], zr_[4], zi_[4];
+    alignas(32) double dr_[4], di_[4], iteration_[4];
+    int lanePixel[4] = { -1, -1, -1, -1 };
+    int nextPixel = 0;
+    int activeCount = 0;
+
+    auto loadLane = [&](int lane) {
+        lanePixel[lane] = -1;
+        while (nextPixel < count) {
+            int pixelIndex = nextPixel++;
+            formula::Complex pixel{
+                startRe + dx * pixelIndex, pixelIm
+            };
+            formula::Complex z = pixelParameter == FormulaParameter::InitialZ
+                ? pixel : fixed.z0;
+            formula::Complex c = pixelParameter == FormulaParameter::C
+                ? pixel : fixed.c;
+            float initial = initialPowerResult(
+                z, pixelParameter, coloring, power, bailout, dx);
+            if (initial != EMPTYPIXEL) {
+                output[pixelIndex] = initial;
+                continue;
+            }
+            cr_[lane] = c.real();
+            ci_[lane] = c.imag();
+            zr_[lane] = z.real();
+            zi_[lane] = z.imag();
+            dr_[lane] =
+                pixelParameter == FormulaParameter::InitialZ ? 1.0 : 0.0;
+            di_[lane] = 0.0;
+            iteration_[lane] = 0.0;
+            lanePixel[lane] = pixelIndex;
+            ++activeCount;
+            return;
+        }
+        cr_[lane] = ci_[lane] = zr_[lane] = zi_[lane] = 0.0;
+        dr_[lane] = di_[lane] = iteration_[lane] = 0.0;
+    };
+
+    for (int lane = 0; lane < 4; ++lane) loadLane(lane);
+
+    __m256d cr = _mm256_load_pd(cr_);
+    __m256d ci = _mm256_load_pd(ci_);
+    __m256d zr = _mm256_load_pd(zr_);
+    __m256d zi = _mm256_load_pd(zi_);
+    __m256d dr = _mm256_load_pd(dr_);
+    __m256d di = _mm256_load_pd(di_);
+    __m256d iteration = _mm256_load_pd(iteration_);
+    unsigned steps = 0;
+
+    while (activeCount > 0) {
+        if ((steps++ & 255u) == 0u && *halt) return false;
+
+        // Match the scalar std::complex multiplication order: form z^(d-1)
+        // by repeated complex products, then multiply once more for z^d.
+        __m256d powerMinusOneRe = zr;
+        __m256d powerMinusOneIm = zi;
+        for (int exponent = 2; exponent < power; ++exponent) {
+            __m256d nextRe = _mm256_sub_pd(
+                _mm256_mul_pd(powerMinusOneRe, zr),
+                _mm256_mul_pd(powerMinusOneIm, zi));
+            __m256d nextIm = _mm256_add_pd(
+                _mm256_mul_pd(powerMinusOneRe, zi),
+                _mm256_mul_pd(powerMinusOneIm, zr));
+            powerMinusOneRe = nextRe;
+            powerMinusOneIm = nextIm;
+        }
+        __m256d nextZr = _mm256_add_pd(
+            _mm256_sub_pd(
+                _mm256_mul_pd(powerMinusOneRe, zr),
+                _mm256_mul_pd(powerMinusOneIm, zi)),
+            cr);
+        __m256d nextZi = _mm256_add_pd(
+            _mm256_add_pd(
+                _mm256_mul_pd(powerMinusOneRe, zi),
+                _mm256_mul_pd(powerMinusOneIm, zr)),
+            ci);
+
+        __m256d nextDr = dr;
+        __m256d nextDi = di;
+        if (distance) {
+            nextDr = _mm256_mul_pd(
+                powerVector,
+                _mm256_sub_pd(
+                    _mm256_mul_pd(powerMinusOneRe, dr),
+                    _mm256_mul_pd(powerMinusOneIm, di)));
+            nextDi = _mm256_mul_pd(
+                powerVector,
+                _mm256_add_pd(
+                    _mm256_mul_pd(powerMinusOneRe, di),
+                    _mm256_mul_pd(powerMinusOneIm, dr)));
+            if (pixelParameter == FormulaParameter::C)
+                nextDr = _mm256_add_pd(nextDr, one);
+        }
+        zr = nextZr;
+        zi = nextZi;
+        dr = nextDr;
+        di = nextDi;
+
+        __m256d magnitudeSquared = _mm256_add_pd(
+            _mm256_mul_pd(zr, zr), _mm256_mul_pd(zi, zi));
+        __m256d nextIteration = _mm256_add_pd(iteration, one);
+        int escaped = _mm256_movemask_pd(_mm256_cmp_pd(
+            magnitudeSquared, bailoutVector, _CMP_GT_OQ));
+        __m256d absZr = _mm256_andnot_pd(signMask, zr);
+        __m256d absZi = _mm256_andnot_pd(signMask, zi);
+        int nonfinite = _mm256_movemask_pd(_mm256_or_pd(
+            _mm256_or_pd(
+                _mm256_cmp_pd(zr, zr, _CMP_UNORD_Q),
+                _mm256_cmp_pd(zi, zi, _CMP_UNORD_Q)),
+            _mm256_or_pd(
+                _mm256_cmp_pd(absZr, maxDouble, _CMP_GT_OQ),
+                _mm256_cmp_pd(absZi, maxDouble, _CMP_GT_OQ))));
+        int reachedMaximum = _mm256_movemask_pd(_mm256_cmp_pd(
+            nextIteration, mxitVector, _CMP_GE_OQ));
+        int activeMask =
+            (lanePixel[0] >= 0) |
+            ((lanePixel[1] >= 0) << 1) |
+            ((lanePixel[2] >= 0) << 2) |
+            ((lanePixel[3] >= 0) << 3);
+        int finishMask =
+            (escaped | nonfinite | reachedMaximum) & activeMask;
+        if (finishMask == 0) {
+            iteration = nextIteration;
+            continue;
+        }
+
+        _mm256_store_pd(cr_, cr);
+        _mm256_store_pd(ci_, ci);
+        _mm256_store_pd(zr_, zr);
+        _mm256_store_pd(zi_, zi);
+        _mm256_store_pd(dr_, dr);
+        _mm256_store_pd(di_, di);
+        _mm256_store_pd(iteration_, iteration);
+        for (int lane = 0; lane < 4; ++lane) {
+            if (lanePixel[lane] < 0) continue;
+            int bit = 1 << lane;
+            if ((finishMask & bit) == 0) {
+                iteration_[lane] += 1.0;
+                continue;
+            }
+
+            float result = -2.0f;
+            if ((escaped | nonfinite) & bit) {
+                double magnitude = std::hypot(zr_[lane], zi_[lane]);
+                if (coloring == formula::ExpressionColoring::Smooth &&
+                    std::isfinite(magnitude) && magnitude > 1.0) {
+                    result = (float)(iteration_[lane] + 1.0 -
+                        std::log(std::log(magnitude)) / logPower);
+                } else if (distance && std::isfinite(magnitude)) {
+                    double derivative =
+                        std::hypot(dr_[lane], di_[lane]);
+                    double denominator =
+                        derivative * std::fabs(dx);
+                    result = denominator > 0.0 &&
+                             std::isfinite(denominator)
+                        ? (float)(magnitude * std::log(magnitude) /
+                                  denominator)
+                        : 0.0f;
+                } else {
+                    result = (float)(iteration_[lane] + 1.0);
+                }
+            }
+            output[lanePixel[lane]] = result;
+            --activeCount;
+            loadLane(lane);
+        }
+
+        cr = _mm256_load_pd(cr_);
+        ci = _mm256_load_pd(ci_);
+        zr = _mm256_load_pd(zr_);
+        zi = _mm256_load_pd(zi_);
+        dr = _mm256_load_pd(dr_);
+        di = _mm256_load_pd(di_);
+        iteration = _mm256_load_pd(iteration_);
+    }
+    return true;
+}
+
+} // namespace
 
 bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                                const formula::ExpressionProgram& program,
@@ -44,6 +265,12 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
     const int integerPower =
         program.fastPath() == formula::ExpressionProgram::FastPath::IntegerPowerPlusC
             ? program.fastIntegerPower() : 0;
+    const char* powerSimdSetting = std::getenv("MANDEL_EXPR_POWER_SIMD");
+    const double bailoutSquared = bailout * bailout;
+    const bool powerSimd =
+        integerPower >= 2 && integerPower <= 8 &&
+        bailoutSquared >= DBL_MIN && std::isfinite(bailoutSquared) &&
+        (!powerSimdSetting || std::atoi(powerSimdSetting) != 0);
     if (integerPower < 2 || bailout < 1.0)
         coloring = formula::ExpressionColoring::Raw;
     // Reserve the final progress slot for the successful completion commit.
@@ -54,6 +281,14 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
         if (_flag_halt) continue;
         bool rowCompleted = true;
         const double pixelIm = startIm + dy * i;
+        if (powerSimd) {
+            rowCompleted = solveIntegerPowerSimdRow(
+                startRe, dx, pixelIm, _w, integerPower,
+                pixelParameter, fixed, mxit, bailout, coloring,
+                _iter + (size_t)i * _w, &_flag_halt);
+            if (rowCompleted) progressAdvance();
+            continue;
+        }
         if (integerPower == 0 && program.avx2Compatible()) {
             for (int j = 0; j < _w; j += 4) {
                 if (_flag_halt) { rowCompleted = false; break; }
