@@ -254,7 +254,8 @@ public:
     bool juliaUiEnabled = false;           // internal-only until parameters/perf are production ready
     FormulaDialogConfig formulaConfig;
     std::unique_ptr<FormulaEditorPanel> formulaEditor;
-    int formulaEditorExpansion = 0;
+    int formulaEditorExpansionDip = 0;
+    int formulaEditorHeightExpansionDip = 0;
     int savedColoringIdx = 0;
     bool savedSsOn = false, savedOrbitOn = false;
     bool hasSavedMandelUi = false;
@@ -677,48 +678,67 @@ public:
     }
 
     void expandWindowForFormulaEditor() {
-        if (formulaEditorExpansion > 0 || IsZoomed(hwnd)) return;
+        if (formulaEditorExpansionDip > 0 || IsZoomed(hwnd)) return;
         RECT wr{}; GetWindowRect(hwnd, &wr);
         HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi{ sizeof(mi) };
         if (!GetMonitorInfoW(monitor, &mi)) return;
         int desired = S(FormulaEditorPanel::DESIGN_WIDTH);
         int currentW = wr.right - wr.left;
+        int currentH = wr.bottom - wr.top;
         int grow = std::min(desired,
             std::max(0, (int)(mi.rcWork.right - mi.rcWork.left) - currentW));
-        if (grow <= 0) return;
+        int growHeight = std::min(
+            std::max(0, S(907) - currentH),
+            std::max(0, (int)(mi.rcWork.bottom - mi.rcWork.top) - currentH));
+        if (grow <= 0 && growHeight <= 0) return;
         int newW = currentW + grow;
+        int newH = currentH + growHeight;
         int newX = std::clamp(
             wr.left - grow / 2, mi.rcWork.left, mi.rcWork.right - newW);
-        SetWindowPos(hwnd, nullptr, newX, wr.top, newW, wr.bottom - wr.top,
+        int newY = std::clamp(
+            wr.top - growHeight / 2,
+            mi.rcWork.top, mi.rcWork.bottom - newH);
+        SetWindowPos(hwnd, nullptr, newX, newY, newW, newH,
                      SWP_NOZORDER | SWP_NOACTIVATE);
-        formulaEditorExpansion = grow;
+        formulaEditorExpansionDip = MulDiv(grow, 96, dpi);
+        formulaEditorHeightExpansionDip = MulDiv(growHeight, 96, dpi);
     }
 
     void closeFormulaEditor() {
         if (!formulaEditor) return;
         formulaEditor->hide();
-        if (formulaEditorExpansion > 0 && !IsZoomed(hwnd)) {
+        if ((formulaEditorExpansionDip > 0 ||
+             formulaEditorHeightExpansionDip > 0) && !IsZoomed(hwnd)) {
             RECT wr{}; GetWindowRect(hwnd, &wr);
             HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
             MONITORINFO mi{ sizeof(mi) };
             if (GetMonitorInfoW(monitor, &mi)) {
                 int width = wr.right - wr.left;
+                int height = wr.bottom - wr.top;
                 int shrink = std::min(
-                    formulaEditorExpansion,
+                    S(formulaEditorExpansionDip),
                     std::max(0, width - S(900)));
-                if (shrink > 0) {
+                int shrinkHeight = std::min(
+                    S(formulaEditorHeightExpansionDip),
+                    std::max(0, height - S(640)));
+                if (shrink > 0 || shrinkHeight > 0) {
                     int newWidth = width - shrink;
+                    int newHeight = height - shrinkHeight;
                     int newX = std::clamp(
-                        wr.left + shrink / 2,
-                        mi.rcWork.left, mi.rcWork.right - newWidth);
-                    SetWindowPos(hwnd, nullptr, newX, wr.top, newWidth,
-                                 wr.bottom - wr.top,
+                        wr.left + shrink / 2, mi.rcWork.left,
+                        mi.rcWork.right - newWidth);
+                    int newY = std::clamp(
+                        wr.top + shrinkHeight / 2, mi.rcWork.top,
+                        mi.rcWork.bottom - newHeight);
+                    SetWindowPos(hwnd, nullptr, newX, newY, newWidth,
+                                 newHeight,
                                  SWP_NOZORDER | SWP_NOACTIVATE);
                 }
             }
         }
-        formulaEditorExpansion = 0;
+        formulaEditorExpansionDip = 0;
+        formulaEditorHeightExpansionDip = 0;
         layout();
         if (!inSizeMove && !orbitBench) retargetToView();
         needFull = true;

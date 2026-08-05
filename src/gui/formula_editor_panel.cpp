@@ -42,7 +42,7 @@ constexpr int ID_IMAGINARY_SERVICE = 1804;
 constexpr int HEADER_HEIGHT = 62;
 constexpr int FOOTER_HEIGHT = 62;
 constexpr int BODY_PADDING = 14;
-constexpr int CONTENT_HEIGHT = 590;
+constexpr int CONTENT_HEIGHT = 710;
 
 constexpr int HIT_NONE = 0;
 constexpr int HIT_CLOSE = 1;
@@ -155,6 +155,7 @@ struct PanelLayout {
     RECT body{};
     RECT footer{};
     RECT contentClip{};
+    RECT presetCard{};
     RECT preset{};
     RECT formulaCard{};
     RECT formulaField{};
@@ -597,6 +598,11 @@ struct FormulaEditorPanel::Impl {
     HFONT formulaFont = nullptr;
     HFONT chipFont = nullptr;
     HFONT tinyFont = nullptr;
+    HFONT sectionFont = nullptr;
+    HFONT functionFont = nullptr;
+    HFONT controlFont = nullptr;
+    HFONT headerFont = nullptr;
+    HFONT actionFont = nullptr;
 
     PanelLayout layout;
     std::vector<ButtonSpec> buttons;
@@ -610,6 +616,7 @@ struct FormulaEditorPanel::Impl {
     int focusedId = FOCUS_FORMULA;
     int hoverHit = HIT_NONE;
     int pressedHit = HIT_NONE;
+    int hoveredFormulaToken = -1;
     double pickerRange = 2.0;
     bool formulaValid = false;
     bool syncing = false;
@@ -670,24 +677,46 @@ struct FormulaEditorPanel::Impl {
         if (formulaFont) DeleteObject(formulaFont);
         if (chipFont) DeleteObject(chipFont);
         if (tinyFont) DeleteObject(tinyFont);
-        formulaFont = chipFont = tinyFont = nullptr;
+        if (sectionFont) DeleteObject(sectionFont);
+        if (functionFont) DeleteObject(functionFont);
+        if (controlFont) DeleteObject(controlFont);
+        if (headerFont) DeleteObject(headerFont);
+        if (actionFont) DeleteObject(actionFont);
+        formulaFont = chipFont = tinyFont = sectionFont = nullptr;
+        functionFont = controlFont = headerFont = actionFont = nullptr;
     }
 
     bool recreateResources() {
         if (!resources.create(dpi)) return false;
-        HFONT newFormula = createFont(dpi, 15, FW_NORMAL, L"Consolas");
-        HFONT newChip = createFont(dpi, 11, FW_NORMAL, L"Consolas");
+        HFONT newFormula = createFont(dpi, 16, FW_MEDIUM, L"Cascadia Mono");
+        HFONT newChip = createFont(dpi, 12, FW_MEDIUM, L"Cascadia Mono");
         HFONT newTiny = createFont(dpi, 10, FW_NORMAL, L"Segoe UI");
-        if (!newFormula || !newChip || !newTiny) {
+        HFONT newSection = createFont(dpi, 10, FW_BOLD, L"Segoe UI");
+        HFONT newFunction = createFont(dpi, 10, FW_MEDIUM, L"Cascadia Mono");
+        HFONT newControl = createFont(dpi, 11, FW_MEDIUM, L"Cascadia Mono");
+        HFONT newHeader = createFont(dpi, 16, FW_BOLD, L"Segoe UI");
+        HFONT newAction = createFont(dpi, 14, FW_SEMIBOLD, L"Segoe UI");
+        if (!newFormula || !newChip || !newTiny || !newSection ||
+            !newFunction || !newControl || !newHeader || !newAction) {
             if (newFormula) DeleteObject(newFormula);
             if (newChip) DeleteObject(newChip);
             if (newTiny) DeleteObject(newTiny);
+            if (newSection) DeleteObject(newSection);
+            if (newFunction) DeleteObject(newFunction);
+            if (newControl) DeleteObject(newControl);
+            if (newHeader) DeleteObject(newHeader);
+            if (newAction) DeleteObject(newAction);
             return false;
         }
         deleteExtraFonts();
         formulaFont = newFormula;
         chipFont = newChip;
         tinyFont = newTiny;
+        sectionFont = newSection;
+        functionFont = newFunction;
+        controlFont = newControl;
+        headerFont = newHeader;
+        actionFont = newAction;
         return true;
     }
 
@@ -1055,7 +1084,7 @@ struct FormulaEditorPanel::Impl {
         hwnd = CreateWindowExW(
             WS_EX_CONTROLPARENT, PANEL_CLASS, L"",
             WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
-            0, 0, scale(FormulaEditorPanel::DESIGN_WIDTH), scale(760),
+            0, 0, scale(FormulaEditorPanel::DESIGN_WIDTH), scale(870),
             owner, nullptr, instance, this);
         return hwnd != nullptr;
     }
@@ -1132,38 +1161,44 @@ struct FormulaEditorPanel::Impl {
             pixelRect(0, bodyBottom, widthDip, heightDip);
         layout.contentClip = layout.body;
 
-        int copyWidth = 54;
-        int pasteLeft = contentRight - copyWidth;
-        int copyLeft = pasteLeft - 6 - copyWidth;
-        int dropdownLeft = contentLeft + 112;
-        int dropdownRight = std::max(dropdownLeft + 120, copyLeft - 8);
-        layout.preset = contentPixelRect(
-            dropdownLeft, 0, dropdownRight, 26);
         layout.formulaCard = contentPixelRect(
-            contentLeft, 32, contentRight, 122);
+            contentLeft, 21, contentRight, 112);
         layout.formulaField = contentPixelRect(
-            contentLeft + 57, 38, contentRight - 12, 90);
+            contentLeft + 63, 27, contentRight - 12, 79);
         layout.formulaMeta = contentPixelRect(
-            contentLeft + 1, 91, contentRight - 1, 121);
+            contentLeft + 1, 80, contentRight - 1, 111);
 
         layout.variableCard = contentPixelRect(
-            contentLeft, 134, contentLeft + leftWidth, 257);
+            contentLeft, 124, contentLeft + leftWidth, 268);
         layout.functionCard = contentPixelRect(
-            contentLeft, 267, contentLeft + leftWidth, 435);
+            contentLeft, 278, contentLeft + leftWidth, 477);
         layout.planeCard = contentPixelRect(
-            contentLeft, 445, contentLeft + leftWidth, 542);
+            contentLeft, 489, contentLeft + leftWidth, 604);
         layout.capabilityCard = contentPixelRect(
-            contentLeft, 552, contentLeft + leftWidth, 590);
+            contentLeft, 614, contentLeft + leftWidth, 659);
+        layout.presetCard = contentPixelRect(
+            contentLeft, 669, contentLeft + leftWidth, 710);
         layout.valueCard = contentPixelRect(
-            rightLeft, 134, contentRight, 590);
+            rightLeft, 124, contentRight, 718);
 
         layout.bailout = contentPixelRect(
-            contentLeft + 82, 512,
-            contentLeft + leftWidth - 10, 539);
+            contentLeft + 82, 566,
+            contentLeft + leftWidth - 10, 593);
 
-        int pickerSize = std::clamp(rightWidth - 54, 150, 218);
-        int pickerLeft = rightLeft + (rightWidth - pickerSize) / 2 + 5;
-        int pickerTop = 207;
+        int presetInnerLeft = contentLeft + 53;
+        int presetInnerRight = contentLeft + leftWidth - 10;
+        int smallActionWidth = 39;
+        int pasteLeft = presetInnerRight - smallActionWidth;
+        int copyLeft = pasteLeft - 5 - smallActionWidth;
+        int dropdownLeft = presetInnerLeft;
+        int dropdownRight = std::max(
+            dropdownLeft + 70, copyLeft - 6);
+        layout.preset = contentPixelRect(
+            dropdownLeft, 675, dropdownRight, 704);
+
+        int pickerSize = std::clamp(rightWidth - 44, 170, 235);
+        int pickerLeft = rightLeft + 31;
+        int pickerTop = 224;
         layout.picker = contentPixelRect(
             pickerLeft, pickerTop,
             pickerLeft + pickerSize, pickerTop + pickerSize);
@@ -1173,13 +1208,13 @@ struct FormulaEditorPanel::Impl {
         int fieldWidth =
             std::max(60, (valueInnerRight - valueInnerLeft - fieldGap) / 2);
         layout.realField = contentPixelRect(
-            valueInnerLeft, 476,
-            valueInnerLeft + fieldWidth, 507);
+            valueInnerLeft, 528,
+            valueInnerLeft + fieldWidth, 559);
         layout.imaginaryField = contentPixelRect(
-            valueInnerLeft + fieldWidth + fieldGap, 476,
-            valueInnerRight, 507);
+            valueInnerLeft + fieldWidth + fieldGap, 528,
+            valueInnerRight, 559);
         layout.complexPreview = contentPixelRect(
-            valueInnerLeft, 516, valueInnerRight, 543);
+            valueInnerLeft, 568, valueInnerRight, 595);
 
         formulaField.setBounds(layout.formulaField);
         bailoutField.setBounds(layout.bailout);
@@ -1198,25 +1233,25 @@ struct FormulaEditorPanel::Impl {
                   HIT_CLOSE, L"\u00d7", ButtonKind::Icon,
                   true, false, false);
         addFocus(FOCUS_FORMULA, layout.formulaField,
-                 contentLocalRect(contentLeft + 57, 38,
-                                  contentRight - 12, 90),
+                 contentLocalRect(contentLeft + 63, 27,
+                                  contentRight - 12, 79),
                  true, true);
         addFocus(FOCUS_PRESET, layout.preset,
-                 contentLocalRect(dropdownLeft, 0,
-                                  dropdownRight, 26),
+                 contentLocalRect(dropdownLeft, 675,
+                                  dropdownRight, 704),
                  true, true);
-        addButton(contentPixelRect(copyLeft, 0,
-                                   copyLeft + copyWidth, 26),
+        addButton(contentPixelRect(copyLeft, 675,
+                                   copyLeft + smallActionWidth, 704),
                   HIT_COPY, L"Copy", ButtonKind::Normal,
                   true, false, true,
-                  contentLocalRect(copyLeft, 0,
-                                   copyLeft + copyWidth, 26));
-        addButton(contentPixelRect(pasteLeft, 0,
-                                   pasteLeft + copyWidth, 26),
+                  contentLocalRect(copyLeft, 675,
+                                   copyLeft + smallActionWidth, 704));
+        addButton(contentPixelRect(pasteLeft, 675,
+                                   pasteLeft + smallActionWidth, 704),
                   HIT_PASTE, L"Paste", ButtonKind::Normal,
                   true, false, true,
-                  contentLocalRect(pasteLeft, 0,
-                                   pasteLeft + copyWidth, 26));
+                  contentLocalRect(pasteLeft, 675,
+                                   pasteLeft + smallActionWidth, 704));
 
         int chipLeft = contentLeft + 11;
         int chipRight = contentLeft + leftWidth - 11;
@@ -1226,15 +1261,15 @@ struct FormulaEditorPanel::Impl {
             int row = i / 4;
             int column = i % 4;
             int left = chipLeft + column * (chipWidth + chipGap);
-            int top = 166 + row * 31;
+            int top = 157 + row * 35;
             InspectorValue value =
                 variableFromButton(static_cast<size_t>(i));
             addButton(
-                contentPixelRect(left, top, left + chipWidth, top + 26),
+                contentPixelRect(left, top, left + chipWidth, top + 29),
                 HIT_VARIABLE_BASE + i,
                 variableLabels()[static_cast<size_t>(i)],
                 ButtonKind::Chip, true, selected == value, true,
-                contentLocalRect(left, top, left + chipWidth, top + 26));
+                contentLocalRect(left, top, left + chipWidth, top + 29));
         }
 
         int tabLeft = contentLeft + 11;
@@ -1246,11 +1281,11 @@ struct FormulaEditorPanel::Impl {
         for (int i = 0; i < 3; ++i) {
             int left = tabLeft + i * tabWidth;
             int right = i == 2 ? tabRight : left + tabWidth;
-            addButton(contentPixelRect(left, 298, right, 321),
+            addButton(contentPixelRect(left, 311, right, 336),
                       HIT_FUNCTION_TAB_BASE + i,
                       tabLabels[static_cast<size_t>(i)],
                       ButtonKind::Tab, true, functionTab == i, true,
-                      contentLocalRect(left, 298, right, 321));
+                      contentLocalRect(left, 311, right, 336));
         }
 
         int functionLeft = contentLeft + 11;
@@ -1265,39 +1300,39 @@ struct FormulaEditorPanel::Impl {
             int column = i % 4;
             int left =
                 functionLeft + column * (functionWidth + functionGap);
-            int top = 326 + row * 26;
+            int top = 343 + row * 33;
             addButton(
                 contentPixelRect(left, top,
-                                 left + functionWidth, top + 23),
+                                 left + functionWidth, top + 27),
                 HIT_FUNCTION_BASE + i,
                 labels[static_cast<size_t>(i)],
                 ButtonKind::Function, true, false, true,
                 contentLocalRect(left, top,
-                                 left + functionWidth, top + 23));
+                                 left + functionWidth, top + 27));
         }
 
         int segmentLeft = contentLeft + 11;
         int segmentRight = contentLeft + leftWidth - 11;
         int segmentMiddle = (segmentLeft + segmentRight) / 2;
-        addButton(contentPixelRect(segmentLeft, 477,
-                                   segmentMiddle, 507),
+        addButton(contentPixelRect(segmentLeft, 523,
+                                   segmentMiddle, 554),
                   HIT_C_PLANE, L"c plane", ButtonKind::Segment,
                   true,
                   working.pixelParameter != FormulaParameter::InitialZ,
                   true,
-                  contentLocalRect(segmentLeft, 477,
-                                   segmentMiddle, 507));
-        addButton(contentPixelRect(segmentMiddle, 477,
-                                   segmentRight, 507),
+                  contentLocalRect(segmentLeft, 523,
+                                   segmentMiddle, 554));
+        addButton(contentPixelRect(segmentMiddle, 523,
+                                   segmentRight, 554),
                   HIT_Z0_PLANE, L"z0 plane", ButtonKind::Segment,
                   true,
                   working.pixelParameter == FormulaParameter::InitialZ,
                   true,
-                  contentLocalRect(segmentMiddle, 477,
-                                   segmentRight, 507));
+                  contentLocalRect(segmentMiddle, 523,
+                                   segmentRight, 554));
         addFocus(FOCUS_BAILOUT, layout.bailout,
-                 contentLocalRect(contentLeft + 82, 512,
-                                  contentLeft + leftWidth - 10, 539),
+                 contentLocalRect(contentLeft + 82, 566,
+                                  contentLeft + leftWidth - 10, 593),
                  true, true);
 
         addButton(layout.picker, HIT_PICKER, L"",
@@ -1311,36 +1346,36 @@ struct FormulaEditorPanel::Impl {
         int rangeGap = 4;
         int rangeLeft = rangeRight -
             rangeButtonWidth * 3 - rangeGap * 2;
-        addButton(contentPixelRect(rangeLeft, 432,
-                                   rangeLeft + rangeButtonWidth, 455),
+        addButton(contentPixelRect(rangeLeft, 486,
+                                   rangeLeft + rangeButtonWidth, 509),
                   HIT_RANGE_OUT, L"-", ButtonKind::Range,
                   true, false, true,
-                  contentLocalRect(rangeLeft, 432,
-                                   rangeLeft + rangeButtonWidth, 455));
+                  contentLocalRect(rangeLeft, 486,
+                                   rangeLeft + rangeButtonWidth, 509));
         addButton(contentPixelRect(
-                      rangeLeft + rangeButtonWidth + rangeGap, 432,
-                      rangeLeft + rangeButtonWidth * 2 + rangeGap, 455),
+                      rangeLeft + rangeButtonWidth + rangeGap, 486,
+                      rangeLeft + rangeButtonWidth * 2 + rangeGap, 509),
                   HIT_RANGE_RESET, L"0", ButtonKind::Range,
                   true, false, true,
                   contentLocalRect(
-                      rangeLeft + rangeButtonWidth + rangeGap, 432,
-                      rangeLeft + rangeButtonWidth * 2 + rangeGap, 455));
+                      rangeLeft + rangeButtonWidth + rangeGap, 486,
+                      rangeLeft + rangeButtonWidth * 2 + rangeGap, 509));
         addButton(contentPixelRect(
-                      rangeLeft + (rangeButtonWidth + rangeGap) * 2, 432,
-                      rangeRight, 455),
+                      rangeLeft + (rangeButtonWidth + rangeGap) * 2, 486,
+                      rangeRight, 509),
                   HIT_RANGE_IN, L"+", ButtonKind::Range,
                   true, false, true,
                   contentLocalRect(
-                      rangeLeft + (rangeButtonWidth + rangeGap) * 2, 432,
-                      rangeRight, 455));
+                      rangeLeft + (rangeButtonWidth + rangeGap) * 2, 486,
+                      rangeRight, 509));
         addFocus(FOCUS_REAL, layout.realField,
-                 contentLocalRect(valueInnerLeft, 476,
-                                  valueInnerLeft + fieldWidth, 507),
+                 contentLocalRect(valueInnerLeft, 528,
+                                  valueInnerLeft + fieldWidth, 559),
                  true, selectedEditable(working));
         addFocus(FOCUS_IMAGINARY, layout.imaginaryField,
                  contentLocalRect(
-                     valueInnerLeft + fieldWidth + fieldGap, 476,
-                     valueInnerRight, 507),
+                     valueInnerLeft + fieldWidth + fieldGap, 528,
+                     valueInnerRight, 559),
                  true, selectedEditable(working));
         if (scrollbar.visible()) {
             addFocus(FOCUS_SCROLLBAR, scrollbar.bounds(), {},
@@ -1369,6 +1404,42 @@ struct FormulaEditorPanel::Impl {
                             applyRight, buttonBottom),
                   HIT_APPLY, L"Apply & render", ButtonKind::Primary,
                   true, false, false);
+
+        auto focusRank = [](int id) {
+            if (id == FOCUS_FORMULA) return 0;
+            if (id >= HIT_VARIABLE_BASE &&
+                id < HIT_VARIABLE_BASE + 12)
+                return 100 + id - HIT_VARIABLE_BASE;
+            if (id >= HIT_FUNCTION_TAB_BASE &&
+                id < HIT_FUNCTION_TAB_BASE + 3)
+                return 200 + id - HIT_FUNCTION_TAB_BASE;
+            if (id >= HIT_FUNCTION_BASE &&
+                id < HIT_FUNCTION_BASE + 16)
+                return 300 + id - HIT_FUNCTION_BASE;
+            if (id == HIT_C_PLANE) return 400;
+            if (id == HIT_Z0_PLANE) return 401;
+            if (id == FOCUS_BAILOUT) return 402;
+            if (id == FOCUS_PRESET) return 500;
+            if (id == HIT_COPY) return 501;
+            if (id == HIT_PASTE) return 502;
+            if (id == HIT_PICKER) return 600;
+            if (id == HIT_RANGE_OUT) return 601;
+            if (id == HIT_RANGE_RESET) return 602;
+            if (id == HIT_RANGE_IN) return 603;
+            if (id == FOCUS_REAL) return 604;
+            if (id == FOCUS_IMAGINARY) return 605;
+            if (id == FOCUS_SCROLLBAR) return 700;
+            if (id == HIT_MANDELBROT) return 800;
+            if (id == HIT_REVERT) return 801;
+            if (id == HIT_APPLY) return 802;
+            if (id == HIT_CLOSE) return 803;
+            return 900;
+        };
+        std::stable_sort(
+            focusEntries.begin(), focusEntries.end(),
+            [&focusRank](const FocusEntry& a, const FocusEntry& b) {
+                return focusRank(a.id) < focusRank(b.id);
+            });
     }
 
     const ButtonSpec* findButton(int hit) const {
@@ -1630,6 +1701,45 @@ struct FormulaEditorPanel::Impl {
                 L"Selects this formula preset.", L"Choose",
                 !presetDropdown.open());
         }
+
+        auto accessibleRank = [](LONG key) {
+            if (key == FORMULA_ACC_EXPRESSION) return 0L;
+            if (key >= FORMULA_ACC_VARIABLE_BASE &&
+                key < FORMULA_ACC_VARIABLE_BASE + 12)
+                return 100L + key - FORMULA_ACC_VARIABLE_BASE;
+            if (key >= FORMULA_ACC_TAB_BASE &&
+                key < FORMULA_ACC_TAB_BASE + 3)
+                return 200L + key - FORMULA_ACC_TAB_BASE;
+            if (key >= FORMULA_ACC_FUNCTION_BASE &&
+                key < FORMULA_ACC_FUNCTION_BASE + 16)
+                return 300L + key - FORMULA_ACC_FUNCTION_BASE;
+            if (key == FORMULA_ACC_C_PLANE) return 400L;
+            if (key == FORMULA_ACC_Z0_PLANE) return 401L;
+            if (key == FORMULA_ACC_BAILOUT) return 402L;
+            if (key == FORMULA_ACC_PRESET) return 500L;
+            if (key == FORMULA_ACC_COPY) return 501L;
+            if (key == FORMULA_ACC_PASTE) return 502L;
+            if (key >= FORMULA_ACC_PRESET_ITEM_BASE)
+                return 510L + key - FORMULA_ACC_PRESET_ITEM_BASE;
+            if (key == FORMULA_ACC_PICKER) return 600L;
+            if (key == FORMULA_ACC_RANGE_OUT) return 601L;
+            if (key == FORMULA_ACC_RANGE_RESET) return 602L;
+            if (key == FORMULA_ACC_RANGE_IN) return 603L;
+            if (key == FORMULA_ACC_REAL) return 604L;
+            if (key == FORMULA_ACC_IMAGINARY) return 605L;
+            if (key == FORMULA_ACC_SCROLLBAR) return 700L;
+            if (key == FORMULA_ACC_MANDELBROT) return 800L;
+            if (key == FORMULA_ACC_REVERT) return 801L;
+            if (key == FORMULA_ACC_APPLY) return 802L;
+            if (key == FORMULA_ACC_CLOSE) return 803L;
+            return 900L;
+        };
+        std::stable_sort(
+            items.begin(), items.end(),
+            [&accessibleRank](const FormulaAccessibleItem& a,
+                              const FormulaAccessibleItem& b) {
+                return accessibleRank(a.key) < accessibleRank(b.key);
+            });
     }
 
     LONG accessibleKeyForFocus(int id) const {
@@ -2688,7 +2798,7 @@ struct FormulaEditorPanel::Impl {
               L"compact resize custom scrolling");
         SetWindowPos(
             hwnd, nullptr, 0, 0,
-            scale(FormulaEditorPanel::DESIGN_WIDTH), scale(760),
+            scale(FormulaEditorPanel::DESIGN_WIDTH), scale(870),
             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         updateLayout();
         check(!scrollbar.visible(),
@@ -2698,7 +2808,7 @@ struct FormulaEditorPanel::Impl {
             setDpi(testDpi);
             SetWindowPos(
                 hwnd, nullptr, 0, 0,
-                scale(FormulaEditorPanel::DESIGN_WIDTH), scale(760),
+                scale(FormulaEditorPanel::DESIGN_WIDTH), scale(870),
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             updateLayout();
             int pickerWidth =
@@ -2708,7 +2818,7 @@ struct FormulaEditorPanel::Impl {
             check(std::abs(clientWidthDip() -
                            FormulaEditorPanel::DESIGN_WIDTH) <= 1 &&
                       layout.header.bottom == scale(HEADER_HEIGHT) &&
-                      layout.footer.bottom == scale(760) &&
+                      layout.footer.bottom == scale(870) &&
                       std::abs(pickerWidth - pickerHeight) <= 1 &&
                       !scrollbar.visible(),
                   testDpi == 96
@@ -2720,7 +2830,7 @@ struct FormulaEditorPanel::Impl {
         setDpi(savedDpi);
         SetWindowPos(
             hwnd, nullptr, 0, 0,
-            scale(FormulaEditorPanel::DESIGN_WIDTH), scale(760),
+            scale(FormulaEditorPanel::DESIGN_WIDTH), scale(870),
             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         updateLayout();
 
@@ -2919,7 +3029,7 @@ struct FormulaEditorPanel::Impl {
                       SUCCEEDED(accessible->accNavigate(
                           NAVDIR_NEXT, expression, &next)) &&
                       next.vt == VT_I4 &&
-                      next.lVal == presetChild,
+                      next.lVal == variableChild,
                   L"accessible sequential navigation");
             VariantClear(&first);
             VariantClear(&next);
@@ -2955,7 +3065,7 @@ struct FormulaEditorPanel::Impl {
         }
         SetWindowPos(
             hwnd, nullptr, 0, 0,
-            scale(FormulaEditorPanel::DESIGN_WIDTH), scale(760),
+            scale(FormulaEditorPanel::DESIGN_WIDTH), scale(870),
             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         updateLayout();
 
@@ -3116,7 +3226,9 @@ struct FormulaEditorPanel::Impl {
 
     std::vector<ui::TextRangeStyle> formulaStyles() const {
         std::vector<ui::TextRangeStyle> styles;
-        for (const Token& token : tokens) {
+        std::wstring source = formulaField.text();
+        for (size_t index = 0; index < tokens.size(); ++index) {
+            const Token& token = tokens[index];
             ui::TextRangeStyle style;
             style.first = token.first;
             style.last = token.last;
@@ -3133,6 +3245,17 @@ struct FormulaEditorPanel::Impl {
                 style.text = TOKEN_NUMBER;
                 break;
             case TokenKind::Operator:
+                style.text = TOKEN_OPERATOR;
+                if (token.first < source.size() &&
+                    source[token.first] != L'=') {
+                    if (token.first == 0 ||
+                        !std::iswspace(source[token.first - 1]))
+                        style.paddingBefore = scale(3);
+                    if (token.last >= source.size() ||
+                        !std::iswspace(source[token.last]))
+                        style.paddingAfter = scale(3);
+                }
+                break;
             case TokenKind::Punctuation:
                 style.text = TOKEN_OPERATOR;
                 break;
@@ -3141,8 +3264,17 @@ struct FormulaEditorPanel::Impl {
                 break;
             }
             if (token.selectable && token.inspector == selected) {
-                style.background = RGB(44, 68, 108);
+                style.text = RGB(255, 255, 255);
+                style.background = RGB(39, 56, 88);
                 style.border = CLR_ACCENT;
+                style.paddingBefore += scale(3);
+                style.paddingAfter += scale(3);
+            } else if (token.selectable &&
+                       static_cast<int>(index) == hoveredFormulaToken) {
+                style.background = RGB(35, 43, 56);
+                style.border = RGB(70, 80, 100);
+                style.paddingBefore += scale(2);
+                style.paddingAfter += scale(2);
             }
             styles.push_back(style);
         }
@@ -3152,8 +3284,10 @@ struct FormulaEditorPanel::Impl {
     void drawSectionTitle(HDC dc, RECT rect, const std::wstring& title,
                           const std::wstring& hint) {
         RECT titleRect = rect;
-        drawText(dc, titleRect, title, CLR_TEXT_DIM, tinyFont,
+        int oldExtra = SetTextCharacterExtra(dc, scale(1));
+        drawText(dc, titleRect, title, CLR_TEXT_DIM, sectionFont,
                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        SetTextCharacterExtra(dc, oldExtra);
         if (!hint.empty()) {
             drawText(dc, titleRect, hint, RGB(98, 108, 128), tinyFont,
                      DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
@@ -3167,7 +3301,7 @@ struct FormulaEditorPanel::Impl {
                       SOFT_BORDER);
         RECT title = pixelRect(18, 11, 300, 34);
         drawText(dc, title, L"Formula editor", CLR_TEXT,
-                 resources.semibold(),
+                 headerFont,
                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         RECT subtitle = pixelRect(18, 33, 360, 51);
         drawText(dc, subtitle,
@@ -3188,13 +3322,17 @@ struct FormulaEditorPanel::Impl {
         int left = layout.contentLeftDip;
         int right = layout.contentRightDip;
         drawSectionTitle(
-            dc, contentPixelRect(left, 0, left + 104, 26),
-            L"ORBIT EXPRESSION", L"");
+            dc, contentPixelRect(left, 0, right, 21),
+            L"ORBIT EXPRESSION",
+            L"Click a variable to edit its value");
+        RECT glow = layout.formulaCard;
+        InflateRect(&glow, scale(3), scale(3));
+        fillRound(dc, glow, DOCK_BG, RGB(27, 38, 56), scale(11));
         drawCardWithColor(dc, layout.formulaCard, EDIT_BG,
                           RGB(70, 80, 100), scale(9));
 
-        RECT prefix = contentPixelRect(left + 14, 38,
-                                       left + 54, 90);
+        RECT prefix = contentPixelRect(left + 14, 27,
+                                       left + 60, 79);
         drawText(dc, prefix, L"z' =", RGB(119, 131, 153),
                  formulaFont,
                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -3282,13 +3420,13 @@ struct FormulaEditorPanel::Impl {
                            : (hovered ? CLR_ACCENT_HI : CLR_ACCENT);
             border = fill;
             text = RGB(255, 255, 255);
-            font = resources.semibold();
+            font = actionFont;
             radius = scale(8);
             break;
         case ButtonKind::Chip:
             font = chipFont;
             if (button.active) {
-                fill = RGB(43, 64, 100);
+                fill = RGB(50, 64, 95);
                 border = CLR_ACCENT;
                 text = RGB(255, 255, 255);
             } else if (hovered) {
@@ -3297,7 +3435,7 @@ struct FormulaEditorPanel::Impl {
             }
             break;
         case ButtonKind::Function:
-            font = chipFont;
+            font = functionFont;
             fill = hovered ? CLR_CARD_HOV : RGB(36, 40, 51);
             border = hovered ? CLR_ACCENT : RGB(52, 58, 72);
             text = RGB(191, 200, 215);
@@ -3320,7 +3458,7 @@ struct FormulaEditorPanel::Impl {
             font = resources.regular();
             break;
         case ButtonKind::Range:
-            font = chipFont;
+            font = functionFont;
             if (hovered) fill = CLR_CARD_HOV;
             break;
         case ButtonKind::Normal:
@@ -3328,6 +3466,8 @@ struct FormulaEditorPanel::Impl {
             if (hovered) fill = CLR_CARD_HOV;
             break;
         }
+        if (button.hit == HIT_COPY || button.hit == HIT_PASTE)
+            font = tinyFont;
         if (pressed && button.kind != ButtonKind::Primary)
             fill = RGB(31, 35, 44);
         if (!button.enabled) {
@@ -3364,52 +3504,52 @@ struct FormulaEditorPanel::Impl {
                           SOFT_BORDER, scale(9));
         drawSectionTitle(
             dc, contentPixelRect(
-                    layout.contentLeftDip + 11, 144,
+                    layout.contentLeftDip + 11, 139,
                     layout.contentLeftDip +
                         unscale(layout.variableCard.right -
                                 layout.variableCard.left) - 11,
-                    162),
+                    156),
             L"INSERT VARIABLE", L"at cursor");
 
         drawCardWithColor(dc, layout.functionCard, VALUE_CARD,
                           SOFT_BORDER, scale(9));
         drawSectionTitle(
             dc, contentPixelRect(
-                    layout.contentLeftDip + 11, 277,
+                    layout.contentLeftDip + 11, 288,
                     layout.contentLeftDip +
                         unscale(layout.functionCard.right -
                                 layout.functionCard.left) - 11,
-                    295),
+                    306),
             L"INSERT FUNCTION", L"wrap selection");
 
         drawCardWithColor(dc, layout.planeCard, VALUE_CARD,
                           SOFT_BORDER, scale(9));
         drawSectionTitle(
             dc, contentPixelRect(
-                    layout.contentLeftDip + 11, 455,
+                    layout.contentLeftDip + 11, 499,
                     layout.contentLeftDip +
                         unscale(layout.planeCard.right -
                                 layout.planeCard.left) - 11,
-                    473),
+                    517),
             L"PIXEL PLANE", L"what each pixel controls");
         RECT segmentBackground = contentPixelRect(
-            layout.contentLeftDip + 9, 475,
+            layout.contentLeftDip + 9, 521,
             layout.contentLeftDip +
                 unscale(layout.planeCard.right -
                         layout.planeCard.left) - 9,
-            509);
+            556);
         fillRound(dc, segmentBackground, EDIT_BG,
                   EDIT_BG, scale(7));
         RECT bailoutLabel = contentPixelRect(
-            layout.contentLeftDip + 11, 512,
-            layout.contentLeftDip + 79, 539);
+            layout.contentLeftDip + 11, 566,
+            layout.contentLeftDip + 79, 593);
         drawText(dc, bailoutLabel, L"Bailout |z|",
                  CLR_TEXT_DIM, tinyFont,
                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         ui::TextFieldStyle numericStyle;
         numericStyle.radius = scale(6);
         numericStyle.horizontalPadding = scale(8);
-        bailoutField.draw(dc, chipFont, numericStyle);
+        bailoutField.draw(dc, controlFont, numericStyle);
 
         drawCardWithColor(dc, layout.capabilityCard,
                           RGB(25, 45, 41), RGB(43, 83, 68),
@@ -3418,7 +3558,7 @@ struct FormulaEditorPanel::Impl {
         if (!formulaValid) {
             capability = L"Unavailable until the formula is valid.";
         } else {
-            capability = L"Available: expression bytecode";
+            capability = L"expression bytecode";
             if (formulaProgram.avx2Compatible())
                 capability += L", AVX2 batch";
             if (formulaProgram.derivativeCompatible())
@@ -3428,11 +3568,28 @@ struct FormulaEditorPanel::Impl {
         RECT capabilityText = layout.capabilityCard;
         capabilityText.left += scale(9);
         capabilityText.right -= scale(9);
+        capabilityText.top += scale(6);
+        capabilityText.bottom -= scale(5);
+        if (formulaValid) {
+            RECT available = capabilityText;
+            available.right = available.left + scale(54);
+            drawText(dc, available, L"Available:", CLR_GREEN,
+                     sectionFont,
+                     DT_LEFT | DT_TOP | DT_SINGLELINE);
+            capabilityText.left = available.right;
+        }
         drawText(dc, capabilityText, capability,
                  formulaValid ? RGB(167, 183, 173) : CLR_TEXT_DIM,
-                 tinyFont,
-                 DT_LEFT | DT_VCENTER | DT_WORDBREAK |
+                 tinyFont, DT_LEFT | DT_TOP | DT_WORDBREAK |
                      DT_END_ELLIPSIS);
+
+        drawCardWithColor(dc, layout.presetCard, VALUE_CARD,
+                          SOFT_BORDER, scale(8));
+        RECT presetLabel = contentPixelRect(
+            layout.contentLeftDip + 11, 675,
+            layout.contentLeftDip + 50, 704);
+        drawText(dc, presetLabel, L"Preset", CLR_TEXT_DIM,
+                 tinyFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
 
     void drawPicker(HDC dc) {
@@ -3531,12 +3688,12 @@ struct FormulaEditorPanel::Impl {
         int rightLeft = unscale(layout.valueCard.left);
         int contentRight = layout.contentRightDip;
         drawSectionTitle(
-            dc, contentPixelRect(rightLeft + 12, 144,
-                                 contentRight - 12, 162),
+            dc, contentPixelRect(rightLeft + 12, 139,
+                                 contentRight - 12, 156),
             L"SELECTED VALUE", usageLabel());
 
         RECT symbol = contentPixelRect(
-            rightLeft + 13, 166, rightLeft + 47, 200);
+            rightLeft + 13, 170, rightLeft + 47, 204);
         fillRound(dc, symbol, RGB(43, 64, 100),
                   CLR_ACCENT, scale(8));
         drawText(dc, symbol, inspectorName(selected), RGB(255, 255, 255),
@@ -3583,7 +3740,7 @@ struct FormulaEditorPanel::Impl {
         swprintf_s(range, L"Range: -%.3g \u2026 %.3g",
                    pickerRange, pickerRange);
         RECT rangeText = contentPixelRect(
-            rightLeft + 13, 432, contentRight - 95, 455);
+            rightLeft + 13, 486, contentRight - 95, 509);
         drawText(dc, rangeText, range, CLR_TEXT_DIM, tinyFont,
                  DT_LEFT | DT_VCENTER | DT_SINGLELINE |
                      DT_END_ELLIPSIS);
@@ -3593,26 +3750,26 @@ struct FormulaEditorPanel::Impl {
         int gap = 7;
         int width = (valueInnerRight - valueInnerLeft - gap) / 2;
         drawText(dc, contentPixelRect(
-                     valueInnerLeft, 459,
-                     valueInnerLeft + width, 475),
+                    valueInnerLeft, 513,
+                    valueInnerLeft + width, 527),
                  L"Real", CLR_TEXT_DIM, tinyFont,
                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         drawText(dc, contentPixelRect(
-                     valueInnerLeft + width + gap, 459,
-                     valueInnerRight, 475),
+                     valueInnerLeft + width + gap, 513,
+                     valueInnerRight, 527),
                  L"Imaginary", CLR_TEXT_DIM, tinyFont,
                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
         ui::TextFieldStyle numericStyle;
         numericStyle.radius = scale(6);
         numericStyle.horizontalPadding = scale(8);
-        realField.draw(dc, chipFont, numericStyle);
-        imaginaryField.draw(dc, chipFont, numericStyle);
+        realField.draw(dc, controlFont, numericStyle);
+        imaginaryField.draw(dc, controlFont, numericStyle);
 
         fillRound(dc, layout.complexPreview, RGB(21, 24, 32),
                   RGB(21, 24, 32), scale(6));
         drawText(dc, layout.complexPreview, complexPreviewText(),
-                 RGB(223, 232, 247), chipFont,
+                 RGB(223, 232, 247), functionFont,
                  DT_CENTER | DT_VCENTER | DT_SINGLELINE |
                      DT_END_ELLIPSIS);
     }
@@ -3849,6 +4006,26 @@ struct FormulaEditorPanel::Impl {
 
         bool changed =
             presetDropdown.mouseMove(point, layout.contentClip);
+        int newHoveredToken = -1;
+        if (containsPoint(layout.formulaField, point)) {
+            std::vector<ui::TextRangeStyle> styles = formulaStyles();
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                const Token& token = tokens[i];
+                int leading = i < styles.size()
+                    ? styles[i].paddingBefore : 0;
+                RECT tokenBounds = formulaField.textRangeBounds(
+                    token.first, token.last, leading);
+                if (token.selectable &&
+                    containsPoint(tokenBounds, point)) {
+                    newHoveredToken = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        if (newHoveredToken != hoveredFormulaToken) {
+            hoveredFormulaToken = newHoveredToken;
+            changed = true;
+        }
         changed = scrollbar.mouseMove(point) || changed;
         if (hitRouter.move(point.x, point.y)) {
             hoverHit = hitRouter.hovered();
@@ -3870,7 +4047,8 @@ struct FormulaEditorPanel::Impl {
              containsPoint(layout.realField, point)) ||
             (imaginaryField.enabled() &&
              containsPoint(layout.imaginaryField, point))) {
-            SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
+            SetCursor(LoadCursorW(
+                nullptr, hoveredFormulaToken >= 0 ? IDC_HAND : IDC_IBEAM));
         } else if (containsPoint(layout.picker, point)) {
             SetCursor(LoadCursorW(nullptr, IDC_CROSS));
         } else if (hoverHit != HIT_NONE ||
@@ -4062,6 +4240,7 @@ struct FormulaEditorPanel::Impl {
         case WM_MOUSELEAVE:
             trackingMouse = false;
             hoverHit = HIT_NONE;
+            hoveredFormulaToken = -1;
             hitRouter.cancel();
             presetDropdown.mouseMove(
                 {-32000, -32000}, layout.contentClip);

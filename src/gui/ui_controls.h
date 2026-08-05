@@ -25,6 +25,8 @@ struct TextRangeStyle {
     COLORREF text = RGB(224, 229, 238);
     COLORREF background = CLR_INVALID;
     COLORREF border = CLR_INVALID;
+    int paddingBefore = 0;
+    int paddingAfter = 0;
 };
 
 struct TextFieldStyle {
@@ -83,6 +85,8 @@ public:
 
     void draw(HDC dc, HFONT font, const TextFieldStyle& style,
               const std::vector<TextRangeStyle>& ranges = {});
+    RECT textRangeBounds(size_t first, size_t last,
+                         int leadingPadding = 0) const;
     size_t indexAtPoint(POINT point) const;
     bool mouseDown(POINT point, bool extendSelection);
     bool mouseMove(POINT point);
@@ -100,7 +104,8 @@ private:
     bool copySelection(bool cut);
     bool pasteSelection();
     void updateAdvances(HDC dc, HFONT font, const std::wstring& value,
-                        int availableWidth);
+                        int availableWidth,
+                        const std::vector<TextRangeStyle>& ranges);
     int xForIndex(size_t index) const;
     void resetBlink();
 

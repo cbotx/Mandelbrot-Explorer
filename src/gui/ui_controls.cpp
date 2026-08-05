@@ -252,7 +252,8 @@ bool TextField::undo() {
 
 void TextField::updateAdvances(HDC dc, HFONT font,
                                const std::wstring& value,
-                               int availableWidth) {
+                               int availableWidth,
+                               const std::vector<TextRangeStyle>& ranges) {
     _advances.assign(value.size() + 1u, 0);
     if (value.empty()) {
         _scrollX = 0;
@@ -276,6 +277,19 @@ void TextField::updateAdvances(HDC dc, HFONT font,
         }
     }
     if (oldFont) SelectObject(dc, oldFont);
+
+    std::vector<int> padding(value.size() + 1u, 0);
+    for (const TextRangeStyle& range : ranges) {
+        size_t first = std::min(range.first, value.size());
+        size_t last = std::min(range.last, value.size());
+        padding[first] += std::max(0, range.paddingBefore);
+        padding[last] += std::max(0, range.paddingAfter);
+    }
+    int accumulatedPadding = 0;
+    for (size_t i = 0; i < _advances.size(); ++i) {
+        accumulatedPadding += padding[i];
+        _advances[i] += accumulatedPadding;
+    }
 
     size_t caret = std::min(_activeCaret, value.size());
     int caretX = _advances[caret];
@@ -318,7 +332,7 @@ void TextField::draw(HDC dc, HFONT font, const TextFieldStyle& style,
     if (_inner.right <= _inner.left) return;
 
     std::wstring value = text();
-    updateAdvances(dc, font, value, _inner.right - _inner.left);
+    updateAdvances(dc, font, value, _inner.right - _inner.left, ranges);
 
     int saved = SaveDC(dc);
     IntersectClipRect(dc, _inner.left, _inner.top,
@@ -347,7 +361,7 @@ void TextField::draw(HDC dc, HFONT font, const TextFieldStyle& style,
             size_t last = std::min(range.last, value.size());
             if (last <= first || range.background == CLR_INVALID) continue;
             RECT highlight{
-                xForIndex(first), textY - 1,
+                xForIndex(first) - std::max(0, range.paddingBefore), textY - 1,
                 xForIndex(last), textY + textHeight + 1
             };
             fillRound(dc, highlight, range.background,
@@ -435,6 +449,21 @@ size_t TextField::indexAtPoint(POINT point) const {
         if (target - previous < next - target) --index;
     }
     return index;
+}
+
+RECT TextField::textRangeBounds(size_t first, size_t last,
+                                int leadingPadding) const {
+    if (_advances.empty()) return {};
+    size_t maximum = _advances.size() - 1u;
+    first = std::min(first, maximum);
+    last = std::min(last, maximum);
+    if (last < first) std::swap(first, last);
+    return {
+        xForIndex(first) - std::max(0, leadingPadding),
+        _inner.top,
+        xForIndex(last),
+        _inner.bottom
+    };
 }
 
 bool TextField::mouseDown(POINT point, bool extendSelection) {
