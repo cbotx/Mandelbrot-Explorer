@@ -1889,10 +1889,132 @@ static int runMultibrotCase() {
     double speedup = simdMedian > 0.0 ? scalarMedian / simdMedian : 0.0;
     if (speedup < 1.05) ++failures;
 
+    formula::ExpressionProgram cubicProgram;
+    formula::ExpressionError cubicError;
+    cubicProgram.compile("z*z*z+c", &cubicError);
+    constexpr int RW = 320, RH = 216, RMIT = 1500, RSAMPLES = 3;
+    std::vector<double> genericResidualTimes;
+    std::vector<double> cubicResidualTimes;
+    std::vector<float> genericResidual;
+    std::vector<float> cubicResidual;
+    auto renderResidual = [&](bool specialized,
+                              formula::ExpressionColoring coloring,
+                              std::vector<float>& output,
+                              double& elapsed) {
+        output.assign((size_t)RW * RH, EMPTYPIXEL);
+        Mandel renderer(RW, RH, RMIT, 1, output.data());
+        formula::ExpressionContext fixed;
+        mpf_t centerRe, centerIm, scale;
+        mpf_init_set_d(centerRe, 0.3849001794597505);
+        mpf_init_set_ui(centerIm, 0);
+        mpf_init_set_d(scale, 1e5);
+        _putenv_s(
+            "MANDEL_EXPR_RESIDUAL_POWER", specialized ? "1" : "0");
+        bool used = false;
+        auto begin = Clock::now();
+        bool okay = renderer.ComputeExpressionResidual(
+            centerRe, centerIm, scale, cubicProgram, fixed,
+            FormulaParameter::C, RMIT, 4.0, &used, coloring);
+        elapsed = since(begin);
+        mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+        return okay && used;
+    };
+    const formula::ExpressionColoring residualColorings[] = {
+        formula::ExpressionColoring::Raw,
+        formula::ExpressionColoring::Smooth,
+        formula::ExpressionColoring::Distance
+    };
+    const char* residualColoringNames[] = {
+        "raw", "smooth", "distance"
+    };
+    for (int coloringIndex = 0; coloringIndex < 3; ++coloringIndex) {
+        std::vector<float> direct((size_t)RW * RH, EMPTYPIXEL);
+        std::vector<float> residual;
+        Mandel directRenderer(RW, RH, RMIT, 1, direct.data());
+        formula::ExpressionContext fixed;
+        mpf_t centerRe, centerIm, scale;
+        mpf_init_set_d(centerRe, 0.3849001794597505);
+        mpf_init_set_ui(centerIm, 0);
+        mpf_init_set_d(scale, 1e5);
+        _putenv_s("MANDEL_EXPR_POWER_SIMD", "0");
+        bool directOkay = directRenderer.ComputeExpression(
+            centerRe, centerIm, scale, cubicProgram, fixed,
+            FormulaParameter::C, RMIT, 4.0,
+            residualColorings[coloringIndex]);
+        mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+        double residualTime = 0.0;
+        bool residualOkay = renderResidual(
+            true, residualColorings[coloringIndex],
+            residual, residualTime);
+        int classMismatches = 0;
+        int floorMismatches = 0;
+        double maxDifference = 0.0;
+        for (size_t i = 0; i < direct.size(); ++i) {
+            bool directInterior = isInterior(direct[i]);
+            bool residualInterior = isInterior(residual[i]);
+            if (directInterior != residualInterior) {
+                ++classMismatches;
+            } else if (!directInterior) {
+                if ((int)direct[i] != (int)residual[i])
+                    ++floorMismatches;
+                maxDifference = std::max(
+                    maxDifference,
+                    std::fabs((double)direct[i] - residual[i]));
+            }
+        }
+        if (!directOkay || !residualOkay ||
+            classMismatches || floorMismatches ||
+            (coloringIndex == 0 && maxDifference != 0.0) ||
+            (coloringIndex != 0 && maxDifference > 1e-3))
+            ++failures;
+        printf("  cubic residual %-8s class=%d floor=%d max=%.6g\n",
+               residualColoringNames[coloringIndex],
+               classMismatches, floorMismatches, maxDifference);
+    }
+    for (int sample = 0; sample < RSAMPLES; ++sample) {
+        double genericTime = 0.0, specializedTime = 0.0;
+        if (!renderResidual(
+                false, formula::ExpressionColoring::Raw,
+                genericResidual, genericTime) ||
+            !renderResidual(
+                true, formula::ExpressionColoring::Raw,
+                cubicResidual, specializedTime)) {
+            ++failures;
+            break;
+        }
+        genericResidualTimes.push_back(genericTime);
+        cubicResidualTimes.push_back(specializedTime);
+    }
+    _putenv_s("MANDEL_EXPR_RESIDUAL_POWER", "");
+    int residualBitMismatches = 0;
+    if (genericResidual.size() == cubicResidual.size()) {
+        for (size_t i = 0; i < genericResidual.size(); ++i) {
+            if (std::memcmp(
+                    &genericResidual[i], &cubicResidual[i],
+                    sizeof(float)) != 0)
+                ++residualBitMismatches;
+        }
+    } else {
+        residualBitMismatches = 1;
+    }
+    std::sort(genericResidualTimes.begin(), genericResidualTimes.end());
+    std::sort(cubicResidualTimes.begin(), cubicResidualTimes.end());
+    double genericResidualMedian = genericResidualTimes.empty()
+        ? 0.0 : genericResidualTimes[genericResidualTimes.size() / 2];
+    double cubicResidualMedian = cubicResidualTimes.empty()
+        ? 0.0 : cubicResidualTimes[cubicResidualTimes.size() / 2];
+    double residualSpeedup = cubicResidualMedian > 0.0
+        ? genericResidualMedian / cubicResidualMedian : 0.0;
+    if (residualBitMismatches || residualSpeedup < 1.10) ++failures;
+
     printf("  aggregate bits=%d class=%d max=%.6g\n",
            totalBitMismatches, totalClassMismatches, maximumDifference);
     printf("  cubic %dx%d mxit=%d scalar/AVX2 %.3f/%.3f s speedup %.2fx\n",
            BW, BH, BMIT, scalarMedian, simdMedian, speedup);
+    printf("  cubic residual generic/specialized %.3f/%.3f s speedup %.2fx"
+           " bits=%d\n",
+           genericResidualMedian, cubicResidualMedian,
+           residualSpeedup, residualBitMismatches);
     printf("  => %s\n\n",
            failures == 0 ? "PASS"
                          : "CHECK (Multibrot correctness/performance)");
@@ -1912,10 +2034,15 @@ static int runExpressionResidualSuite() {
         int mxit;
         double bailout;
         bool expectResidual;
+        formula::ExpressionColoring coloring =
+            formula::ExpressionColoring::Raw;
     };
     const ResidualCase cases[] = {
         { "quadratic-c", "z*z+c", FormulaParameter::C,
           { -0.75, 0.0 }, 1e4, {}, {}, {}, 1000, 4.0, true },
+        { "cubic-c", "z*z*z+c", FormulaParameter::C,
+          { 0.3849001794597505, 0.0 }, 1e5,
+          {}, {}, {}, 1500, 4.0, true },
         { "sine-c", "sin(z)+c", FormulaParameter::C,
           {}, 4.0, {}, {}, {}, 200, 8.0, true },
         { "burning-c", "sqr(complex(abs(re(z)),abs(im(z))))+c",
@@ -1926,6 +2053,13 @@ static int runExpressionResidualSuite() {
           {}, 1.0, {}, {}, {}, 500, 4.0, true },
         { "escaping-reference-fallback", "z*z+c", FormulaParameter::C,
           { 0.5, 0.5 }, 10.0, {}, {}, {}, 300, 4.0, false }
+        ,
+        { "cubic-escaping-smooth", "z*z*z+c", FormulaParameter::C,
+          { 1.0, 1.0 }, 10.0, {}, {}, {}, 300, 4.0, false,
+          formula::ExpressionColoring::Smooth },
+        { "cubic-small-bailout-distance", "z*z*z+c",
+          FormulaParameter::C, {}, 4.0, {}, {}, {}, 100, 0.5, true,
+          formula::ExpressionColoring::Distance }
     };
 
     int failures = 0;
@@ -1951,14 +2085,14 @@ static int runExpressionResidualSuite() {
         auto begin = Clock::now();
         bool ok = renderer.ComputeExpression(
             centerRe, centerIm, scale, program, fixed, test.pixel,
-            test.mxit, test.bailout);
+            test.mxit, test.bailout, test.coloring);
         double directTime = since(begin);
         direct = output;
         bool usedResidual = false;
         begin = Clock::now();
         ok = ok && renderer.ComputeExpressionResidual(
             centerRe, centerIm, scale, program, fixed, test.pixel,
-            test.mxit, test.bailout, &usedResidual);
+            test.mxit, test.bailout, &usedResidual, test.coloring);
         double residualTime = since(begin);
         mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
 

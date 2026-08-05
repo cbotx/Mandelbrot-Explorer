@@ -470,7 +470,8 @@ bool Mandel::ComputeExpressionResidual(
         const formula::ExpressionProgram& program,
         const formula::ExpressionContext& fixed,
         FormulaParameter pixelParameter, int mxit, double bailout,
-        bool* usedPerturbation) {
+        bool* usedPerturbation,
+        formula::ExpressionColoring coloring) {
     if (usedPerturbation) *usedPerturbation = false;
     if (_sub != 1 || !program.valid() || mxit < 1 || !(bailout > 0.0) ||
         !std::isfinite(bailout) ||
@@ -478,6 +479,8 @@ bool Mandel::ComputeExpressionResidual(
          pixelParameter != FormulaParameter::InitialZ))
         return false;
     if (_flag_halt) return false;
+    if (bailout < 1.0)
+        coloring = formula::ExpressionColoring::Raw;
 
     mpf_t dw, dh;
     mpf_init_set_ui(dw, 2);
@@ -493,6 +496,18 @@ bool Mandel::ComputeExpressionResidual(
     mpf_clear(dw); mpf_clear(dh);
 
     formula::ExpressionContext reference = fixed;
+    const int integerPower =
+        program.fastPath() ==
+            formula::ExpressionProgram::FastPath::IntegerPowerPlusC
+        ? program.fastIntegerPower() : 0;
+    const char* residualPowerSetting =
+        std::getenv("MANDEL_EXPR_RESIDUAL_POWER");
+    const bool cubicResidual =
+        integerPower == 3 &&
+        (!residualPowerSetting || std::atoi(residualPowerSetting) != 0);
+    if (coloring != formula::ExpressionColoring::Raw &&
+        !cubicResidual)
+        return false;
     formula::Complex center{ mpf_get_ld(center_re), mpf_get_ld(center_im) };
     if (pixelParameter == FormulaParameter::C) reference.c = center;
     else reference.z0 = center;
@@ -508,8 +523,13 @@ bool Mandel::ComputeExpressionResidual(
         if (_flag_halt) return false;
         reference.iteration = n;
         reference.z = orbit[n];
-        orbit[n + 1] = program.evaluate(reference, refStack.data(),
-                                        program.stackDepth());
+        if (cubicResidual) {
+            formula::Complex square = orbit[n] * orbit[n];
+            orbit[n + 1] = square * orbit[n] + reference.c;
+        } else {
+            orbit[n + 1] = program.evaluate(
+                reference, refStack.data(), program.stackDepth());
+        }
         boundedReference =
             std::isfinite(orbit[n + 1].real()) &&
             std::isfinite(orbit[n + 1].imag()) &&
@@ -519,7 +539,7 @@ bool Mandel::ComputeExpressionResidual(
     if (!boundedReference) {
         return ComputeExpression(center_re, center_im, scale, program, fixed,
                                  pixelParameter, mxit, bailout,
-                                 formula::ExpressionColoring::Raw, nullptr);
+                                 coloring, nullptr);
     }
     if (usedPerturbation) *usedPerturbation = true;
 
@@ -527,6 +547,8 @@ bool Mandel::ComputeExpressionResidual(
     std::fill(_iter, _iter + (size_t)_w * _h, EMPTYPIXEL);
     const double startRe = mpf_get_ld(_c0_re), startIm = mpf_get_ld(_c0_im);
     const double dx = mpf_get_ld(_dx), dy = mpf_get_ld(_dy);
+    const double halfWidth = (_w - 1) * 0.5;
+    const double halfHeight = (_h - 1) * 0.5;
 #pragma omp parallel for schedule(dynamic, 1)
     for (int i = 0; i < _h; ++i) {
         if (_flag_halt) continue;
@@ -538,13 +560,37 @@ bool Mandel::ComputeExpressionResidual(
             formula::Complex pixel{ startRe + dx * j, pixelIm };
             if (pixelParameter == FormulaParameter::C) context.c = pixel;
             else context.z0 = pixel;
-            formula::Complex delta = context.z0 - orbit[0];
+            formula::Complex parameterDelta{};
+            formula::Complex delta;
+            if (cubicResidual) {
+                formula::Complex gridDelta{
+                    dx * (j - halfWidth), dy * (i - halfHeight)
+                };
+                if (pixelParameter == FormulaParameter::C) {
+                    parameterDelta = gridDelta;
+                    context.c = reference.c + parameterDelta;
+                    delta = context.z0 - orbit[0];
+                } else {
+                    context.z0 = reference.z0 + gridDelta;
+                    delta = gridDelta;
+                }
+            } else {
+                delta = context.z0 - orbit[0];
+            }
             float result = -2.0f;
             formula::Complex absolute = orbit[0] + delta;
+            formula::Complex derivative =
+                pixelParameter == FormulaParameter::InitialZ
+                    ? formula::Complex{ 1.0, 0.0 }
+                    : formula::Complex{};
             if (!std::isfinite(absolute.real()) ||
                 !std::isfinite(absolute.imag()) ||
                 std::hypot(absolute.real(), absolute.imag()) > bailout) {
-                result = 0.0f;
+                result = cubicResidual
+                    ? initialPowerResult(
+                        absolute, pixelParameter, coloring,
+                        3, bailout, dx)
+                    : 0.0f;
             } else {
                 std::array<formula::Complex,
                            formula::ExpressionProgram::MAX_STACK> stack;
@@ -553,15 +599,58 @@ bool Mandel::ComputeExpressionResidual(
                         rowCompleted = false;
                         break;
                     }
-                    context.iteration = n;
-                    context.z = orbit[n] + delta;
-                    formula::Complex next = program.evaluate(
-                        context, stack.data(), program.stackDepth());
-                    delta = next - orbit[n + 1];
+                    formula::Complex next;
+                    if (cubicResidual) {
+                        formula::Complex absoluteCurrent =
+                            orbit[n] + delta;
+                        formula::Complex absoluteSquared =
+                            absoluteCurrent * absoluteCurrent;
+                        formula::Complex nextDerivative =
+                            (3.0 * absoluteSquared) * derivative;
+                        if (pixelParameter == FormulaParameter::C)
+                            nextDerivative += 1.0;
+                        formula::Complex deltaSquared = delta * delta;
+                        formula::Complex referenceSquared =
+                            orbit[n] * orbit[n];
+                        delta =
+                            (3.0 * referenceSquared) * delta +
+                            (3.0 * orbit[n]) * deltaSquared +
+                            deltaSquared * delta + parameterDelta;
+                        next = orbit[n + 1] + delta;
+                        derivative = nextDerivative;
+                    } else {
+                        context.iteration = n;
+                        context.z = orbit[n] + delta;
+                        next = program.evaluate(
+                            context, stack.data(), program.stackDepth());
+                        delta = next - orbit[n + 1];
+                    }
                     if (!std::isfinite(next.real()) ||
                         !std::isfinite(next.imag()) ||
                         std::hypot(next.real(), next.imag()) > bailout) {
-                        result = (float)(n + 1);
+                        double magnitude =
+                            std::hypot(next.real(), next.imag());
+                        if (coloring ==
+                                formula::ExpressionColoring::Smooth &&
+                            std::isfinite(magnitude) &&
+                            magnitude > 1.0) {
+                            result = (float)(n + 1 -
+                                std::log(std::log(magnitude)) /
+                                std::log(3.0));
+                        } else if (coloring ==
+                                       formula::ExpressionColoring::Distance &&
+                                   std::isfinite(magnitude)) {
+                            double denominator =
+                                std::abs(derivative) * std::fabs(dx);
+                            result = denominator > 0.0 &&
+                                     std::isfinite(denominator)
+                                ? (float)(
+                                    magnitude * std::log(magnitude) /
+                                    denominator)
+                                : 0.0f;
+                        } else {
+                            result = (float)(n + 1);
+                        }
                         break;
                     }
                 }
