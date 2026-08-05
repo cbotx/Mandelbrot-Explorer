@@ -220,7 +220,8 @@ static bool inRect(const RECT& r, int x, int y) {
 class App {
 public:
     HWND hwnd = nullptr;
-    HFONT fUi = nullptr, fBold = nullptr, fSmall = nullptr, fMono = nullptr;
+    HFONT fUi = nullptr, fBold = nullptr, fSmall = nullptr;
+    HFONT fMono = nullptr, fMicro = nullptr;
 
     std::unique_ptr<MandelNavigator> nav;
     std::vector<uint8_t> bitmap = std::vector<uint8_t>((size_t)RENDER_W * RENDER_H * 3, 0);
@@ -269,6 +270,7 @@ public:
     bool galleryOpen = false;              // gallery dropdown expanded
     int galleryHover = -1;                 // hovered gallery item (-1 none)
     bool navDragging = false, wasComputing = false;
+    bool gradientFocused = false;
     Hit hover = H_NONE, pressed = H_NONE;
     int liveFrames = 0;   // frames still needing per-tick repaint (animation/compute)
     // ---- panel vertical scroll (the control stack can exceed the window height) --
@@ -506,20 +508,20 @@ public:
         if (formulaEditor && formulaEditor->visible())
             formulaEditor->move({ panelR, 0, rc.right, rc.bottom });
         int px = panelR - S(PANEL_W) + S(18), w = S(PANEL_W) - S(36), y = S(18);
-        int g = S(8), bh = S(30);
+        int g = S(8), topH = S(30), bh = S(34);
         int bw = (w - 4 * g) / 5;
-        rcReset   = { px,              y, px + bw,          y + bh };
-        rcRender  = { px + bw + g,     y, px + 2*bw + g,    y + bh };
-        rcSave    = { px + 2*(bw+g),   y, px + 3*bw + 2*g,  y + bh };
-        rcCopy    = { px + 3*(bw+g),   y, px + 4*bw + 3*g,  y + bh };
-        rcPaste   = { px + 4*(bw+g),   y, px + 5*bw + 4*g,  y + bh };
-        y += bh + S(14);
-        int locationH = nav && !nav->IsMandelbrot() ? S(126) : S(100);
+        rcReset   = { px,              y, px + bw,          y + topH };
+        rcRender  = { px + bw + g,     y, px + 2*bw + g,    y + topH };
+        rcSave    = { px + 2*(bw+g),   y, px + 3*bw + 2*g,  y + topH };
+        rcCopy    = { px + 3*(bw+g),   y, px + 4*bw + 3*g,  y + topH };
+        rcPaste   = { px + 4*(bw+g),   y, px + 5*bw + 4*g,  y + topH };
+        y += topH + S(14);
+        int locationH = nav && nav->IsJulia() ? S(122) : S(96);
         rcLocation = { px, y, px + w, y + locationH }; y += locationH + S(16);
-        rcMaxTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
-        rcDensTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
-        rcPhaseTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
-        rcSpeedTrack = { px, y + S(24), px + w, y + S(38) }; y += S(52);
+        rcMaxTrack = { px, y + S(24), px + w, y + S(38) }; y += S(44);
+        rcDensTrack = { px, y + S(24), px + w, y + S(38) }; y += S(44);
+        rcPhaseTrack = { px, y + S(24), px + w, y + S(38) }; y += S(44);
+        rcSpeedTrack = { px, y + S(24), px + w, y + S(38) }; y += S(44);
         // Unlabeled toggle: box sits at y (no label above), then a uniform 14px gap.
         rcSS  = { px, y, px + w, y + bh }; y += bh + S(14);
         rcFormula = { px, y, px + w, y + bh }; y += bh + S(14);
@@ -540,7 +542,7 @@ public:
         // box.top-S(20)) -- the same rhythm as the sliders and the gradient bar -- so
         // the gap to the next control stays uniform instead of double-gapping after a
         // dropdown and overlapping before one.
-        rcColoringDD = { px, y + S(24), px + w, y + S(24) + bh }; y += S(24) + bh + S(14);
+        rcColoringDD = { px, y + S(30), px + w, y + S(30) + bh }; y += S(30) + bh + S(14);
         // Relief/normal light use azimuth+elevation+strength; DE overlay uses only the
         // falloff strength (there is no light direction), so it shows a single slider.
         if (relief_on || normal_light_on) {
@@ -554,8 +556,8 @@ public:
         } else {
             rcReliefAz = rcReliefEl = rcReliefStr = RECT{};
         }
-        rcPaletteDD = { px, y + S(24), px + w, y + S(24) + bh }; y += S(24) + bh + S(14);
-        rcGradient = { px, y + S(22), px + w, y + S(62) }; y += S(84);
+        rcPaletteDD = { px, y + S(30), px + w, y + S(30) + bh }; y += S(30) + bh + S(14);
+        rcGradient = { px, y - S(4), px + w, y + S(30) }; y += S(44);
         rcColor = { px, y, px + w, y + bh }; y += bh + S(16);
         rcGalleryDD = { px, y, px + w, y + bh }; y += bh;
 
@@ -709,11 +711,22 @@ public:
         if (!formulaEditor) return;
         formulaEditor->hide();
         if ((formulaEditorExpansionDip > 0 ||
-             formulaEditorHeightExpansionDip > 0) && !IsZoomed(hwnd)) {
-            RECT wr{}; GetWindowRect(hwnd, &wr);
-            HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+             formulaEditorHeightExpansionDip > 0)) {
+            bool maximized = IsZoomed(hwnd) != FALSE;
+            WINDOWPLACEMENT placement{ sizeof(placement) };
+            RECT wr{};
+            if (maximized) {
+                if (GetWindowPlacement(hwnd, &placement))
+                    wr = placement.rcNormalPosition;
+            } else {
+                GetWindowRect(hwnd, &wr);
+            }
+            HMONITOR monitor = MonitorFromRect(
+                &wr, MONITOR_DEFAULTTONEAREST);
             MONITORINFO mi{ sizeof(mi) };
-            if (GetMonitorInfoW(monitor, &mi)) {
+            bool restored = false;
+            if (wr.right > wr.left && wr.bottom > wr.top &&
+                GetMonitorInfoW(monitor, &mi)) {
                 int width = wr.right - wr.left;
                 int height = wr.bottom - wr.top;
                 int shrink = std::min(
@@ -731,14 +744,27 @@ public:
                     int newY = std::clamp(
                         wr.top + shrinkHeight / 2, mi.rcWork.top,
                         mi.rcWork.bottom - newHeight);
-                    SetWindowPos(hwnd, nullptr, newX, newY, newWidth,
-                                 newHeight,
-                                 SWP_NOZORDER | SWP_NOACTIVATE);
+                    if (maximized) {
+                        placement.rcNormalPosition = {
+                            newX, newY, newX + newWidth, newY + newHeight
+                        };
+                        restored = SetWindowPlacement(
+                            hwnd, &placement) != FALSE;
+                    } else {
+                        restored = SetWindowPos(
+                            hwnd, nullptr, newX, newY,
+                            newWidth, newHeight,
+                            SWP_NOZORDER | SWP_NOACTIVATE) != FALSE;
+                    }
+                } else {
+                    restored = true;
                 }
             }
+            if (restored) {
+                formulaEditorExpansionDip = 0;
+                formulaEditorHeightExpansionDip = 0;
+            }
         }
-        formulaEditorExpansionDip = 0;
-        formulaEditorHeightExpansionDip = 0;
         layout();
         if (!inSizeMove && !orbitBench) retargetToView();
         needFull = true;
@@ -775,11 +801,20 @@ public:
     }
 
     void createFonts() {
-        if (fUi) { DeleteObject(fUi); DeleteObject(fBold); DeleteObject(fSmall); DeleteObject(fMono); }
-        fUi   = CreateFontW(-S(15),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-        fBold = CreateFontW(-S(15),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-        fSmall= CreateFontW(-S(12),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-        fMono = CreateFontW(-S(12),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Consolas");
+        if (fUi) {
+            DeleteObject(fUi); DeleteObject(fBold); DeleteObject(fSmall);
+            DeleteObject(fMono); DeleteObject(fMicro);
+        }
+        fUi = CreateFontW(-S(12),0,0,0,FW_NORMAL,0,0,0,
+            DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+        fBold = CreateFontW(-S(12),0,0,0,FW_SEMIBOLD,0,0,0,
+            DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+        fSmall = CreateFontW(-S(11),0,0,0,FW_NORMAL,0,0,0,
+            DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+        fMono = CreateFontW(-S(12),0,0,0,FW_MEDIUM,0,0,0,
+            DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Cascadia Mono");
+        fMicro = CreateFontW(-S(11),0,0,0,FW_NORMAL,0,0,0,
+            DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     }
 
     // ---- view compositing ----
@@ -929,6 +964,8 @@ public:
         return best;
     }
     void gradientDown(int x) {
+        gradientFocused = true;
+        SetFocus(hwnd);
         int n = nearestStop(x, 9);
         if (n >= 0) palette.selected = n;
         else {
@@ -955,12 +992,21 @@ public:
     }
     void gradientDelete(int x) {
         int i = nearestStop(x, 9);
-        if (i >= 0 && palette.stops.size() > 2) {
-            palette.stops.erase(palette.stops.begin() + i);
-            palette.selected = std::min(i, (int)palette.stops.size() - 1);
-            palette.rebuild(); nav->SetRedisplay();
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
+        if (i < 0) return;
+        palette.selected = i;
+        gradientDeleteSelected();
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+    void gradientDeleteSelected() {
+        if (palette.stops.size() <= 2 ||
+            palette.selected < 0 ||
+            palette.selected >= (int)palette.stops.size())
+            return;
+        int i = palette.selected;
+        palette.stops.erase(palette.stops.begin() + i);
+        palette.selected = std::min(i, (int)palette.stops.size() - 1);
+        palette.rebuild(); nav->SetRedisplay();
+        InvalidateRect(hwnd, nullptr, FALSE);
     }
     void chooseSelectedColor() {
         if (palette.stops.empty()) return;
@@ -1111,12 +1157,22 @@ public:
     }
 
     // ---- widget drawing ----
-    void drawButton(HDC dc, RECT r, const std::wstring& s, Hit id, bool accent) {
+    void drawButton(HDC dc, RECT r, const std::wstring& s, Hit id,
+                   bool accent, bool activeOutline = false) {
         bool hov = hover == id, prs = pressed == id;
-        COLORREF bg = accent ? (prs ? RGB(70,120,220) : hov ? CLR_ACCENT_HI : CLR_ACCENT)
-                             : (prs ? CLR_CARD_HOV : hov ? CLR_CARD_HOV : CLR_CARD);
-        fillRound(dc, r, bg, accent ? bg : CLR_BORDER, S(8));
-        drawText(dc, r, s, accent ? RGB(255,255,255) : CLR_TEXT, fUi,
+        COLORREF bg = accent
+            ? (prs ? RGB(70,120,220) : hov ? CLR_ACCENT_HI : CLR_ACCENT)
+            : (prs || hov ? CLR_CARD_HOV : CLR_CARD);
+        COLORREF border = activeOutline ? CLR_ACCENT
+            : (accent ? bg : CLR_BORDER);
+        fillRound(dc, r, bg, border, S(8));
+        if (activeOutline) {
+            RECT stripe = {r.left + S(1), r.top + S(5),
+                          r.left + S(4), r.bottom - S(5)};
+            fillRound(dc, stripe, CLR_ACCENT, CLR_ACCENT, S(3));
+        }
+        HFONT font = id >= H_RESET && id <= H_PASTE ? fMicro : fUi;
+        drawText(dc, r, s, accent ? RGB(255,255,255) : CLR_TEXT, font,
                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
     void drawSlider(HDC dc, RECT track, double t, Hit id,
@@ -1177,6 +1233,35 @@ public:
         Ellipse(dc, kx - kr, cy - kr, kx + kr, cy + kr);
         SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(kb);
     }
+    void drawFormulaButton(HDC dc) {
+        bool open = formulaEditor && formulaEditor->visible();
+        bool active = open || nav->IsExpression();
+        bool hov = hover == H_FORMULA, prs = pressed == H_FORMULA;
+        fillRound(dc, rcFormula,
+                  prs || hov ? CLR_CARD_HOV : CLR_CARD,
+                  active ? CLR_ACCENT : CLR_BORDER, S(8));
+        if (active) {
+            RECT stripe = {
+                rcFormula.left + S(1), rcFormula.top + S(5),
+                rcFormula.left + S(4), rcFormula.bottom - S(5)
+            };
+            fillRound(dc, stripe, CLR_ACCENT, CLR_ACCENT, S(3));
+        }
+        RECT title = rcFormula;
+        title.left += S(12);
+        title.right -= S(72);
+        drawText(dc, title, L"Formula editor", CLR_TEXT, fUi,
+                 DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        const wchar_t* state = open ? L"OPEN"
+            : (nav->IsExpression() ? L"CUSTOM" : L"");
+        if (*state) {
+            RECT status = rcFormula;
+            status.left = status.right - S(68);
+            status.right -= S(12);
+            drawText(dc, status, state, CLR_ACCENT_HI, fMicro,
+                     DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
     void drawSeg(HDC dc, RECT r, const std::wstring& s, bool sel, Hit id) {
         bool hov = hover == id;
         fillRound(dc, r, sel ? CLR_ACCENT : (hov ? CLR_CARD_HOV : CLR_CARD),
@@ -1234,7 +1319,7 @@ public:
     }
     // ---- coloring-mode dropdown (Smooth / Distance / Feather / Relief) ----
     static const wchar_t* coloringName(int i) {
-        static const wchar_t* n[7] = { L"Smooth", L"Distance (EDE)", L"Feather (stripe)", L"Relief (3D light)", L"Normal light (3D)", L"Orbit trap", L"DE + smooth" };
+        static const wchar_t* n[7] = { L"Smooth iteration", L"Distance (EDE)", L"Feather (stripe)", L"Relief (3D light)", L"Normal light (3D)", L"Orbit trap", L"DE + smooth" };
         return n[i < 0 ? 0 : (i > 6 ? 6 : i)];
     }
     int coloringItemH() const { return S(28); }
@@ -1457,13 +1542,18 @@ public:
         int panelR = panelRight();
         RECT panel = { panelR - S(PANEL_W), 0, panelR, rc.bottom };
         fillRect(dc, panel, CLR_PANEL);
+        RECT panelRail = {
+            panel.right - S(11), panel.top,
+            panel.right, panel.bottom
+        };
+        fillRect(dc, panelRail, RGB(21, 24, 33));
         HPEN sep = CreatePen(PS_SOLID, 1, CLR_BORDER);
         HGDIOBJ osep = SelectObject(dc, sep);
         MoveToEx(dc, panel.left, 0, nullptr); LineTo(dc, panel.left, rc.bottom);
         SelectObject(dc, osep); DeleteObject(sep);
 
         drawButton(dc, rcReset, L"Reset", H_RESET, false);
-        drawButton(dc, rcRender, L"Render", H_RENDER, true);
+        drawButton(dc, rcRender, L"Render", H_RENDER, false);
         drawButton(dc, rcSave, L"Export", H_SAVE, false);
         drawButton(dc, rcCopy, L"Copy", H_COPY, false);
         drawButton(dc, rcPaste, L"Paste", H_PASTE, false);
@@ -1474,11 +1564,17 @@ public:
         fillRound(dc, rcLocation, CLR_CARD, CLR_BORDER, S(8));
         RECT lt = rcLocation; lt.left += S(10); lt.top += S(6); lt.right -= S(10); lt.bottom -= S(6);
         {
+            std::string location = nav->GetLocationText();
+            if (nav->IsExpression()) {
+                size_t formulaLine = location.find("\r\nformula:");
+                if (formulaLine != std::string::npos)
+                    location.resize(formulaLine);
+            }
             HGDIOBJ ofm = SelectObject(dc, fMono);
             SIZE cs{}; GetTextExtentPoint32W(dc, L"0", 1, &cs);
             SelectObject(dc, ofm);
             int cpl = cs.cx > 0 ? (int)((lt.right - lt.left) / cs.cx) : 40;
-            drawText(dc, lt, truncLocation(nav->GetLocationText(), cpl), CLR_TEXT, fMono,
+            drawText(dc, lt, truncLocation(location, cpl), CLR_TEXT, fMono,
                      DT_LEFT | DT_TOP | DT_NOPREFIX);
         }
 
@@ -1505,17 +1601,12 @@ public:
                    speedSnaps, 1);
 
         drawToggle(dc, rcSS, L"5x supersampling", ssOn, H_SS);
-        bool editorOpen = formulaEditor && formulaEditor->visible();
-        drawButton(dc, rcFormula,
-                   editorOpen ? L"Formula editor: open"
-                              : (nav->IsExpression() ? L"Formula: custom"
-                                                     : L"Formula..."),
-                   H_FORMULA, editorOpen || nav->IsExpression());
+        drawFormulaButton(dc);
         if (juliaUiEnabled)
             drawToggle(dc, rcJulia, L"Julia set (experimental)", nav->IsJulia(), H_JULIA);
-        drawToggle(dc, rcOrbitToggle, L"Show orbit", orbitOn, H_ORBIT);
+        drawToggle(dc, rcOrbitToggle, L"Orbit overlay", orbitOn, H_ORBIT);
         if (orbitOn) drawOrbitThumbnail(dc);
-        label(dc, rcColoringDD.left, rcColoringDD.top - S(20), L"Coloring");
+        label(dc, rcColoringDD.left, rcColoringDD.top - S(30), L"Coloring");
         drawColoringDD(dc);
 
         if (relief_on || normal_light_on) {
@@ -1537,11 +1628,11 @@ public:
             drawSlider(dc, rcReliefStr, std::clamp((de_scale - DE_SCALE_MIN) / (DE_SCALE_MAX - DE_SCALE_MIN), 0.0, 1.0), H_RELSTR);
         }
 
-        label(dc, rcPaletteDD.left, rcPaletteDD.top - S(20), L"Palette");
+        label(dc, rcPaletteDD.left, rcPaletteDD.top - S(30), L"Palette");
         drawPaletteDD(dc);
 
-        // gradient bar
-        label(dc, rcGradient.left, rcGradient.top - S(20), L"Gradient  (drag / right-click / dbl-click)");
+        // Gradient: click empty space to add, drag to move, Delete/Backspace or
+        // right-click to remove, and double-click to edit a stop's color.
         for (int x = rcGradient.left; x < rcGradient.right; ++x) {
             float p = (float)(x - rcGradient.left) / std::max(1L, rcGradient.right - rcGradient.left - 1);
             auto c = palette.sample(p);
@@ -1561,6 +1652,11 @@ public:
             Polygon(dc, pts, 3);
             SelectObject(dc, ob2); SelectObject(dc, op2); DeleteObject(br); DeleteObject(pn);
         }
+        if (gradientFocused) {
+            HBRUSH focus = CreateSolidBrush(CLR_ACCENT);
+            FrameRect(dc, &rcGradient, focus);
+            DeleteObject(focus);
+        }
 
         // selected color button (shows swatch)
         {
@@ -1572,7 +1668,9 @@ public:
                 fillRound(dc, sw, RGB((BYTE)s.r,(BYTE)s.g,(BYTE)s.b), CLR_BORDER, S(5));
             }
             RECT tr = rcColor; tr.left += S(44);
-            drawText(dc, tr, L"Edit selected stop color", CLR_TEXT, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            drawText(dc, tr, L"Edit color  \u00b7  Delete removes stop",
+                     CLR_TEXT, fUi,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
         // palette dropdown list -- drawn last so it overlays the widgets below it
         if (paletteOpen) drawPaletteList(dc);
@@ -2084,6 +2182,7 @@ public:
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
             if (formulaEditor && formulaEditor->visible())
                 formulaEditor->dismissPopups();
+            gradientFocused = false;
             if (paletteOpen) {   // a click while the list is open selects or dismisses it
                 int it = paletteItemAt(x,y);
                 if (it >= 0) selectPalette(it);
@@ -2106,6 +2205,7 @@ public:
                 return 0;
             }
             Hit h = hitTest(x,y);
+            gradientFocused = h == H_GRADIENT;
             if (h == H_PALETTE_DD) { paletteOpen = true; paletteHover = -1; pressed = H_NONE; layout(); int over = (int)paletteListRect().bottom - panelViewH + S(8); if (over > 0) panelScrollBy(over); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
             if (h == H_EDE) { coloringOpen = true; coloringHover = -1; pressed = H_NONE; layout(); int over = (int)coloringListRect().bottom - panelViewH + S(8); if (over > 0) panelScrollBy(over); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
             if (h == H_GALLERY_DD) { galleryOpen = true; galleryHover = -1; pressed = H_NONE; layout(); int over = (int)galleryListRect().bottom - panelViewH + S(8); if (over > 0) panelScrollBy(over); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
@@ -2188,7 +2288,10 @@ public:
         case WM_RBUTTONDOWN: {
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
             Hit h = hitTest(x,y);
-            if (h == H_GRADIENT) gradientDelete(x);
+            if (h == H_GRADIENT) {
+                gradientFocused = true;
+                gradientDelete(x);
+            }
             else if (h == H_VIEW) { POINT p = mapToRender(x,y); nav->ZoomOut(p.x,p.y); keepLive(); }
             return 0;
         }
@@ -2276,6 +2379,9 @@ public:
             else if (wp == 'S') saveImage();
             else if (wp == 'C') copyLocation();
             else if (wp == 'V') pasteLocation();
+            else if ((wp == VK_DELETE || wp == VK_BACK) &&
+                     gradientFocused)
+                gradientDeleteSelected();
             else if (wp == VK_ADD || wp == VK_OEM_PLUS) { nav->ZoomIn(renderW/2, renderH/2); keepLive(); }
             else if (wp == VK_SUBTRACT || wp == VK_OEM_MINUS) { nav->ZoomOut(renderW/2, renderH/2); keepLive(); }
             return 0;
@@ -2291,7 +2397,8 @@ public:
             formulaEditor.reset();
             nav.reset();
             if (memDC) { SelectObject(memDC, memOld); DeleteObject(memBmp); DeleteDC(memDC); memDC = nullptr; }
-            DeleteObject(fUi); DeleteObject(fBold); DeleteObject(fSmall); DeleteObject(fMono);
+            DeleteObject(fUi); DeleteObject(fBold); DeleteObject(fSmall);
+            DeleteObject(fMono); DeleteObject(fMicro);
             PostQuitMessage(0);
             return 0;
         }

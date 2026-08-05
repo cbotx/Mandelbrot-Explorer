@@ -1274,12 +1274,13 @@ struct FormulaEditorPanel::Impl {
 
         int tabLeft = contentLeft + 11;
         int tabRight = contentLeft + leftWidth - 11;
-        int tabWidth = (tabRight - tabLeft) / 3;
+        int tabGap = 4;
+        int tabWidth = (tabRight - tabLeft - tabGap * 2) / 3;
         static const std::array<const wchar_t*, 3> tabLabels = {
             L"Common", L"Complex", L"All"
         };
         for (int i = 0; i < 3; ++i) {
-            int left = tabLeft + i * tabWidth;
+            int left = tabLeft + i * (tabWidth + tabGap);
             int right = i == 2 ? tabRight : left + tabWidth;
             addButton(contentPixelRect(left, 311, right, 336),
                       HIT_FUNCTION_TAB_BASE + i,
@@ -2111,6 +2112,21 @@ struct FormulaEditorPanel::Impl {
         return nullptr;
     }
 
+    int tokenIndexAtPoint(POINT point) const {
+        std::vector<ui::TextRangeStyle> styles = formulaStyles();
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            const Token& token = tokens[i];
+            if (!token.selectable) continue;
+            int leading = i < styles.size()
+                ? styles[i].paddingBefore : 0;
+            RECT bounds = formulaField.textRangeBounds(
+                token.first, token.last, leading);
+            if (containsPoint(bounds, point))
+                return static_cast<int>(i);
+        }
+        return -1;
+    }
+
     void selectInspectorAtCaret(bool selectToken) {
         auto selection = formulaField.selection();
         size_t position = selection.first != selection.second
@@ -2672,6 +2688,23 @@ struct FormulaEditorPanel::Impl {
                       tokenSelection.second == 4 &&
                       usageCount(InspectorValue::P0) == 2,
                   L"token click selection");
+            std::vector<ui::TextRangeStyle> styles = formulaStyles();
+            RECT p0Bounds = formulaField.textRangeBounds(
+                tokens[2].first, tokens[2].last,
+                styles[2].paddingBefore);
+            POINT tokenRight{
+                p0Bounds.right - 1,
+                (p0Bounds.top + p0Bounds.bottom) / 2
+            };
+            formulaField.setSelection(0, 0);
+            selected = InspectorValue::Z;
+            onLeftButtonDown(tokenRight);
+            onLeftButtonUp(tokenRight);
+            tokenSelection = formulaField.selection();
+            check(selected == InspectorValue::P0 &&
+                      tokenSelection.first == 2 &&
+                      tokenSelection.second == 4,
+                  L"token rendered-boundary click");
         }
 
         formulaField.setText(L"z+c");
@@ -3263,18 +3296,18 @@ struct FormulaEditorPanel::Impl {
                 style.text = CLR_TEXT;
                 break;
             }
+            if (token.selectable) {
+                style.paddingBefore += scale(3);
+                style.paddingAfter += scale(3);
+            }
             if (token.selectable && token.inspector == selected) {
                 style.text = RGB(255, 255, 255);
                 style.background = RGB(39, 56, 88);
                 style.border = CLR_ACCENT;
-                style.paddingBefore += scale(3);
-                style.paddingAfter += scale(3);
             } else if (token.selectable &&
                        static_cast<int>(index) == hoveredFormulaToken) {
                 style.background = RGB(35, 43, 56);
                 style.border = RGB(70, 80, 100);
-                style.paddingBefore += scale(2);
-                style.paddingAfter += scale(2);
             }
             styles.push_back(style);
         }
@@ -3878,12 +3911,16 @@ struct FormulaEditorPanel::Impl {
                         POINT point, bool selectToken) {
         setFocused(focus);
         size_t position = field.indexAtPoint(point);
+        int tokenIndex = &field == &formulaField
+            ? tokenIndexAtPoint(point) : -1;
         bool extend = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         if (!field.mouseDown(point, extend)) return;
         draggingText = &field;
         SetCapture(hwnd);
         if (&field == &formulaField) {
-            const Token* token = tokenAt(position);
+            const Token* token = tokenIndex >= 0
+                ? &tokens[static_cast<size_t>(tokenIndex)]
+                : tokenAt(position);
             if (token && token->selectable &&
                 selectInspector(token->inspector, false)) {
                 if (selectToken)
@@ -4008,19 +4045,7 @@ struct FormulaEditorPanel::Impl {
             presetDropdown.mouseMove(point, layout.contentClip);
         int newHoveredToken = -1;
         if (containsPoint(layout.formulaField, point)) {
-            std::vector<ui::TextRangeStyle> styles = formulaStyles();
-            for (size_t i = 0; i < tokens.size(); ++i) {
-                const Token& token = tokens[i];
-                int leading = i < styles.size()
-                    ? styles[i].paddingBefore : 0;
-                RECT tokenBounds = formulaField.textRangeBounds(
-                    token.first, token.last, leading);
-                if (token.selectable &&
-                    containsPoint(tokenBounds, point)) {
-                    newHoveredToken = static_cast<int>(i);
-                    break;
-                }
-            }
+            newHoveredToken = tokenIndexAtPoint(point);
         }
         if (newHoveredToken != hoveredFormulaToken) {
             hoveredFormulaToken = newHoveredToken;
