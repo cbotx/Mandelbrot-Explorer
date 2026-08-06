@@ -344,16 +344,23 @@ public:
     }
 
     POINT orbitMap(double re, double im, const RECT& r) const {
-        int x = r.left + (int)((re - ORBIT_X0) / (ORBIT_X1 - ORBIT_X0) *
-                               (r.right - r.left - 1));
-        int y = r.top + (int)((ORBIT_Y1 - im) / (ORBIT_Y1 - ORBIT_Y0) *
-                              (r.bottom - r.top - 1));
-        return { x, y };
+        double x = r.left + (re - ORBIT_X0) / (ORBIT_X1 - ORBIT_X0) *
+                              (r.right - r.left - 1);
+        double y = r.top + (ORBIT_Y1 - im) / (ORBIT_Y1 - ORBIT_Y0) *
+                             (r.bottom - r.top - 1);
+        constexpr double coordinateLimit = 10000000.0;
+        return {
+            (LONG)std::clamp(x, -coordinateLimit, coordinateLimit),
+            (LONG)std::clamp(y, -coordinateLimit, coordinateLimit)
+        };
     }
 
     void drawOrbitThumbnail(HDC dc) {
         if (!orbitOn || rcOrbitThumb.right <= rcOrbitThumb.left) return;
-        label(dc, rcOrbitThumb.left, rcOrbitThumb.top - S(20), L"Orbit in the full set");
+        label(dc, rcOrbitThumb.left, rcOrbitThumb.top - S(20),
+              nav && nav->IsExpression()
+                  ? L"Custom orbit (Mandelbrot backdrop)"
+                  : L"Orbit in the Mandelbrot set");
         fillRound(dc, rcOrbitThumb, CLR_CARD, CLR_BORDER, S(8));
         RECT image = rcOrbitThumb;
         InflateRect(&image, -S(6), -S(6));
@@ -371,14 +378,18 @@ public:
         if (orbitResult.points.size() >= 2) {
             std::vector<POINT> points;
             points.reserve(orbitResult.points.size());
-            for (const OrbitPoint& p : orbitResult.points)
+            for (const OrbitPoint& p : orbitResult.points) {
+                if (!std::isfinite(p.re) || !std::isfinite(p.im))
+                    break;
                 points.push_back(orbitMap(p.re, p.im, image));
+            }
             HPEN line = CreatePen(PS_SOLID, std::max(1, S(1)), RGB(255, 230, 96));
             HGDIOBJ old = SelectObject(dc, line);
-            Polyline(dc, points.data(), (int)points.size());
+            if (points.size() >= 2)
+                Polyline(dc, points.data(), (int)points.size());
             SelectObject(dc, old); DeleteObject(line);
         }
-        POINT cp = orbitMap(orbitResult.cRe, orbitResult.cIm, image);
+        POINT cp = orbitMap(orbitResult.pixelRe, orbitResult.pixelIm, image);
         HBRUSH marker = CreateSolidBrush(CLR_GREEN);
         HGDIOBJ oldBrush = SelectObject(dc, marker);
         HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
@@ -401,7 +412,12 @@ public:
     }
 
     void requestOrbit(int x, int y, bool applyBoundary = true) {
-        if (!orbitOn || navDragging || !nav || !nav->IsMandelbrot()) return;
+        if (!orbitOn || navDragging || !nav || !nav->SupportsOrbitOverlay()) return;
+        std::shared_ptr<const formula::ExpressionOrbitSnapshot> expression;
+        if (nav->IsExpression()) {
+            expression = nav->GetExpressionOrbitSnapshot();
+            if (!expression) return;
+        }
         if (!orbitWorker) orbitWorker = std::make_unique<OrbitWorker>();
         if (orbitThumbnail.empty()) buildOrbitThumbnail();
         auto now = std::chrono::steady_clock::now();
@@ -427,9 +443,20 @@ public:
         mpf_init2(re, precision); mpf_init2(im, precision); mpf_init2(scale, precision);
         nav->GetView(re, im, scale);
         orbitWorker->request(re, im, scale, p.x, p.y, renderW, renderH, maxIter,
-                             nav->GetFormulaContext());
+                             nav->GetFormulaContext(), std::move(expression));
         mpf_clear(re); mpf_clear(im); mpf_clear(scale);
         lastOrbitRequest = now; lastOrbitX = x; lastOrbitY = y;
+    }
+
+    void requestCurrentOrbit() {
+        if (!orbitOn || !nav || !nav->SupportsOrbitOverlay()) return;
+        RECT vr = viewRect();
+        int x = inRect(vr, lastOrbitX, lastOrbitY)
+            ? lastOrbitX : (vr.left + vr.right) / 2;
+        int y = inRect(vr, lastOrbitX, lastOrbitY)
+            ? lastOrbitY : (vr.top + vr.bottom) / 2;
+        lastOrbitRequest = {};
+        requestOrbit(x, y);
     }
 
     // Set the palette phase from a phase-slider x (0..colP over the track).
@@ -620,6 +647,8 @@ public:
 
     void restoreMandelbrotUi(bool render = true) {
         if (nav->IsMandelbrot()) return;
+        if (orbitWorker) orbitWorker->cancel();
+        orbitResult = OrbitResult{};
         maxIter = savedMaxIter;
         nav->SetMxit(maxIter);
         nav->RestoreMandelbrotMode();
@@ -633,6 +662,7 @@ public:
         layout();
         needFull = true;
         if (render) startRender();
+        if (render && orbitOn) requestCurrentOrbit();
     }
 
     bool applyFormulaConfig(const FormulaDialogConfig& candidate, bool render = true) {
@@ -665,7 +695,6 @@ public:
         if (formulaEditor && formulaEditor->visible())
             formulaEditor->setConfig(formulaConfig);
         if (orbitWorker) orbitWorker->cancel();
-        orbitOn = false;
         orbitResult = OrbitResult{};
         ssOn = false;
         coloringIdx = 0;
@@ -673,6 +702,7 @@ public:
         layout();
         needFull = true;
         if (render) startRender();
+        if (render && orbitOn) requestCurrentOrbit();
         return true;
     }
 
@@ -1867,10 +1897,10 @@ public:
                 if (orbitBench) {
                     FILE* f = nullptr; fopen_s(&f, "build\\orbit_bench.txt", "a");
                     if (f) {
-                        fprintf(f, "orbit=%.3f ms iterations=%d points=%zu escaped=%d c=(%.17g,%.17g)\n",
+                        fprintf(f, "orbit=%.3f ms iterations=%d points=%zu escaped=%d pixel=(%.17g,%.17g)\n",
                                 orbitResult.computeMs, orbitResult.iterations,
                                 orbitResult.points.size(), orbitResult.escaped ? 1 : 0,
-                                orbitResult.cRe, orbitResult.cIm);
+                                orbitResult.pixelRe, orbitResult.pixelIm);
                         fclose(f);
                     }
                     PostQuitMessage(0);
@@ -2257,7 +2287,7 @@ public:
                     break;
                 }
                 case H_ORBIT:
-                    if (nav->IsMandelbrot()) orbitOn = !orbitOn;
+                    if (nav->SupportsOrbitOverlay()) orbitOn = !orbitOn;
                     if (orbitOn) {
                         if (!orbitWorker) orbitWorker = std::make_unique<OrbitWorker>();
                         if (orbitThumbnail.empty()) buildOrbitThumbnail();
@@ -2266,6 +2296,7 @@ public:
                     }
                     orbitResult = OrbitResult{};
                     layout(); needFull = true;
+                    if (orbitOn) requestCurrentOrbit();
                     break;
                 case H_COLOR: chooseSelectedColor(); break;
                 default: break;

@@ -620,6 +620,7 @@ void MandelNavigator::RestoreMandelbrotMode() {
     _expressionUseJit = false;
     _expressionJit.reset();
 #endif
+    _expressionOrbitSnapshot.reset();
     _formula = quadraticMandelbrot();
     if (_has_saved_mandel_view) {
         mpf_set_prec(_z_re, mpf_get_prec(_saved_mandel_re));
@@ -670,6 +671,14 @@ bool MandelNavigator::SetExpressionFormula(
     formula::ExpressionOrbitPlan orbitPlan;
     if (!orbitPlan.build(runtime, error))
         return false;
+    formula::ExpressionOrbitSnapshot orbitSnapshot;
+    orbitSnapshot.program = runtime;
+    orbitSnapshot.fixed = fixed;
+    orbitSnapshot.pixelParameter = pixel;
+    orbitSnapshot.bailout = bailout;
+    auto immutableOrbitSnapshot =
+        std::make_shared<const formula::ExpressionOrbitSnapshot>(
+            std::move(orbitSnapshot));
 #if defined(MANDEL_ENABLE_ASMJIT)
     formula::ExpressionJit4 runtimeJit;
     bool useRuntimeJit =
@@ -680,12 +689,13 @@ bool MandelNavigator::SetExpressionFormula(
 #endif
 
     InterruptCompute();
-    if (IsJulia()) RestoreMandelbrotMode();
+    if (IsJulia() && !IsExpression()) RestoreMandelbrotMode();
     if (!IsExpression()) SaveMandelbrotState();
     bool planeChanged = IsExpression() && _expressionPixel != pixel;
     _expressionProgram = std::move(compiled);
     _expressionRuntimeProgram = std::move(runtime);
     _expressionOrbitPlan = std::move(orbitPlan);
+    _expressionOrbitSnapshot = std::move(immutableOrbitSnapshot);
 #if defined(MANDEL_ENABLE_ASMJIT)
     _expressionUseJit = useRuntimeJit;
     _expressionJit = std::move(runtimeJit);

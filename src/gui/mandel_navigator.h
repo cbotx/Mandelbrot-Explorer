@@ -5,11 +5,13 @@
 #include <gmp.h>
 #include <atomic>
 #include <future>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "navigator.h"
 #include "compute_backend.h"
+#include "formula_expression_orbit.h"
 #if defined(MANDEL_ENABLE_ASMJIT)
 #include "formula_expression_jit.h"
 #endif
@@ -24,6 +26,8 @@ private:
     formula::ExpressionProgram _expressionProgram;
     formula::ExpressionProgram _expressionRuntimeProgram;
     formula::ExpressionOrbitPlan _expressionOrbitPlan;
+    std::shared_ptr<const formula::ExpressionOrbitSnapshot>
+        _expressionOrbitSnapshot;
 #if defined(MANDEL_ENABLE_ASMJIT)
     formula::ExpressionJit4 _expressionJit;
     bool _expressionUseJit = false;
@@ -111,6 +115,11 @@ public:
                                       _formula.slice.pixel == FormulaParameter::C; }
     bool IsJulia() const { return _formula.slice.pixel == FormulaParameter::InitialZ; }
     bool IsExpression() const { return _formula.formula.id == FormulaId::Expression; }
+    bool SupportsOrbitOverlay() const { return IsMandelbrot() || IsExpression(); }
+    std::shared_ptr<const formula::ExpressionOrbitSnapshot>
+    GetExpressionOrbitSnapshot() const {
+        return IsExpression() ? _expressionOrbitSnapshot : nullptr;
+    }
     bool ExpressionSupportsDistance() const {
         return IsExpression() && _expressionProgram.fastIntegerPower() >= 2 &&
                _expressionBailout >= 1.0;

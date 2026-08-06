@@ -28,15 +28,21 @@ OrbitWorker::~OrbitWorker() {
 
 void OrbitWorker::request(mpf_srcptr centerRe, mpf_srcptr centerIm, mpf_srcptr scale,
                           int pixelX, int pixelY, int width, int height,
-                          int maxIterations, FormulaContext formula) {
+                          int maxIterations, FormulaContext formulaContext,
+                          std::shared_ptr<const formula::ExpressionOrbitSnapshot>
+                              expression) {
     const mp_bitcnt_t precision = std::max({ mpf_get_prec(centerRe),
                                              mpf_get_prec(centerIm),
                                              mpf_get_prec(scale) });
     uint64_t generation;
+    OrbitResult staleResult;
+    std::shared_ptr<const formula::ExpressionOrbitSnapshot> staleExpression;
     {
         std::lock_guard<std::mutex> lock(_mutex);
         generation = _requestedGeneration.fetch_add(1) + 1;
+        staleResult = std::move(_latest);
         _latest = OrbitResult{};
+        staleExpression = std::move(_expression);
         mpf_set_prec(_centerRe, precision);
         mpf_set_prec(_centerIm, precision);
         mpf_set_prec(_scale, precision);
@@ -48,7 +54,8 @@ void OrbitWorker::request(mpf_srcptr centerRe, mpf_srcptr centerIm, mpf_srcptr s
         _width = std::max(2, width);
         _height = std::max(2, height);
         _maxIterations = std::max(1, std::min(maxIterations, 2048));
-        _formula = formula;
+        _formula = formulaContext;
+        _expression = std::move(expression);
         _pendingGeneration = generation;
         _hasRequest = true;
     }
@@ -65,11 +72,17 @@ bool OrbitWorker::takeLatest(OrbitResult& result) {
 }
 
 void OrbitWorker::cancel() {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _requestedGeneration.fetch_add(1);
-    _hasRequest = false;
-    _latest = OrbitResult{};
-    _deliveredGeneration = 0;
+    OrbitResult staleResult;
+    std::shared_ptr<const formula::ExpressionOrbitSnapshot> staleExpression;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _requestedGeneration.fetch_add(1);
+        _hasRequest = false;
+        staleResult = std::move(_latest);
+        _latest = OrbitResult{};
+        staleExpression = std::move(_expression);
+        _deliveredGeneration = 0;
+    }
 }
 
 void OrbitWorker::run() {
@@ -77,7 +90,8 @@ void OrbitWorker::run() {
         mp_bitcnt_t precision;
         int pixelX, pixelY, width, height, maxIterations;
         uint64_t generation;
-        FormulaContext formula;
+        FormulaContext formulaContext;
+        std::shared_ptr<const formula::ExpressionOrbitSnapshot> expression;
         mpf_t centerRe, centerIm, scale;
 
         {
@@ -97,7 +111,8 @@ void OrbitWorker::run() {
             width = _width; height = _height;
             maxIterations = _maxIterations;
             generation = _pendingGeneration;
-            formula = _formula;
+            formulaContext = _formula;
+            expression = _expression;
             _hasRequest = false;
         }
 
@@ -130,18 +145,19 @@ void OrbitWorker::run() {
         mpf_sub(cIm, centerIm, dh);
         mpf_mul_ui(t, dy, (unsigned long)(height - 1 - pixelY));
         mpf_add(cIm, cIm, t);
-        result.cRe = mpf_get_d(cRe);
-        result.cIm = mpf_get_d(cIm);
-
-        mpf_set_ui(zr, 0);
-        mpf_set_ui(zi, 0);
-        result.points.reserve((size_t)maxIterations + 1);
-        result.points.push_back({ 0.0f, 0.0f });
+        result.pixelRe = mpf_get_d(cRe);
+        result.pixelIm = mpf_get_d(cIm);
+        result.pixelParameter = expression
+            ? expression->pixelParameter : formulaContext.slice.pixel;
 
         // The current specialized kernel is the quadratic Mandelbrot c-plane.
-        if (formula.formula.id == FormulaId::PowerPlusC &&
-            formula.formula.power == 2 &&
-            formula.slice.pixel == FormulaParameter::C) {
+        if (formulaContext.formula.id == FormulaId::PowerPlusC &&
+            formulaContext.formula.power == 2 &&
+            formulaContext.slice.pixel == FormulaParameter::C) {
+            mpf_set_ui(zr, 0);
+            mpf_set_ui(zi, 0);
+            result.points.reserve((size_t)maxIterations + 1);
+            result.points.push_back({ 0.0f, 0.0f });
             for (int i = 0; i < maxIterations; ++i) {
                 if ((i & 63) == 0 && _requestedGeneration.load() != generation)
                     break;
@@ -163,8 +179,24 @@ void OrbitWorker::run() {
                     break;
                 }
             }
+        } else if (formulaContext.formula.id == FormulaId::Expression &&
+                   expression && expression->valid()) {
+            formula::ExpressionOrbitEvaluation evaluation;
+            formula::evaluateExpressionOrbit(
+                *expression, { result.pixelRe, result.pixelIm },
+                maxIterations, evaluation,
+                [this, generation] {
+                    return _requestedGeneration.load() != generation;
+                });
+            result.points.reserve(evaluation.points.size());
+            for (const formula::Complex& point : evaluation.points) {
+                result.points.push_back({
+                    (float)point.real(), (float)point.imag()
+                });
+            }
+            result.iterations = evaluation.iterations;
+            result.escaped = evaluation.escaped;
         }
-
         result.computeMs = std::chrono::duration<double, std::milli>(
             Clock::now() - begin).count();
         mpf_clears(dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni, zr2, zi2,

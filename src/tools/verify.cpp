@@ -10,7 +10,7 @@
 //   case = shallow | deep | ticktock | flake | exterior1000 | parity1000 |
 //          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
-//          expression | expression-oracle | expression-suite |
+//          expression | expression-orbit | expression-oracle | expression-suite |
 //          expression-residual | formula-bench | multibrot | backend | gpu | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
@@ -30,14 +30,18 @@
 #include <chrono>
 #include <algorithm>
 #include <future>
+#include <iterator>
+#include <memory>
 #include <thread>
 #include <vector>
 
 #include "compute_backend.h"
 #include "mandel_perturbation.h"
 #include "formula_expression.h"
+#include "formula_expression_orbit.h"
 #include "formula_expression_jit.h"
 #include "formula_expression_oracle.h"
+#include "orbit_overlay.h"
 #include "test_cases.h"
 
 using Clock = std::chrono::high_resolution_clock;
@@ -1896,6 +1900,235 @@ static int runExpressionCoreCase() {
                (unsigned long)memory.Protect);
     }
     printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (expression core failure)");
+    return failures == 0 ? 0 : 1;
+}
+
+static int runExpressionOrbitCase() {
+    using formula::Complex;
+    using formula::ExpressionContext;
+    using formula::ExpressionError;
+    using formula::ExpressionOrbitEvaluation;
+    using formula::ExpressionOrbitSnapshot;
+    using formula::ExpressionProgram;
+
+    int failures = 0;
+    auto close = [](Complex a, Complex b, double eps = 1e-12) {
+        return std::abs(a - b) <= eps * std::max(1.0, std::abs(b));
+    };
+    auto makeSnapshot = [&](const char* source, FormulaParameter pixelParameter,
+                            const ExpressionContext& fixed, double bailout,
+                            ExpressionOrbitSnapshot& snapshot) {
+        ExpressionProgram sourceProgram, runtime;
+        ExpressionError error;
+        if (!sourceProgram.compile(source, &error) ||
+            !sourceProgram.specialize(
+                fixed, pixelParameter, runtime, &error)) {
+            printf("  orbit compile failed @ %zu: %s  [%s]\n",
+                   error.position, error.message.c_str(), source);
+            ++failures;
+            return false;
+        }
+        snapshot = {};
+        snapshot.program = std::move(runtime);
+        snapshot.fixed = fixed;
+        snapshot.pixelParameter = pixelParameter;
+        snapshot.bailout = bailout;
+        return true;
+    };
+    auto evaluate = [&](const ExpressionOrbitSnapshot& snapshot, Complex pixel,
+                        int maxIterations, ExpressionOrbitEvaluation& evaluation) {
+        if (!formula::evaluateExpressionOrbit(
+                snapshot, pixel, maxIterations, evaluation)) {
+            ++failures;
+            return false;
+        }
+        return true;
+    };
+
+    ExpressionContext fixed;
+    ExpressionOrbitSnapshot quadratic;
+    ExpressionOrbitEvaluation evaluation;
+    if (makeSnapshot("z*z+c", FormulaParameter::C, fixed, 4.0, quadratic) &&
+        evaluate(quadratic, { 1.0, 0.0 }, 10, evaluation)) {
+        const Complex expected[] = { 0.0, 1.0, 2.0, 5.0 };
+        if (!evaluation.escaped || evaluation.iterations != 3 ||
+            evaluation.points.size() != std::size(expected)) {
+            ++failures;
+        } else {
+            for (size_t i = 0; i < std::size(expected); ++i)
+                if (!close(evaluation.points[i], expected[i])) ++failures;
+        }
+    }
+
+    fixed = {};
+    fixed.z0 = { 99.0, -50.0 };
+    fixed.c = { -0.25, 0.0 };
+    ExpressionOrbitSnapshot z0Plane;
+    if (makeSnapshot(
+            "z*z+c", FormulaParameter::InitialZ, fixed, 10.0, z0Plane) &&
+        evaluate(z0Plane, { 0.5, 0.0 }, 3, evaluation)) {
+        const Complex expected[] = { 0.5, 0.0, -0.25, -0.1875 };
+        if (evaluation.escaped || evaluation.iterations != 3 ||
+            evaluation.points.size() != std::size(expected)) {
+            ++failures;
+        } else {
+            for (size_t i = 0; i < std::size(expected); ++i)
+                if (!close(evaluation.points[i], expected[i])) ++failures;
+        }
+    }
+
+    fixed = {};
+    ExpressionOrbitSnapshot iterationDependent;
+    if (makeSnapshot(
+            "z+c+n", FormulaParameter::C, fixed, 100.0,
+            iterationDependent) &&
+        evaluate(iterationDependent, { 1.0, 0.0 }, 3, evaluation)) {
+        const Complex expected[] = { 0.0, 1.0, 3.0, 6.0 };
+        if (evaluation.points.size() != std::size(expected)) {
+            ++failures;
+        } else {
+            for (size_t i = 0; i < std::size(expected); ++i)
+                if (!close(evaluation.points[i], expected[i])) ++failures;
+        }
+    }
+
+    fixed = {};
+    fixed.z0 = { 0.2, -0.1 };
+    ExpressionOrbitSnapshot transcendental;
+    Complex transcendentalPixel{ 0.1, 0.2 };
+    if (makeSnapshot(
+            "sin(z)+c", FormulaParameter::C, fixed, 100.0,
+            transcendental) &&
+        evaluate(transcendental, transcendentalPixel, 4, evaluation)) {
+        Complex expected = fixed.z0;
+        if (evaluation.points.size() != 5 ||
+            !close(evaluation.points[0], expected)) {
+            ++failures;
+        } else {
+            for (int n = 0; n < 4; ++n) {
+                expected = std::sin(expected) + transcendentalPixel;
+                if (!close(evaluation.points[(size_t)n + 1], expected))
+                    ++failures;
+            }
+        }
+    }
+
+    fixed = {};
+    ExpressionOrbitSnapshot initialEscape;
+    if (makeSnapshot(
+            "z+c", FormulaParameter::InitialZ, fixed, 4.0,
+            initialEscape) &&
+        evaluate(initialEscape, { 5.0, 0.0 }, 10, evaluation) &&
+        (!evaluation.escaped || evaluation.iterations != 0 ||
+         evaluation.points.size() != 1 ||
+         evaluation.points[0] != Complex{ 5.0, 0.0 }))
+        ++failures;
+
+    fixed = {};
+    ExpressionOrbitSnapshot domain;
+    if (makeSnapshot(
+            "log(z)", FormulaParameter::InitialZ, fixed, 4.0, domain) &&
+        evaluate(domain, {}, 10, evaluation)) {
+        if (!evaluation.escaped || evaluation.iterations != 1 ||
+            evaluation.points.size() != 2 ||
+            (std::isfinite(evaluation.points[1].real()) &&
+             std::isfinite(evaluation.points[1].imag())))
+            ++failures;
+    }
+
+    fixed = {};
+    ExpressionOrbitSnapshot cancellable;
+    if (makeSnapshot(
+            "z+1", FormulaParameter::C, fixed, 1e100, cancellable)) {
+        int checks = 0;
+        if (!formula::evaluateExpressionOrbit(
+                cancellable, {}, 100, evaluation,
+                [&checks] { return ++checks > 3; }) ||
+            !evaluation.cancelled || evaluation.escaped ||
+            evaluation.iterations != 3 || evaluation.points.size() != 4)
+            ++failures;
+    }
+
+    auto requestSnapshot =
+        std::make_shared<const ExpressionOrbitSnapshot>(quadratic);
+    quadratic = iterationDependent;
+    if (evaluate(*requestSnapshot, { 1.0, 0.0 }, 10, evaluation) &&
+        (evaluation.points.size() != 4 ||
+         !close(evaluation.points.back(), { 5.0, 0.0 })))
+        ++failures;
+
+    auto waitForOrbit = [](OrbitWorker& worker, OrbitResult& result) {
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (worker.takeLatest(result)) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    };
+    mpf_t centerRe, centerIm, scale;
+    mpf_init_set_ui(centerRe, 0);
+    mpf_init_set_ui(centerIm, 0);
+    mpf_init_set_ui(scale, 1);
+    FormulaContext customFormula = expressionFormula();
+    customFormula.slice.pixel = FormulaParameter::C;
+    {
+        OrbitWorker worker;
+        OrbitResult workerResult;
+        auto lifetimeSnapshot =
+            std::make_shared<const ExpressionOrbitSnapshot>(cancellable);
+        worker.request(
+            centerRe, centerIm, scale, 1, 1, 3, 3, 3,
+            customFormula, lifetimeSnapshot);
+        lifetimeSnapshot.reset();
+        cancellable = iterationDependent;
+        if (!waitForOrbit(worker, workerResult) ||
+            workerResult.iterations != 3 ||
+            workerResult.points.size() != 4 ||
+            !close({ workerResult.points.back().re,
+                     workerResult.points.back().im }, { 3.0, 0.0 })) {
+            ++failures;
+        }
+
+        ExpressionOrbitSnapshot plusOne, plusTwo, identity;
+        fixed = {};
+        makeSnapshot(
+            "z+1", FormulaParameter::C, fixed, 1e100, plusOne);
+        makeSnapshot(
+            "z+2", FormulaParameter::C, fixed, 1e100, plusTwo);
+        makeSnapshot(
+            "z", FormulaParameter::C, fixed, 1e100, identity);
+        worker.request(
+            centerRe, centerIm, scale, 1, 1, 3, 3, 2048,
+            customFormula,
+            std::make_shared<const ExpressionOrbitSnapshot>(plusOne));
+        worker.request(
+            centerRe, centerIm, scale, 1, 1, 3, 3, 2,
+            customFormula,
+            std::make_shared<const ExpressionOrbitSnapshot>(plusTwo));
+        if (!waitForOrbit(worker, workerResult) ||
+            workerResult.iterations != 2 ||
+            workerResult.points.size() != 3 ||
+            !close({ workerResult.points.back().re,
+                     workerResult.points.back().im }, { 4.0, 0.0 })) {
+            ++failures;
+        }
+
+        worker.request(
+            centerRe, centerIm, scale, 1, 1, 3, 3, 100000,
+            customFormula,
+            std::make_shared<const ExpressionOrbitSnapshot>(identity));
+        if (!waitForOrbit(worker, workerResult) ||
+            workerResult.iterations != 2048 ||
+            workerResult.points.size() != 2049)
+            ++failures;
+    }
+    mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+
+    printf("=== expression orbit overlay\n");
+    printf("  c-plane/z0/n/transcendental/escape/domain/cancel/lifetime/generation/cap\n");
+    printf("  => %s\n\n",
+           failures == 0 ? "PASS" : "CHECK (expression orbit failure)");
     return failures == 0 ? 0 : 1;
 }
 
@@ -4521,6 +4754,7 @@ int main(int argc, char** argv) {
     if (which == "julia-dendrite")             rc |= runJuliaCase(false, true);
     if (which == "julia-critical")             rc |= runJuliaCase(false, true, true);
     if (which == "expression")                 rc |= runExpressionCoreCase();
+    if (which == "expression-orbit")           rc |= runExpressionOrbitCase();
     if (which == "expression-oracle")          rc |= runExpressionOracleCase();
     if (which == "expression-suite")           rc |= runFormulaRegressionSuite();
     if (which == "expression-residual")        rc |= runExpressionResidualSuite();
