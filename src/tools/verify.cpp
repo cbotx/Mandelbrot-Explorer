@@ -425,6 +425,16 @@ static int runExpressionCoreCase() {
     auto close = [](Complex a, Complex b, double eps = 1e-12) {
         return std::abs(a - b) <= eps * std::max(1.0, std::abs(b));
     };
+    auto sameDoubleBits = [](double a, double b) {
+        uint64_t aa, bb;
+        std::memcpy(&aa, &a, sizeof(a));
+        std::memcpy(&bb, &b, sizeof(b));
+        return aa == bb;
+    };
+    auto sameComplexBits = [&](Complex a, Complex b) {
+        return sameDoubleBits(a.real(), b.real()) &&
+               sameDoubleBits(a.imag(), b.imag());
+    };
     auto compile = [&](ExpressionProgram& program, const char* source) {
         ExpressionError error;
         if (!program.compile(source, &error)) {
@@ -476,6 +486,7 @@ static int runExpressionCoreCase() {
         if (!close(functions.evaluate(context), expected)) ++failures;
         if (functions.fastPath() != ExpressionProgram::FastPath::None) ++failures;
         if (functions.avx2Compatible()) ++failures;
+        if (!functions.batchCompatible()) ++failures;
     }
 
     ExpressionProgram burningShip;
@@ -637,6 +648,133 @@ static int runExpressionCoreCase() {
         if (!std::isnan(result.real()) || !std::isnan(result.imag())) ++failures;
     }
 
+    struct HybridOpcodeCase {
+        const char* name;
+        const char* source;
+    };
+    const HybridOpcodeCase hybridOpcodeCases[] = {
+        { "divide", "z/p0" },
+        { "power", "pow(z,p0)" },
+        { "sin", "sin(z)" },
+        { "cos", "cos(z)" },
+        { "tan", "tan(z)" },
+        { "sinh", "sinh(z)" },
+        { "cosh", "cosh(z)" },
+        { "tanh", "tanh(z)" },
+        { "exp", "exp(z)" },
+        { "log", "log(z)" },
+        { "log10", "log10(z)" },
+        { "sqrt", "sqrt(z)" },
+        { "abs", "abs(z)" },
+        { "norm", "norm(z)" },
+        { "arg", "arg(z)" },
+        { "polar", "polar(real(z),real(p0))" }
+    };
+    uint64_t randomState = 0x9e3779b97f4a7c15ull;
+    auto randomComponent = [&]() {
+        randomState ^= randomState >> 12;
+        randomState ^= randomState << 25;
+        randomState ^= randomState >> 27;
+        uint64_t bits = randomState * 2685821657736338717ull;
+        int32_t centered = (int32_t)(bits >> 32);
+        return 3.0 * (double)centered / 2147483648.0;
+    };
+    int hybridMismatch = 0;
+    int hybridProgramsTested = 0;
+    auto checkHybridLanes = [&](const char* name,
+                                const ExpressionProgram& program,
+                                ExpressionContext* lanes) {
+        Complex batch[4];
+        if (!program.evaluate4Hybrid(lanes, batch)) {
+            ++hybridMismatch;
+            return;
+        }
+        for (int lane = 0; lane < 4; ++lane) {
+            Complex scalar = program.evaluate(lanes[lane]);
+            if (!sameComplexBits(scalar, batch[lane])) {
+                if (hybridMismatch++ == 0)
+                    printf("  first hybrid mismatch %s lane=%d scalar=(%.17g,%.17g) batch=(%.17g,%.17g)\n",
+                           name, lane, scalar.real(), scalar.imag(),
+                           batch[lane].real(), batch[lane].imag());
+            }
+        }
+    };
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const Complex edgeValues[] = {
+        { -1.0, 0.0 }, { -1.0, -0.0 }, { 0.0, 0.0 }, { -0.0, -0.0 },
+        { 1.0, 0.0 }, { 0.0, 1.0 }, { inf, 0.0 }, { -inf, -0.0 },
+        { nan, 0.0 }, { 0.0, nan }, { 1e308, -1e308 }, { 1e-308, -1e-308 }
+    };
+    const Complex edgeParameters[] = {
+        { 0.5, 0.0 }, { 0.5, -0.0 }, { 0.0, 0.0 }, { -0.0, 0.0 },
+        { -1.0, 0.0 }, { 0.0, -1.0 }, { 2.0, 0.0 }, { inf, 0.0 },
+        { nan, 0.0 }, { 1.0, nan }, { 1e308, 1e308 }, { 1e-308, 0.0 }
+    };
+    for (const HybridOpcodeCase& test : hybridOpcodeCases) {
+        ExpressionProgram program;
+        if (!compile(program, test.source)) continue;
+        ++hybridProgramsTested;
+        if (!program.batchCompatible() || program.avx2Compatible())
+            ++hybridMismatch;
+        for (int group = 0; group < 256; ++group) {
+            ExpressionContext lanes[4];
+            for (int lane = 0; lane < 4; ++lane) {
+                lanes[lane] = context;
+                lanes[lane].z = { randomComponent(), randomComponent() };
+                lanes[lane].c = { randomComponent(), randomComponent() };
+                lanes[lane].z0 = { randomComponent(), randomComponent() };
+                lanes[lane].parameters[0] =
+                    { randomComponent(), randomComponent() };
+                lanes[lane].iteration = group * 4 + lane;
+            }
+            checkHybridLanes(test.name, program, lanes);
+        }
+        for (size_t first = 0;
+             first < sizeof(edgeValues) / sizeof(edgeValues[0]); first += 4) {
+            ExpressionContext lanes[4];
+            for (int lane = 0; lane < 4; ++lane) {
+                size_t index = first + (size_t)lane;
+                lanes[lane] = context;
+                lanes[lane].z = edgeValues[index];
+                lanes[lane].parameters[0] = edgeParameters[index];
+            }
+            checkHybridLanes(test.name, program, lanes);
+        }
+    }
+    {
+        ExpressionProgram polarDomain;
+        if (compile(polarDomain, "polar(z,p0)")) {
+            const ExpressionContext polarCases[8] = {
+                [&] { ExpressionContext c; c.z = { 1.0, 1.0 }; return c; }(),
+                [&] { ExpressionContext c; c.z = { -1.0, 0.0 }; return c; }(),
+                [&] { ExpressionContext c; c.z = { inf, 0.0 }; return c; }(),
+                [&] { ExpressionContext c; c.z = { nan, 0.0 }; return c; }(),
+                [&] { ExpressionContext c; c.z = { 1.0, 0.0 }; c.parameters[0] = { 0.0, 1.0 }; return c; }(),
+                [&] { ExpressionContext c; c.z = { 1.0, 0.0 }; c.parameters[0] = { inf, 0.0 }; return c; }(),
+                [&] { ExpressionContext c; c.z = { -0.0, 0.0 }; c.parameters[0] = { -0.0, 0.0 }; return c; }(),
+                [&] { ExpressionContext c; c.z = { 0.0, -0.0 }; c.parameters[0] = { 3.141592653589793, -0.0 }; return c; }()
+            };
+            for (int first = 0; first < 8; first += 4) {
+                ExpressionContext lanes[4];
+                for (int lane = 0; lane < 4; ++lane)
+                    lanes[lane] = polarCases[first + lane];
+                checkHybridLanes("polar-domain", polarDomain, lanes);
+            }
+        }
+    }
+    {
+        ExpressionProgram uncompiled;
+        Complex outputs[4];
+        ExpressionContext lanes[4]{};
+        if (uncompiled.batchCompatible() ||
+            uncompiled.evaluate4Hybrid(lanes, outputs) ||
+            functions.evaluate4Hybrid(nullptr, outputs) ||
+            functions.evaluate4Hybrid(lanes, nullptr))
+            ++hybridMismatch;
+    }
+    failures += hybridMismatch;
+
     // The immutable bytecode must be safe to evaluate concurrently.
     std::atomic<int> parallelFailures{0};
 #pragma omp parallel for schedule(static)
@@ -703,12 +841,6 @@ static int runExpressionCoreCase() {
                 }
             }
         }
-        auto sameDoubleBits = [](double a, double b) {
-            uint64_t aa, bb;
-            std::memcpy(&aa, &a, sizeof(a));
-            std::memcpy(&bb, &b, sizeof(b));
-            return aa == bb;
-        };
         for (const char* source : { "-z", "conj(z)" }) {
             ExpressionProgram signProgram;
             if (!compile(signProgram, source) || !signProgram.avx2Compatible()) {
@@ -1031,6 +1163,8 @@ static int runExpressionCoreCase() {
            quadratic.instructionCount(), quadratic.stackDepth());
     printf("  parallel failures=%d   classification mismatch=%d   render mismatch=%d\n",
            parallelFailures.load(), classificationMismatch, renderMismatch);
+    printf("  hybrid opcode programs=%d lane mismatches=%d\n",
+           hybridProgramsTested, hybridMismatch);
     printf("  evaluator AVX2/JIT-wrapper/JIT-raw: %.3f / %.3f / %.3f ms  raw speedup %.2fx\n",
            avxMs, jitMs, jitRawMs, jitRawMs > 0.0 ? avxMs / jitRawMs : 0.0);
     printf("  JIT mismatches=%d\n", jitMismatch);
@@ -1439,6 +1573,8 @@ static int runGenericFormulaProfile() {
     };
     constexpr int W = 322, H = 216, SAMPLES = 3;
     int failures = 0;
+    int exactHybridCases = 0;
+    bool hybridImproved = false;
     printf("=== generic formula full-frame profile (%dx%d)\n", W, H);
 
     for (const ProfileCase& test : cases) {
@@ -1474,24 +1610,24 @@ static int runGenericFormulaProfile() {
         };
 
         std::vector<double> scalarTimes;
-        std::vector<double> avxTimes;
+        std::vector<double> batchTimes;
         std::vector<double> jitTimes;
         std::vector<float> scalar;
-        std::vector<float> avx;
+        std::vector<float> batch;
         std::vector<float> native;
         for (int sample = 0; sample < SAMPLES; ++sample) {
-            double scalarTime = 0.0, avxTime = 0.0, jitTime = 0.0;
+            double scalarTime = 0.0, batchTime = 0.0, jitTime = 0.0;
             if (!render(false, nullptr, scalar, scalarTime)) {
                 ++failures;
                 break;
             }
             scalarTimes.push_back(scalarTime);
-            if (program.avx2Compatible()) {
-                if (!render(true, nullptr, avx, avxTime)) {
+            if (program.batchCompatible()) {
+                if (!render(true, nullptr, batch, batchTime)) {
                     ++failures;
                     break;
                 }
-                avxTimes.push_back(avxTime);
+                batchTimes.push_back(batchTime);
             }
             if (jitAvailable) {
                 if (!render(true, &jit, native, jitTime)) {
@@ -1507,32 +1643,64 @@ static int runGenericFormulaProfile() {
             return values.empty() ? 0.0 : values[values.size() / 2];
         };
         double scalarTime = median(scalarTimes);
-        double avxTime = median(avxTimes);
+        double batchTime = median(batchTimes);
         double jitTime = median(jitTimes);
-        int avxMismatches = 0, jitMismatches = 0;
-        if (!avx.empty()) {
-            for (size_t i = 0; i < scalar.size(); ++i)
-                if (std::memcmp(&scalar[i], &avx[i], sizeof(float)) != 0)
-                    ++avxMismatches;
+        int batchMismatches = 0, jitMismatches = 0;
+        bool batchExact = !batch.empty() &&
+            batch.size() == scalar.size() &&
+             std::memcmp(scalar.data(), batch.data(),
+                         scalar.size() * sizeof(float)) == 0;
+        if (!batchExact) {
+            size_t compared = std::min(scalar.size(), batch.size());
+            batchMismatches = (int)(std::max(scalar.size(), batch.size()) -
+                                    compared);
+            for (size_t i = 0; i < compared; ++i)
+                if (std::memcmp(&scalar[i], &batch[i], sizeof(float)) != 0)
+                    ++batchMismatches;
         }
-        if (!native.empty()) {
-            for (size_t i = 0; i < scalar.size(); ++i)
+        bool jitExact = native.empty() ||
+            (native.size() == scalar.size() &&
+             std::memcmp(scalar.data(), native.data(),
+                         scalar.size() * sizeof(float)) == 0);
+        if (!jitExact) {
+            size_t compared = std::min(scalar.size(), native.size());
+            jitMismatches = (int)(std::max(scalar.size(), native.size()) -
+                                  compared);
+            for (size_t i = 0; i < compared; ++i)
                 if (std::memcmp(&scalar[i], &native[i], sizeof(float)) != 0)
                     ++jitMismatches;
         }
-        if (avxMismatches || jitMismatches) ++failures;
+        if (!batchExact || !jitExact) ++failures;
+        bool acceptanceCase =
+            std::strcmp(test.name, "sine") == 0 ||
+            std::strcmp(test.name, "branch-power") == 0;
+        if (acceptanceCase && program.batchCompatible() &&
+            batchExact && batchTime > 0.0) {
+            ++exactHybridCases;
+            if (batchTime > 0.0 && scalarTime / batchTime >= 1.10)
+                hybridImproved = true;
+        }
         printf("  %-13s ops=%zu scalar=%.3fs",
                test.name, program.instructionCount(), scalarTime);
-        if (avxTime > 0.0)
-            printf(" AVX2=%.3fs(%.2fx)", avxTime, scalarTime / avxTime);
+        if (batchTime > 0.0)
+            printf(" %s=%.3fs(%.2fx)",
+                   program.avx2Compatible() ? "AVX2" : "Hybrid",
+                   batchTime, scalarTime / batchTime);
         else
-            printf(" AVX2=n/a");
+            printf(" batch=n/a");
         if (jitTime > 0.0)
             printf(" JIT=%.3fs(%.2fx)", jitTime, scalarTime / jitTime);
         else
             printf(" JIT=n/a");
-        printf(" mismatch=%d/%d\n", avxMismatches, jitMismatches);
+        printf(" memcmp=%s/%s mismatch=%d/%d\n",
+               batchExact ? "exact" : "FAIL",
+               jitExact ? "exact" : "FAIL",
+               batchMismatches, jitMismatches);
     }
+    bool hybridDefaultGate = exactHybridCases == 2 && hybridImproved;
+    if (!hybridDefaultGate) ++failures;
+    printf("  hybrid default gate: exact=%d/2 >=1.10x=%s\n",
+           exactHybridCases, hybridImproved ? "PASS" : "FAIL");
     {
         formula::ExpressionProgram identity;
         formula::ExpressionError error;

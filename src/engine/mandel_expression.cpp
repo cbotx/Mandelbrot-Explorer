@@ -412,8 +412,7 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
             if (rowCompleted) progressAdvance();
             continue;
         }
-        if (integerPower == 0 && program.avx2Compatible() &&
-            vectorEnabled) {
+        if (integerPower == 0 && program.batchCompatible() && vectorEnabled) {
             for (int j = 0; j < _w; j += 4) {
                 if (_flag_halt) { rowCompleted = false; break; }
                 int lanes = std::min(4, _w - j);
@@ -438,7 +437,8 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                     }
                 }
 #if defined(MANDEL_ENABLE_ASMJIT)
-                const bool useJit = jit && jit->valid();
+                const bool useJit =
+                    program.avx2Compatible() && jit && jit->valid();
                 if (useJit) {
                     rowCompleted = jit->evaluateOrbit(
                         contexts, lanes, mxit, bailout,
@@ -456,7 +456,10 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                     }
                     for (int lane = 0; lane < 4; ++lane)
                         contexts[lane].iteration = n;
-                    if (!program.evaluate4(contexts, outputs)) {
+                    bool evaluated = program.avx2Compatible()
+                        ? program.evaluate4(contexts, outputs)
+                        : program.evaluate4Hybrid(contexts, outputs);
+                    if (!evaluated) {
                         rowCompleted = false;
                         break;
                     }

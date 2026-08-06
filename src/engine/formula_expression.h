@@ -57,6 +57,8 @@ public:
     Complex evaluate(const ExpressionContext& context, Complex* stack,
                      size_t capacity) const;
     bool evaluate4(const ExpressionContext* contexts, Complex* outputs) const;
+    bool evaluate4Hybrid(const ExpressionContext* contexts,
+                         Complex* outputs) const;
     bool evaluateWithDerivative(const ExpressionContext& context,
                                 const ExpressionDerivativeSeed& seed,
                                 Complex& value, Complex& derivative) const;
@@ -68,6 +70,7 @@ public:
     FastPath fastPath() const { return _fastPath; }
     int fastIntegerPower() const { return _fastIntegerPower; }
     bool avx2Compatible() const { return _avx2Compatible; }
+    bool batchCompatible() const { return _batchCompatible; }
     bool derivativeCompatible() const { return _derivativeCompatible; }
 
 private:
@@ -94,6 +97,7 @@ private:
     FastPath _fastPath = FastPath::None;
     uint8_t _fastIntegerPower = 0;
     bool _avx2Compatible = false;
+    bool _batchCompatible = false;
     bool _derivativeCompatible = false;
     bool _valid = false;
 

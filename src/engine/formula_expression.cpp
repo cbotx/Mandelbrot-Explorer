@@ -267,6 +267,7 @@ bool ExpressionProgram::compile(const std::string& source, ExpressionError* erro
     _fastPath = FastPath::None;
     _fastIntegerPower = 0;
     _avx2Compatible = false;
+    _batchCompatible = false;
     _derivativeCompatible = false;
     if (error) *error = {};
     ExpressionParser parser(*this, source, error);
@@ -321,6 +322,44 @@ bool ExpressionProgram::compile(const std::string& source, ExpressionError* erro
             default:
                 return false;
             }
+        });
+    _batchCompatible = std::all_of(_code.begin(), _code.end(),
+        [](const Instruction& instruction) {
+            switch (instruction.op) {
+            case Op::Constant:
+            case Op::Z:
+            case Op::C:
+            case Op::Z0:
+            case Op::Iteration:
+            case Op::Parameter:
+            case Op::Negate:
+            case Op::Add:
+            case Op::Subtract:
+            case Op::Multiply:
+            case Op::Divide:
+            case Op::Power:
+            case Op::Square:
+            case Op::Sin:
+            case Op::Cos:
+            case Op::Tan:
+            case Op::Sinh:
+            case Op::Cosh:
+            case Op::Tanh:
+            case Op::Exp:
+            case Op::Log:
+            case Op::Log10:
+            case Op::Sqrt:
+            case Op::Abs:
+            case Op::Norm:
+            case Op::Arg:
+            case Op::Conjugate:
+            case Op::Real:
+            case Op::Imaginary:
+            case Op::MakeComplex:
+            case Op::Polar:
+                return true;
+            }
+            return false;
         });
     _derivativeCompatible = std::all_of(_code.begin(), _code.end(),
         [](const Instruction& instruction) {
@@ -533,6 +572,203 @@ bool ExpressionProgram::evaluate4(const ExpressionContext* contexts,
         }
         default:
             return false;
+        }
+    }
+    alignas(32) double re[4], im[4];
+    _mm256_store_pd(re, stack[0].re);
+    _mm256_store_pd(im, stack[0].im);
+    for (int lane = 0; lane < 4; ++lane) outputs[lane] = { re[lane], im[lane] };
+    return true;
+}
+
+bool ExpressionProgram::evaluate4Hybrid(const ExpressionContext* contexts,
+                                        Complex* outputs) const {
+    if (!_valid || !_batchCompatible || !contexts || !outputs) return false;
+    struct VecComplex { __m256d re, im; };
+    std::array<VecComplex, MAX_STACK> stack;
+    size_t top = 0;
+    auto real = [&](auto getter) {
+        return _mm256_set_pd(getter(contexts[3]).real(), getter(contexts[2]).real(),
+                             getter(contexts[1]).real(), getter(contexts[0]).real());
+    };
+    auto imag = [&](auto getter) {
+        return _mm256_set_pd(getter(contexts[3]).imag(), getter(contexts[2]).imag(),
+                             getter(contexts[1]).imag(), getter(contexts[0]).imag());
+    };
+    auto unary = [&](auto function) {
+        VecComplex& value = stack[top - 1];
+        alignas(32) double re[4], im[4];
+        _mm256_store_pd(re, value.re);
+        _mm256_store_pd(im, value.im);
+        for (int lane = 0; lane < 4; ++lane) {
+            Complex result = function(Complex{ re[lane], im[lane] });
+            re[lane] = result.real();
+            im[lane] = result.imag();
+        }
+        value.re = _mm256_load_pd(re);
+        value.im = _mm256_load_pd(im);
+    };
+    auto binary = [&](auto function) {
+        VecComplex right = stack[--top];
+        VecComplex& left = stack[top - 1];
+        alignas(32) double leftRe[4], leftIm[4], rightRe[4], rightIm[4];
+        _mm256_store_pd(leftRe, left.re);
+        _mm256_store_pd(leftIm, left.im);
+        _mm256_store_pd(rightRe, right.re);
+        _mm256_store_pd(rightIm, right.im);
+        for (int lane = 0; lane < 4; ++lane) {
+            Complex result = function(Complex{ leftRe[lane], leftIm[lane] },
+                                      Complex{ rightRe[lane], rightIm[lane] });
+            leftRe[lane] = result.real();
+            leftIm[lane] = result.imag();
+        }
+        left.re = _mm256_load_pd(leftRe);
+        left.im = _mm256_load_pd(leftIm);
+    };
+    for (const Instruction& instruction : _code) {
+        switch (instruction.op) {
+        case Op::Constant:
+            stack[top++] = {
+                _mm256_set1_pd(instruction.value.real()),
+                _mm256_set1_pd(instruction.value.imag())
+            };
+            break;
+        case Op::Z:
+            stack[top++] = { real([](const ExpressionContext& c) { return c.z; }),
+                             imag([](const ExpressionContext& c) { return c.z; }) };
+            break;
+        case Op::C:
+            stack[top++] = { real([](const ExpressionContext& c) { return c.c; }),
+                             imag([](const ExpressionContext& c) { return c.c; }) };
+            break;
+        case Op::Z0:
+            stack[top++] = { real([](const ExpressionContext& c) { return c.z0; }),
+                             imag([](const ExpressionContext& c) { return c.z0; }) };
+            break;
+        case Op::Iteration:
+            stack[top++] = {
+                _mm256_set_pd((double)contexts[3].iteration, (double)contexts[2].iteration,
+                              (double)contexts[1].iteration, (double)contexts[0].iteration),
+                _mm256_setzero_pd()
+            };
+            break;
+        case Op::Parameter: {
+            int p = instruction.argument;
+            stack[top++] = {
+                _mm256_set_pd(contexts[3].parameters[p].real(),
+                              contexts[2].parameters[p].real(),
+                              contexts[1].parameters[p].real(),
+                              contexts[0].parameters[p].real()),
+                _mm256_set_pd(contexts[3].parameters[p].imag(),
+                              contexts[2].parameters[p].imag(),
+                              contexts[1].parameters[p].imag(),
+                              contexts[0].parameters[p].imag())
+            };
+            break;
+        }
+        case Op::Negate:
+            stack[top - 1].re = _mm256_xor_pd(stack[top - 1].re, _mm256_set1_pd(-0.0));
+            stack[top - 1].im = _mm256_xor_pd(stack[top - 1].im, _mm256_set1_pd(-0.0));
+            break;
+        case Op::Add:
+        case Op::Subtract:
+        case Op::Multiply: {
+            VecComplex right = stack[--top];
+            VecComplex& left = stack[top - 1];
+            if (instruction.op == Op::Add) {
+                left.re = _mm256_add_pd(left.re, right.re);
+                left.im = _mm256_add_pd(left.im, right.im);
+            } else if (instruction.op == Op::Subtract) {
+                left.re = _mm256_sub_pd(left.re, right.re);
+                left.im = _mm256_sub_pd(left.im, right.im);
+            } else {
+                __m256d re = _mm256_sub_pd(_mm256_mul_pd(left.re, right.re),
+                                           _mm256_mul_pd(left.im, right.im));
+                __m256d im = _mm256_add_pd(_mm256_mul_pd(left.re, right.im),
+                                           _mm256_mul_pd(left.im, right.re));
+                left.re = re; left.im = im;
+            }
+            break;
+        }
+        case Op::Divide:
+            binary([](Complex a, Complex b) { return a / b; });
+            break;
+        case Op::Power:
+            binary([](Complex a, Complex b) { return std::pow(a, b); });
+            break;
+        case Op::Square: {
+            VecComplex& value = stack[top - 1];
+            __m256d re = _mm256_sub_pd(_mm256_mul_pd(value.re, value.re),
+                                       _mm256_mul_pd(value.im, value.im));
+            __m256d im = _mm256_add_pd(_mm256_mul_pd(value.re, value.im),
+                                       _mm256_mul_pd(value.im, value.re));
+            value.re = re; value.im = im;
+            break;
+        }
+        case Op::Sin:
+            unary([](Complex a) { return std::sin(a); });
+            break;
+        case Op::Cos:
+            unary([](Complex a) { return std::cos(a); });
+            break;
+        case Op::Tan:
+            unary([](Complex a) { return std::tan(a); });
+            break;
+        case Op::Sinh:
+            unary([](Complex a) { return std::sinh(a); });
+            break;
+        case Op::Cosh:
+            unary([](Complex a) { return std::cosh(a); });
+            break;
+        case Op::Tanh:
+            unary([](Complex a) { return std::tanh(a); });
+            break;
+        case Op::Exp:
+            unary([](Complex a) { return std::exp(a); });
+            break;
+        case Op::Log:
+            unary([](Complex a) { return std::log(a); });
+            break;
+        case Op::Log10:
+            unary([](Complex a) { return std::log10(a); });
+            break;
+        case Op::Sqrt:
+            unary([](Complex a) { return std::sqrt(a); });
+            break;
+        case Op::Abs:
+            unary([](Complex a) { return Complex{ std::abs(a), 0.0 }; });
+            break;
+        case Op::Norm:
+            unary([](Complex a) { return Complex{ std::norm(a), 0.0 }; });
+            break;
+        case Op::Arg:
+            unary([](Complex a) { return Complex{ std::arg(a), 0.0 }; });
+            break;
+        case Op::Conjugate:
+            stack[top - 1].im = _mm256_xor_pd(stack[top - 1].im, _mm256_set1_pd(-0.0));
+            break;
+        case Op::Real:
+            stack[top - 1].im = _mm256_setzero_pd();
+            break;
+        case Op::Imaginary:
+            stack[top - 1].re = stack[top - 1].im;
+            stack[top - 1].im = _mm256_setzero_pd();
+            break;
+        case Op::MakeComplex: {
+            VecComplex right = stack[--top];
+            stack[top - 1].im = right.re;
+            break;
+        }
+        case Op::Polar:
+            binary([](Complex a, Complex b) {
+                const double nan = std::numeric_limits<double>::quiet_NaN();
+                if (a.imag() != 0.0 || b.imag() != 0.0 ||
+                    !std::isfinite(a.real()) || a.real() < 0.0 ||
+                    !std::isfinite(b.real()))
+                    return Complex{ nan, nan };
+                return std::polar(a.real(), b.real());
+            });
+            break;
         }
     }
     alignas(32) double re[4], im[4];
