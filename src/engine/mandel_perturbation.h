@@ -72,7 +72,8 @@ public:
                            int mxit, double bailout = 4.0,
                            formula::ExpressionColoring coloring =
                                formula::ExpressionColoring::Raw,
-                           const formula::ExpressionJit4* jit = nullptr);
+                           const formula::ExpressionJit4* jit = nullptr,
+                           const formula::ExpressionOrbitPlan* plan = nullptr);
     // Exact residual perturbation prototype:
     // dz' = F(Z + dz, pixel parameters) - Z'. Falls back to the direct
     // expression renderer when the center reference escapes before mxit.

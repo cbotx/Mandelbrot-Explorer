@@ -97,7 +97,7 @@ public:
                     *request.expression, *request.expressionFixed,
                     request.expressionPixel, request.maxIterations,
                     request.expressionBailout, request.expressionColoring,
-                    request.expressionJit);
+                    request.expressionJit, request.expressionPlan);
             }
             break;
         }

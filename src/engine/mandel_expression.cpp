@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <immintrin.h>
 #include <limits>
+#include <memory>
 
 #include "float_math.h"
 #if defined(MANDEL_ENABLE_ASMJIT)
@@ -349,9 +350,19 @@ bool solveIntegerPowerSimdRow(
     return true;
 }
 
+template<bool UsePlan>
+struct HybridPreparedState {};
+
+template<>
+struct HybridPreparedState<true> {
+    formula::ExpressionOrbitPlan::Prepared values[4]{};
+};
+
+template<bool UsePlan>
 bool solveExpressionHybridRow(
         double startRe, double dx, double pixelIm, int count,
         const formula::ExpressionProgram& program,
+        const formula::ExpressionOrbitPlan* plan,
         const formula::ExpressionContext& fixed,
         FormulaParameter pixelParameter, int mxit, double bailout,
         float* output, volatile bool* halt) {
@@ -359,10 +370,12 @@ bool solveExpressionHybridRow(
         fixed, fixed, fixed, fixed
     };
     formula::Complex nextValues[4]{};
+    HybridPreparedState<UsePlan> prepared;
     int lanePixel[4] = { -1, -1, -1, -1 };
     int laneIteration[4] = {};
     int nextPixel = 0;
     int activeCount = 0;
+    bool preparationFailed = false;
 
     auto loadLane = [&](int lane) {
         lanePixel[lane] = -1;
@@ -387,6 +400,14 @@ bool solveExpressionHybridRow(
                 output[pixelIndex] = 0.0f;
                 continue;
             }
+            if constexpr (UsePlan) {
+                if (!plan->prepare(
+                        contexts[lane],
+                        prepared.values[(size_t)lane])) {
+                    preparationFailed = true;
+                    return;
+                }
+            }
             lanePixel[lane] = pixelIndex;
             laneIteration[lane] = 0;
             ++activeCount;
@@ -397,13 +418,25 @@ bool solveExpressionHybridRow(
         contexts[lane].iteration = 0;
     };
     for (int lane = 0; lane < 4; ++lane) loadLane(lane);
+    if (preparationFailed) return false;
 
     unsigned steps = 0;
     while (activeCount > 0) {
         if ((steps++ & 255u) == 0u && *halt) return false;
         for (int lane = 0; lane < 4; ++lane)
             contexts[lane].iteration = laneIteration[lane];
-        if (!program.evaluate4Hybrid(contexts, nextValues))
+        bool evaluated;
+        if constexpr (UsePlan) {
+            evaluated = plan->avx2Compatible()
+                ? plan->evaluate4(
+                    contexts, prepared.values, nextValues)
+                : plan->evaluate4Hybrid(
+                    contexts, prepared.values, nextValues);
+        } else {
+            evaluated =
+                program.evaluate4Hybrid(contexts, nextValues);
+        }
+        if (!evaluated)
             return false;
         for (int lane = 0; lane < 4; ++lane) {
             if (lanePixel[lane] < 0) continue;
@@ -416,6 +449,7 @@ bool solveExpressionHybridRow(
                     (float)(laneIteration[lane] + 1);
                 --activeCount;
                 loadLane(lane);
+                if (preparationFailed) return false;
                 continue;
             }
             ++laneIteration[lane];
@@ -423,11 +457,116 @@ bool solveExpressionHybridRow(
                 output[lanePixel[lane]] = -2.0f;
                 --activeCount;
                 loadLane(lane);
+                if (preparationFailed) return false;
             }
         }
     }
     return true;
 }
+
+#if defined(MANDEL_ENABLE_ASMJIT)
+bool solveExpressionJitRow(
+        double startRe, double dx, double pixelIm, int count,
+        const formula::ExpressionJit4& jit,
+        const formula::ExpressionOrbitPlan& plan,
+        const formula::ExpressionContext& fixed,
+        FormulaParameter pixelParameter, int mxit, double bailout,
+        float* output, volatile bool* halt) {
+    if (!jit.supports(plan)) return false;
+    formula::ExpressionContext contexts[4] = {
+        fixed, fixed, fixed, fixed
+    };
+    formula::ExpressionOrbitPlan::Prepared prepared[4]{};
+    formula::ExpressionJitInput4 input;
+    formula::ExpressionJitInvariantInput4 invariantInput;
+    formula::ExpressionJitOutput4 nextValues;
+    int lanePixel[4] = { -1, -1, -1, -1 };
+    int laneIteration[4] = {};
+    int nextPixel = 0;
+    int activeCount = 0;
+    bool preparationFailed = false;
+
+    auto loadLane = [&](int lane) {
+        lanePixel[lane] = -1;
+        while (nextPixel < count) {
+            int pixelIndex = nextPixel++;
+            contexts[lane] = fixed;
+            formula::Complex pixel{
+                startRe + dx * pixelIndex, pixelIm
+            };
+            if (pixelParameter == FormulaParameter::C)
+                contexts[lane].c = pixel;
+            else
+                contexts[lane].z0 = pixel;
+            contexts[lane].z = contexts[lane].z0;
+            contexts[lane].iteration = 0;
+            double magnitude = std::hypot(
+                contexts[lane].z.real(),
+                contexts[lane].z.imag());
+            if (!std::isfinite(contexts[lane].z.real()) ||
+                !std::isfinite(contexts[lane].z.imag()) ||
+                magnitude > bailout) {
+                output[pixelIndex] = 0.0f;
+                continue;
+            }
+            if (!plan.prepare(contexts[lane], prepared[lane])) {
+                preparationFailed = true;
+                return;
+            }
+            input.setContextLane(lane, contexts[lane]);
+            invariantInput.setPreparedLane(
+                lane, plan, prepared[lane]);
+            lanePixel[lane] = pixelIndex;
+            laneIteration[lane] = 0;
+            ++activeCount;
+            return;
+        }
+        contexts[lane] = fixed;
+        contexts[lane].z = {};
+        contexts[lane].iteration = 0;
+        prepared[lane] = {};
+        input.setContextLane(lane, contexts[lane]);
+        invariantInput.setPreparedLane(
+            lane, plan, prepared[lane]);
+    };
+    for (int lane = 0; lane < 4; ++lane) loadLane(lane);
+    if (preparationFailed) return false;
+
+    unsigned steps = 0;
+    while (activeCount > 0) {
+        if ((steps++ & 255u) == 0u && *halt) return false;
+        for (int lane = 0; lane < 4; ++lane)
+            input.vectors[formula::ExpressionJitInput4::N_RE][lane] =
+                (double)laneIteration[lane];
+        jit.evaluate(input, &invariantInput, nextValues);
+        for (int lane = 0; lane < 4; ++lane) {
+            if (lanePixel[lane] < 0) continue;
+            double re = nextValues.re[lane];
+            double im = nextValues.im[lane];
+            contexts[lane].z = { re, im };
+            input.vectors[formula::ExpressionJitInput4::Z_RE][lane] = re;
+            input.vectors[formula::ExpressionJitInput4::Z_IM][lane] = im;
+            if (!std::isfinite(re) || !std::isfinite(im) ||
+                std::hypot(re, im) > bailout) {
+                output[lanePixel[lane]] =
+                    (float)(laneIteration[lane] + 1);
+                --activeCount;
+                loadLane(lane);
+                if (preparationFailed) return false;
+                continue;
+            }
+            ++laneIteration[lane];
+            if (laneIteration[lane] >= mxit) {
+                output[lanePixel[lane]] = -2.0f;
+                --activeCount;
+                loadLane(lane);
+                if (preparationFailed) return false;
+            }
+        }
+    }
+    return true;
+}
+#endif
 
 } // namespace
 
@@ -437,7 +576,8 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                                FormulaParameter pixelParameter,
                                int mxit, double bailout,
                                formula::ExpressionColoring coloring,
-                               const formula::ExpressionJit4* jit) {
+                               const formula::ExpressionJit4* jit,
+                               const formula::ExpressionOrbitPlan* plan) {
     if (_sub != 1 || !program.valid() || mxit < 1 || !(bailout > 0.0) ||
         !std::isfinite(bailout) ||
         (pixelParameter != FormulaParameter::C &&
@@ -465,6 +605,13 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
     const int integerPower =
         program.fastPath() == formula::ExpressionProgram::FastPath::IntegerPowerPlusC
             ? program.fastIntegerPower() : 0;
+    const formula::ExpressionOrbitPlan* orbitPlan =
+        plan && plan->profitable() && plan->matches(program)
+            ? plan : nullptr;
+    const bool effectiveAvx2 = orbitPlan
+        ? orbitPlan->avx2Compatible() : program.avx2Compatible();
+    const bool effectiveBatch = orbitPlan
+        ? orbitPlan->batchCompatible() : program.batchCompatible();
     const char* powerSimdSetting = std::getenv("MANDEL_EXPR_POWER_SIMD");
     const char* vectorSetting = std::getenv("MANDEL_EXPR_VECTOR");
     const char* hybridRefillSetting =
@@ -497,15 +644,37 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
             if (rowCompleted) progressAdvance();
             continue;
         }
-        if (integerPower == 0 && program.batchCompatible() && vectorEnabled) {
-            if (!program.avx2Compatible() && hybridRefill) {
-                rowCompleted = solveExpressionHybridRow(
-                    startRe, dx, pixelIm, _w, program, fixed,
-                    pixelParameter, mxit, bailout,
+        if (integerPower == 0 && effectiveBatch && vectorEnabled) {
+#if defined(MANDEL_ENABLE_ASMJIT)
+            if (orbitPlan && jit && jit->supports(*orbitPlan)) {
+                rowCompleted = solveExpressionJitRow(
+                    startRe, dx, pixelIm, _w, *jit, *orbitPlan,
+                    fixed, pixelParameter, mxit, bailout,
                     _iter + (size_t)i * _w, &_flag_halt);
                 if (rowCompleted) progressAdvance();
                 continue;
             }
+#endif
+            if (!effectiveAvx2 && hybridRefill) {
+                rowCompleted = orbitPlan
+                    ? solveExpressionHybridRow<true>(
+                        startRe, dx, pixelIm, _w,
+                        program, orbitPlan, fixed,
+                        pixelParameter, mxit, bailout,
+                        _iter + (size_t)i * _w, &_flag_halt)
+                    : solveExpressionHybridRow<false>(
+                        startRe, dx, pixelIm, _w,
+                        program, nullptr, fixed,
+                        pixelParameter, mxit, bailout,
+                        _iter + (size_t)i * _w, &_flag_halt);
+                if (rowCompleted) progressAdvance();
+                continue;
+            }
+            std::unique_ptr<formula::ExpressionOrbitPlan::Prepared[]>
+                batchPrepared = orbitPlan
+                    ? std::make_unique<
+                        formula::ExpressionOrbitPlan::Prepared[]>(4)
+                    : nullptr;
             for (int j = 0; j < _w; j += 4) {
                 if (_flag_halt) { rowCompleted = false; break; }
                 int lanes = std::min(4, _w - j);
@@ -529,13 +698,27 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                         ++activeCount;
                     }
                 }
+                if (orbitPlan) {
+                    uint8_t activeMask = 0;
+                    for (int lane = 0; lane < lanes; ++lane)
+                        if (active[lane])
+                            activeMask |= static_cast<uint8_t>(1u << lane);
+                    if (!orbitPlan->prepare4(
+                            contexts, activeMask,
+                            batchPrepared.get())) {
+                        rowCompleted = false;
+                        break;
+                    }
+                }
 #if defined(MANDEL_ENABLE_ASMJIT)
                 const bool useJit =
-                    program.avx2Compatible() && jit && jit->valid();
+                    jit && (orbitPlan
+                        ? jit->supports(*orbitPlan)
+                        : (program.avx2Compatible() && jit->valid()));
                 if (useJit) {
                     rowCompleted = jit->evaluateOrbit(
                         contexts, lanes, mxit, bailout,
-                        results, &_flag_halt);
+                        results, &_flag_halt, orbitPlan);
                     if (!rowCompleted) break;
                     for (int lane = 0; lane < lanes; ++lane)
                         _iter[i * _w + j + lane] = results[lane];
@@ -549,9 +732,15 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                     }
                     for (int lane = 0; lane < 4; ++lane)
                         contexts[lane].iteration = n;
-                    bool evaluated = program.avx2Compatible()
-                        ? program.evaluate4(contexts, outputs)
-                        : program.evaluate4Hybrid(contexts, outputs);
+                    bool evaluated = orbitPlan
+                        ? (effectiveAvx2
+                            ? orbitPlan->evaluate4(
+                                contexts, batchPrepared.get(), outputs)
+                            : orbitPlan->evaluate4Hybrid(
+                                contexts, batchPrepared.get(), outputs))
+                        : (program.avx2Compatible()
+                            ? program.evaluate4(contexts, outputs)
+                            : program.evaluate4Hybrid(contexts, outputs));
                     if (!evaluated) {
                         rowCompleted = false;
                         break;
@@ -575,6 +764,11 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
             if (rowCompleted) progressAdvance();
             continue;
         }
+        std::unique_ptr<formula::ExpressionOrbitPlan::Prepared>
+            scalarPrepared = orbitPlan
+                ? std::make_unique<
+                    formula::ExpressionOrbitPlan::Prepared>()
+                : nullptr;
         for (int j = 0; j < _w; ++j) {
             if (_flag_halt) { rowCompleted = false; break; }
             formula::ExpressionContext context = fixed;
@@ -647,14 +841,25 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                         }
                     }
                 } else {
+                    if (orbitPlan &&
+                        !orbitPlan->prepare(
+                            context, *scalarPrepared)) {
+                        rowCompleted = false;
+                        break;
+                    }
                     for (int n = 0; n < mxit; ++n) {
                         if ((n & 255) == 0 && _flag_halt) {
                             rowCompleted = false;
                             break;
                         }
                         context.iteration = n;
-                        context.z = program.evaluate(context, stack.data(),
-                                                     program.stackDepth());
+                        context.z = orbitPlan
+                            ? orbitPlan->evaluate(
+                                context, *scalarPrepared, stack.data(),
+                                orbitPlan->bodyStackDepth())
+                            : program.evaluate(
+                                context, stack.data(),
+                                program.stackDepth());
                         double re = context.z.real(), im = context.z.imag();
                         if (!std::isfinite(re) || !std::isfinite(im) ||
                             std::hypot(re, im) > bailout) {

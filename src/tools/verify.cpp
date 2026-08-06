@@ -419,6 +419,7 @@ static int runExpressionCoreCase() {
     using formula::ExpressionContext;
     using formula::ExpressionDerivativeSeed;
     using formula::ExpressionError;
+    using formula::ExpressionOrbitPlan;
     using formula::ExpressionProgram;
 
     int failures = 0;
@@ -960,6 +961,342 @@ static int runExpressionCoreCase() {
             }
         }
     }
+
+    int orbitPlanFailures = 0;
+    int orbitPlanScalarMismatches = 0;
+    int orbitPlanBatchMismatches = 0;
+    int orbitPlanJitMismatches = 0;
+    {
+        ExpressionProgram original;
+        ExpressionProgram runtime;
+        ExpressionOrbitPlan plan;
+        const char* source = "sin(c)+z";
+        if (!compile(original, source) ||
+            !original.specialize(
+                specializationFixed, FormulaParameter::C, runtime) ||
+            !plan.build(runtime) ||
+            !plan.profitable() ||
+            plan.source() != source ||
+            runtime.source() != source ||
+            original.source() != source ||
+            plan.dependencyMask() !=
+                (ExpressionOrbitPlan::DependencyZ |
+                 ExpressionOrbitPlan::DependencyC) ||
+            plan.invariantCount() != 1 ||
+            plan.invariantDependencyMask(0) !=
+                ExpressionOrbitPlan::DependencyC ||
+            plan.invariantInstructionCount(0) != 2 ||
+            plan.invariantOperationCount() != 1 ||
+            plan.bodyInstructionCount() != 3 ||
+            plan.bodyOperationCount() != 1 ||
+            !plan.matches(runtime)) {
+            ++orbitPlanFailures;
+        }
+
+        ExpressionProgram duplicateOriginal;
+        ExpressionProgram duplicateRuntime;
+        ExpressionOrbitPlan duplicatePlan;
+        const char* duplicateSource = "sin(c)+sin(c)+z";
+        if (!compile(duplicateOriginal, duplicateSource) ||
+            !duplicateOriginal.specialize(
+                specializationFixed, FormulaParameter::C,
+                duplicateRuntime) ||
+            !duplicatePlan.build(duplicateRuntime) ||
+            duplicatePlan.invariantCount() != 2 ||
+            duplicatePlan.invariantOperationCount() != 2 ||
+            duplicatePlan.bodyInstructionCount() != 3 ||
+            duplicatePlan.bodyOperationCount() != 1 ||
+            duplicatePlan.source() != duplicateSource) {
+            ++orbitPlanFailures;
+        }
+
+        ExpressionProgram dynamicOriginal;
+        ExpressionProgram dynamicRuntime;
+        ExpressionOrbitPlan dynamicPlan;
+        const char* dynamicSource = "sin(z)+n+c";
+        if (!compile(dynamicOriginal, dynamicSource) ||
+            !dynamicOriginal.specialize(
+                specializationFixed, FormulaParameter::C,
+                dynamicRuntime) ||
+            !dynamicPlan.build(dynamicRuntime) ||
+            dynamicPlan.profitable() ||
+            dynamicPlan.invariantCount() != 0 ||
+            dynamicPlan.bodyInstructionCount() !=
+                dynamicRuntime.instructionCount() ||
+            dynamicPlan.dependencyMask() !=
+                (ExpressionOrbitPlan::DependencyZ |
+                 ExpressionOrbitPlan::DependencyIteration |
+                 ExpressionOrbitPlan::DependencyC)) {
+            ++orbitPlanFailures;
+        }
+
+        auto nanWithPayload = [](uint64_t payload) {
+            uint64_t bits =
+                0x7ff8000000000000ull |
+                (payload & 0x0007ffffffffffffull);
+            double value;
+            std::memcpy(&value, &bits, sizeof(value));
+            return value;
+        };
+        ExpressionContext keyFixed = specializationFixed;
+        keyFixed.parameters[0] = {
+            nanWithPayload(0x1234), 0.0
+        };
+        keyFixed.parameters[1] = {
+            nanWithPayload(0x5678), 0.0
+        };
+        auto checkKeyPlan = [&](const char* keySource,
+                                size_t expectedInvariants) {
+            ExpressionProgram keyOriginal;
+            ExpressionProgram keyRuntime;
+            ExpressionOrbitPlan keyPlan;
+            if (!compile(keyOriginal, keySource) ||
+                !keyOriginal.specialize(
+                    keyFixed, FormulaParameter::C,
+                    keyRuntime) ||
+                !keyPlan.build(keyRuntime) ||
+                keyPlan.invariantCount() !=
+                    expectedInvariants)
+                ++orbitPlanFailures;
+        };
+        checkKeyPlan("(c+p0)*z+(c+p0)", 1);
+        checkKeyPlan("(c+p0)*z+(c+p1)", 2);
+        checkKeyPlan("(c+p0)*z+(p0+c)", 2);
+        keyFixed.parameters[0] = { 0.0, -0.0 };
+        keyFixed.parameters[1] = { -0.0, 0.0 };
+        checkKeyPlan("(c+p0)*z+(c+p1)", 2);
+
+        ExpressionOrbitPlan transactionPlan;
+        ExpressionProgram transactionRuntime;
+        ExpressionProgram uncompiledProgram;
+        ExpressionError planError;
+        if (!original.specialize(
+                specializationFixed, FormulaParameter::C,
+                transactionRuntime) ||
+            !transactionPlan.build(transactionRuntime)) {
+            ++orbitPlanFailures;
+        } else {
+            const std::string oldSource = transactionPlan.source();
+            const size_t oldInvariants =
+                transactionPlan.invariantCount();
+            if (transactionPlan.build(
+                    uncompiledProgram, &planError) ||
+                planError.message.empty() ||
+                transactionPlan.source() != oldSource ||
+                transactionPlan.invariantCount() != oldInvariants ||
+                !transactionPlan.matches(transactionRuntime)) {
+                ++orbitPlanFailures;
+            }
+        }
+    }
+
+    const double payloadNaN = [] {
+        uint64_t bits = 0x7ff8000000001234ull;
+        double value;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }();
+    const Complex orbitEdges[] = {
+        { 0.0, 0.0 }, { -0.0, 0.0 },
+        { 0.0, -0.0 }, { -1.0, -0.0 },
+        { 1.0, 0.0 }, { -2.0, 0.0 },
+        { 0.0, 1.0 }, { 1e-300, -1e-300 },
+        { 1e300, -1e300 },
+        { std::numeric_limits<double>::infinity(), -0.0 },
+        { -std::numeric_limits<double>::infinity(), 0.0 },
+        { payloadNaN, -0.0 }
+    };
+    struct OrbitParityCase {
+        const char* source;
+        FormulaParameter pixel;
+        bool expectAvx;
+        bool expectJit;
+    };
+    const OrbitParityCase orbitParityCases[] = {
+        { "sqr(c)+z", FormulaParameter::C, true, true },
+        { "sin(c)+z", FormulaParameter::C, false, true },
+        { "sin(c)+sin(c)+z", FormulaParameter::C, false, true },
+        { "log(c)+sqrt(c)+pow(c,complex(0.5,0))+z",
+          FormulaParameter::C, false, true },
+        { "sin(c)+sin(z)", FormulaParameter::C, false, false },
+        { "sin(z0)+z", FormulaParameter::InitialZ, false, true },
+        { "log(z0)+sqrt(z0)+z",
+          FormulaParameter::InitialZ, false, true }
+    };
+    for (const OrbitParityCase& test : orbitParityCases) {
+        ExpressionProgram original;
+        ExpressionProgram runtime;
+        ExpressionOrbitPlan plan;
+        if (!compile(original, test.source) ||
+            !original.specialize(
+                specializationFixed, test.pixel, runtime) ||
+            !plan.build(runtime) || !plan.profitable()) {
+            ++orbitPlanFailures;
+            continue;
+        }
+        if (runtime.avx2Compatible() != test.expectAvx)
+            ++orbitPlanFailures;
+        for (size_t sample = 0;
+             sample < sizeof(orbitEdges) / sizeof(orbitEdges[0]);
+             ++sample) {
+            ExpressionContext lane = specializationFixed;
+            if (test.pixel == FormulaParameter::C)
+                lane.c = orbitEdges[sample];
+            else
+                lane.z0 = orbitEdges[sample];
+            lane.z = orbitEdges[
+                (sample * 5 + 3) %
+                (sizeof(orbitEdges) / sizeof(orbitEdges[0]))];
+            lane.iteration = (int)sample * 13 - 7;
+            ExpressionOrbitPlan::Prepared prepared;
+            if (!plan.prepare(lane, prepared)) {
+                ++orbitPlanFailures;
+                continue;
+            }
+            Complex expected = runtime.evaluate(lane);
+            Complex actual = plan.evaluate(lane, prepared);
+            if (!sameComplexBits(expected, actual))
+                ++orbitPlanScalarMismatches;
+        }
+
+        for (size_t first = 0;
+             first < sizeof(orbitEdges) / sizeof(orbitEdges[0]);
+             first += 4) {
+            ExpressionContext lanes[4];
+            ExpressionOrbitPlan::Prepared prepared[4];
+            for (int lane = 0; lane < 4; ++lane) {
+                size_t index = first + (size_t)lane;
+                lanes[lane] = specializationFixed;
+                if (test.pixel == FormulaParameter::C)
+                    lanes[lane].c = orbitEdges[index];
+                else
+                    lanes[lane].z0 = orbitEdges[index];
+                lanes[lane].z = orbitEdges[
+                    (index * 7 + 1) %
+                    (sizeof(orbitEdges) / sizeof(orbitEdges[0]))];
+                lanes[lane].iteration = (int)index * 17 - 11;
+            }
+            Complex expected[4], actual[4];
+            bool originalOkay = runtime.avx2Compatible()
+                ? runtime.evaluate4(lanes, expected)
+                : runtime.evaluate4Hybrid(lanes, expected);
+            bool planOkay =
+                plan.prepare4(lanes, 0x0f, prepared) &&
+                (plan.avx2Compatible()
+                    ? plan.evaluate4(lanes, prepared, actual)
+                    : plan.evaluate4Hybrid(
+                        lanes, prepared, actual));
+            if (!originalOkay || !planOkay) {
+                ++orbitPlanFailures;
+                continue;
+            }
+            for (int lane = 0; lane < 4; ++lane)
+                if (!sameComplexBits(expected[lane], actual[lane]))
+                    ++orbitPlanBatchMismatches;
+
+            formula::ExpressionJit4 planJit;
+            bool compiled = planJit.compile(plan);
+            if (compiled != test.expectJit) {
+                ++orbitPlanFailures;
+            } else if (compiled) {
+                formula::ExpressionJitInput4 input;
+                formula::ExpressionJitInvariantInput4
+                    invariantInput;
+                formula::ExpressionJitOutput4 output;
+                input.setContexts(lanes);
+                for (int lane = 0; lane < 4; ++lane)
+                    invariantInput.setPreparedLane(
+                        lane, plan, prepared[lane]);
+                planJit.evaluate(input, &invariantInput, output);
+                for (int lane = 0; lane < 4; ++lane) {
+                    Complex jitValue{
+                        output.re[lane], output.im[lane]
+                    };
+                    if (!sameComplexBits(
+                            expected[lane], jitValue))
+                        ++orbitPlanJitMismatches;
+                }
+                Complex rejected[4];
+                if (!planJit.supports(plan) ||
+                    planJit.evaluate(lanes, rejected))
+                    ++orbitPlanFailures;
+            }
+        }
+    }
+
+    auto checkOrbitPlanFrame = [&](
+            const char* source, FormulaParameter pixel,
+            bool expectJit) {
+        ExpressionProgram original;
+        ExpressionProgram runtime;
+        ExpressionOrbitPlan plan;
+        ExpressionContext fixed = specializationFixed;
+        fixed.z0 = { 0.1, -0.05 };
+        fixed.c = { -0.7, 0.2 };
+        if (!compile(original, source) ||
+            !original.specialize(fixed, pixel, runtime) ||
+            !plan.build(runtime) || !plan.profitable()) {
+            ++orbitPlanFailures;
+            return;
+        }
+        formula::ExpressionJit4 planJit;
+        bool jitAvailable = planJit.compile(plan);
+        if (jitAvailable != expectJit)
+            ++orbitPlanFailures;
+        constexpr int PW = 37, PH = 23, PMXIT = 90;
+        std::vector<float> baseline((size_t)PW * PH);
+        std::vector<float> scalarPlan((size_t)PW * PH);
+        std::vector<float> batchPlan((size_t)PW * PH);
+        std::vector<float> jitPlan((size_t)PW * PH);
+        mpf_t re, im, scale;
+        mpf_init_set_ui(re, 0);
+        mpf_init_set_ui(im, 0);
+        mpf_init_set_ui(scale, 1);
+        auto render = [&](std::vector<float>& output,
+                          bool vector,
+                          const formula::ExpressionJit4* activeJit,
+                          const ExpressionOrbitPlan* activePlan) {
+            std::fill(output.begin(), output.end(), EMPTYPIXEL);
+            Mandel renderer(PW, PH, PMXIT, 1, output.data());
+            _putenv_s("MANDEL_EXPR_VECTOR", vector ? "1" : "0");
+            return renderer.ComputeExpression(
+                re, im, scale, runtime, fixed, pixel,
+                PMXIT, 8.0, formula::ExpressionColoring::Raw,
+                activeJit, activePlan);
+        };
+        bool okay =
+            render(baseline, false, nullptr, nullptr) &&
+            render(scalarPlan, false, nullptr, &plan) &&
+            render(batchPlan, true, nullptr, &plan);
+        if (jitAvailable)
+            okay = okay &&
+                render(jitPlan, true, &planJit, &plan);
+        _putenv_s("MANDEL_EXPR_VECTOR", "");
+        mpf_clears(re, im, scale, (mpf_ptr)0);
+        if (!okay ||
+            std::memcmp(
+                baseline.data(), scalarPlan.data(),
+                baseline.size() * sizeof(float)) != 0 ||
+            std::memcmp(
+                baseline.data(), batchPlan.data(),
+                baseline.size() * sizeof(float)) != 0 ||
+            (jitAvailable &&
+             std::memcmp(
+                 baseline.data(), jitPlan.data(),
+                 baseline.size() * sizeof(float)) != 0))
+            ++orbitPlanFailures;
+    };
+    checkOrbitPlanFrame(
+        "sin(c)+z", FormulaParameter::C, true);
+    checkOrbitPlanFrame(
+        "sin(z0)+z", FormulaParameter::InitialZ, true);
+    checkOrbitPlanFrame(
+        "sin(c)+sin(z)", FormulaParameter::C, false);
+    failures += orbitPlanFailures +
+                orbitPlanScalarMismatches +
+                orbitPlanBatchMismatches +
+                orbitPlanJitMismatches;
+
     struct HybridOpcodeCase {
         const char* name;
         const char* source;
@@ -1545,6 +1882,9 @@ static int runExpressionCoreCase() {
            specializationFoldCases, specializationFailures,
            specializationParityMismatches,
            specializationFrameMismatch);
+    printf("  orbit plan failures=%d scalar/AVX-Hybrid/JIT mismatches=%d/%d/%d\n",
+           orbitPlanFailures, orbitPlanScalarMismatches,
+           orbitPlanBatchMismatches, orbitPlanJitMismatches);
     printf("  evaluator AVX2/JIT-wrapper/JIT-raw: %.3f / %.3f / %.3f ms  raw speedup %.2fx\n",
            avxMs, jitMs, jitRawMs, jitRawMs > 0.0 ? avxMs / jitRawMs : 0.0);
     printf("  JIT mismatches=%d\n", jitMismatch);
@@ -1941,7 +2281,8 @@ static int runGenericFormulaProfile() {
         double bailout;
         int mxit;
         formula::Complex p1{};
-        bool invariantHeavy = false;
+        bool orbitStage = false;
+        bool expectOrbitInvariant = false;
     };
     const ProfileCase cases[] = {
         { "arithmetic", "z*z+c+p0*z", {}, { 0.1, -0.05 }, 4.0, 1200 },
@@ -1953,20 +2294,31 @@ static int runGenericFormulaProfile() {
         { "branch-power", "exp(p0*log(z))+c",
           { 0.3, 0.2 }, { 2.5, 0.0 }, 8.0, 300 },
         { "invariant-fn", "z*z+c+sin(p0)+exp(p1)",
-          {}, { 0.15, -0.2 }, 8.0, 800, { -0.35, 0.1 }, true },
+          {}, { 0.15, -0.2 }, 8.0, 800, { -0.35, 0.1 } },
         { "invariant-components",
           "z*z+c+complex(real(p0),imag(p1))*z",
-          {}, { 0.15, -0.2 }, 4.0, 1000, { -0.35, 0.1 }, true }
+          {}, { 0.15, -0.2 }, 4.0, 1000, { -0.35, 0.1 } },
+        { "orbit-sin-c",
+          "0.5*z+0.1*sin(c)",
+          {}, {}, 4.0, 800, {}, true, true },
+        { "orbit-sin-c-cse",
+          "0.5*z+0.1*(sin(c)+sin(c))",
+          {}, {}, 4.0, 800, {}, true, true },
+        { "orbit-control-z-n",
+          "0.5*z+0.1*sin(z)+0.000001*n+c",
+          {}, {}, 4.0, 500, {}, true, false }
     };
     constexpr int W = 322, H = 216, SAMPLES = 7, PAIR_REPEATS = 5;
     int failures = 0;
     int exactHybridCases = 0;
     int hybridNoRegressionCases = 0;
     int refillNoRegressionCases = 0;
-    int representativeSpecializationExact = 0;
-    int representativeSpecializationNoRegression = 0;
-    int invariantSpecializationExact = 0;
-    int invariantSpecializationImproved = 0;
+    int unaffectedOrbitExact = 0;
+    int unaffectedOrbitNoRegression = 0;
+    int orbitInvariantExact = 0;
+    int orbitInvariantImproved = 0;
+    int orbitControlExact = 0;
+    int orbitControlNoRegression = 0;
     printf("=== generic formula full-frame profile (%dx%d)\n", W, H);
 
     for (const ProfileCase& test : cases) {
@@ -1994,12 +2346,22 @@ static int runGenericFormulaProfile() {
             specializedProgram.fastPath() ==
                 formula::ExpressionProgram::FastPath::None &&
             specializedJit.compile(specializedProgram);
+        formula::ExpressionOrbitPlan orbitPlan;
+        if (!orbitPlan.build(specializedProgram, &error)) {
+            ++failures;
+            continue;
+        }
+        formula::ExpressionJit4 orbitJit;
+        bool orbitJitAvailable =
+            orbitPlan.profitable() && orbitJit.compile(orbitPlan);
 
         auto render = [&](const formula::ExpressionProgram& activeProgram,
                           bool vector,
                           const formula::ExpressionJit4* activeJit,
                           std::vector<float>& output, double& elapsed,
-                          bool refill = true) {
+                          bool refill = true,
+                          const formula::ExpressionOrbitPlan* activePlan =
+                              nullptr) {
             output.assign((size_t)W * H, EMPTYPIXEL);
             Mandel renderer(W, H, test.mxit, 1, output.data());
             mpf_t centerRe, centerIm, scale;
@@ -2013,7 +2375,8 @@ static int runGenericFormulaProfile() {
             bool okay = renderer.ComputeExpression(
                 centerRe, centerIm, scale, activeProgram, fixed,
                 FormulaParameter::C, test.mxit, test.bailout,
-                formula::ExpressionColoring::Raw, activeJit);
+                formula::ExpressionColoring::Raw, activeJit,
+                activePlan);
             elapsed = std::chrono::duration<double>(
                 Clock::now() - begin).count();
             mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
@@ -2091,20 +2454,33 @@ static int runGenericFormulaProfile() {
                 double specializedOnce = 0.0;
                 auto renderDefault = [&]() {
                     return render(
-                        program, true,
-                        jitAvailable ? &jit : nullptr,
+                        specializedProgram, true,
+                        specializedJitAvailable
+                            ? &specializedJit : nullptr,
                         defaultOutput, defaultOnce);
                 };
                 auto renderSpecialized = [&]() {
                     return render(
                         specializedProgram, true,
-                        specializedJitAvailable
-                            ? &specializedJit : nullptr,
-                        specializedOutput, specializedOnce);
+                        orbitPlan.profitable() &&
+                            orbitJitAvailable
+                            ? &orbitJit
+                            : (specializedJitAvailable
+                                ? &specializedJit : nullptr),
+                        specializedOutput, specializedOnce,
+                        true,
+                        orbitPlan.profitable()
+                            ? &orbitPlan : nullptr);
                 };
-                paired = ((sample + repeat) & 1)
-                    ? renderSpecialized() && renderDefault()
-                    : renderDefault() && renderSpecialized();
+                if (!orbitPlan.profitable()) {
+                    paired = renderDefault();
+                    specializedOnce = defaultOnce;
+                    specializedOutput = defaultOutput;
+                } else {
+                    paired = ((sample + repeat) & 1)
+                        ? renderSpecialized() && renderDefault()
+                        : renderDefault() && renderSpecialized();
+                }
                 defaultTime += defaultOnce;
                 specializedTime += specializedOnce;
             }
@@ -2202,15 +2578,30 @@ static int runGenericFormulaProfile() {
         bool improved =
             specializationRatio > 0.0 &&
             specializationRatio < 1.0;
-        if (test.invariantHeavy) {
-            if (specializedExact) ++invariantSpecializationExact;
-            if (specializedExact && improved)
-                ++invariantSpecializationImproved;
+        if (test.orbitStage) {
+            bool classificationOkay =
+                orbitPlan.profitable() ==
+                    test.expectOrbitInvariant;
+            if (std::strcmp(
+                    test.name, "orbit-sin-c-cse") == 0 &&
+                (orbitPlan.invariantCount() < 2 ||
+                 orbitPlan.invariantOperationCount() >= 4))
+                classificationOkay = false;
+            if (!classificationOkay) ++failures;
+            if (test.expectOrbitInvariant) {
+                if (specializedExact) ++orbitInvariantExact;
+                if (specializedExact && improved)
+                    ++orbitInvariantImproved;
+            } else {
+                if (specializedExact) ++orbitControlExact;
+                if (specializedExact && noRegression)
+                    ++orbitControlNoRegression;
+            }
         } else {
-            if (specializedExact)
-                ++representativeSpecializationExact;
+            if (orbitPlan.profitable()) ++failures;
+            if (specializedExact) ++unaffectedOrbitExact;
             if (specializedExact && noRegression)
-                ++representativeSpecializationNoRegression;
+                ++unaffectedOrbitNoRegression;
         }
         bool acceptanceCase =
             std::strcmp(test.name, "sine") == 0 ||
@@ -2243,9 +2634,9 @@ static int runGenericFormulaProfile() {
             printf(" JIT=%.3fs(%.2fx)", jitTime, scalarTime / jitTime);
         else
             printf(" JIT=n/a");
-        printf(" default=%.4fs specialized-%s=%.4fs(%.2fx)",
+        printf(" default=%.4fs orbit-%s=%.4fs(%.2fx)",
                defaultTime,
-               specializedJitAvailable
+               (orbitJitAvailable || specializedJitAvailable)
                    ? "JIT"
                    : (specializedProgram.avx2Compatible()
                        ? "AVX2" : "Hybrid"),
@@ -2259,6 +2650,12 @@ static int runGenericFormulaProfile() {
                specializedExact ? "exact" : "FAIL",
                batchMismatches, jitMismatches,
                refillMismatches, specializedMismatches);
+        if (test.orbitStage)
+            printf("    orbit invariants=%zu invariant-ops=%zu body-ops=%zu profitable=%d\n",
+                   orbitPlan.invariantCount(),
+                   orbitPlan.invariantOperationCount(),
+                   orbitPlan.bodyOperationCount(),
+                   orbitPlan.profitable() ? 1 : 0);
     }
     bool hybridDefaultGate =
         exactHybridCases == 2 && hybridNoRegressionCases == 2;
@@ -2268,17 +2665,19 @@ static int runGenericFormulaProfile() {
     if (refillNoRegressionCases != 2) ++failures;
     printf("  hybrid refill non-regression=%d/2\n",
            refillNoRegressionCases);
-    if (representativeSpecializationExact != 5 ||
-        representativeSpecializationNoRegression != 5)
+    if (unaffectedOrbitExact != 7 ||
+        unaffectedOrbitNoRegression != 7)
         ++failures;
-    if (invariantSpecializationExact != 2 ||
-        invariantSpecializationImproved < 1)
+    printf("  unaffected orbit-plan gate: exact=%d/7 non-regression=%d/7\n",
+           unaffectedOrbitExact, unaffectedOrbitNoRegression);
+    if (orbitInvariantExact != 2 ||
+        orbitInvariantImproved < 1 ||
+        orbitControlExact != 1 ||
+        orbitControlNoRegression != 1)
         ++failures;
-    printf("  specialization gate: representative exact=%d/5 non-regression=%d/5; invariant exact=%d/2 improved=%d/2\n",
-           representativeSpecializationExact,
-           representativeSpecializationNoRegression,
-           invariantSpecializationExact,
-           invariantSpecializationImproved);
+    printf("  orbit-plan gate: invariant exact=%d/2 improved=%d/2; control exact=%d/1 non-regression=%d/1\n",
+           orbitInvariantExact, orbitInvariantImproved,
+           orbitControlExact, orbitControlNoRegression);
     {
         formula::ExpressionProgram identity;
         formula::ExpressionError error;
@@ -2388,6 +2787,8 @@ static bool renderExpressionOracle(const FormulaRegressionCase& test,
 static int runFormulaRegressionCase(const FormulaRegressionCase& test,
                                     bool updateGoldens) {
     formula::ExpressionProgram program;
+    formula::ExpressionProgram runtimeProgram;
+    formula::ExpressionOrbitPlan orbitPlan;
     formula::ExpressionError compileError;
     if (!program.compile(test.source, &compileError)) {
         printf("=== formula %s\n  compile error @ %zu: %s\n  => CHECK\n\n",
@@ -2399,6 +2800,19 @@ static int runFormulaRegressionCase(const FormulaRegressionCase& test,
     fixed.z0 = test.fixedZ0;
     fixed.c = test.fixedC;
     fixed.parameters = test.parameters;
+    if (!program.specialize(
+            fixed, test.pixel, runtimeProgram, &compileError) ||
+        !orbitPlan.build(runtimeProgram, &compileError))
+        return 1;
+    formula::ExpressionJit4 jit;
+    const formula::ExpressionJit4* activeJit = nullptr;
+    if (runtimeProgram.fastPath() ==
+        formula::ExpressionProgram::FastPath::None) {
+        bool compiled = orbitPlan.profitable()
+            ? jit.compile(orbitPlan)
+            : jit.compile(runtimeProgram);
+        if (compiled) activeJit = &jit;
+    }
     std::vector<float> engine((size_t)test.width * test.height, EMPTYPIXEL);
     std::vector<float> golden(engine.size(), EMPTYPIXEL);
     Mandel renderer(test.width, test.height, test.mxit, 1, engine.data());
@@ -2408,8 +2822,9 @@ static int runFormulaRegressionCase(const FormulaRegressionCase& test,
     mpf_init_set_d(scale, test.scale);
     auto begin = Clock::now();
     bool rendered = renderer.ComputeExpression(
-        centerRe, centerIm, scale, program, fixed, test.pixel,
-        test.mxit, test.bailout);
+        centerRe, centerIm, scale, runtimeProgram, fixed, test.pixel,
+        test.mxit, test.bailout, formula::ExpressionColoring::Raw,
+        activeJit, orbitPlan.profitable() ? &orbitPlan : nullptr);
     double engineTime = since(begin);
     mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
     if (!rendered) return 1;
@@ -3535,15 +3950,18 @@ static int runBackendCase() {
 
     formula::ExpressionProgram expression;
     formula::ExpressionProgram runtimeExpression;
+    formula::ExpressionOrbitPlan runtimeExpressionPlan;
     formula::ExpressionJit4 runtimeExpressionJit;
     formula::ExpressionError compileError;
     formula::ExpressionContext fixed;
     fixed.parameters[0] = { 0.15, -0.2 };
     fixed.parameters[1] = { -0.35, 0.1 };
     if (!expression.compile(
-            "z*z+c+sin(p0)+exp(p1)", &compileError) ||
+            "0.5*z+0.1*sin(c)", &compileError) ||
         !expression.specialize(
             fixed, FormulaParameter::C,
+            runtimeExpression, &compileError) ||
+        !runtimeExpressionPlan.build(
             runtimeExpression, &compileError)) {
         ++failures;
     } else {
@@ -3552,8 +3970,14 @@ static int runBackendCase() {
         request.mode = ComputeMode::Expression;
         request.expression = &runtimeExpression;
         request.expressionFixed = &fixed;
+        request.expressionPlan =
+            runtimeExpressionPlan.profitable()
+                ? &runtimeExpressionPlan : nullptr;
         request.expressionJit =
-            runtimeExpressionJit.compile(runtimeExpression)
+            (runtimeExpressionPlan.profitable()
+                ? runtimeExpressionJit.compile(
+                    runtimeExpressionPlan)
+                : runtimeExpressionJit.compile(runtimeExpression))
                 ? &runtimeExpressionJit : nullptr;
         request.expressionPixel = FormulaParameter::C;
         request.expressionBailout = 4.0;
@@ -3800,14 +4224,24 @@ static int runBackendCase() {
         mpf_set_ui(scale, 1);
     }
 
-    // Running cancellation: a bounded identity expression would otherwise execute
-    // ten million iterations for every pixel.
+    // Running cancellation through the hoisted JIT lane-refill path.
     constexpr int CW = 8, CH = 8, CMXIT = 10000000;
     std::vector<float> cancelOutput((size_t)CW * CH, EMPTYPIXEL);
     Mandel cancelMandel(CW, CH, CMXIT, 1, cancelOutput.data());
-    formula::ExpressionProgram identity;
-    identity.compile("z", &compileError);
+    formula::ExpressionProgram cancelExpression;
+    formula::ExpressionProgram cancelRuntime;
+    formula::ExpressionOrbitPlan cancelPlan;
+    formula::ExpressionJit4 cancelJit;
+    cancelExpression.compile(
+        "0.5*z+0.1*sin(c)", &compileError);
     formula::ExpressionContext cancelFixed;
+    bool cancelSetup =
+        cancelExpression.specialize(
+            cancelFixed, FormulaParameter::C,
+            cancelRuntime, &compileError) &&
+        cancelPlan.build(cancelRuntime, &compileError) &&
+        cancelPlan.profitable() &&
+        cancelJit.compile(cancelPlan);
     ComputeRequest cancelRequest;
     cancelRequest.mode = ComputeMode::Expression;
     cancelRequest.cpuEngine = &cancelMandel;
@@ -3816,8 +4250,10 @@ static int runBackendCase() {
     cancelRequest.width = CW; cancelRequest.height = CH; cancelRequest.sub = 1;
     cancelRequest.maxIterations = CMXIT;
     cancelRequest.iterations = cancelOutput.data();
-    cancelRequest.expression = &identity;
+    cancelRequest.expression = &cancelRuntime;
     cancelRequest.expressionFixed = &cancelFixed;
+    cancelRequest.expressionPlan = &cancelPlan;
+    cancelRequest.expressionJit = &cancelJit;
     cancelRequest.expressionPixel = FormulaParameter::C;
     backend->resetCancellation();
     auto start = Clock::now();
@@ -3830,7 +4266,9 @@ static int runBackendCase() {
     double cancelSeconds = since(start);
     backend->resetCancellation();
     int empty = (int)std::count(cancelOutput.begin(), cancelOutput.end(), EMPTYPIXEL);
-    if (cancelResult || cancelSeconds > 2.0 || empty == 0) ++failures;
+    if (!cancelSetup || cancelResult ||
+        cancelSeconds > 2.0 || empty == 0)
+        ++failures;
 
     printf("=== compute backend interface\n");
     printf("  backend=%s detail=%s fallback-test=%s\n",

@@ -4,9 +4,12 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <string_view>
+#include <unordered_map>
 #include <immintrin.h>
 
 namespace formula {
@@ -267,6 +270,7 @@ int ExpressionProgram::operandCount(Op op) {
     case Op::Z0:
     case Op::Iteration:
     case Op::Parameter:
+    case Op::OrbitInvariant:
         return 0;
     case Op::Negate:
     case Op::Square:
@@ -421,6 +425,7 @@ bool ExpressionProgram::analyze(ExpressionError* error) {
             case Op::Z0:
             case Op::Iteration:
             case Op::Parameter:
+            case Op::OrbitInvariant:
             case Op::Negate:
             case Op::Add:
             case Op::Subtract:
@@ -444,6 +449,7 @@ bool ExpressionProgram::analyze(ExpressionError* error) {
             case Op::Z0:
             case Op::Iteration:
             case Op::Parameter:
+            case Op::OrbitInvariant:
             case Op::Negate:
             case Op::Add:
             case Op::Subtract:
@@ -662,6 +668,361 @@ bool ExpressionProgram::specialize(
     return true;
 }
 
+bool ExpressionOrbitPlan::build(
+        const ExpressionProgram& program, ExpressionError* error) {
+    if (error) *error = {};
+    auto fail = [&](const char* message) {
+        if (error) {
+            error->position = program.source().size();
+            error->message = message;
+        }
+        return false;
+    };
+    if (!program.valid()) return fail("expression program is invalid");
+
+    struct Node {
+        ExpressionProgram::Instruction instruction;
+        int operands = 0;
+        int left = -1;
+        int right = -1;
+        size_t instructionCount = 1;
+        uint8_t dependencies = DependencyNone;
+        std::string key;
+    };
+    std::vector<Node> nodes;
+    std::vector<int> stack;
+    nodes.reserve(program._code.size());
+    stack.reserve(program._stackDepth);
+
+    auto appendBytes = [](std::string& key, const void* data, size_t size) {
+        key.append(static_cast<const char*>(data), size);
+    };
+    for (const ExpressionProgram::Instruction& instruction : program._code) {
+        Node node;
+        node.instruction = instruction;
+        node.operands = ExpressionProgram::operandCount(instruction.op);
+        if (node.operands < 0 || stack.size() < (size_t)node.operands)
+            return fail("invalid expression stack");
+        if (node.operands == 1) {
+            node.left = stack.back();
+            stack.pop_back();
+        } else if (node.operands == 2) {
+            node.right = stack.back();
+            stack.pop_back();
+            node.left = stack.back();
+            stack.pop_back();
+        }
+
+        switch (instruction.op) {
+        case ExpressionProgram::Op::Z:
+            node.dependencies = DependencyZ;
+            break;
+        case ExpressionProgram::Op::Iteration:
+            node.dependencies = DependencyIteration;
+            break;
+        case ExpressionProgram::Op::C:
+            node.dependencies = DependencyC;
+            break;
+        case ExpressionProgram::Op::Z0:
+            node.dependencies = DependencyZ0;
+            break;
+        case ExpressionProgram::Op::Parameter:
+            node.dependencies = DependencyParameter;
+            break;
+        case ExpressionProgram::Op::OrbitInvariant:
+            return fail("nested orbit plan is not supported");
+        default:
+            break;
+        }
+        if (node.left >= 0) {
+            node.dependencies |= nodes[(size_t)node.left].dependencies;
+            node.instructionCount +=
+                nodes[(size_t)node.left].instructionCount;
+        }
+        if (node.right >= 0) {
+            node.dependencies |= nodes[(size_t)node.right].dependencies;
+            node.instructionCount +=
+                nodes[(size_t)node.right].instructionCount;
+        }
+
+        const uint8_t op = static_cast<uint8_t>(instruction.op);
+        node.key.push_back(static_cast<char>(op));
+        node.key.push_back(static_cast<char>(instruction.argument));
+        uint64_t realBits = 0, imaginaryBits = 0;
+        const double real = instruction.value.real();
+        const double imaginary = instruction.value.imag();
+        std::memcpy(&realBits, &real, sizeof(realBits));
+        std::memcpy(&imaginaryBits, &imaginary, sizeof(imaginaryBits));
+        appendBytes(node.key, &realBits, sizeof(realBits));
+        appendBytes(node.key, &imaginaryBits, sizeof(imaginaryBits));
+        node.key.push_back(static_cast<char>(node.operands));
+        auto appendChildKey = [&](int child) {
+            const std::string& childKey = nodes[(size_t)child].key;
+            const uint32_t size = static_cast<uint32_t>(childKey.size());
+            appendBytes(node.key, &size, sizeof(size));
+            appendBytes(node.key, childKey.data(), childKey.size());
+        };
+        if (node.left >= 0) appendChildKey(node.left);
+        if (node.right >= 0) appendChildKey(node.right);
+
+        nodes.push_back(std::move(node));
+        stack.push_back(static_cast<int>(nodes.size() - 1));
+    }
+    if (stack.size() != 1) return fail("invalid expression stack");
+    const int root = stack.back();
+
+    ExpressionOrbitPlan candidate;
+    candidate._source = program._source;
+    candidate._programKey = nodes[(size_t)root].key;
+    candidate._originalCode = program._code;
+    candidate._dependencyMask = nodes[(size_t)root].dependencies;
+    candidate._programAvx2Compatible = program._avx2Compatible;
+    candidate._body._source = program._source;
+
+    const uint8_t iterationDependencies =
+        DependencyZ | DependencyIteration;
+    auto isInvariant = [&](const Node& node) {
+        return (node.dependencies & iterationDependencies) == 0 &&
+               node.instructionCount > 1;
+    };
+    std::vector<int> maximalInvariantRoots;
+    std::function<void(int)> collectMaximal;
+    collectMaximal = [&](int index) {
+        const Node& node = nodes[(size_t)index];
+        if (isInvariant(node)) {
+            maximalInvariantRoots.push_back(index);
+            return;
+        }
+        if (node.left >= 0) collectMaximal(node.left);
+        if (node.right >= 0) collectMaximal(node.right);
+    };
+    collectMaximal(root);
+
+    std::unordered_map<std::string, size_t> invariantOccurrences;
+    std::function<void(int)> countInvariantNodes;
+    countInvariantNodes = [&](int index) {
+        const Node& node = nodes[(size_t)index];
+        if (isInvariant(node)) ++invariantOccurrences[node.key];
+        if (node.left >= 0) countInvariantNodes(node.left);
+        if (node.right >= 0) countInvariantNodes(node.right);
+    };
+    for (int index : maximalInvariantRoots)
+        countInvariantNodes(index);
+
+    std::unordered_map<std::string, uint8_t> invariantIndices;
+    bool okay = true;
+    std::function<uint8_t(int)> internInvariant;
+    std::function<void(
+        int, std::vector<ExpressionProgram::Instruction>&)> emitInvariant;
+    emitInvariant = [&](int index,
+                        std::vector<ExpressionProgram::Instruction>& code) {
+        if (!okay) return;
+        const Node& node = nodes[(size_t)index];
+        auto emitChild = [&](int child) {
+            if (child < 0 || !okay) return;
+            const Node& childNode = nodes[(size_t)child];
+            auto occurrence = invariantOccurrences.find(childNode.key);
+            if (isInvariant(childNode) &&
+                occurrence != invariantOccurrences.end() &&
+                occurrence->second > 1) {
+                uint8_t childIndex = internInvariant(child);
+                code.push_back({
+                    ExpressionProgram::Op::OrbitInvariant,
+                    childIndex, {}
+                });
+            } else {
+                emitInvariant(child, code);
+            }
+        };
+        emitChild(node.left);
+        emitChild(node.right);
+        if (okay) code.push_back(node.instruction);
+    };
+    internInvariant = [&](int index) -> uint8_t {
+        const Node& node = nodes[(size_t)index];
+        auto found = invariantIndices.find(node.key);
+        if (found != invariantIndices.end()) return found->second;
+        if (candidate._invariantPrograms.size() >= MAX_INVARIANTS) {
+            okay = false;
+            return 0;
+        }
+        ExpressionProgram invariantProgram;
+        invariantProgram._source = program._source;
+        emitInvariant(index, invariantProgram._code);
+        if (!okay || !invariantProgram.analyze(error)) {
+            okay = false;
+            return 0;
+        }
+        uint8_t invariantIndex = static_cast<uint8_t>(
+            candidate._invariantPrograms.size());
+        invariantIndices.emplace(node.key, invariantIndex);
+        candidate._invariantDependencies.push_back(node.dependencies);
+        candidate._invariantOperationCount +=
+            std::count_if(
+                invariantProgram._code.begin(),
+                invariantProgram._code.end(),
+                [](const ExpressionProgram::Instruction& item) {
+                    return ExpressionProgram::operandCount(item.op) > 0;
+                });
+        candidate._invariantPrograms.push_back(
+            std::move(invariantProgram));
+        return invariantIndex;
+    };
+    std::function<void(int)> emitBody;
+    emitBody = [&](int index) {
+        if (!okay) return;
+        const Node& node = nodes[(size_t)index];
+        if (isInvariant(node)) {
+            uint8_t invariantIndex = internInvariant(index);
+            candidate._body._code.push_back({
+                ExpressionProgram::Op::OrbitInvariant,
+                invariantIndex, {}
+            });
+            return;
+        }
+        if (node.left >= 0) emitBody(node.left);
+        if (node.right >= 0) emitBody(node.right);
+        candidate._body._code.push_back(node.instruction);
+    };
+    emitBody(root);
+    if (!okay) {
+        if (!error || error->message.empty())
+            return fail("expression has too many orbit invariants");
+        return false;
+    }
+    if (!candidate._body.analyze(error)) return false;
+    candidate._bodyOperationCount = std::count_if(
+        candidate._body._code.begin(), candidate._body._code.end(),
+        [](const ExpressionProgram::Instruction& instruction) {
+            return ExpressionProgram::operandCount(instruction.op) > 0;
+        });
+    candidate._valid = true;
+    *this = std::move(candidate);
+    return true;
+}
+
+void ExpressionOrbitPlan::reset() {
+    *this = ExpressionOrbitPlan{};
+}
+
+bool ExpressionOrbitPlan::matches(
+        const ExpressionProgram& program) const {
+    if (!_valid || !program.valid() ||
+        _source != program._source ||
+        _originalCode.size() != program._code.size())
+        return false;
+    for (size_t i = 0; i < _originalCode.size(); ++i) {
+        const ExpressionProgram::Instruction& left = _originalCode[i];
+        const ExpressionProgram::Instruction& right = program._code[i];
+        if (left.op != right.op || left.argument != right.argument)
+            return false;
+        uint64_t leftReal = 0, leftImaginary = 0;
+        uint64_t rightReal = 0, rightImaginary = 0;
+        double value = left.value.real();
+        std::memcpy(&leftReal, &value, sizeof(leftReal));
+        value = left.value.imag();
+        std::memcpy(&leftImaginary, &value, sizeof(leftImaginary));
+        value = right.value.real();
+        std::memcpy(&rightReal, &value, sizeof(rightReal));
+        value = right.value.imag();
+        std::memcpy(&rightImaginary, &value, sizeof(rightImaginary));
+        if (leftReal != rightReal || leftImaginary != rightImaginary)
+            return false;
+    }
+    return true;
+}
+
+bool ExpressionOrbitPlan::prepare(
+        const ExpressionContext& context, Prepared& prepared) const {
+    if (!_valid) return false;
+    std::array<Complex, ExpressionProgram::MAX_STACK> stack;
+    for (size_t i = 0; i < _invariantPrograms.size(); ++i) {
+        prepared.values[i] = _invariantPrograms[i].evaluatePrepared(
+            context, prepared.values.data(), i,
+            stack.data(), stack.size());
+    }
+    return true;
+}
+
+bool ExpressionOrbitPlan::prepare4(
+        const ExpressionContext* contexts, uint8_t activeMask,
+        Prepared* prepared) const {
+    if (!_valid || !contexts || !prepared) return false;
+    activeMask &= 0x0f;
+    if (activeMask == 0) return true;
+    if (activeMask != 0x0f) {
+        for (int lane = 0; lane < 4; ++lane) {
+            if ((activeMask & (1u << lane)) &&
+                !prepare(contexts[lane], prepared[lane]))
+                return false;
+        }
+        return true;
+    }
+    for (size_t index = 0;
+         index < _invariantPrograms.size(); ++index) {
+        Complex values[4];
+        const ExpressionProgram& invariant =
+            _invariantPrograms[index];
+        const Complex* invariants[4] = {
+            prepared[0].values.data(), prepared[1].values.data(),
+            prepared[2].values.data(), prepared[3].values.data()
+        };
+        bool evaluated = _programAvx2Compatible
+            ? invariant.evaluate4Prepared(
+                contexts, invariants, index, values)
+            : invariant.evaluate4HybridPrepared(
+                contexts, invariants, index, values);
+        if (!evaluated) return false;
+        for (int lane = 0; lane < 4; ++lane)
+            prepared[lane].values[index] = values[lane];
+    }
+    return true;
+}
+
+Complex ExpressionOrbitPlan::evaluate(
+        const ExpressionContext& context,
+        const Prepared& prepared) const {
+    std::array<Complex, ExpressionProgram::MAX_STACK> stack;
+    return evaluate(
+        context, prepared, stack.data(), stack.size());
+}
+
+Complex ExpressionOrbitPlan::evaluate(
+        const ExpressionContext& context, const Prepared& prepared,
+        Complex* stack, size_t capacity) const {
+    if (!_valid) {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        return { nan, nan };
+    }
+    return _body.evaluatePrepared(
+        context, prepared.values.data(), _invariantPrograms.size(),
+        stack, capacity);
+}
+
+bool ExpressionOrbitPlan::evaluate4(
+        const ExpressionContext* contexts, const Prepared* prepared,
+        Complex* outputs) const {
+    if (!_valid || !prepared) return false;
+    const Complex* invariants[4] = {
+        prepared[0].values.data(), prepared[1].values.data(),
+        prepared[2].values.data(), prepared[3].values.data()
+    };
+    return _body.evaluate4Prepared(
+        contexts, invariants, _invariantPrograms.size(), outputs);
+}
+
+bool ExpressionOrbitPlan::evaluate4Hybrid(
+        const ExpressionContext* contexts, const Prepared* prepared,
+        Complex* outputs) const {
+    if (!_valid || !prepared) return false;
+    const Complex* invariants[4] = {
+        prepared[0].values.data(), prepared[1].values.data(),
+        prepared[2].values.data(), prepared[3].values.data()
+    };
+    return _body.evaluate4HybridPrepared(
+        contexts, invariants, _invariantPrograms.size(), outputs);
+}
+
 Complex ExpressionProgram::evaluate(const ExpressionContext& context) const {
     std::array<Complex, MAX_STACK> stack;
     return evaluate(context, stack.data(), stack.size());
@@ -669,6 +1030,12 @@ Complex ExpressionProgram::evaluate(const ExpressionContext& context) const {
 
 Complex ExpressionProgram::evaluate(const ExpressionContext& context,
                                     Complex* stack, size_t capacity) const {
+    return evaluatePrepared(context, nullptr, 0, stack, capacity);
+}
+
+Complex ExpressionProgram::evaluatePrepared(
+        const ExpressionContext& context, const Complex* invariants,
+        size_t invariantCount, Complex* stack, size_t capacity) const {
     if (!_valid) return {
         std::numeric_limits<double>::quiet_NaN(),
         std::numeric_limits<double>::quiet_NaN()
@@ -692,6 +1059,14 @@ Complex ExpressionProgram::evaluate(const ExpressionContext& context,
         case Op::Z0: stack[top++] = context.z0; break;
         case Op::Iteration: stack[top++] = Complex{ (double)context.iteration, 0.0 }; break;
         case Op::Parameter: stack[top++] = context.parameters[instruction.argument]; break;
+        case Op::OrbitInvariant:
+            if (!invariants || instruction.argument >= invariantCount)
+                return {
+                    std::numeric_limits<double>::quiet_NaN(),
+                    std::numeric_limits<double>::quiet_NaN()
+                };
+            stack[top++] = invariants[instruction.argument];
+            break;
         case Op::Negate:
         case Op::Square:
         case Op::Sin:
@@ -732,6 +1107,13 @@ Complex ExpressionProgram::evaluate(const ExpressionContext& context,
 
 bool ExpressionProgram::evaluate4(const ExpressionContext* contexts,
                                   Complex* outputs) const {
+    return evaluate4Prepared(contexts, nullptr, 0, outputs);
+}
+
+bool ExpressionProgram::evaluate4Prepared(
+        const ExpressionContext* contexts,
+        const Complex* const* invariants, size_t invariantCount,
+        Complex* outputs) const {
     if (!_valid || !_avx2Compatible || !contexts || !outputs) return false;
     struct VecComplex { __m256d re, im; };
     std::array<VecComplex, MAX_STACK> stack;
@@ -782,6 +1164,22 @@ bool ExpressionProgram::evaluate4(const ExpressionContext* contexts,
                               contexts[2].parameters[p].imag(),
                               contexts[1].parameters[p].imag(),
                               contexts[0].parameters[p].imag())
+            };
+            break;
+        }
+        case Op::OrbitInvariant: {
+            if (!invariants || instruction.argument >= invariantCount)
+                return false;
+            const size_t index = instruction.argument;
+            stack[top++] = {
+                _mm256_set_pd(invariants[3][index].real(),
+                              invariants[2][index].real(),
+                              invariants[1][index].real(),
+                              invariants[0][index].real()),
+                _mm256_set_pd(invariants[3][index].imag(),
+                              invariants[2][index].imag(),
+                              invariants[1][index].imag(),
+                              invariants[0][index].imag())
             };
             break;
         }
@@ -846,6 +1244,13 @@ bool ExpressionProgram::evaluate4(const ExpressionContext* contexts,
 
 bool ExpressionProgram::evaluate4Hybrid(const ExpressionContext* contexts,
                                         Complex* outputs) const {
+    return evaluate4HybridPrepared(contexts, nullptr, 0, outputs);
+}
+
+bool ExpressionProgram::evaluate4HybridPrepared(
+        const ExpressionContext* contexts,
+        const Complex* const* invariants, size_t invariantCount,
+        Complex* outputs) const {
     if (!_valid || !_batchCompatible || !contexts || !outputs) return false;
     struct VecComplex { __m256d re, im; };
     std::array<VecComplex, MAX_STACK> stack;
@@ -926,6 +1331,22 @@ bool ExpressionProgram::evaluate4Hybrid(const ExpressionContext* contexts,
                               contexts[2].parameters[p].imag(),
                               contexts[1].parameters[p].imag(),
                               contexts[0].parameters[p].imag())
+            };
+            break;
+        }
+        case Op::OrbitInvariant: {
+            if (!invariants || instruction.argument >= invariantCount)
+                return false;
+            const size_t index = instruction.argument;
+            stack[top++] = {
+                _mm256_set_pd(invariants[3][index].real(),
+                              invariants[2][index].real(),
+                              invariants[1][index].real(),
+                              invariants[0][index].real()),
+                _mm256_set_pd(invariants[3][index].imag(),
+                              invariants[2][index].imag(),
+                              invariants[1][index].imag(),
+                              invariants[0][index].imag())
             };
             break;
         }

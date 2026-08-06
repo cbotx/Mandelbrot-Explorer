@@ -148,6 +148,8 @@ void MandelNavigator::StartCompute() {
             request.mode = ComputeMode::Expression;
             request.expression = &this->_expressionRuntimeProgram;
             request.expressionFixed = &this->_expressionFixed;
+            request.expressionPlan = this->_expressionOrbitPlan.profitable()
+                ? &this->_expressionOrbitPlan : nullptr;
 #if defined(MANDEL_ENABLE_ASMJIT)
             request.expressionJit = this->_expressionUseJit
                 ? &this->_expressionJit : nullptr;
@@ -665,11 +667,16 @@ bool MandelNavigator::SetExpressionFormula(
     formula::ExpressionProgram runtime;
     if (!compiled.specialize(fixed, pixel, runtime, error))
         return false;
+    formula::ExpressionOrbitPlan orbitPlan;
+    if (!orbitPlan.build(runtime, error))
+        return false;
 #if defined(MANDEL_ENABLE_ASMJIT)
     formula::ExpressionJit4 runtimeJit;
     bool useRuntimeJit =
         runtime.fastPath() == formula::ExpressionProgram::FastPath::None &&
-        runtimeJit.compile(runtime);
+        (orbitPlan.profitable()
+            ? runtimeJit.compile(orbitPlan)
+            : runtimeJit.compile(runtime));
 #endif
 
     InterruptCompute();
@@ -678,6 +685,7 @@ bool MandelNavigator::SetExpressionFormula(
     bool planeChanged = IsExpression() && _expressionPixel != pixel;
     _expressionProgram = std::move(compiled);
     _expressionRuntimeProgram = std::move(runtime);
+    _expressionOrbitPlan = std::move(orbitPlan);
 #if defined(MANDEL_ENABLE_ASMJIT)
     _expressionUseJit = useRuntimeJit;
     _expressionJit = std::move(runtimeJit);
@@ -728,15 +736,25 @@ std::string MandelNavigator::GetExpressionAccelerationText() const {
 #if defined(MANDEL_ENABLE_ASMJIT)
     if (_expressionUseJit)
         return "W^X JIT";
-    return _expressionRuntimeProgram.avx2Compatible()
+    const bool avx2 = _expressionOrbitPlan.profitable()
+        ? _expressionOrbitPlan.avx2Compatible()
+        : _expressionRuntimeProgram.avx2Compatible();
+    const bool batch = _expressionOrbitPlan.profitable()
+        ? _expressionOrbitPlan.batchCompatible()
+        : _expressionRuntimeProgram.batchCompatible();
+    return avx2
         ? "AVX2"
-        : (_expressionRuntimeProgram.batchCompatible()
-            ? "hybrid AVX2" : "scalar");
+        : (batch ? "hybrid AVX2" : "scalar");
 #else
-    return _expressionRuntimeProgram.avx2Compatible()
+    const bool avx2 = _expressionOrbitPlan.profitable()
+        ? _expressionOrbitPlan.avx2Compatible()
+        : _expressionRuntimeProgram.avx2Compatible();
+    const bool batch = _expressionOrbitPlan.profitable()
+        ? _expressionOrbitPlan.batchCompatible()
+        : _expressionRuntimeProgram.batchCompatible();
+    return avx2
         ? "AVX2"
-        : (_expressionRuntimeProgram.batchCompatible()
-            ? "hybrid AVX2" : "scalar");
+        : (batch ? "hybrid AVX2" : "scalar");
 #endif
 }
 

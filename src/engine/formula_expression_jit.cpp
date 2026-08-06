@@ -8,12 +8,14 @@
 
 namespace formula {
 
-using JitFunction = void (*)(const double*, double*);
+using JitFunction = void (*)(const double*, const double*, double*);
 
 struct ExpressionJit4::Impl {
     asmjit::JitAllocator::CreateParams params;
     asmjit::JitRuntime runtime;
     JitFunction function = nullptr;
+    std::string planKey;
+    size_t invariantCount = 0;
 
     Impl()
         : params(makeParams()),
@@ -33,19 +35,38 @@ struct ExpressionJit4::Impl {
 };
 
 void ExpressionJitInput4::setContexts(const ExpressionContext* contexts) {
-    for (int lane = 0; lane < 4; ++lane) {
-        vectors[Z_RE][lane] = contexts[lane].z.real();
-        vectors[Z_IM][lane] = contexts[lane].z.imag();
-        vectors[C_RE][lane] = contexts[lane].c.real();
-        vectors[C_IM][lane] = contexts[lane].c.imag();
-        vectors[Z0_RE][lane] = contexts[lane].z0.real();
-        vectors[Z0_IM][lane] = contexts[lane].z0.imag();
-        vectors[N_RE][lane] = (double)contexts[lane].iteration;
-        vectors[N_IM][lane] = 0.0;
-        for (int p = 0; p < 8; ++p) {
-            vectors[PARAM_RE + 2 * p][lane] = contexts[lane].parameters[p].real();
-            vectors[PARAM_RE + 2 * p + 1][lane] = contexts[lane].parameters[p].imag();
-        }
+    for (int lane = 0; lane < 4; ++lane)
+        setContextLane(lane, contexts[lane]);
+}
+
+void ExpressionJitInput4::setContextLane(
+        int lane, const ExpressionContext& context) {
+    if (lane < 0 || lane >= 4) return;
+    vectors[Z_RE][lane] = context.z.real();
+    vectors[Z_IM][lane] = context.z.imag();
+    vectors[C_RE][lane] = context.c.real();
+    vectors[C_IM][lane] = context.c.imag();
+    vectors[Z0_RE][lane] = context.z0.real();
+    vectors[Z0_IM][lane] = context.z0.imag();
+    vectors[N_RE][lane] = (double)context.iteration;
+    vectors[N_IM][lane] = 0.0;
+    for (int p = 0; p < 8; ++p) {
+        vectors[PARAM_RE + 2 * p][lane] =
+            context.parameters[p].real();
+        vectors[PARAM_RE + 2 * p + 1][lane] =
+            context.parameters[p].imag();
+    }
+}
+
+void ExpressionJitInvariantInput4::setPreparedLane(
+        int lane, const ExpressionOrbitPlan& plan,
+        const ExpressionOrbitPlan::Prepared& prepared) {
+    if (lane < 0 || lane >= 4) return;
+    for (size_t index = 0; index < plan.invariantCount(); ++index) {
+        vectors[2 * index][lane] =
+            prepared.values[index].real();
+        vectors[2 * index + 1][lane] =
+            prepared.values[index].imag();
     }
 }
 
@@ -58,6 +79,12 @@ bool ExpressionJit4::valid() const {
     return _impl && _impl->function;
 }
 
+bool ExpressionJit4::supports(const ExpressionOrbitPlan& plan) const {
+    return valid() && plan.valid() &&
+           _impl->invariantCount == plan.invariantCount() &&
+           _impl->planKey == plan._programKey;
+}
+
 bool ExpressionJit4::usesDualMapping() const {
     return _impl && _impl->runtime.allocator()->hasOption(
         asmjit::JitAllocatorOptions::kUseDualMapping);
@@ -68,12 +95,31 @@ const void* ExpressionJit4::codeAddress() const {
 }
 
 bool ExpressionJit4::compile(const ExpressionProgram& program, std::string* error) {
+    return compileProgram(program, 0, nullptr, error);
+}
+
+bool ExpressionJit4::compile(
+        const ExpressionOrbitPlan& plan, std::string* error) {
+    if (!plan.valid() || !plan.profitable()) {
+        reset();
+        if (error) *error = "orbit plan is not profitable";
+        return false;
+    }
+    return compileProgram(
+        plan._body, plan.invariantCount(), &plan._programKey, error);
+}
+
+bool ExpressionJit4::compileProgram(
+        const ExpressionProgram& program, size_t invariantCount,
+        const std::string* planKey, std::string* error) {
     if (error) error->clear();
     if (!_impl) _impl = std::make_unique<Impl>();
     if (_impl->function) {
         _impl->runtime.release(_impl->function);
         _impl->function = nullptr;
     }
+    _impl->planKey.clear();
+    _impl->invariantCount = 0;
     if (!program.valid() || !program.avx2Compatible()) {
         if (error) *error = "program is not AVX2-JIT compatible";
         return false;
@@ -107,6 +153,10 @@ bool ExpressionJit4::compile(const ExpressionProgram& program, std::string* erro
     };
     auto loadInput = [&](size_t vectorIndex, const Ymm& destination) {
         a.vmovupd(destination, ptr(rcx, (int32_t)(vectorIndex * 32)));
+    };
+    auto loadInvariant = [&](size_t vectorIndex,
+                             const Ymm& destination) {
+        a.vmovupd(destination, ptr(rdx, (int32_t)(vectorIndex * 32)));
     };
     auto broadcast = [&](double value, const Ymm& destination) {
         uint64_t bits;
@@ -149,6 +199,17 @@ bool ExpressionJit4::compile(const ExpressionProgram& program, std::string* erro
             size_t index = ExpressionJitInput4::PARAM_RE + 2 * instruction.argument;
             loadInput(index, yr0);
             loadInput(index + 1, yi0);
+            store(top++, yr0, yi0);
+            break;
+        }
+        case ExpressionProgram::Op::OrbitInvariant: {
+            if (instruction.argument >= invariantCount) {
+                if (error) *error = "invalid orbit invariant input";
+                return false;
+            }
+            size_t index = 2 * instruction.argument;
+            loadInvariant(index, yr0);
+            loadInvariant(index + 1, yi0);
             store(top++, yr0, yi0);
             break;
         }
@@ -224,8 +285,8 @@ bool ExpressionJit4::compile(const ExpressionProgram& program, std::string* erro
     }
 
     load(0, yr0, yi0);
-    a.vmovupd(ptr(rdx, 0), yr0);
-    a.vmovupd(ptr(rdx, 32), yi0);
+    a.vmovupd(ptr(r8, 0), yr0);
+    a.vmovupd(ptr(r8, 32), yi0);
     a.vzeroupper();
     a.add(rsp, frameSize);
     a.ret();
@@ -235,6 +296,8 @@ bool ExpressionJit4::compile(const ExpressionProgram& program, std::string* erro
         _impl->function = nullptr;
         return false;
     }
+    _impl->invariantCount = invariantCount;
+    if (planKey) _impl->planKey = *planKey;
     return true;
 }
 
@@ -243,17 +306,34 @@ void ExpressionJit4::reset() {
         _impl->runtime.release(_impl->function);
         _impl->function = nullptr;
     }
+    if (_impl) {
+        _impl->planKey.clear();
+        _impl->invariantCount = 0;
+    }
 }
 
 void ExpressionJit4::evaluate(const ExpressionJitInput4& input,
                               ExpressionJitOutput4& output) const {
-    if (_impl && _impl->function)
-        _impl->function(&input.vectors[0][0], &output.re[0]);
+    evaluate(input, nullptr, output);
+}
+
+void ExpressionJit4::evaluate(
+        const ExpressionJitInput4& input,
+        const ExpressionJitInvariantInput4* invariants,
+        ExpressionJitOutput4& output) const {
+    if (!_impl || !_impl->function ||
+        (!_impl->planKey.empty() && !invariants))
+        return;
+    _impl->function(
+        &input.vectors[0][0],
+        invariants ? &invariants->vectors[0][0] : nullptr,
+        &output.re[0]);
 }
 
 bool ExpressionJit4::evaluate(const ExpressionContext* contexts,
                               Complex* outputs) const {
-    if (!valid() || !contexts || !outputs) return false;
+    if (!valid() || !_impl->planKey.empty() || !contexts || !outputs)
+        return false;
     ExpressionJitInput4 input;
     ExpressionJitOutput4 output;
     input.setContexts(contexts);
@@ -266,16 +346,24 @@ bool ExpressionJit4::evaluate(const ExpressionContext* contexts,
 bool ExpressionJit4::evaluateOrbit(
         const ExpressionContext* contexts, int lanes,
         int mxit, double bailout, float* results,
-        const volatile bool* halt) const {
+        const volatile bool* halt,
+        const ExpressionOrbitPlan* plan) const {
     if (!valid() || !contexts || !results ||
         lanes < 1 || lanes > 4 || mxit < 1 ||
         !(bailout > 0.0) || !std::isfinite(bailout))
         return false;
+    if ((!_impl->planKey.empty() &&
+         (!plan || !supports(*plan))) ||
+        (_impl->planKey.empty() && plan))
+        return false;
 
     ExpressionJitInput4 input;
     ExpressionJitOutput4 output;
+    std::unique_ptr<ExpressionJitInvariantInput4> invariantInput;
+    std::unique_ptr<ExpressionOrbitPlan::Prepared[]> prepared;
     input.setContexts(contexts);
     bool active[4] = { false, false, false, false };
+    uint8_t activeMask = 0;
     int activeCount = 0;
     for (int lane = 0; lane < 4; ++lane) {
         results[lane] = -2.0f;
@@ -287,8 +375,21 @@ bool ExpressionJit4::evaluateOrbit(
             results[lane] = 0.0f;
         } else {
             active[lane] = true;
+            activeMask |= static_cast<uint8_t>(1u << lane);
             ++activeCount;
         }
+    }
+    if (plan) {
+        invariantInput =
+            std::make_unique<ExpressionJitInvariantInput4>();
+        prepared =
+            std::make_unique<ExpressionOrbitPlan::Prepared[]>(4);
+        if (!plan->prepare4(
+                contexts, activeMask, prepared.get()))
+            return false;
+        for (int lane = 0; lane < 4; ++lane)
+            invariantInput->setPreparedLane(
+                lane, *plan, prepared[(size_t)lane]);
     }
 
     for (int iteration = 0;
@@ -298,7 +399,7 @@ bool ExpressionJit4::evaluateOrbit(
         for (int lane = 0; lane < 4; ++lane)
             input.vectors[ExpressionJitInput4::N_RE][lane] =
                 (double)iteration;
-        evaluate(input, output);
+        evaluate(input, invariantInput.get(), output);
         for (int lane = 0; lane < lanes; ++lane) {
             if (!active[lane]) continue;
             double re = output.re[lane];

@@ -37,6 +37,7 @@ struct ComputeRequest {
 
     const formula::ExpressionProgram* expression = nullptr;
     const formula::ExpressionContext* expressionFixed = nullptr;
+    const formula::ExpressionOrbitPlan* expressionPlan = nullptr;
     const formula::ExpressionJit4* expressionJit = nullptr;
     FormulaParameter expressionPixel = FormulaParameter::C;
     formula::ExpressionColoring expressionColoring =

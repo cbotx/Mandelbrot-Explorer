@@ -23,6 +23,7 @@ private:
     std::unique_ptr<IComputeBackend> _backend;
     formula::ExpressionProgram _expressionProgram;
     formula::ExpressionProgram _expressionRuntimeProgram;
+    formula::ExpressionOrbitPlan _expressionOrbitPlan;
 #if defined(MANDEL_ENABLE_ASMJIT)
     formula::ExpressionJit4 _expressionJit;
     bool _expressionUseJit = false;
