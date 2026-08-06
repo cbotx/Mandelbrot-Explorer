@@ -168,17 +168,14 @@ static std::wstring widen(const std::string& s) {
     return w;
 }
 
-// Cap the x:/y: lines of the location text to at most 2 mono lines each (cpl
-// chars/line), truncating with "..." so the zoom line is always visible.
+// Keep x/y on one line each so mode, coordinates and zoom always fit the card.
 static std::wstring truncLocation(const std::string& raw, int cpl) {
     if (cpl < 8) cpl = 8;
     std::wstring out; std::string acc;
     auto flush = [&](bool last) {
         std::string L = acc; acc.clear();
         if ((L.rfind("x:", 0) == 0 || L.rfind("y:", 0) == 0) && (int)L.size() > cpl) {
-            std::string l1 = L.substr(0, cpl), rest = L.substr(cpl);
-            if ((int)rest.size() > cpl) rest = rest.substr(0, std::max(0, cpl - 3)) + "...";
-            L = l1 + "\n" + rest;
+            L = L.substr(0, std::max(0, cpl - 3)) + "...";
         }
         for (char c : L) out.push_back(c == '\n' ? L'\n' : (wchar_t)(unsigned char)c);
         if (!last) out.push_back(L'\n');
@@ -1560,7 +1557,7 @@ public:
 
         drawGalleryDD(dc);
 
-        // location card -- cap x/y to 2 lines each so the zoom line always shows
+        // location card -- keep mode, x, y and zoom on four stable lines
         fillRound(dc, rcLocation, CLR_CARD, CLR_BORDER, S(8));
         RECT lt = rcLocation; lt.left += S(10); lt.top += S(6); lt.right -= S(10); lt.bottom -= S(6);
         {
