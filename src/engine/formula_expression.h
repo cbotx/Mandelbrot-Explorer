@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "formula_spec.h"
+
 namespace formula {
 
 using Complex = std::complex<double>;
@@ -53,6 +55,10 @@ public:
     };
 
     bool compile(const std::string& source, ExpressionError* error = nullptr);
+    bool specialize(const ExpressionContext& fixed,
+                    FormulaParameter pixelParameter,
+                    ExpressionProgram& output,
+                    ExpressionError* error = nullptr) const;
     Complex evaluate(const ExpressionContext& context) const;
     Complex evaluate(const ExpressionContext& context, Complex* stack,
                      size_t capacity) const;
@@ -91,6 +97,8 @@ private:
         Complex value{};
     };
 
+    static constexpr uint8_t CONSTANT_FIXED_C = 1;
+
     std::vector<Instruction> _code;
     std::string _source;
     size_t _stackDepth = 0;
@@ -100,6 +108,11 @@ private:
     bool _batchCompatible = false;
     bool _derivativeCompatible = false;
     bool _valid = false;
+
+    bool analyze(ExpressionError* error);
+    static int operandCount(Op op);
+    static Complex evaluateUnary(Op op, Complex value);
+    static Complex evaluateBinary(Op op, Complex left, Complex right);
 
     friend class ExpressionParser;
     friend class ExpressionOracle;

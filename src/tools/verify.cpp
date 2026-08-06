@@ -648,6 +648,318 @@ static int runExpressionCoreCase() {
         if (!std::isnan(result.real()) || !std::isnan(result.imag())) ++failures;
     }
 
+    int specializationFailures = 0;
+    int specializationParityMismatches = 0;
+    int specializationFoldCases = 0;
+    ExpressionContext specializationFixed;
+    specializationFixed.z0 = { -0.45, 0.125 };
+    specializationFixed.c = { -0.8, 0.156 };
+    for (int p = 0; p < 8; ++p)
+        specializationFixed.parameters[p] = {
+            0.25 + 0.125 * p, -0.5 + 0.0625 * p
+        };
+
+    for (int p = 0; p < 8; ++p) {
+        std::string source = "p" + std::to_string(p);
+        ExpressionProgram parameter;
+        ExpressionProgram cPlane;
+        ExpressionProgram z0Plane;
+        if (!compile(parameter, source.c_str()) ||
+            !parameter.specialize(
+                specializationFixed, FormulaParameter::C, cPlane) ||
+            !parameter.specialize(
+                specializationFixed, FormulaParameter::InitialZ, z0Plane)) {
+            ++specializationFailures;
+            continue;
+        }
+        ExpressionContext changed = specializationFixed;
+        changed.parameters[p] = { 99.0 + p, -77.0 - p };
+        if (!sameComplexBits(
+                cPlane.evaluate(changed),
+                specializationFixed.parameters[p]) ||
+            !sameComplexBits(
+                z0Plane.evaluate(changed),
+                specializationFixed.parameters[p]) ||
+            cPlane.source() != source || z0Plane.source() != source)
+            ++specializationFailures;
+    }
+
+    auto checkDynamicVariable = [&](const char* source,
+                                    FormulaParameter pixel,
+                                    Complex expected,
+                                    ExpressionContext runtime) {
+        ExpressionProgram original;
+        ExpressionProgram specializedProgram;
+        if (!compile(original, source) ||
+            !original.specialize(
+                specializationFixed, pixel, specializedProgram)) {
+            ++specializationFailures;
+            return;
+        }
+        if (!sameComplexBits(
+                specializedProgram.evaluate(runtime), expected) ||
+            specializedProgram.source() != source)
+            ++specializationFailures;
+    };
+    ExpressionContext changed = specializationFixed;
+    changed.c = { 4.0, -3.0 };
+    changed.z0 = { 2.0, 5.0 };
+    changed.z = { -6.0, 7.0 };
+    changed.iteration = -11;
+    checkDynamicVariable(
+        "c", FormulaParameter::C, changed.c, changed);
+    checkDynamicVariable(
+        "c", FormulaParameter::InitialZ,
+        specializationFixed.c, changed);
+    checkDynamicVariable(
+        "z0", FormulaParameter::C,
+        specializationFixed.z0, changed);
+    checkDynamicVariable(
+        "z0", FormulaParameter::InitialZ, changed.z0, changed);
+    checkDynamicVariable(
+        "z", FormulaParameter::C, changed.z, changed);
+    checkDynamicVariable(
+        "z", FormulaParameter::InitialZ, changed.z, changed);
+    checkDynamicVariable(
+        "n", FormulaParameter::C,
+        { (double)changed.iteration, 0.0 }, changed);
+    checkDynamicVariable(
+        "n", FormulaParameter::InitialZ,
+        { (double)changed.iteration, 0.0 }, changed);
+
+    const char* foldSources[] = {
+        "-p0", "p0+p1", "p0-p1", "p0*p1", "p0/p1",
+        "pow(p0,p1)", "sqr(p0)", "sin(p0)", "cos(p0)", "tan(p0)",
+        "sinh(p0)", "cosh(p0)", "tanh(p0)", "exp(p0)", "log(p0)",
+        "log10(p0)", "sqrt(p0)", "abs(p0)", "norm(p0)", "arg(p0)",
+        "conj(p0)", "real(p0)", "imag(p0)",
+        "complex(real(p0),imag(p1))",
+        "polar(abs(p0),arg(p1))",
+        "polar(-abs(p0),real(p1))",
+        "sin(0.5)+exp(1)"
+    };
+    for (const char* source : foldSources) {
+        ExpressionProgram original;
+        ExpressionProgram specializedProgram;
+        if (!compile(original, source) ||
+            !original.specialize(
+                specializationFixed, FormulaParameter::C,
+                specializedProgram)) {
+            ++specializationFailures;
+            continue;
+        }
+        ExpressionContext runtime = specializationFixed;
+        runtime.parameters.fill({ 91.0, -37.0 });
+        Complex expected = original.evaluate(specializationFixed);
+        Complex actual = specializedProgram.evaluate(runtime);
+        if (specializedProgram.instructionCount() != 1 ||
+            specializedProgram.stackDepth() != 1 ||
+            specializedProgram.source() != source ||
+            !sameComplexBits(actual, expected))
+            ++specializationFailures;
+        ++specializationFoldCases;
+    }
+
+    ExpressionProgram analyzedOriginal;
+    ExpressionProgram analyzedRuntime;
+    if (!compile(
+            analyzedOriginal,
+            "z*(sin(p0)+exp(p1))+abs(p2)") ||
+        !analyzedOriginal.specialize(
+            specializationFixed, FormulaParameter::C,
+            analyzedRuntime) ||
+        analyzedRuntime.stackDepth() >= analyzedOriginal.stackDepth() ||
+        analyzedRuntime.instructionCount() >=
+            analyzedOriginal.instructionCount() ||
+        analyzedOriginal.avx2Compatible() ||
+        analyzedOriginal.derivativeCompatible() ||
+        !analyzedRuntime.avx2Compatible() ||
+        !analyzedRuntime.batchCompatible() ||
+        !analyzedRuntime.derivativeCompatible())
+        ++specializationFailures;
+
+    ExpressionProgram quadraticCPlane;
+    ExpressionProgram quadraticZ0Plane;
+    ExpressionProgram literalRecurrence;
+    ExpressionProgram literalRuntime;
+    if (!quadratic.specialize(
+            specializationFixed, FormulaParameter::C,
+            quadraticCPlane) ||
+        !quadratic.specialize(
+            specializationFixed, FormulaParameter::InitialZ,
+            quadraticZ0Plane) ||
+        quadraticCPlane.fastIntegerPower() != 2 ||
+        quadraticZ0Plane.fastIntegerPower() != 2 ||
+        !compile(literalRecurrence, "z*z+1") ||
+        !literalRecurrence.specialize(
+            specializationFixed, FormulaParameter::InitialZ,
+            literalRuntime) ||
+        literalRuntime.fastPath() != ExpressionProgram::FastPath::None)
+        ++specializationFailures;
+
+    ExpressionProgram transactionTarget;
+    ExpressionProgram uncompiled;
+    ExpressionError specializationError;
+    if (!compile(transactionTarget, "z+c")) {
+        ++specializationFailures;
+    } else {
+        const std::string oldSource = transactionTarget.source();
+        const size_t oldInstructions = transactionTarget.instructionCount();
+        Complex oldValue = transactionTarget.evaluate(context);
+        if (uncompiled.specialize(
+                specializationFixed, FormulaParameter::C,
+                transactionTarget, &specializationError) ||
+            specializationError.message.empty() ||
+            transactionTarget.source() != oldSource ||
+            transactionTarget.instructionCount() != oldInstructions ||
+            !sameComplexBits(
+                transactionTarget.evaluate(context), oldValue))
+            ++specializationFailures;
+        specializationError = {};
+        if (quadratic.specialize(
+                specializationFixed, FormulaParameter::Power,
+                transactionTarget, &specializationError) ||
+            specializationError.message.empty() ||
+            transactionTarget.source() != oldSource ||
+            transactionTarget.instructionCount() != oldInstructions)
+            ++specializationFailures;
+    }
+
+    const char* paritySources[] = {
+        "z*z+c+sin(p0)+exp(p1)",
+        "z*z+c+complex(real(p0),imag(p1))*z",
+        "sin(p0)+cos(p1)+tan(p2)+z",
+        "sinh(p0)+cosh(p1)-tanh(p2)+z",
+        "exp(p0)+log(p1)+log10(p2)+sqrt(p3)+z",
+        "abs(p0)+norm(p1)+arg(p2)+conj(p3)+z",
+        "complex(real(p0),imag(p1))+z",
+        "polar(abs(p0),arg(p1))+z",
+        "p0/p1+pow(p2,p3)+z",
+        "sqr(p0-p1)+z",
+        "c+z0+z+n+p0",
+        "pow(p0,p1)+c-z0+z",
+        "log(p0)+sqrt(p1)+z",
+        "1/p0+z",
+        "polar(p0,p1)+z",
+        "-p0*z+c",
+        "conj(complex(real(p0),imag(p1)))*z+c",
+        "p0*p1+p2/p3+z+n"
+    };
+    const double infValue = std::numeric_limits<double>::infinity();
+    const double nanValue = std::numeric_limits<double>::quiet_NaN();
+    const Complex specializationEdges[] = {
+        { -1.0, 0.0 }, { -1.0, -0.0 },
+        { 0.0, 0.0 }, { -0.0, -0.0 },
+        { 1.0, 0.0 }, { 0.0, 1.0 },
+        { infValue, 0.0 }, { -infValue, -0.0 },
+        { nanValue, 0.0 }, { 0.0, nanValue },
+        { 1e308, -1e308 }, { 1e-308, -1e-308 }
+    };
+    uint64_t specializationRandom = 0x243f6a8885a308d3ull;
+    auto specializationRandomComponent = [&]() {
+        specializationRandom ^= specializationRandom >> 12;
+        specializationRandom ^= specializationRandom << 25;
+        specializationRandom ^= specializationRandom >> 27;
+        uint64_t bits =
+            specializationRandom * 2685821657736338717ull;
+        int32_t centered = (int32_t)(bits >> 32);
+        return 4.0 * (double)centered / 2147483648.0;
+    };
+    for (const char* source : paritySources) {
+        ExpressionProgram original;
+        if (!compile(original, source)) {
+            ++specializationFailures;
+            continue;
+        }
+        for (FormulaParameter pixel :
+             { FormulaParameter::C, FormulaParameter::InitialZ }) {
+            for (int fixedSample = 0; fixedSample < 20; ++fixedSample) {
+                ExpressionContext fixedSampleContext;
+                if (fixedSample < 12) {
+                    fixedSampleContext.c =
+                        specializationEdges[(fixedSample + 1) % 12];
+                    fixedSampleContext.z0 =
+                        specializationEdges[(fixedSample + 3) % 12];
+                    for (int p = 0; p < 8; ++p)
+                        fixedSampleContext.parameters[p] =
+                            specializationEdges[
+                                (fixedSample + p) % 12];
+                } else {
+                    fixedSampleContext.c = {
+                        specializationRandomComponent(),
+                        specializationRandomComponent()
+                    };
+                    fixedSampleContext.z0 = {
+                        specializationRandomComponent(),
+                        specializationRandomComponent()
+                    };
+                    for (Complex& parameter :
+                         fixedSampleContext.parameters) {
+                        parameter = {
+                            specializationRandomComponent(),
+                            specializationRandomComponent()
+                        };
+                    }
+                }
+                ExpressionProgram specializedProgram;
+                if (!original.specialize(
+                        fixedSampleContext, pixel,
+                        specializedProgram)) {
+                    ++specializationFailures;
+                    continue;
+                }
+                for (int dynamicSample = 0;
+                     dynamicSample < 8; ++dynamicSample) {
+                    ExpressionContext reference = fixedSampleContext;
+                    Complex pixelValue = dynamicSample < 4
+                        ? specializationEdges[
+                            (fixedSample + dynamicSample * 2) % 12]
+                        : Complex{
+                            specializationRandomComponent(),
+                            specializationRandomComponent()
+                        };
+                    if (pixel == FormulaParameter::C)
+                        reference.c = pixelValue;
+                    else
+                        reference.z0 = pixelValue;
+                    reference.z = dynamicSample < 4
+                        ? specializationEdges[
+                            (fixedSample + dynamicSample * 3 + 5) % 12]
+                        : Complex{
+                            specializationRandomComponent(),
+                            specializationRandomComponent()
+                        };
+                    reference.iteration =
+                        dynamicSample == 0 ? -1 :
+                        dynamicSample * 17 + fixedSample;
+                    ExpressionContext runtime = reference;
+                    for (int p = 0; p < 8; ++p)
+                        runtime.parameters[p] =
+                            specializationEdges[
+                                (fixedSample + dynamicSample + p + 7) % 12];
+                    if (pixel == FormulaParameter::C)
+                        runtime.z0 =
+                            specializationEdges[
+                                (fixedSample + dynamicSample + 9) % 12];
+                    else
+                        runtime.c =
+                            specializationEdges[
+                                (fixedSample + dynamicSample + 10) % 12];
+                    Complex expected = original.evaluate(reference);
+                    Complex actual =
+                        specializedProgram.evaluate(runtime);
+                    if (!sameComplexBits(expected, actual)) {
+                        if (specializationParityMismatches++ == 0)
+                            printf("  first specialization parity mismatch [%s] plane=%s fixed=%d dynamic=%d\n",
+                                   source,
+                                   pixel == FormulaParameter::C
+                                       ? "c" : "z0",
+                                   fixedSample, dynamicSample);
+                    }
+                }
+            }
+        }
+    }
     struct HybridOpcodeCase {
         const char* name;
         const char* source;
@@ -1008,6 +1320,70 @@ static int runExpressionCoreCase() {
         }
     }
 
+    int specializationFrameMismatch = 0;
+    auto checkSpecializedFrame = [&](const char* source,
+                                     FormulaParameter pixel,
+                                     const ExpressionContext& frameFixed,
+                                     double centerReal) {
+        ExpressionProgram original;
+        ExpressionProgram runtime;
+        if (!compile(original, source) ||
+            !original.specialize(frameFixed, pixel, runtime)) {
+            ++specializationFailures;
+            return;
+        }
+        formula::ExpressionJit4 runtimeJit;
+        const formula::ExpressionJit4* activeJit =
+            runtime.fastPath() == ExpressionProgram::FastPath::None &&
+            runtimeJit.compile(runtime)
+                ? &runtimeJit : nullptr;
+        mpf_set_d(centerRe, centerReal);
+        mpf_set_ui(centerIm, 0);
+        mpf_set_ui(renderScale, 1);
+        if (!expressionRenderer.ComputeExpression(
+                centerRe, centerIm, renderScale,
+                original, frameFixed, pixel, 240, 8.0)) {
+            ++specializationFailures;
+            return;
+        }
+        std::vector<float> originalFrame = rendered;
+        if (!expressionRenderer.ComputeExpression(
+                centerRe, centerIm, renderScale,
+                runtime, frameFixed, pixel, 240, 8.0,
+                formula::ExpressionColoring::Raw, activeJit)) {
+            ++specializationFailures;
+            return;
+        }
+        for (size_t i = 0; i < rendered.size(); ++i) {
+            if (std::memcmp(
+                    &originalFrame[i], &rendered[i],
+                    sizeof(float)) != 0)
+                ++specializationFrameMismatch;
+        }
+    };
+    ExpressionContext invariantFixed;
+    invariantFixed.z0 = { 0.0, 0.0 };
+    invariantFixed.c = { -0.8, 0.156 };
+    invariantFixed.parameters[0] = { 0.15, -0.2 };
+    invariantFixed.parameters[1] = { -0.35, 0.1 };
+    for (FormulaParameter pixel :
+         { FormulaParameter::C, FormulaParameter::InitialZ }) {
+        checkSpecializedFrame(
+            "z*z+c+sin(p0)+exp(p1)", pixel,
+            invariantFixed,
+            pixel == FormulaParameter::C ? -0.5 : 0.0);
+        checkSpecializedFrame(
+            "z*z+c+complex(real(p0),imag(p1))*z", pixel,
+            invariantFixed,
+            pixel == FormulaParameter::C ? -0.5 : 0.0);
+    }
+    checkSpecializedFrame(
+        "z*z+c", FormulaParameter::InitialZ,
+        invariantFixed, 0.0);
+    renderMismatch += specializationFrameMismatch;
+    failures += specializationFailures +
+                specializationParityMismatches;
+
     fixed.c = { -0.8, 0.156 };
     mpf_set_ui(centerRe, 0);
     if (!expressionRenderer.ComputeExpression(
@@ -1165,6 +1541,10 @@ static int runExpressionCoreCase() {
            parallelFailures.load(), classificationMismatch, renderMismatch);
     printf("  hybrid opcode programs=%d lane mismatches=%d\n",
            hybridProgramsTested, hybridMismatch);
+    printf("  specialization folds=%d failures=%d scalar-bit mismatches=%d frame-bit mismatches=%d\n",
+           specializationFoldCases, specializationFailures,
+           specializationParityMismatches,
+           specializationFrameMismatch);
     printf("  evaluator AVX2/JIT-wrapper/JIT-raw: %.3f / %.3f / %.3f ms  raw speedup %.2fx\n",
            avxMs, jitMs, jitRawMs, jitRawMs > 0.0 ? avxMs / jitRawMs : 0.0);
     printf("  JIT mismatches=%d\n", jitMismatch);
@@ -1560,6 +1940,8 @@ static int runGenericFormulaProfile() {
         formula::Complex p0;
         double bailout;
         int mxit;
+        formula::Complex p1{};
+        bool invariantHeavy = false;
     };
     const ProfileCase cases[] = {
         { "arithmetic", "z*z+c+p0*z", {}, { 0.1, -0.05 }, 4.0, 1200 },
@@ -1569,13 +1951,22 @@ static int runGenericFormulaProfile() {
           { 0.02, -0.01 }, 4.0, 800 },
         { "sine", "sin(z)+c", {}, {}, 8.0, 400 },
         { "branch-power", "exp(p0*log(z))+c",
-          { 0.3, 0.2 }, { 2.5, 0.0 }, 8.0, 300 }
+          { 0.3, 0.2 }, { 2.5, 0.0 }, 8.0, 300 },
+        { "invariant-fn", "z*z+c+sin(p0)+exp(p1)",
+          {}, { 0.15, -0.2 }, 8.0, 800, { -0.35, 0.1 }, true },
+        { "invariant-components",
+          "z*z+c+complex(real(p0),imag(p1))*z",
+          {}, { 0.15, -0.2 }, 4.0, 1000, { -0.35, 0.1 }, true }
     };
-    constexpr int W = 322, H = 216, SAMPLES = 7;
+    constexpr int W = 322, H = 216, SAMPLES = 7, PAIR_REPEATS = 5;
     int failures = 0;
     int exactHybridCases = 0;
     int hybridNoRegressionCases = 0;
     int refillNoRegressionCases = 0;
+    int representativeSpecializationExact = 0;
+    int representativeSpecializationNoRegression = 0;
+    int invariantSpecializationExact = 0;
+    int invariantSpecializationImproved = 0;
     printf("=== generic formula full-frame profile (%dx%d)\n", W, H);
 
     for (const ProfileCase& test : cases) {
@@ -1588,10 +1979,25 @@ static int runGenericFormulaProfile() {
         formula::ExpressionContext fixed;
         fixed.z0 = test.fixedZ0;
         fixed.parameters[0] = test.p0;
+        fixed.parameters[1] = test.p1;
+        formula::ExpressionProgram specializedProgram;
+        if (!program.specialize(
+                fixed, FormulaParameter::C,
+                specializedProgram, &error)) {
+            ++failures;
+            continue;
+        }
         formula::ExpressionJit4 jit;
         bool jitAvailable = jit.compile(program);
+        formula::ExpressionJit4 specializedJit;
+        bool specializedJitAvailable =
+            specializedProgram.fastPath() ==
+                formula::ExpressionProgram::FastPath::None &&
+            specializedJit.compile(specializedProgram);
 
-        auto render = [&](bool vector, const formula::ExpressionJit4* activeJit,
+        auto render = [&](const formula::ExpressionProgram& activeProgram,
+                          bool vector,
+                          const formula::ExpressionJit4* activeJit,
                           std::vector<float>& output, double& elapsed,
                           bool refill = true) {
             output.assign((size_t)W * H, EMPTYPIXEL);
@@ -1605,10 +2011,11 @@ static int runGenericFormulaProfile() {
                 "MANDEL_EXPR_HYBRID_REFILL", refill ? "1" : "0");
             auto begin = Clock::now();
             bool okay = renderer.ComputeExpression(
-                centerRe, centerIm, scale, program, fixed,
+                centerRe, centerIm, scale, activeProgram, fixed,
                 FormulaParameter::C, test.mxit, test.bailout,
                 formula::ExpressionColoring::Raw, activeJit);
-            elapsed = since(begin);
+            elapsed = std::chrono::duration<double>(
+                Clock::now() - begin).count();
             mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
             return okay;
         };
@@ -1617,13 +2024,23 @@ static int runGenericFormulaProfile() {
         std::vector<double> batchTimes;
         std::vector<double> fixedBatchTimes;
         std::vector<double> jitTimes;
+        std::vector<double> defaultTimes;
+        std::vector<double> specializedTimes;
+        std::vector<double> specializationRatios;
         std::vector<float> scalar;
         std::vector<float> batch;
         std::vector<float> fixedBatch;
         std::vector<float> native;
+        std::vector<float> defaultOutput;
+        std::vector<float> specializedOutput;
         for (int sample = 0; sample < SAMPLES; ++sample) {
-            double scalarTime = 0.0, batchTime = 0.0, jitTime = 0.0;
-            if (!render(false, nullptr, scalar, scalarTime)) {
+            double scalarTime = 0.0;
+            double batchTime = 0.0;
+            double jitTime = 0.0;
+            double specializedTime = 0.0;
+            if (!render(
+                    program, false, nullptr,
+                    scalar, scalarTime)) {
                 ++failures;
                 break;
             }
@@ -1633,16 +2050,16 @@ static int runGenericFormulaProfile() {
                     double fixedBatchTime = 0.0;
                     bool rendered = (sample & 1)
                         ? render(
-                            true, nullptr, fixedBatch,
+                            program, true, nullptr, fixedBatch,
                             fixedBatchTime, false) &&
                           render(
-                            true, nullptr, batch,
+                            program, true, nullptr, batch,
                             batchTime, true)
                         : render(
-                            true, nullptr, batch,
+                            program, true, nullptr, batch,
                             batchTime, true) &&
                           render(
-                            true, nullptr, fixedBatch,
+                            program, true, nullptr, fixedBatch,
                             fixedBatchTime, false);
                     if (!rendered) {
                         ++failures;
@@ -1650,19 +2067,58 @@ static int runGenericFormulaProfile() {
                     }
                     fixedBatchTimes.push_back(fixedBatchTime);
                 } else if (!render(
-                               true, nullptr, batch, batchTime)) {
+                               program, true, nullptr,
+                               batch, batchTime)) {
                     ++failures;
                     break;
                 }
                 batchTimes.push_back(batchTime);
             }
             if (jitAvailable) {
-                if (!render(true, &jit, native, jitTime)) {
+                if (!render(
+                        program, true, &jit,
+                        native, jitTime)) {
                     ++failures;
                     break;
                 }
                 jitTimes.push_back(jitTime);
             }
+            double defaultTime = 0.0;
+            bool paired = true;
+            for (int repeat = 0;
+                 repeat < PAIR_REPEATS && paired; ++repeat) {
+                double defaultOnce = 0.0;
+                double specializedOnce = 0.0;
+                auto renderDefault = [&]() {
+                    return render(
+                        program, true,
+                        jitAvailable ? &jit : nullptr,
+                        defaultOutput, defaultOnce);
+                };
+                auto renderSpecialized = [&]() {
+                    return render(
+                        specializedProgram, true,
+                        specializedJitAvailable
+                            ? &specializedJit : nullptr,
+                        specializedOutput, specializedOnce);
+                };
+                paired = ((sample + repeat) & 1)
+                    ? renderSpecialized() && renderDefault()
+                    : renderDefault() && renderSpecialized();
+                defaultTime += defaultOnce;
+                specializedTime += specializedOnce;
+            }
+            if (!paired) {
+                ++failures;
+                break;
+            }
+            defaultTime /= PAIR_REPEATS;
+            specializedTime /= PAIR_REPEATS;
+            defaultTimes.push_back(defaultTime);
+            specializedTimes.push_back(specializedTime);
+            specializationRatios.push_back(
+                defaultTime > 0.0
+                    ? specializedTime / defaultTime : 0.0);
         }
         _putenv_s("MANDEL_EXPR_VECTOR", "");
         _putenv_s("MANDEL_EXPR_HYBRID_REFILL", "");
@@ -1674,8 +2130,12 @@ static int runGenericFormulaProfile() {
         double batchTime = median(batchTimes);
         double fixedBatchTime = median(fixedBatchTimes);
         double jitTime = median(jitTimes);
+        double defaultTime = median(defaultTimes);
+        double specializedTime = median(specializedTimes);
+        double specializationRatio =
+            median(specializationRatios);
         int batchMismatches = 0, jitMismatches = 0;
-        int refillMismatches = 0;
+        int refillMismatches = 0, specializedMismatches = 0;
         bool batchExact = !batch.empty() &&
             batch.size() == scalar.size() &&
              std::memcmp(scalar.data(), batch.data(),
@@ -1715,7 +2175,43 @@ static int runGenericFormulaProfile() {
                         &fixedBatch[i], &batch[i], sizeof(float)) != 0)
                     ++refillMismatches;
         }
-        if (!batchExact || !jitExact || !refillExact) ++failures;
+        bool specializedExact =
+            specializedOutput.size() == scalar.size() &&
+            std::memcmp(
+                scalar.data(), specializedOutput.data(),
+                scalar.size() * sizeof(float)) == 0;
+        if (!specializedExact) {
+            size_t compared =
+                std::min(specializedOutput.size(), scalar.size());
+            specializedMismatches = (int)(
+                std::max(specializedOutput.size(), scalar.size()) -
+                compared);
+            for (size_t i = 0; i < compared; ++i) {
+                if (std::memcmp(
+                        &scalar[i], &specializedOutput[i],
+                        sizeof(float)) != 0)
+                    ++specializedMismatches;
+            }
+        }
+        if (!batchExact || !jitExact ||
+            !refillExact || !specializedExact)
+            ++failures;
+        bool noRegression =
+            specializationRatio > 0.0 &&
+            specializationRatio <= 1.02;
+        bool improved =
+            specializationRatio > 0.0 &&
+            specializationRatio < 1.0;
+        if (test.invariantHeavy) {
+            if (specializedExact) ++invariantSpecializationExact;
+            if (specializedExact && improved)
+                ++invariantSpecializationImproved;
+        } else {
+            if (specializedExact)
+                ++representativeSpecializationExact;
+            if (specializedExact && noRegression)
+                ++representativeSpecializationNoRegression;
+        }
         bool acceptanceCase =
             std::strcmp(test.name, "sine") == 0 ||
             std::strcmp(test.name, "branch-power") == 0;
@@ -1728,8 +2224,12 @@ static int runGenericFormulaProfile() {
                 batchTime <= fixedBatchTime * 1.02)
                 ++refillNoRegressionCases;
         }
-        printf("  %-13s ops=%zu scalar=%.3fs",
-               test.name, program.instructionCount(), scalarTime);
+        printf("  %-20s ops=%zu->%zu(-%zu) scalar=%.3fs",
+               test.name, program.instructionCount(),
+               specializedProgram.instructionCount(),
+               program.instructionCount() -
+                   specializedProgram.instructionCount(),
+               scalarTime);
         if (batchTime > 0.0)
             printf(" %s=%.3fs(%.2fx)",
                    program.avx2Compatible() ? "AVX2" : "Hybrid",
@@ -1743,11 +2243,22 @@ static int runGenericFormulaProfile() {
             printf(" JIT=%.3fs(%.2fx)", jitTime, scalarTime / jitTime);
         else
             printf(" JIT=n/a");
-        printf(" memcmp=%s/%s/%s mismatch=%d/%d/%d\n",
+        printf(" default=%.4fs specialized-%s=%.4fs(%.2fx)",
+               defaultTime,
+               specializedJitAvailable
+                   ? "JIT"
+                   : (specializedProgram.avx2Compatible()
+                       ? "AVX2" : "Hybrid"),
+               specializedTime,
+               specializationRatio > 0.0
+                   ? 1.0 / specializationRatio : 0.0);
+        printf(" memcmp=%s/%s/%s/%s mismatch=%d/%d/%d/%d\n",
                batchExact ? "exact" : "FAIL",
                jitExact ? "exact" : "FAIL",
                refillExact ? "exact" : "FAIL",
-               batchMismatches, jitMismatches, refillMismatches);
+               specializedExact ? "exact" : "FAIL",
+               batchMismatches, jitMismatches,
+               refillMismatches, specializedMismatches);
     }
     bool hybridDefaultGate =
         exactHybridCases == 2 && hybridNoRegressionCases == 2;
@@ -1757,6 +2268,17 @@ static int runGenericFormulaProfile() {
     if (refillNoRegressionCases != 2) ++failures;
     printf("  hybrid refill non-regression=%d/2\n",
            refillNoRegressionCases);
+    if (representativeSpecializationExact != 5 ||
+        representativeSpecializationNoRegression != 5)
+        ++failures;
+    if (invariantSpecializationExact != 2 ||
+        invariantSpecializationImproved < 1)
+        ++failures;
+    printf("  specialization gate: representative exact=%d/5 non-regression=%d/5; invariant exact=%d/2 improved=%d/2\n",
+           representativeSpecializationExact,
+           representativeSpecializationNoRegression,
+           invariantSpecializationExact,
+           invariantSpecializationImproved);
     {
         formula::ExpressionProgram identity;
         formula::ExpressionError error;
@@ -3012,16 +3534,27 @@ static int runBackendCase() {
     if (!backend->compute(request) || !same(direct, dispatched)) ++failures;
 
     formula::ExpressionProgram expression;
+    formula::ExpressionProgram runtimeExpression;
+    formula::ExpressionJit4 runtimeExpressionJit;
     formula::ExpressionError compileError;
     formula::ExpressionContext fixed;
-    if (!expression.compile("z*z+c+0", &compileError)) {
+    fixed.parameters[0] = { 0.15, -0.2 };
+    fixed.parameters[1] = { -0.35, 0.1 };
+    if (!expression.compile(
+            "z*z+c+sin(p0)+exp(p1)", &compileError) ||
+        !expression.specialize(
+            fixed, FormulaParameter::C,
+            runtimeExpression, &compileError)) {
         ++failures;
     } else {
         directMandel.ComputeExpression(centerRe, centerIm, scale, expression,
                                        fixed, FormulaParameter::C, MXIT, 4.0);
         request.mode = ComputeMode::Expression;
-        request.expression = &expression;
+        request.expression = &runtimeExpression;
         request.expressionFixed = &fixed;
+        request.expressionJit =
+            runtimeExpressionJit.compile(runtimeExpression)
+                ? &runtimeExpressionJit : nullptr;
         request.expressionPixel = FormulaParameter::C;
         request.expressionBailout = 4.0;
         request.expressionColoring = formula::ExpressionColoring::Raw;

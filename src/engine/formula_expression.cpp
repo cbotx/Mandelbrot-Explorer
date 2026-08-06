@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
+#include <iterator>
 #include <limits>
 #include <string_view>
 #include <immintrin.h>
@@ -24,7 +25,6 @@ public:
         skipSpace();
         if (_pos != _source.size()) return fail(_pos, "unexpected token");
         if (_stack != 1) return fail(_pos, "invalid expression stack");
-        _program._stackDepth = _maxStack;
         return true;
     }
 
@@ -259,25 +259,137 @@ private:
     }
 };
 
-bool ExpressionProgram::compile(const std::string& source, ExpressionError* error) {
-    _valid = false;
-    _source.clear();
-    _code.clear();
+int ExpressionProgram::operandCount(Op op) {
+    switch (op) {
+    case Op::Constant:
+    case Op::Z:
+    case Op::C:
+    case Op::Z0:
+    case Op::Iteration:
+    case Op::Parameter:
+        return 0;
+    case Op::Negate:
+    case Op::Square:
+    case Op::Sin:
+    case Op::Cos:
+    case Op::Tan:
+    case Op::Sinh:
+    case Op::Cosh:
+    case Op::Tanh:
+    case Op::Exp:
+    case Op::Log:
+    case Op::Log10:
+    case Op::Sqrt:
+    case Op::Abs:
+    case Op::Norm:
+    case Op::Arg:
+    case Op::Conjugate:
+    case Op::Real:
+    case Op::Imaginary:
+        return 1;
+    case Op::Add:
+    case Op::Subtract:
+    case Op::Multiply:
+    case Op::Divide:
+    case Op::Power:
+    case Op::MakeComplex:
+    case Op::Polar:
+        return 2;
+    }
+    return -1;
+}
+
+Complex ExpressionProgram::evaluateUnary(Op op, Complex value) {
+    switch (op) {
+    case Op::Negate: return -value;
+    case Op::Square: return value * value;
+    case Op::Sin: return std::sin(value);
+    case Op::Cos: return std::cos(value);
+    case Op::Tan: return std::tan(value);
+    case Op::Sinh: return std::sinh(value);
+    case Op::Cosh: return std::cosh(value);
+    case Op::Tanh: return std::tanh(value);
+    case Op::Exp: return std::exp(value);
+    case Op::Log: return std::log(value);
+    case Op::Log10: return std::log10(value);
+    case Op::Sqrt: return std::sqrt(value);
+    case Op::Abs: return { std::abs(value), 0.0 };
+    case Op::Norm: return { std::norm(value), 0.0 };
+    case Op::Arg: return { std::arg(value), 0.0 };
+    case Op::Conjugate: return std::conj(value);
+    case Op::Real: return { value.real(), 0.0 };
+    case Op::Imaginary: return { value.imag(), 0.0 };
+    default:
+        break;
+    }
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    return { nan, nan };
+}
+
+Complex ExpressionProgram::evaluateBinary(Op op, Complex left, Complex right) {
+    switch (op) {
+    case Op::Add: return left + right;
+    case Op::Subtract: return left - right;
+    case Op::Multiply: return left * right;
+    case Op::Divide: return left / right;
+    case Op::Power: return std::pow(left, right);
+    case Op::MakeComplex: return { left.real(), right.real() };
+    case Op::Polar: {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        if (left.imag() != 0.0 || right.imag() != 0.0 ||
+            !std::isfinite(left.real()) || left.real() < 0.0 ||
+            !std::isfinite(right.real()))
+            return { nan, nan };
+        return std::polar(left.real(), right.real());
+    }
+    default:
+        break;
+    }
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    return { nan, nan };
+}
+
+bool ExpressionProgram::analyze(ExpressionError* error) {
     _stackDepth = 0;
     _fastPath = FastPath::None;
     _fastIntegerPower = 0;
     _avx2Compatible = false;
     _batchCompatible = false;
     _derivativeCompatible = false;
-    if (error) *error = {};
-    ExpressionParser parser(*this, source, error);
-    if (!parser.parse()) {
-        _code.clear();
+    _valid = false;
+    auto fail = [&](const char* message) {
+        if (error) {
+            error->position = _source.size();
+            error->message = message;
+        }
         return false;
+    };
+    if (_code.empty()) return fail("expression bytecode is empty");
+    if (_code.size() > MAX_INSTRUCTIONS)
+        return fail("expression has too many operations");
+
+    size_t stack = 0;
+    for (const Instruction& instruction : _code) {
+        int operands = operandCount(instruction.op);
+        if (operands < 0) return fail("expression contains an invalid operation");
+        if (instruction.op == Op::Parameter && instruction.argument >= 8)
+            return fail("expression contains an invalid parameter");
+        if (stack < (size_t)operands)
+            return fail("invalid expression stack");
+        stack = stack - (size_t)operands + 1;
+        _stackDepth = std::max(_stackDepth, stack);
+        if (_stackDepth > MAX_STACK)
+            return fail("expression stack is too deep");
     }
-    _source = source;
+    if (stack != 1) return fail("invalid expression stack");
+
     const auto is = [&](size_t index, Op op) {
         return index < _code.size() && _code[index].op == op;
+    };
+    const auto isRecurrenceC = [&](size_t index) {
+        return is(index, Op::C) ||
+               (is(index, Op::Constant) &&
+                _code[index].argument == CONSTANT_FIXED_C);
     };
     int degree = 0;
     if (_code.size() >= 5 && is(0, Op::Z) && is(1, Op::Z) &&
@@ -289,11 +401,11 @@ bool ExpressionProgram::compile(const std::string& source, ExpressionError* erro
             ++degree;
             cursor += 2;
         }
-        if (!(cursor + 2 == _code.size() && is(cursor, Op::C) &&
+        if (!(cursor + 2 == _code.size() && isRecurrenceC(cursor) &&
               is(cursor + 1, Op::Add)))
             degree = 0;
     } else if (_code.size() == 4 && is(0, Op::Z) && is(1, Op::Square) &&
-               is(2, Op::C) && is(3, Op::Add)) {
+               isRecurrenceC(2) && is(3, Op::Add)) {
         degree = 2;
     }
     if (degree >= 2) {
@@ -396,6 +508,160 @@ bool ExpressionProgram::compile(const std::string& source, ExpressionError* erro
     return true;
 }
 
+bool ExpressionProgram::compile(const std::string& source, ExpressionError* error) {
+    _valid = false;
+    _source.clear();
+    _code.clear();
+    _stackDepth = 0;
+    _fastPath = FastPath::None;
+    _fastIntegerPower = 0;
+    _avx2Compatible = false;
+    _batchCompatible = false;
+    _derivativeCompatible = false;
+    if (error) *error = {};
+    ExpressionParser parser(*this, source, error);
+    if (!parser.parse()) {
+        _code.clear();
+        return false;
+    }
+    _source = source;
+    if (!analyze(error)) {
+        _source.clear();
+        _code.clear();
+        return false;
+    }
+    return true;
+}
+
+bool ExpressionProgram::specialize(
+        const ExpressionContext& fixed, FormulaParameter pixelParameter,
+        ExpressionProgram& output, ExpressionError* error) const {
+    if (error) *error = {};
+    auto fail = [&](const char* message) {
+        if (error) {
+            error->position = 0;
+            error->message = message;
+        }
+        return false;
+    };
+    if (!_valid) return fail("expression program is invalid");
+    if (pixelParameter != FormulaParameter::C &&
+        pixelParameter != FormulaParameter::InitialZ)
+        return fail("unsupported pixel parameter");
+
+    struct Node {
+        bool constant = false;
+        Complex value{};
+        uint8_t constantArgument = 0;
+        std::vector<Instruction> code;
+    };
+    std::vector<Node> stack;
+    stack.reserve(_stackDepth);
+
+    auto materialize = [](Node& node) {
+        if (node.constant) {
+            node.code.push_back({
+                Op::Constant, node.constantArgument, node.value
+            });
+            node.constant = false;
+        }
+    };
+
+    ExpressionProgram candidate;
+    candidate._source = _source;
+    for (const Instruction& instruction : _code) {
+        int operands = operandCount(instruction.op);
+        if (operands == 0) {
+            Node node;
+            switch (instruction.op) {
+            case Op::Constant:
+                node.constant = true;
+                node.value = instruction.value;
+                node.constantArgument = instruction.argument;
+                break;
+            case Op::C:
+                if (pixelParameter == FormulaParameter::InitialZ) {
+                    node.constant = true;
+                    node.value = fixed.c;
+                    node.constantArgument = CONSTANT_FIXED_C;
+                } else {
+                    node.code.push_back(instruction);
+                }
+                break;
+            case Op::Z0:
+                if (pixelParameter == FormulaParameter::C) {
+                    node.constant = true;
+                    node.value = fixed.z0;
+                } else {
+                    node.code.push_back(instruction);
+                }
+                break;
+            case Op::Parameter:
+                if (instruction.argument >= fixed.parameters.size())
+                    return fail("expression contains an invalid parameter");
+                node.constant = true;
+                node.value = fixed.parameters[instruction.argument];
+                break;
+            case Op::Z:
+            case Op::Iteration:
+                node.code.push_back(instruction);
+                break;
+            default:
+                return fail("expression contains an invalid operation");
+            }
+            stack.push_back(std::move(node));
+            continue;
+        }
+        if (stack.size() < (size_t)operands)
+            return fail("invalid expression stack");
+        if (operands == 1) {
+            Node node = std::move(stack.back());
+            stack.pop_back();
+            if (node.constant) {
+                node.value = evaluateUnary(instruction.op, node.value);
+                node.constantArgument = 0;
+            } else {
+                node.code.push_back(instruction);
+            }
+            stack.push_back(std::move(node));
+            continue;
+        }
+        if (operands != 2)
+            return fail("expression contains an invalid operation");
+        Node right = std::move(stack.back());
+        stack.pop_back();
+        Node left = std::move(stack.back());
+        stack.pop_back();
+        Node node;
+        if (left.constant && right.constant) {
+            node.constant = true;
+            node.value = evaluateBinary(
+                instruction.op, left.value, right.value);
+        } else {
+            materialize(left);
+            materialize(right);
+            node.code.reserve(
+                left.code.size() + right.code.size() + 1);
+            node.code.insert(
+                node.code.end(),
+                std::make_move_iterator(left.code.begin()),
+                std::make_move_iterator(left.code.end()));
+            node.code.insert(
+                node.code.end(),
+                std::make_move_iterator(right.code.begin()),
+                std::make_move_iterator(right.code.end()));
+            node.code.push_back(instruction);
+        }
+        stack.push_back(std::move(node));
+    }
+    if (stack.size() != 1) return fail("invalid expression stack");
+    materialize(stack.back());
+    candidate._code = std::move(stack.back().code);
+    if (!candidate.analyze(error)) return false;
+    output = std::move(candidate);
+    return true;
+}
+
 Complex ExpressionProgram::evaluate(const ExpressionContext& context) const {
     std::array<Complex, MAX_STACK> stack;
     return evaluate(context, stack.data(), stack.size());
@@ -426,40 +692,37 @@ Complex ExpressionProgram::evaluate(const ExpressionContext& context,
         case Op::Z0: stack[top++] = context.z0; break;
         case Op::Iteration: stack[top++] = Complex{ (double)context.iteration, 0.0 }; break;
         case Op::Parameter: stack[top++] = context.parameters[instruction.argument]; break;
-        case Op::Negate: unary([](Complex a) { return -a; }); break;
-        case Op::Add: binary([](Complex a, Complex b) { return a + b; }); break;
-        case Op::Subtract: binary([](Complex a, Complex b) { return a - b; }); break;
-        case Op::Multiply: binary([](Complex a, Complex b) { return a * b; }); break;
-        case Op::Divide: binary([](Complex a, Complex b) { return a / b; }); break;
-        case Op::Power: binary([](Complex a, Complex b) { return std::pow(a, b); }); break;
-        case Op::Square: unary([](Complex a) { return a * a; }); break;
-        case Op::Sin: unary([](Complex a) { return std::sin(a); }); break;
-        case Op::Cos: unary([](Complex a) { return std::cos(a); }); break;
-        case Op::Tan: unary([](Complex a) { return std::tan(a); }); break;
-        case Op::Sinh: unary([](Complex a) { return std::sinh(a); }); break;
-        case Op::Cosh: unary([](Complex a) { return std::cosh(a); }); break;
-        case Op::Tanh: unary([](Complex a) { return std::tanh(a); }); break;
-        case Op::Exp: unary([](Complex a) { return std::exp(a); }); break;
-        case Op::Log: unary([](Complex a) { return std::log(a); }); break;
-        case Op::Log10: unary([](Complex a) { return std::log10(a); }); break;
-        case Op::Sqrt: unary([](Complex a) { return std::sqrt(a); }); break;
-        case Op::Abs: unary([](Complex a) { return Complex{ std::abs(a), 0.0 }; }); break;
-        case Op::Norm: unary([](Complex a) { return Complex{ std::norm(a), 0.0 }; }); break;
-        case Op::Arg: unary([](Complex a) { return Complex{ std::arg(a), 0.0 }; }); break;
-        case Op::Conjugate: unary([](Complex a) { return std::conj(a); }); break;
-        case Op::Real: unary([](Complex a) { return Complex{ a.real(), 0.0 }; }); break;
-        case Op::Imaginary: unary([](Complex a) { return Complex{ a.imag(), 0.0 }; }); break;
-        case Op::MakeComplex:
-            binary([](Complex a, Complex b) { return Complex{ a.real(), b.real() }; });
+        case Op::Negate:
+        case Op::Square:
+        case Op::Sin:
+        case Op::Cos:
+        case Op::Tan:
+        case Op::Sinh:
+        case Op::Cosh:
+        case Op::Tanh:
+        case Op::Exp:
+        case Op::Log:
+        case Op::Log10:
+        case Op::Sqrt:
+        case Op::Abs:
+        case Op::Norm:
+        case Op::Arg:
+        case Op::Conjugate:
+        case Op::Real:
+        case Op::Imaginary:
+            unary([&](Complex value) {
+                return evaluateUnary(instruction.op, value);
+            });
             break;
+        case Op::Add:
+        case Op::Subtract:
+        case Op::Multiply:
+        case Op::Divide:
+        case Op::Power:
+        case Op::MakeComplex:
         case Op::Polar:
-            binary([](Complex a, Complex b) {
-                const double nan = std::numeric_limits<double>::quiet_NaN();
-                if (a.imag() != 0.0 || b.imag() != 0.0 ||
-                    !std::isfinite(a.real()) || a.real() < 0.0 ||
-                    !std::isfinite(b.real()))
-                    return Complex{ nan, nan };
-                return std::polar(a.real(), b.real());
+            binary([&](Complex left, Complex right) {
+                return evaluateBinary(instruction.op, left, right);
             });
             break;
         }

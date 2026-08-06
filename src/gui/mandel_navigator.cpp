@@ -146,7 +146,7 @@ void MandelNavigator::StartCompute() {
         request.normal = this->_normal;
         if (this->IsExpression()) {
             request.mode = ComputeMode::Expression;
-            request.expression = &this->_expressionProgram;
+            request.expression = &this->_expressionRuntimeProgram;
             request.expressionFixed = &this->_expressionFixed;
 #if defined(MANDEL_ENABLE_ASMJIT)
             request.expressionJit = this->_expressionUseJit
@@ -644,27 +644,45 @@ bool MandelNavigator::SetExpressionFormula(
         const std::array<std::complex<double>, 8>& parameters,
         double bailout, formula::ExpressionError* error) {
     formula::ExpressionProgram compiled;
-    if (!compiled.compile(source, error) ||
-        (pixel != FormulaParameter::C && pixel != FormulaParameter::InitialZ) ||
-        !(bailout > 0.0) || !std::isfinite(bailout))
+    if (!compiled.compile(source, error))
         return false;
+    if ((pixel != FormulaParameter::C &&
+         pixel != FormulaParameter::InitialZ) ||
+        !(bailout > 0.0) || !std::isfinite(bailout)) {
+        if (error) {
+            error->position = 0;
+            error->message = pixel != FormulaParameter::C &&
+                             pixel != FormulaParameter::InitialZ
+                ? "unsupported pixel parameter"
+                : "bailout must be finite and positive";
+        }
+        return false;
+    }
+    formula::ExpressionContext fixed;
+    fixed.z0 = fixedZ0;
+    fixed.c = fixedC;
+    fixed.parameters = parameters;
+    formula::ExpressionProgram runtime;
+    if (!compiled.specialize(fixed, pixel, runtime, error))
+        return false;
+#if defined(MANDEL_ENABLE_ASMJIT)
+    formula::ExpressionJit4 runtimeJit;
+    bool useRuntimeJit =
+        runtime.fastPath() == formula::ExpressionProgram::FastPath::None &&
+        runtimeJit.compile(runtime);
+#endif
+
     InterruptCompute();
     if (IsJulia()) RestoreMandelbrotMode();
     if (!IsExpression()) SaveMandelbrotState();
     bool planeChanged = IsExpression() && _expressionPixel != pixel;
     _expressionProgram = std::move(compiled);
+    _expressionRuntimeProgram = std::move(runtime);
 #if defined(MANDEL_ENABLE_ASMJIT)
-    _expressionUseJit = false;
-    _expressionJit.reset();
-    if (_expressionProgram.fastPath() ==
-            formula::ExpressionProgram::FastPath::None &&
-        _expressionJit.compile(_expressionProgram))
-        _expressionUseJit = true;
+    _expressionUseJit = useRuntimeJit;
+    _expressionJit = std::move(runtimeJit);
 #endif
-    _expressionFixed = {};
-    _expressionFixed.z0 = fixedZ0;
-    _expressionFixed.c = fixedC;
-    _expressionFixed.parameters = parameters;
+    _expressionFixed = fixed;
     _expressionPixel = pixel;
     _expressionBailout = bailout;
     _formula = expressionFormula();
@@ -710,9 +728,15 @@ std::string MandelNavigator::GetExpressionAccelerationText() const {
 #if defined(MANDEL_ENABLE_ASMJIT)
     if (_expressionUseJit)
         return "W^X JIT";
-    return _expressionProgram.avx2Compatible() ? "AVX2" : "scalar";
+    return _expressionRuntimeProgram.avx2Compatible()
+        ? "AVX2"
+        : (_expressionRuntimeProgram.batchCompatible()
+            ? "hybrid AVX2" : "scalar");
 #else
-    return _expressionProgram.avx2Compatible() ? "AVX2" : "scalar";
+    return _expressionRuntimeProgram.avx2Compatible()
+        ? "AVX2"
+        : (_expressionRuntimeProgram.batchCompatible()
+            ? "hybrid AVX2" : "scalar");
 #endif
 }
 
