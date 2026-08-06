@@ -3,6 +3,7 @@
 #include <asmjit/x86.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace formula {
@@ -259,6 +260,59 @@ bool ExpressionJit4::evaluate(const ExpressionContext* contexts,
     evaluate(input, output);
     for (int lane = 0; lane < 4; ++lane)
         outputs[lane] = { output.re[lane], output.im[lane] };
+    return true;
+}
+
+bool ExpressionJit4::evaluateOrbit(
+        const ExpressionContext* contexts, int lanes,
+        int mxit, double bailout, float* results,
+        const volatile bool* halt) const {
+    if (!valid() || !contexts || !results ||
+        lanes < 1 || lanes > 4 || mxit < 1 ||
+        !(bailout > 0.0) || !std::isfinite(bailout))
+        return false;
+
+    ExpressionJitInput4 input;
+    ExpressionJitOutput4 output;
+    input.setContexts(contexts);
+    bool active[4] = { false, false, false, false };
+    int activeCount = 0;
+    for (int lane = 0; lane < 4; ++lane) {
+        results[lane] = -2.0f;
+        if (lane >= lanes) continue;
+        double re = input.vectors[ExpressionJitInput4::Z_RE][lane];
+        double im = input.vectors[ExpressionJitInput4::Z_IM][lane];
+        if (!std::isfinite(re) || !std::isfinite(im) ||
+            std::hypot(re, im) > bailout) {
+            results[lane] = 0.0f;
+        } else {
+            active[lane] = true;
+            ++activeCount;
+        }
+    }
+
+    for (int iteration = 0;
+         iteration < mxit && activeCount > 0; ++iteration) {
+        if ((iteration & 255) == 0 && halt && *halt)
+            return false;
+        for (int lane = 0; lane < 4; ++lane)
+            input.vectors[ExpressionJitInput4::N_RE][lane] =
+                (double)iteration;
+        evaluate(input, output);
+        for (int lane = 0; lane < lanes; ++lane) {
+            if (!active[lane]) continue;
+            double re = output.re[lane];
+            double im = output.im[lane];
+            input.vectors[ExpressionJitInput4::Z_RE][lane] = re;
+            input.vectors[ExpressionJitInput4::Z_IM][lane] = im;
+            if (!std::isfinite(re) || !std::isfinite(im) ||
+                std::hypot(re, im) > bailout) {
+                results[lane] = (float)(iteration + 1);
+                active[lane] = false;
+                --activeCount;
+            }
+        }
+    }
     return true;
 }
 

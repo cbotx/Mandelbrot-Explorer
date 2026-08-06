@@ -386,6 +386,9 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
         program.fastPath() == formula::ExpressionProgram::FastPath::IntegerPowerPlusC
             ? program.fastIntegerPower() : 0;
     const char* powerSimdSetting = std::getenv("MANDEL_EXPR_POWER_SIMD");
+    const char* vectorSetting = std::getenv("MANDEL_EXPR_VECTOR");
+    const bool vectorEnabled =
+        !vectorSetting || std::atoi(vectorSetting) != 0;
     const double bailoutSquared = bailout * bailout;
     const bool powerSimd =
         integerPower >= 2 && integerPower <= 8 &&
@@ -409,7 +412,8 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
             if (rowCompleted) progressAdvance();
             continue;
         }
-        if (integerPower == 0 && program.avx2Compatible()) {
+        if (integerPower == 0 && program.avx2Compatible() &&
+            vectorEnabled) {
             for (int j = 0; j < _w; j += 4) {
                 if (_flag_halt) { rowCompleted = false; break; }
                 int lanes = std::min(4, _w - j);
@@ -434,10 +438,16 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                     }
                 }
 #if defined(MANDEL_ENABLE_ASMJIT)
-                formula::ExpressionJitInput4 jitInput;
-                formula::ExpressionJitOutput4 jitOutput;
                 const bool useJit = jit && jit->valid();
-                if (useJit) jitInput.setContexts(contexts);
+                if (useJit) {
+                    rowCompleted = jit->evaluateOrbit(
+                        contexts, lanes, mxit, bailout,
+                        results, &_flag_halt);
+                    if (!rowCompleted) break;
+                    for (int lane = 0; lane < lanes; ++lane)
+                        _iter[i * _w + j + lane] = results[lane];
+                    continue;
+                }
 #endif
                 for (int n = 0; n < mxit && activeCount > 0; ++n) {
                     if ((n & 255) == 0 && _flag_halt) {
@@ -446,26 +456,9 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                     }
                     for (int lane = 0; lane < 4; ++lane)
                         contexts[lane].iteration = n;
-#if defined(MANDEL_ENABLE_ASMJIT)
-                    if (useJit) {
-                        for (int lane = 0; lane < 4; ++lane) {
-                            jitInput.vectors[formula::ExpressionJitInput4::Z_RE][lane] =
-                                contexts[lane].z.real();
-                            jitInput.vectors[formula::ExpressionJitInput4::Z_IM][lane] =
-                                contexts[lane].z.imag();
-                            jitInput.vectors[formula::ExpressionJitInput4::N_RE][lane] =
-                                (double)n;
-                        }
-                        jit->evaluate(jitInput, jitOutput);
-                        for (int lane = 0; lane < 4; ++lane)
-                            outputs[lane] = { jitOutput.re[lane], jitOutput.im[lane] };
-                    } else
-#endif
-                    {
-                        if (!program.evaluate4(contexts, outputs)) {
-                            rowCompleted = false;
-                            break;
-                        }
+                    if (!program.evaluate4(contexts, outputs)) {
+                        rowCompleted = false;
+                        break;
                     }
                     for (int lane = 0; lane < lanes; ++lane) {
                         if (!active[lane]) continue;

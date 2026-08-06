@@ -46,6 +46,9 @@ public:
     const void* codeAddress() const;
     void evaluate(const ExpressionJitInput4& input, ExpressionJitOutput4& output) const;
     bool evaluate(const ExpressionContext* contexts, Complex* outputs) const;
+    bool evaluateOrbit(const ExpressionContext* contexts, int lanes,
+                       int mxit, double bailout, float* results,
+                       const volatile bool* halt = nullptr) const;
 
 private:
     struct Impl;

@@ -11,7 +11,7 @@
 //          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
 //          expression | expression-oracle | expression-suite |
-//          expression-residual | multibrot | backend | gpu | all
+//          expression-residual | formula-bench | multibrot | backend | gpu | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
 
@@ -1415,6 +1415,143 @@ static int runExpressionOracleCase() {
            quadraticOrbit.classMismatch, quadraticOrbit.maxIterationDiff,
            parameterOrbit.classMismatch, parameterOrbit.maxIterationDiff);
     printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (MPFR oracle failure)");
+    return failures == 0 ? 0 : 1;
+}
+
+static int runGenericFormulaProfile() {
+    struct ProfileCase {
+        const char* name;
+        const char* source;
+        formula::Complex fixedZ0;
+        formula::Complex p0;
+        double bailout;
+        int mxit;
+    };
+    const ProfileCase cases[] = {
+        { "arithmetic", "z*z+c+p0*z", {}, { 0.1, -0.05 }, 4.0, 1200 },
+        { "iteration", "z*z+c+0.0001*n", {}, {}, 4.0, 800 },
+        { "components",
+          "sqr(complex(real(z),imag(z)))+c+p0", {},
+          { 0.02, -0.01 }, 4.0, 800 },
+        { "sine", "sin(z)+c", {}, {}, 8.0, 400 },
+        { "branch-power", "exp(p0*log(z))+c",
+          { 0.3, 0.2 }, { 2.5, 0.0 }, 8.0, 300 }
+    };
+    constexpr int W = 322, H = 216, SAMPLES = 3;
+    int failures = 0;
+    printf("=== generic formula full-frame profile (%dx%d)\n", W, H);
+
+    for (const ProfileCase& test : cases) {
+        formula::ExpressionProgram program;
+        formula::ExpressionError error;
+        if (!program.compile(test.source, &error)) {
+            ++failures;
+            continue;
+        }
+        formula::ExpressionContext fixed;
+        fixed.z0 = test.fixedZ0;
+        fixed.parameters[0] = test.p0;
+        formula::ExpressionJit4 jit;
+        bool jitAvailable = jit.compile(program);
+
+        auto render = [&](bool vector, const formula::ExpressionJit4* activeJit,
+                          std::vector<float>& output, double& elapsed) {
+            output.assign((size_t)W * H, EMPTYPIXEL);
+            Mandel renderer(W, H, test.mxit, 1, output.data());
+            mpf_t centerRe, centerIm, scale;
+            mpf_init_set_ui(centerRe, 0);
+            mpf_init_set_ui(centerIm, 0);
+            mpf_init_set_ui(scale, 1);
+            _putenv_s("MANDEL_EXPR_VECTOR", vector ? "1" : "0");
+            auto begin = Clock::now();
+            bool okay = renderer.ComputeExpression(
+                centerRe, centerIm, scale, program, fixed,
+                FormulaParameter::C, test.mxit, test.bailout,
+                formula::ExpressionColoring::Raw, activeJit);
+            elapsed = since(begin);
+            mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+            return okay;
+        };
+
+        std::vector<double> scalarTimes;
+        std::vector<double> avxTimes;
+        std::vector<double> jitTimes;
+        std::vector<float> scalar;
+        std::vector<float> avx;
+        std::vector<float> native;
+        for (int sample = 0; sample < SAMPLES; ++sample) {
+            double scalarTime = 0.0, avxTime = 0.0, jitTime = 0.0;
+            if (!render(false, nullptr, scalar, scalarTime)) {
+                ++failures;
+                break;
+            }
+            scalarTimes.push_back(scalarTime);
+            if (program.avx2Compatible()) {
+                if (!render(true, nullptr, avx, avxTime)) {
+                    ++failures;
+                    break;
+                }
+                avxTimes.push_back(avxTime);
+            }
+            if (jitAvailable) {
+                if (!render(true, &jit, native, jitTime)) {
+                    ++failures;
+                    break;
+                }
+                jitTimes.push_back(jitTime);
+            }
+        }
+        _putenv_s("MANDEL_EXPR_VECTOR", "");
+        auto median = [](std::vector<double>& values) {
+            std::sort(values.begin(), values.end());
+            return values.empty() ? 0.0 : values[values.size() / 2];
+        };
+        double scalarTime = median(scalarTimes);
+        double avxTime = median(avxTimes);
+        double jitTime = median(jitTimes);
+        int avxMismatches = 0, jitMismatches = 0;
+        if (!avx.empty()) {
+            for (size_t i = 0; i < scalar.size(); ++i)
+                if (std::memcmp(&scalar[i], &avx[i], sizeof(float)) != 0)
+                    ++avxMismatches;
+        }
+        if (!native.empty()) {
+            for (size_t i = 0; i < scalar.size(); ++i)
+                if (std::memcmp(&scalar[i], &native[i], sizeof(float)) != 0)
+                    ++jitMismatches;
+        }
+        if (avxMismatches || jitMismatches) ++failures;
+        printf("  %-13s ops=%zu scalar=%.3fs",
+               test.name, program.instructionCount(), scalarTime);
+        if (avxTime > 0.0)
+            printf(" AVX2=%.3fs(%.2fx)", avxTime, scalarTime / avxTime);
+        else
+            printf(" AVX2=n/a");
+        if (jitTime > 0.0)
+            printf(" JIT=%.3fs(%.2fx)", jitTime, scalarTime / jitTime);
+        else
+            printf(" JIT=n/a");
+        printf(" mismatch=%d/%d\n", avxMismatches, jitMismatches);
+    }
+    {
+        formula::ExpressionProgram identity;
+        formula::ExpressionError error;
+        formula::ExpressionJit4 jit;
+        formula::ExpressionContext contexts[4]{};
+        float results[4]{};
+        volatile bool halt = true;
+        bool cancelled =
+            identity.compile("z", &error) &&
+            jit.compile(identity) &&
+            !jit.evaluateOrbit(
+                contexts, 3, 10000000, 4.0,
+                results, &halt);
+        if (!cancelled) ++failures;
+        printf("  orbit cancellation=%s\n",
+               cancelled ? "PASS" : "FAIL");
+    }
+    printf("  => %s\n\n",
+           failures == 0 ? "PASS" : "CHECK (generic profile mismatch)");
     return failures == 0 ? 0 : 1;
 }
 
@@ -3192,6 +3329,7 @@ int main(int argc, char** argv) {
     if (which == "expression-oracle")          rc |= runExpressionOracleCase();
     if (which == "expression-suite")           rc |= runFormulaRegressionSuite();
     if (which == "expression-residual")        rc |= runExpressionResidualSuite();
+    if (which == "formula-bench")              rc |= runGenericFormulaProfile();
     if (which == "multibrot")                  rc |= runMultibrotCase();
     if (which == "backend")                    rc |= runBackendCase();
     if (which == "gpu")
