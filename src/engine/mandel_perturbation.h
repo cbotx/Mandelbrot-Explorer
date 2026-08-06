@@ -83,7 +83,8 @@ public:
                                    int mxit, double bailout,
                                    bool* usedPerturbation = nullptr,
                                    formula::ExpressionColoring coloring =
-                                       formula::ExpressionColoring::Raw);
+                                       formula::ExpressionColoring::Raw,
+                                   int* seriesIterations = nullptr);
     // Exact shallow scalar used to resolve the small set of numerically
     // sensitive GPU pixels without re-running the full frame on the CPU.
     float ComputeShallowPoint(double cRe, double cIm, int mxit) const;

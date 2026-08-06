@@ -15,6 +15,126 @@
 
 namespace {
 
+constexpr int CUBIC_SA_TERMS = 30;
+
+struct CubicSeries {
+    std::array<formula::Complex, CUBIC_SA_TERMS> terms{};
+    formula::Complex scale{};
+    int iteration = 0;
+    int order = 0;
+};
+
+int cubicSeriesOrder(
+        const std::array<formula::Complex, CUBIC_SA_TERMS>& terms) {
+    double prefix = 0.0;
+    std::array<double, CUBIC_SA_TERMS> suffix{};
+    for (int i = CUBIC_SA_TERMS - 1; i >= 0; --i) {
+        double magnitude = std::abs(terms[(size_t)i]);
+        if (!std::isfinite(magnitude)) return -1;
+        suffix[(size_t)i] = i + 1 < CUBIC_SA_TERMS
+            ? std::max(magnitude, suffix[(size_t)i + 1])
+            : magnitude;
+    }
+    for (int i = 0; i < CUBIC_SA_TERMS - 10; ++i) {
+        prefix = std::max(prefix, std::abs(terms[(size_t)i]));
+        double tolerance =
+            std::max(prefix, std::numeric_limits<double>::min()) *
+            std::ldexp(1.0, -80);
+        if (suffix[(size_t)i + 1] <= tolerance)
+            return std::max(i, 5);
+    }
+    return -1;
+}
+
+CubicSeries buildCubicSeries(
+        const std::vector<formula::Complex>& orbit,
+        FormulaParameter pixelParameter, formula::Complex scale,
+        int mxit, double bailout, volatile bool* halt) {
+    CubicSeries best;
+    best.scale = scale;
+    if (scale == formula::Complex{} ||
+        !std::isfinite(scale.real()) ||
+        !std::isfinite(scale.imag()))
+        return best;
+
+    std::array<formula::Complex, CUBIC_SA_TERMS> old{};
+    std::array<formula::Complex, CUBIC_SA_TERMS> next{};
+    std::array<formula::Complex, CUBIC_SA_TERMS - 1> square{};
+    if (pixelParameter == FormulaParameter::InitialZ)
+        old[0] = scale;
+
+    int limit = std::min(mxit, (int)orbit.size() - 1);
+    for (int iteration = 0; iteration < limit; ++iteration) {
+        if (*halt) break;
+        square.fill({});
+        for (int a = 0; a < CUBIC_SA_TERMS; ++a) {
+            for (int b = 0;
+                 a + b < CUBIC_SA_TERMS - 1; ++b) {
+                square[(size_t)(a + b)] +=
+                    old[(size_t)a] * old[(size_t)b];
+            }
+        }
+
+        formula::Complex z = orbit[(size_t)iteration];
+        formula::Complex zSquared = z * z;
+        for (int coefficient = 0;
+             coefficient < CUBIC_SA_TERMS; ++coefficient) {
+            formula::Complex value =
+                (3.0 * zSquared) * old[(size_t)coefficient];
+            if (coefficient >= 1) {
+                value += (3.0 * z) *
+                    square[(size_t)(coefficient - 1)];
+            }
+            if (coefficient >= 2) {
+                formula::Complex cubic{};
+                for (int squareIndex = 0;
+                     squareIndex <= coefficient - 2; ++squareIndex) {
+                    cubic += square[(size_t)squareIndex] *
+                        old[(size_t)(coefficient - 2 - squareIndex)];
+                }
+                value += cubic;
+            }
+            next[(size_t)coefficient] = value;
+        }
+        if (pixelParameter == FormulaParameter::C)
+            next[0] += scale;
+
+        int order = cubicSeriesOrder(next);
+        if (order < 0) break;
+        double deltaBound = 0.0;
+        for (int coefficient = 0; coefficient <= order; ++coefficient)
+            deltaBound += std::abs(next[(size_t)coefficient]);
+        double absoluteBound =
+            std::abs(orbit[(size_t)iteration + 1]) + deltaBound;
+        if (!std::isfinite(absoluteBound) ||
+            absoluteBound > bailout)
+            break;
+        best.terms = next;
+        best.iteration = iteration + 1;
+        best.order = order;
+        old = next;
+    }
+    return best;
+}
+
+void evaluateCubicSeries(
+        const CubicSeries& series, formula::Complex pixelDelta,
+        formula::Complex& delta, formula::Complex& derivative) {
+    delta = {};
+    derivative = {};
+    if (series.iteration <= 0 || series.scale == formula::Complex{})
+        return;
+    formula::Complex q = pixelDelta / series.scale;
+    for (int coefficient = series.order; coefficient >= 0; --coefficient) {
+        delta += series.terms[(size_t)coefficient];
+        delta *= q;
+        derivative *= q;
+        derivative +=
+            (double)(coefficient + 1) *
+            series.terms[(size_t)coefficient] / series.scale;
+    }
+}
+
 float initialPowerResult(formula::Complex z, FormulaParameter pixelParameter,
                          formula::ExpressionColoring coloring,
                          int power, double bailout, double dx) {
@@ -471,8 +591,10 @@ bool Mandel::ComputeExpressionResidual(
         const formula::ExpressionContext& fixed,
         FormulaParameter pixelParameter, int mxit, double bailout,
         bool* usedPerturbation,
-        formula::ExpressionColoring coloring) {
+        formula::ExpressionColoring coloring,
+        int* seriesIterations) {
     if (usedPerturbation) *usedPerturbation = false;
+    if (seriesIterations) *seriesIterations = 0;
     if (_sub != 1 || !program.valid() || mxit < 1 || !(bailout > 0.0) ||
         !std::isfinite(bailout) ||
         (pixelParameter != FormulaParameter::C &&
@@ -549,6 +671,18 @@ bool Mandel::ComputeExpressionResidual(
     const double dx = mpf_get_ld(_dx), dy = mpf_get_ld(_dy);
     const double halfWidth = (_w - 1) * 0.5;
     const double halfHeight = (_h - 1) * 0.5;
+    CubicSeries series;
+    const char* seriesSetting = std::getenv("MANDEL_EXPR_CUBIC_SA");
+    if (cubicResidual &&
+        (!seriesSetting || std::atoi(seriesSetting) != 0)) {
+        series = buildCubicSeries(
+            orbit, pixelParameter,
+            { dx * halfWidth, dy * halfHeight },
+            mxit, bailout, &_flag_halt);
+        if (series.iteration < 8)
+            series = {};
+        if (seriesIterations) *seriesIterations = series.iteration;
+    }
 #pragma omp parallel for schedule(dynamic, 1)
     for (int i = 0; i < _h; ++i) {
         if (_flag_halt) continue;
@@ -562,27 +696,57 @@ bool Mandel::ComputeExpressionResidual(
             else context.z0 = pixel;
             formula::Complex parameterDelta{};
             formula::Complex delta;
+            formula::Complex pixelGridDelta{
+                dx * (j - halfWidth), dy * (i - halfHeight)
+            };
             if (cubicResidual) {
-                formula::Complex gridDelta{
-                    dx * (j - halfWidth), dy * (i - halfHeight)
-                };
                 if (pixelParameter == FormulaParameter::C) {
-                    parameterDelta = gridDelta;
+                    parameterDelta = pixelGridDelta;
                     context.c = reference.c + parameterDelta;
                     delta = context.z0 - orbit[0];
                 } else {
-                    context.z0 = reference.z0 + gridDelta;
-                    delta = gridDelta;
+                    context.z0 = reference.z0 + pixelGridDelta;
+                    delta = pixelGridDelta;
                 }
             } else {
                 delta = context.z0 - orbit[0];
             }
             float result = -2.0f;
             formula::Complex absolute = orbit[0] + delta;
+            formula::Complex initialDelta = delta;
+            formula::Complex initialAbsolute = absolute;
             formula::Complex derivative =
                 pixelParameter == FormulaParameter::InitialZ
                     ? formula::Complex{ 1.0, 0.0 }
                     : formula::Complex{};
+            int firstIteration = 0;
+            bool initialEscaped =
+                !std::isfinite(initialAbsolute.real()) ||
+                !std::isfinite(initialAbsolute.imag()) ||
+                std::hypot(
+                    initialAbsolute.real(),
+                    initialAbsolute.imag()) > bailout;
+            if (!initialEscaped &&
+                cubicResidual && series.iteration > 0) {
+                evaluateCubicSeries(
+                    series, pixelGridDelta, delta, derivative);
+                firstIteration = series.iteration;
+                absolute = orbit[(size_t)firstIteration] + delta;
+                bool landingEscaped =
+                    !std::isfinite(absolute.real()) ||
+                    !std::isfinite(absolute.imag()) ||
+                    std::hypot(
+                        absolute.real(), absolute.imag()) > bailout;
+                if (landingEscaped) {
+                    delta = initialDelta;
+                    derivative =
+                        pixelParameter == FormulaParameter::InitialZ
+                            ? formula::Complex{ 1.0, 0.0 }
+                            : formula::Complex{};
+                    firstIteration = 0;
+                    absolute = initialAbsolute;
+                }
+            }
             if (!std::isfinite(absolute.real()) ||
                 !std::isfinite(absolute.imag()) ||
                 std::hypot(absolute.real(), absolute.imag()) > bailout) {
@@ -594,7 +758,7 @@ bool Mandel::ComputeExpressionResidual(
             } else {
                 std::array<formula::Complex,
                            formula::ExpressionProgram::MAX_STACK> stack;
-                for (int n = 0; n < mxit; ++n) {
+                for (int n = firstIteration; n < mxit; ++n) {
                     if ((n & 255) == 0 && _flag_halt) {
                         rowCompleted = false;
                         break;

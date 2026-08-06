@@ -1804,6 +1804,58 @@ static int runMultibrotCase() {
                    classMismatches, iterationMismatches);
         }
     }
+    {
+        formula::ExpressionProgram program;
+        formula::ExpressionError error;
+        program.compile("z*z*z+c", &error);
+        FormulaRegressionCase deep{};
+        deep.name = "cubic-deep-oracle";
+        deep.source = "z*z*z+c";
+        deep.pixel = FormulaParameter::C;
+        deep.centerRe = 0.3849001794597505;
+        deep.centerIm = 0.0;
+        deep.scale = 1e10;
+        deep.bailout = 4.0;
+        deep.mxit = 3000;
+        deep.width = 24;
+        deep.height = 16;
+        std::vector<float> oracle;
+        std::vector<float> seriesOutput((size_t)deep.width * deep.height);
+        formula::ExpressionContext fixed;
+        mpf_t centerRe, centerIm, scale;
+        mpf_init_set_d(centerRe, deep.centerRe);
+        mpf_init_set_d(centerIm, deep.centerIm);
+        mpf_init_set_d(scale, deep.scale);
+        Mandel renderer(
+            deep.width, deep.height, deep.mxit, 1,
+            seriesOutput.data());
+        bool used = false;
+        int series = 0;
+        bool okay = renderExpressionOracle(deep, program, oracle) &&
+            renderer.ComputeExpressionResidual(
+                centerRe, centerIm, scale, program, fixed,
+                deep.pixel, deep.mxit, deep.bailout, &used,
+                formula::ExpressionColoring::Raw, &series);
+        mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+        int classMismatches = 0;
+        int iterationMismatches = 0;
+        if (okay && oracle.size() == seriesOutput.size()) {
+            for (size_t i = 0; i < oracle.size(); ++i) {
+                bool a = isInterior(oracle[i]);
+                bool b = isInterior(seriesOutput[i]);
+                if (a != b) ++classMismatches;
+                else if (!a && oracle[i] != seriesOutput[i])
+                    ++iterationMismatches;
+            }
+        } else {
+            classMismatches = 1;
+        }
+        if (!used || series <= 0 ||
+            classMismatches || iterationMismatches)
+            ++failures;
+        printf("    cubic deep 1e10 class=%d iteration=%d SA=%d\n",
+               classMismatches, iterationMismatches, series);
+    }
 
     auto extremeParity = [&](const char* name, const char* centerText,
                              const char* scaleText, double bailout,
@@ -1892,7 +1944,7 @@ static int runMultibrotCase() {
     formula::ExpressionProgram cubicProgram;
     formula::ExpressionError cubicError;
     cubicProgram.compile("z*z*z+c", &cubicError);
-    constexpr int RW = 320, RH = 216, RMIT = 1500, RSAMPLES = 3;
+    constexpr int RW = 320, RH = 216, RMIT = 3000, RSAMPLES = 3;
     std::vector<double> genericResidualTimes;
     std::vector<double> cubicResidualTimes;
     std::vector<float> genericResidual;
@@ -1900,23 +1952,30 @@ static int runMultibrotCase() {
     auto renderResidual = [&](bool specialized,
                               formula::ExpressionColoring coloring,
                               std::vector<float>& output,
-                              double& elapsed) {
+                              double& elapsed,
+                              bool seriesEnabled = true,
+                              int* seriesIterations = nullptr,
+                              double viewScale = 1e10) {
         output.assign((size_t)RW * RH, EMPTYPIXEL);
         Mandel renderer(RW, RH, RMIT, 1, output.data());
         formula::ExpressionContext fixed;
         mpf_t centerRe, centerIm, scale;
         mpf_init_set_d(centerRe, 0.3849001794597505);
         mpf_init_set_ui(centerIm, 0);
-        mpf_init_set_d(scale, 1e5);
+        mpf_init_set_d(scale, viewScale);
         _putenv_s(
             "MANDEL_EXPR_RESIDUAL_POWER", specialized ? "1" : "0");
+        _putenv_s(
+            "MANDEL_EXPR_CUBIC_SA", seriesEnabled ? "1" : "0");
         bool used = false;
+        int series = 0;
         auto begin = Clock::now();
         bool okay = renderer.ComputeExpressionResidual(
             centerRe, centerIm, scale, cubicProgram, fixed,
-            FormulaParameter::C, RMIT, 4.0, &used, coloring);
+            FormulaParameter::C, RMIT, 4.0, &used, coloring, &series);
         elapsed = since(begin);
         mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+        if (seriesIterations) *seriesIterations = series;
         return okay && used;
     };
     const formula::ExpressionColoring residualColorings[] = {
@@ -1935,7 +1994,7 @@ static int runMultibrotCase() {
         mpf_t centerRe, centerIm, scale;
         mpf_init_set_d(centerRe, 0.3849001794597505);
         mpf_init_set_ui(centerIm, 0);
-        mpf_init_set_d(scale, 1e5);
+        mpf_init_set_d(scale, 1e10);
         _putenv_s("MANDEL_EXPR_POWER_SIMD", "0");
         bool directOkay = directRenderer.ComputeExpression(
             centerRe, centerIm, scale, cubicProgram, fixed,
@@ -1985,7 +2044,218 @@ static int runMultibrotCase() {
         genericResidualTimes.push_back(genericTime);
         cubicResidualTimes.push_back(specializedTime);
     }
+    std::vector<float> cubicNoSeries;
+    std::vector<float> cubicWithSeries;
+    double cubicNoSeriesTime = 0.0;
+    double cubicWithSeriesTime = 0.0;
+    int seriesIterations = 0;
+    bool noSeriesOkay = renderResidual(
+        true, formula::ExpressionColoring::Raw,
+        cubicNoSeries, cubicNoSeriesTime, false);
+    bool withSeriesOkay = renderResidual(
+        true, formula::ExpressionColoring::Raw,
+        cubicWithSeries, cubicWithSeriesTime, true,
+        &seriesIterations);
+    int seriesClassMismatches = 0;
+    int seriesFloorMismatches = 0;
+    if (cubicNoSeries.size() == cubicWithSeries.size()) {
+        for (size_t i = 0; i < cubicNoSeries.size(); ++i) {
+            bool a = isInterior(cubicNoSeries[i]);
+            bool b = isInterior(cubicWithSeries[i]);
+            if (a != b) ++seriesClassMismatches;
+            else if (!a &&
+                     (int)cubicNoSeries[i] != (int)cubicWithSeries[i])
+                ++seriesFloorMismatches;
+        }
+    } else {
+        seriesClassMismatches = 1;
+    }
+    double seriesSpeedup = cubicWithSeriesTime > 0.0
+        ? cubicNoSeriesTime / cubicWithSeriesTime : 0.0;
+    if (!noSeriesOkay || !withSeriesOkay ||
+        seriesIterations <= 0 || seriesClassMismatches ||
+        seriesFloorMismatches || seriesSpeedup < 0.95)
+        ++failures;
+    std::vector<float> shallowNoSeries;
+    std::vector<float> shallowWithSeries;
+    double shallowNoSeriesTime = 0.0;
+    double shallowWithSeriesTime = 0.0;
+    int shallowSeriesIterations = 0;
+    bool shallowNoSeriesOkay = renderResidual(
+        true, formula::ExpressionColoring::Raw,
+        shallowNoSeries, shallowNoSeriesTime, false, nullptr, 1.0);
+    bool shallowWithSeriesOkay = renderResidual(
+        true, formula::ExpressionColoring::Raw,
+        shallowWithSeries, shallowWithSeriesTime, true,
+        &shallowSeriesIterations, 1.0);
+    int shallowMismatches = 0;
+    if (shallowNoSeries.size() == shallowWithSeries.size()) {
+        for (size_t i = 0; i < shallowNoSeries.size(); ++i) {
+            if (std::memcmp(
+                    &shallowNoSeries[i], &shallowWithSeries[i],
+                    sizeof(float)) != 0)
+                ++shallowMismatches;
+        }
+    } else {
+        shallowMismatches = 1;
+    }
+    if (!shallowNoSeriesOkay || !shallowWithSeriesOkay ||
+        shallowSeriesIterations != 0 ||
+        shallowMismatches)
+        ++failures;
+
+    auto renderResidualZ0 = [&](
+            formula::ExpressionColoring coloring, bool seriesEnabled,
+            std::vector<float>& output, int* seriesIterations) {
+        constexpr int ZW = 96, ZH = 64, ZMIT = 300;
+        output.assign((size_t)ZW * ZH, EMPTYPIXEL);
+        Mandel renderer(ZW, ZH, ZMIT, 1, output.data());
+        formula::ExpressionContext fixed;
+        fixed.c = { 0.0, 0.0 };
+        mpf_t centerRe, centerIm, scale;
+        mpf_init_set_ui(centerRe, 1);
+        mpf_init_set_ui(centerIm, 0);
+        mpf_init_set_d(scale, 1e10);
+        _putenv_s("MANDEL_EXPR_CUBIC_SA", seriesEnabled ? "1" : "0");
+        bool used = false;
+        int series = 0;
+        bool okay = renderer.ComputeExpressionResidual(
+            centerRe, centerIm, scale, cubicProgram, fixed,
+            FormulaParameter::InitialZ, ZMIT, 4.0,
+            &used, coloring, &series);
+        mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+        if (seriesIterations) *seriesIterations = series;
+        return okay && used;
+    };
+    for (formula::ExpressionColoring coloring :
+         { formula::ExpressionColoring::Raw,
+           formula::ExpressionColoring::Distance }) {
+        std::vector<float> z0Off;
+        std::vector<float> z0On;
+        int z0Series = 0;
+        bool offOkay = renderResidualZ0(coloring, false, z0Off, nullptr);
+        bool onOkay = renderResidualZ0(coloring, true, z0On, &z0Series);
+        int classMismatches = 0;
+        int floorMismatches = 0;
+        double maxDifference = 0.0;
+        for (size_t i = 0; i < z0Off.size(); ++i) {
+            bool a = isInterior(z0Off[i]);
+            bool b = isInterior(z0On[i]);
+            if (a != b) ++classMismatches;
+            else if (!a) {
+                if ((int)z0Off[i] != (int)z0On[i])
+                    ++floorMismatches;
+                maxDifference = std::max(
+                    maxDifference,
+                    std::fabs((double)z0Off[i] - z0On[i]));
+            }
+        }
+        double tolerance =
+            coloring == formula::ExpressionColoring::Raw ? 0.0 : 1e-3;
+        if (!offOkay || !onOkay || z0Series < 8 ||
+            classMismatches || floorMismatches ||
+            maxDifference > tolerance)
+            ++failures;
+        printf("  cubic SA z0 %-8s iterations=%d class=%d floor=%d"
+               " max=%.6g\n",
+               coloring == formula::ExpressionColoring::Raw
+                   ? "raw" : "distance",
+               z0Series, classMismatches, floorMismatches,
+               maxDifference);
+    }
+    {
+        constexpr int IW = 48, IH = 32, IMIT = 50;
+        auto renderInitialEscape = [&](bool seriesEnabled,
+                                       std::vector<float>& output,
+                                       int& seriesIterations) {
+            output.assign((size_t)IW * IH, EMPTYPIXEL);
+            Mandel renderer(IW, IH, IMIT, 1, output.data());
+            formula::ExpressionContext fixed;
+            fixed.c = { 0.099, 0.0 };
+            mpf_t centerRe, centerIm, scale;
+            mpf_init_set_d(centerRe, 0.1);
+            mpf_init_set_ui(centerIm, 0);
+            mpf_init_set_d(scale, 1e6);
+            _putenv_s(
+                "MANDEL_EXPR_CUBIC_SA", seriesEnabled ? "1" : "0");
+            bool used = false;
+            bool okay = renderer.ComputeExpressionResidual(
+                centerRe, centerIm, scale, cubicProgram, fixed,
+                FormulaParameter::InitialZ, IMIT, 0.100001,
+                &used, formula::ExpressionColoring::Raw,
+                &seriesIterations);
+            mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+            return okay && used;
+        };
+        std::vector<float> off;
+        std::vector<float> on;
+        int offSeries = 0, onSeries = 0;
+        bool offOkay = renderInitialEscape(false, off, offSeries);
+        bool onOkay = renderInitialEscape(true, on, onSeries);
+        int mismatches = 0;
+        for (size_t i = 0; i < off.size(); ++i) {
+            if (std::memcmp(&off[i], &on[i], sizeof(float)) != 0)
+                ++mismatches;
+        }
+        if (!offOkay || !onOkay || onSeries < 8 || mismatches)
+            ++failures;
+        printf("  cubic SA z0 initial-escape iterations=%d bits=%d\n",
+               onSeries, mismatches);
+    }
+    {
+        FormulaRegressionCase z0Deep{};
+        z0Deep.name = "cubic-z0-deep-oracle";
+        z0Deep.source = "z*z*z+c";
+        z0Deep.pixel = FormulaParameter::InitialZ;
+        z0Deep.centerRe = 1.0;
+        z0Deep.scale = 1e10;
+        z0Deep.fixedC = {};
+        z0Deep.bailout = 4.0;
+        z0Deep.mxit = 300;
+        z0Deep.width = 24;
+        z0Deep.height = 16;
+        std::vector<float> oracle;
+        std::vector<float> residual;
+        int z0Series = 0;
+        bool okay = renderExpressionOracle(
+            z0Deep, cubicProgram, oracle);
+        int classMismatches = 0;
+        int iterationMismatches = 0;
+        if (okay) {
+            residual.resize((size_t)z0Deep.width * z0Deep.height);
+            Mandel renderer(
+                z0Deep.width, z0Deep.height, z0Deep.mxit, 1,
+                residual.data());
+            formula::ExpressionContext fixed;
+            mpf_t centerRe, centerIm, scale;
+            mpf_init_set_ui(centerRe, 1);
+            mpf_init_set_ui(centerIm, 0);
+            mpf_init_set_d(scale, 1e10);
+            bool used = false;
+            okay = renderer.ComputeExpressionResidual(
+                centerRe, centerIm, scale, cubicProgram, fixed,
+                FormulaParameter::InitialZ, z0Deep.mxit, 4.0,
+                &used, formula::ExpressionColoring::Raw, &z0Series) &&
+                used;
+            mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+        }
+        if (okay && oracle.size() == residual.size()) {
+            for (size_t i = 0; i < oracle.size(); ++i) {
+                bool a = isInterior(oracle[i]);
+                bool b = isInterior(residual[i]);
+                if (a != b) ++classMismatches;
+                else if (!a && oracle[i] != residual[i])
+                    ++iterationMismatches;
+            }
+        } else {
+            classMismatches = 1;
+        }
+        if (classMismatches || iterationMismatches) ++failures;
+        printf("    cubic z0 deep class=%d iteration=%d SA=%d\n",
+               classMismatches, iterationMismatches, z0Series);
+    }
     _putenv_s("MANDEL_EXPR_RESIDUAL_POWER", "");
+    _putenv_s("MANDEL_EXPR_CUBIC_SA", "");
     int residualBitMismatches = 0;
     if (genericResidual.size() == cubicResidual.size()) {
         for (size_t i = 0; i < genericResidual.size(); ++i) {
@@ -2015,6 +2285,12 @@ static int runMultibrotCase() {
            " bits=%d\n",
            genericResidualMedian, cubicResidualMedian,
            residualSpeedup, residualBitMismatches);
+    printf("  cubic SA iterations=%d off/on %.3f/%.3f s speedup %.2fx"
+           " class=%d floor=%d\n",
+           seriesIterations, cubicNoSeriesTime, cubicWithSeriesTime,
+           seriesSpeedup, seriesClassMismatches, seriesFloorMismatches);
+    printf("  cubic SA shallow iteration=%d bits=%d\n",
+           shallowSeriesIterations, shallowMismatches);
     printf("  => %s\n\n",
            failures == 0 ? "PASS"
                          : "CHECK (Multibrot correctness/performance)");
