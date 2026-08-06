@@ -349,6 +349,86 @@ bool solveIntegerPowerSimdRow(
     return true;
 }
 
+bool solveExpressionHybridRow(
+        double startRe, double dx, double pixelIm, int count,
+        const formula::ExpressionProgram& program,
+        const formula::ExpressionContext& fixed,
+        FormulaParameter pixelParameter, int mxit, double bailout,
+        float* output, volatile bool* halt) {
+    formula::ExpressionContext contexts[4] = {
+        fixed, fixed, fixed, fixed
+    };
+    formula::Complex nextValues[4]{};
+    int lanePixel[4] = { -1, -1, -1, -1 };
+    int laneIteration[4] = {};
+    int nextPixel = 0;
+    int activeCount = 0;
+
+    auto loadLane = [&](int lane) {
+        lanePixel[lane] = -1;
+        while (nextPixel < count) {
+            int pixelIndex = nextPixel++;
+            contexts[lane] = fixed;
+            formula::Complex pixel{
+                startRe + dx * pixelIndex, pixelIm
+            };
+            if (pixelParameter == FormulaParameter::C)
+                contexts[lane].c = pixel;
+            else
+                contexts[lane].z0 = pixel;
+            contexts[lane].z = contexts[lane].z0;
+            contexts[lane].iteration = 0;
+            double magnitude = std::hypot(
+                contexts[lane].z.real(),
+                contexts[lane].z.imag());
+            if (!std::isfinite(contexts[lane].z.real()) ||
+                !std::isfinite(contexts[lane].z.imag()) ||
+                magnitude > bailout) {
+                output[pixelIndex] = 0.0f;
+                continue;
+            }
+            lanePixel[lane] = pixelIndex;
+            laneIteration[lane] = 0;
+            ++activeCount;
+            return;
+        }
+        contexts[lane] = fixed;
+        contexts[lane].z = {};
+        contexts[lane].iteration = 0;
+    };
+    for (int lane = 0; lane < 4; ++lane) loadLane(lane);
+
+    unsigned steps = 0;
+    while (activeCount > 0) {
+        if ((steps++ & 255u) == 0u && *halt) return false;
+        for (int lane = 0; lane < 4; ++lane)
+            contexts[lane].iteration = laneIteration[lane];
+        if (!program.evaluate4Hybrid(contexts, nextValues))
+            return false;
+        for (int lane = 0; lane < 4; ++lane) {
+            if (lanePixel[lane] < 0) continue;
+            contexts[lane].z = nextValues[lane];
+            double re = nextValues[lane].real();
+            double im = nextValues[lane].imag();
+            if (!std::isfinite(re) || !std::isfinite(im) ||
+                std::hypot(re, im) > bailout) {
+                output[lanePixel[lane]] =
+                    (float)(laneIteration[lane] + 1);
+                --activeCount;
+                loadLane(lane);
+                continue;
+            }
+            ++laneIteration[lane];
+            if (laneIteration[lane] >= mxit) {
+                output[lanePixel[lane]] = -2.0f;
+                --activeCount;
+                loadLane(lane);
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
@@ -387,8 +467,13 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
             ? program.fastIntegerPower() : 0;
     const char* powerSimdSetting = std::getenv("MANDEL_EXPR_POWER_SIMD");
     const char* vectorSetting = std::getenv("MANDEL_EXPR_VECTOR");
+    const char* hybridRefillSetting =
+        std::getenv("MANDEL_EXPR_HYBRID_REFILL");
     const bool vectorEnabled =
         !vectorSetting || std::atoi(vectorSetting) != 0;
+    const bool hybridRefill =
+        !hybridRefillSetting ||
+        std::atoi(hybridRefillSetting) != 0;
     const double bailoutSquared = bailout * bailout;
     const bool powerSimd =
         integerPower >= 2 && integerPower <= 8 &&
@@ -413,6 +498,14 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
             continue;
         }
         if (integerPower == 0 && program.batchCompatible() && vectorEnabled) {
+            if (!program.avx2Compatible() && hybridRefill) {
+                rowCompleted = solveExpressionHybridRow(
+                    startRe, dx, pixelIm, _w, program, fixed,
+                    pixelParameter, mxit, bailout,
+                    _iter + (size_t)i * _w, &_flag_halt);
+                if (rowCompleted) progressAdvance();
+                continue;
+            }
             for (int j = 0; j < _w; j += 4) {
                 if (_flag_halt) { rowCompleted = false; break; }
                 int lanes = std::min(4, _w - j);

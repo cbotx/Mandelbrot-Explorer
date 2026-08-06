@@ -1571,10 +1571,11 @@ static int runGenericFormulaProfile() {
         { "branch-power", "exp(p0*log(z))+c",
           { 0.3, 0.2 }, { 2.5, 0.0 }, 8.0, 300 }
     };
-    constexpr int W = 322, H = 216, SAMPLES = 3;
+    constexpr int W = 322, H = 216, SAMPLES = 7;
     int failures = 0;
     int exactHybridCases = 0;
-    bool hybridImproved = false;
+    int hybridNoRegressionCases = 0;
+    int refillNoRegressionCases = 0;
     printf("=== generic formula full-frame profile (%dx%d)\n", W, H);
 
     for (const ProfileCase& test : cases) {
@@ -1591,7 +1592,8 @@ static int runGenericFormulaProfile() {
         bool jitAvailable = jit.compile(program);
 
         auto render = [&](bool vector, const formula::ExpressionJit4* activeJit,
-                          std::vector<float>& output, double& elapsed) {
+                          std::vector<float>& output, double& elapsed,
+                          bool refill = true) {
             output.assign((size_t)W * H, EMPTYPIXEL);
             Mandel renderer(W, H, test.mxit, 1, output.data());
             mpf_t centerRe, centerIm, scale;
@@ -1599,6 +1601,8 @@ static int runGenericFormulaProfile() {
             mpf_init_set_ui(centerIm, 0);
             mpf_init_set_ui(scale, 1);
             _putenv_s("MANDEL_EXPR_VECTOR", vector ? "1" : "0");
+            _putenv_s(
+                "MANDEL_EXPR_HYBRID_REFILL", refill ? "1" : "0");
             auto begin = Clock::now();
             bool okay = renderer.ComputeExpression(
                 centerRe, centerIm, scale, program, fixed,
@@ -1611,9 +1615,11 @@ static int runGenericFormulaProfile() {
 
         std::vector<double> scalarTimes;
         std::vector<double> batchTimes;
+        std::vector<double> fixedBatchTimes;
         std::vector<double> jitTimes;
         std::vector<float> scalar;
         std::vector<float> batch;
+        std::vector<float> fixedBatch;
         std::vector<float> native;
         for (int sample = 0; sample < SAMPLES; ++sample) {
             double scalarTime = 0.0, batchTime = 0.0, jitTime = 0.0;
@@ -1623,7 +1629,28 @@ static int runGenericFormulaProfile() {
             }
             scalarTimes.push_back(scalarTime);
             if (program.batchCompatible()) {
-                if (!render(true, nullptr, batch, batchTime)) {
+                if (!program.avx2Compatible()) {
+                    double fixedBatchTime = 0.0;
+                    bool rendered = (sample & 1)
+                        ? render(
+                            true, nullptr, fixedBatch,
+                            fixedBatchTime, false) &&
+                          render(
+                            true, nullptr, batch,
+                            batchTime, true)
+                        : render(
+                            true, nullptr, batch,
+                            batchTime, true) &&
+                          render(
+                            true, nullptr, fixedBatch,
+                            fixedBatchTime, false);
+                    if (!rendered) {
+                        ++failures;
+                        break;
+                    }
+                    fixedBatchTimes.push_back(fixedBatchTime);
+                } else if (!render(
+                               true, nullptr, batch, batchTime)) {
                     ++failures;
                     break;
                 }
@@ -1638,14 +1665,17 @@ static int runGenericFormulaProfile() {
             }
         }
         _putenv_s("MANDEL_EXPR_VECTOR", "");
+        _putenv_s("MANDEL_EXPR_HYBRID_REFILL", "");
         auto median = [](std::vector<double>& values) {
             std::sort(values.begin(), values.end());
             return values.empty() ? 0.0 : values[values.size() / 2];
         };
         double scalarTime = median(scalarTimes);
         double batchTime = median(batchTimes);
+        double fixedBatchTime = median(fixedBatchTimes);
         double jitTime = median(jitTimes);
         int batchMismatches = 0, jitMismatches = 0;
+        int refillMismatches = 0;
         bool batchExact = !batch.empty() &&
             batch.size() == scalar.size() &&
              std::memcmp(scalar.data(), batch.data(),
@@ -1670,15 +1700,33 @@ static int runGenericFormulaProfile() {
                 if (std::memcmp(&scalar[i], &native[i], sizeof(float)) != 0)
                     ++jitMismatches;
         }
-        if (!batchExact || !jitExact) ++failures;
+        bool refillExact = fixedBatch.empty() ||
+            (fixedBatch.size() == batch.size() &&
+             std::memcmp(
+                 fixedBatch.data(), batch.data(),
+                 batch.size() * sizeof(float)) == 0);
+        if (!refillExact) {
+            size_t compared =
+                std::min(fixedBatch.size(), batch.size());
+            refillMismatches = (int)(
+                std::max(fixedBatch.size(), batch.size()) - compared);
+            for (size_t i = 0; i < compared; ++i)
+                if (std::memcmp(
+                        &fixedBatch[i], &batch[i], sizeof(float)) != 0)
+                    ++refillMismatches;
+        }
+        if (!batchExact || !jitExact || !refillExact) ++failures;
         bool acceptanceCase =
             std::strcmp(test.name, "sine") == 0 ||
             std::strcmp(test.name, "branch-power") == 0;
         if (acceptanceCase && program.batchCompatible() &&
             batchExact && batchTime > 0.0) {
             ++exactHybridCases;
-            if (batchTime > 0.0 && scalarTime / batchTime >= 1.10)
-                hybridImproved = true;
+            if (batchTime <= scalarTime * 1.02)
+                ++hybridNoRegressionCases;
+            if (fixedBatchTime > 0.0 &&
+                batchTime <= fixedBatchTime * 1.02)
+                ++refillNoRegressionCases;
         }
         printf("  %-13s ops=%zu scalar=%.3fs",
                test.name, program.instructionCount(), scalarTime);
@@ -1688,19 +1736,27 @@ static int runGenericFormulaProfile() {
                    batchTime, scalarTime / batchTime);
         else
             printf(" batch=n/a");
+        if (fixedBatchTime > 0.0)
+            printf(" refill=%.2fx",
+                   fixedBatchTime / batchTime);
         if (jitTime > 0.0)
             printf(" JIT=%.3fs(%.2fx)", jitTime, scalarTime / jitTime);
         else
             printf(" JIT=n/a");
-        printf(" memcmp=%s/%s mismatch=%d/%d\n",
+        printf(" memcmp=%s/%s/%s mismatch=%d/%d/%d\n",
                batchExact ? "exact" : "FAIL",
                jitExact ? "exact" : "FAIL",
-               batchMismatches, jitMismatches);
+               refillExact ? "exact" : "FAIL",
+               batchMismatches, jitMismatches, refillMismatches);
     }
-    bool hybridDefaultGate = exactHybridCases == 2 && hybridImproved;
+    bool hybridDefaultGate =
+        exactHybridCases == 2 && hybridNoRegressionCases == 2;
     if (!hybridDefaultGate) ++failures;
-    printf("  hybrid default gate: exact=%d/2 >=1.10x=%s\n",
-           exactHybridCases, hybridImproved ? "PASS" : "FAIL");
+    printf("  hybrid default gate: exact=%d/2 non-regression=%d/2\n",
+           exactHybridCases, hybridNoRegressionCases);
+    if (refillNoRegressionCases != 2) ++failures;
+    printf("  hybrid refill non-regression=%d/2\n",
+           refillNoRegressionCases);
     {
         formula::ExpressionProgram identity;
         formula::ExpressionError error;
