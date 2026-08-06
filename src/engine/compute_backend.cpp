@@ -1,6 +1,8 @@
 #include "compute_backend.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -61,13 +63,44 @@ public:
                 request.maxIterations, request.coloringMethod);
             break;
         case ComputeMode::Expression:
-            result = request.cpuEngine->ComputeExpression(
-                request.centerRe, request.centerIm, request.scale,
-                *request.expression, *request.expressionFixed,
-                request.expressionPixel, request.maxIterations,
-                request.expressionBailout, request.expressionColoring,
-                request.expressionJit);
+        {
+            const char* cubicSetting =
+                std::getenv("MANDEL_CUBIC_RESIDUAL");
+            const char* residualPowerSetting =
+                std::getenv("MANDEL_EXPR_RESIDUAL_POWER");
+            const char* seriesSetting =
+                std::getenv("MANDEL_EXPR_CUBIC_SA");
+            const char* thresholdSetting =
+                std::getenv("MANDEL_CUBIC_RESIDUAL_SCALE");
+            double threshold = thresholdSetting
+                ? std::atof(thresholdSetting) : 1e8;
+            bool useCubicResidual =
+                (!cubicSetting || std::atoi(cubicSetting) != 0) &&
+                (!residualPowerSetting ||
+                 std::atoi(residualPowerSetting) != 0) &&
+                (!seriesSetting || std::atoi(seriesSetting) != 0) &&
+                std::isfinite(threshold) && threshold > 0.0 &&
+                request.expression->fastIntegerPower() == 3 &&
+                request.expressionPixel == FormulaParameter::C &&
+                mpf_cmp_d(request.scale, threshold) >= 0;
+            if (useCubicResidual) {
+                result = request.cpuEngine->ComputeExpressionResidual(
+                    request.centerRe, request.centerIm, request.scale,
+                    *request.expression, *request.expressionFixed,
+                    request.expressionPixel, request.maxIterations,
+                    request.expressionBailout, nullptr,
+                    request.expressionColoring, nullptr,
+                    std::max(8, request.maxIterations * 9 / 10));
+            } else {
+                result = request.cpuEngine->ComputeExpression(
+                    request.centerRe, request.centerIm, request.scale,
+                    *request.expression, *request.expressionFixed,
+                    request.expressionPixel, request.maxIterations,
+                    request.expressionBailout, request.expressionColoring,
+                    request.expressionJit);
+            }
             break;
+        }
         }
         std::lock_guard<std::mutex> lock(_mutex);
         return result && !_cancelRequested;

@@ -685,8 +685,28 @@ bool MandelNavigator::SetExpressionFormula(
 std::string MandelNavigator::GetExpressionAccelerationText() const {
     if (!IsExpression()) return {};
     if (_expressionProgram.fastPath() !=
-        formula::ExpressionProgram::FastPath::None)
-        return "integer-power kernel";
+        formula::ExpressionProgram::FastPath::None) {
+        int power = _expressionProgram.fastIntegerPower();
+        if (power == 3 && _expressionPixel == FormulaParameter::C) {
+            const char* enabled = std::getenv("MANDEL_CUBIC_RESIDUAL");
+            const char* residual =
+                std::getenv("MANDEL_EXPR_RESIDUAL_POWER");
+            const char* series =
+                std::getenv("MANDEL_EXPR_CUBIC_SA");
+            const char* configured =
+                std::getenv("MANDEL_CUBIC_RESIDUAL_SCALE");
+            double threshold = configured
+                ? std::atof(configured) : 1e8;
+            if ((!enabled || std::atoi(enabled) != 0) &&
+                (!residual || std::atoi(residual) != 0) &&
+                (!series || std::atoi(series) != 0) &&
+                std::isfinite(threshold) && threshold > 0.0 &&
+                mpf_cmp_d(_scale, threshold) >= 0)
+                return "cubic SA / AVX2 adaptive";
+        }
+        return power <= 8
+            ? "integer-power AVX2" : "integer-power scalar";
+    }
 #if defined(MANDEL_ENABLE_ASMJIT)
     if (_expressionUseJit)
         return "W^X JIT";

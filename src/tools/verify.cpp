@@ -2277,6 +2277,208 @@ static int runMultibrotCase() {
         ? genericResidualMedian / cubicResidualMedian : 0.0;
     if (residualBitMismatches || residualSpeedup < 1.10) ++failures;
 
+    auto renderDirectCusp = [&](double viewScale,
+                                std::vector<float>& output,
+                                double& elapsed) {
+        output.assign((size_t)RW * RH, EMPTYPIXEL);
+        Mandel renderer(RW, RH, RMIT, 1, output.data());
+        formula::ExpressionContext fixed;
+        mpf_t centerRe, centerIm, scale;
+        mpf_init_set_d(centerRe, 0.3849001794597505);
+        mpf_init_set_ui(centerIm, 0);
+        mpf_init_set_d(scale, viewScale);
+        _putenv_s("MANDEL_EXPR_POWER_SIMD", "1");
+        auto begin = Clock::now();
+        bool okay = renderer.ComputeExpression(
+            centerRe, centerIm, scale, cubicProgram, fixed,
+            FormulaParameter::C, RMIT, 4.0,
+            formula::ExpressionColoring::Smooth);
+        elapsed = since(begin);
+        mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+        return okay;
+    };
+    const double crossoverScales[] = {
+        1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12
+    };
+    double firstProfitableScale = 0.0;
+    printf("  cubic production crossover (Smooth):\n");
+    for (double viewScale : crossoverScales) {
+        std::vector<float> direct;
+        std::vector<float> residual;
+        double directTime = 0.0, residualTime = 0.0;
+        int coverage = 0;
+        bool directOkay =
+            renderDirectCusp(viewScale, direct, directTime);
+        bool residualOkay = renderResidual(
+            true, formula::ExpressionColoring::Smooth,
+            residual, residualTime, true, &coverage, viewScale);
+        int classMismatches = 0;
+        int floorMismatches = 0;
+        double maxDifference = 0.0;
+        for (size_t i = 0; i < direct.size(); ++i) {
+            bool a = isInterior(direct[i]);
+            bool b = isInterior(residual[i]);
+            if (a != b) ++classMismatches;
+            else if (!a) {
+                if ((int)direct[i] != (int)residual[i])
+                    ++floorMismatches;
+                maxDifference = std::max(
+                    maxDifference,
+                    std::fabs((double)direct[i] - residual[i]));
+            }
+        }
+        double crossoverSpeedup =
+            residualTime > 0.0 ? directTime / residualTime : 0.0;
+        if (!directOkay || !residualOkay ||
+            classMismatches || floorMismatches ||
+            maxDifference > 1e-3)
+            ++failures;
+        if (firstProfitableScale == 0.0 &&
+            crossoverSpeedup >= 1.10)
+            firstProfitableScale = viewScale;
+        printf("    scale=%.0e SA=%d direct/residual %.3f/%.3f"
+               " speedup=%.2fx class=%d floor=%d max=%.3g\n",
+               viewScale, coverage, directTime, residualTime,
+               crossoverSpeedup, classMismatches,
+               floorMismatches, maxDifference);
+    }
+    if (firstProfitableScale == 0.0) ++failures;
+    _putenv_s("MANDEL_EXPR_POWER_SIMD", "");
+
+    int backendDeepMismatches = 0;
+    int backendShallowMismatches = 0;
+    int backendDisabledMismatches = 0;
+    int backendZ0Mismatches = 0;
+    int backendPartialMismatches = 0;
+    {
+        constexpr int PW = 160, PH = 108, PMIT = 3000;
+        formula::ExpressionContext fixed;
+        std::vector<float> expected((size_t)PW * PH, EMPTYPIXEL);
+        std::vector<float> dispatched((size_t)PW * PH, EMPTYPIXEL);
+        Mandel expectedRenderer(
+            PW, PH, PMIT, 1, expected.data());
+        Mandel dispatchedRenderer(
+            PW, PH, PMIT, 1, dispatched.data());
+        std::unique_ptr<IComputeBackend> backend =
+            createComputeBackend("cpu");
+        mpf_t centerRe, centerIm, scale;
+        mpf_init_set_d(centerRe, 0.3849001794597505);
+        mpf_init_set_ui(centerIm, 0);
+        mpf_init_set_d(scale, 1e8);
+        bool used = false;
+        bool expectedOkay =
+            expectedRenderer.ComputeExpressionResidual(
+                centerRe, centerIm, scale, cubicProgram, fixed,
+                FormulaParameter::C, PMIT, 4.0, &used,
+                formula::ExpressionColoring::Smooth);
+        ComputeRequest request;
+        request.mode = ComputeMode::Expression;
+        request.cpuEngine = &dispatchedRenderer;
+        request.centerRe = centerRe;
+        request.centerIm = centerIm;
+        request.scale = scale;
+        request.width = PW;
+        request.height = PH;
+        request.sub = 1;
+        request.maxIterations = PMIT;
+        request.iterations = dispatched.data();
+        request.expression = &cubicProgram;
+        request.expressionFixed = &fixed;
+        request.expressionPixel = FormulaParameter::C;
+        request.expressionBailout = 4.0;
+        request.expressionColoring =
+            formula::ExpressionColoring::Smooth;
+        _putenv_s("MANDEL_CUBIC_RESIDUAL", "1");
+        _putenv_s("MANDEL_CUBIC_RESIDUAL_SCALE", "1e8");
+        backend->resetCancellation();
+        bool backendOkay = backend->compute(request);
+        for (size_t i = 0; i < expected.size(); ++i) {
+            if (std::memcmp(
+                    &expected[i], &dispatched[i], sizeof(float)) != 0)
+                ++backendDeepMismatches;
+        }
+        if (!expectedOkay || !used || !backendOkay ||
+            backendDeepMismatches)
+            ++failures;
+
+        mpf_set_d(scale, 1e7);
+        expectedOkay = expectedRenderer.ComputeExpression(
+            centerRe, centerIm, scale, cubicProgram, fixed,
+            FormulaParameter::C, PMIT, 4.0,
+            formula::ExpressionColoring::Smooth);
+        std::fill(dispatched.begin(), dispatched.end(), EMPTYPIXEL);
+        backend->resetCancellation();
+        backendOkay = backend->compute(request);
+        for (size_t i = 0; i < expected.size(); ++i) {
+            if (std::memcmp(
+                    &expected[i], &dispatched[i], sizeof(float)) != 0)
+                ++backendShallowMismatches;
+        }
+        if (!expectedOkay || !backendOkay ||
+            backendShallowMismatches)
+            ++failures;
+
+        mpf_set_d(scale, 1e5);
+        _putenv_s("MANDEL_CUBIC_RESIDUAL_SCALE", "1e5");
+        expectedOkay = expectedRenderer.ComputeExpression(
+            centerRe, centerIm, scale, cubicProgram, fixed,
+            FormulaParameter::C, PMIT, 4.0,
+            formula::ExpressionColoring::Smooth);
+        std::fill(dispatched.begin(), dispatched.end(), EMPTYPIXEL);
+        backend->resetCancellation();
+        backendOkay = backend->compute(request);
+        for (size_t i = 0; i < expected.size(); ++i) {
+            if (std::memcmp(
+                    &expected[i], &dispatched[i], sizeof(float)) != 0)
+                ++backendPartialMismatches;
+        }
+        if (!expectedOkay || !backendOkay ||
+            backendPartialMismatches)
+            ++failures;
+        _putenv_s("MANDEL_CUBIC_RESIDUAL_SCALE", "1e8");
+
+        mpf_set_d(scale, 1e8);
+        expectedOkay = expectedRenderer.ComputeExpression(
+            centerRe, centerIm, scale, cubicProgram, fixed,
+            FormulaParameter::C, PMIT, 4.0,
+            formula::ExpressionColoring::Smooth);
+        std::fill(dispatched.begin(), dispatched.end(), EMPTYPIXEL);
+        _putenv_s("MANDEL_EXPR_RESIDUAL_POWER", "0");
+        backend->resetCancellation();
+        backendOkay = backend->compute(request);
+        for (size_t i = 0; i < expected.size(); ++i) {
+            if (std::memcmp(
+                    &expected[i], &dispatched[i], sizeof(float)) != 0)
+                ++backendDisabledMismatches;
+        }
+        if (!expectedOkay || !backendOkay ||
+            backendDisabledMismatches)
+            ++failures;
+        _putenv_s("MANDEL_EXPR_RESIDUAL_POWER", "");
+
+        fixed.c = { 0.0, 0.0 };
+        request.expressionPixel = FormulaParameter::InitialZ;
+        mpf_set_ui(centerRe, 1);
+        mpf_set_d(scale, 1e10);
+        expectedOkay = expectedRenderer.ComputeExpression(
+            centerRe, centerIm, scale, cubicProgram, fixed,
+            FormulaParameter::InitialZ, PMIT, 4.0,
+            formula::ExpressionColoring::Smooth);
+        std::fill(dispatched.begin(), dispatched.end(), EMPTYPIXEL);
+        backend->resetCancellation();
+        backendOkay = backend->compute(request);
+        for (size_t i = 0; i < expected.size(); ++i) {
+            if (std::memcmp(
+                    &expected[i], &dispatched[i], sizeof(float)) != 0)
+                ++backendZ0Mismatches;
+        }
+        if (!expectedOkay || !backendOkay || backendZ0Mismatches)
+            ++failures;
+        _putenv_s("MANDEL_CUBIC_RESIDUAL", "");
+        _putenv_s("MANDEL_CUBIC_RESIDUAL_SCALE", "");
+        mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+    }
+
     printf("  aggregate bits=%d class=%d max=%.6g\n",
            totalBitMismatches, totalClassMismatches, maximumDifference);
     printf("  cubic %dx%d mxit=%d scalar/AVX2 %.3f/%.3f s speedup %.2fx\n",
@@ -2291,6 +2493,13 @@ static int runMultibrotCase() {
            seriesSpeedup, seriesClassMismatches, seriesFloorMismatches);
     printf("  cubic SA shallow iteration=%d bits=%d\n",
            shallowSeriesIterations, shallowMismatches);
+    printf("  cubic production threshold candidate=%.0e\n",
+           firstProfitableScale);
+    printf("  cubic backend deep/shallow/partial/disabled/z0"
+           " bits=%d/%d/%d/%d/%d\n",
+           backendDeepMismatches, backendShallowMismatches,
+           backendPartialMismatches, backendDisabledMismatches,
+           backendZ0Mismatches);
     printf("  => %s\n\n",
            failures == 0 ? "PASS"
                          : "CHECK (Multibrot correctness/performance)");

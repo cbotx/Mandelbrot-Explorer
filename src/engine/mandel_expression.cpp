@@ -592,7 +592,8 @@ bool Mandel::ComputeExpressionResidual(
         FormulaParameter pixelParameter, int mxit, double bailout,
         bool* usedPerturbation,
         formula::ExpressionColoring coloring,
-        int* seriesIterations) {
+        int* seriesIterations,
+        int minimumSeriesIterations) {
     if (usedPerturbation) *usedPerturbation = false;
     if (seriesIterations) *seriesIterations = 0;
     if (_sub != 1 || !program.valid() || mxit < 1 || !(bailout > 0.0) ||
@@ -682,6 +683,13 @@ bool Mandel::ComputeExpressionResidual(
         if (series.iteration < 8)
             series = {};
         if (seriesIterations) *seriesIterations = series.iteration;
+        if (minimumSeriesIterations > 0 &&
+            series.iteration < minimumSeriesIterations) {
+            if (usedPerturbation) *usedPerturbation = false;
+            return ComputeExpression(
+                center_re, center_im, scale, program, fixed,
+                pixelParameter, mxit, bailout, coloring, nullptr);
+        }
     }
 #pragma omp parallel for schedule(dynamic, 1)
     for (int i = 0; i < _h; ++i) {
