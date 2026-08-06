@@ -40,7 +40,9 @@ struct ExpressionDerivativeSeed {
 enum class ExpressionColoring : uint8_t {
     Raw,
     Smooth,
-    Distance
+    Distance,
+    Feather,
+    OrbitTrap
 };
 
 class ExpressionProgram {

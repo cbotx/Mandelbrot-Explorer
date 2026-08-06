@@ -10,7 +10,8 @@
 //   case = shallow | deep | ticktock | flake | exterior1000 | parity1000 |
 //          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
-//          expression | expression-orbit | expression-oracle | expression-suite |
+//          expression | expression-coloring | expression-orbit |
+//          expression-oracle | expression-suite |
 //          expression-residual | formula-bench | multibrot | backend | gpu | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
@@ -41,6 +42,7 @@
 #include "formula_expression_orbit.h"
 #include "formula_expression_jit.h"
 #include "formula_expression_oracle.h"
+#include "orbit_coloring.h"
 #include "orbit_overlay.h"
 #include "test_cases.h"
 
@@ -1903,6 +1905,356 @@ static int runExpressionCoreCase() {
     return failures == 0 ? 0 : 1;
 }
 
+static bool renderExpressionColorReference(
+        const formula::ExpressionProgram& program,
+        const formula::ExpressionContext& fixed,
+        FormulaParameter pixel, double centerRe, double centerIm,
+        double scale, int width, int height, int mxit, double bailout,
+        formula::ExpressionColoring coloring,
+        std::vector<float>& output) {
+    if (!program.valid() || width < 2 || height < 2 ||
+        !(scale > 0.0) || !(bailout > 0.0))
+        return false;
+    const double halfWidth = 2.0 / scale;
+    const double halfHeight = halfWidth * height / width;
+    const double startRe = centerRe - halfWidth;
+    const double startIm = centerIm - halfHeight;
+    const double dx = 2.0 * halfWidth / (width - 1);
+    const double dy = 2.0 * halfHeight / (height - 1);
+    const int power =
+        program.fastPath() ==
+                formula::ExpressionProgram::FastPath::IntegerPowerPlusC
+            ? program.fastIntegerPower() : 0;
+    output.assign((size_t)width * height, EMPTYPIXEL);
+    std::array<formula::Complex,
+               formula::ExpressionProgram::MAX_STACK> stack;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            formula::ExpressionContext context = fixed;
+            formula::Complex coordinate{
+                startRe + dx * x, startIm + dy * y
+            };
+            if (pixel == FormulaParameter::C)
+                context.c = coordinate;
+            else
+                context.z0 = coordinate;
+            context.z = context.z0;
+            double initialRe = context.z.real();
+            double initialIm = context.z.imag();
+            if (!std::isfinite(initialRe) ||
+                !std::isfinite(initialIm) ||
+                std::hypot(initialRe, initialIm) > bailout) {
+                output[(size_t)y * width + x] = 0.0f;
+                continue;
+            }
+
+            orbitcolor::FormulaColorAccum accumulator;
+            if (coloring == formula::ExpressionColoring::Feather ||
+                coloring == formula::ExpressionColoring::OrbitTrap) {
+                accumulator.init(
+                    coloring == formula::ExpressionColoring::OrbitTrap
+                        ? orbitcolor::FormulaColorMode::OrbitTrap
+                        : orbitcolor::FormulaColorMode::Feather);
+            }
+            float result =
+                coloring == formula::ExpressionColoring::OrbitTrap
+                    ? accumulator.interior() : -2.0f;
+            for (int iteration = 0; iteration < mxit; ++iteration) {
+                context.iteration = iteration;
+                context.z = program.evaluate(
+                    context, stack.data(), program.stackDepth());
+                double re = context.z.real();
+                double im = context.z.imag();
+                double magnitude = std::hypot(re, im);
+                if (coloring == formula::ExpressionColoring::Feather ||
+                    coloring == formula::ExpressionColoring::OrbitTrap)
+                    accumulator.push(re, im);
+                if (!std::isfinite(re) || !std::isfinite(im) ||
+                    magnitude > bailout) {
+                    if (coloring == formula::ExpressionColoring::Feather ||
+                        coloring == formula::ExpressionColoring::OrbitTrap) {
+                        result = accumulator.escaped(
+                            iteration + 1, magnitude, power, bailout);
+                    } else {
+                        result = (float)(iteration + 1);
+                    }
+                    break;
+                }
+                if (iteration + 1 == mxit &&
+                    coloring == formula::ExpressionColoring::OrbitTrap)
+                    result = accumulator.interior();
+            }
+            output[(size_t)y * width + x] = result;
+        }
+    }
+    return true;
+}
+
+static int runExpressionColoringCase() {
+    struct Case {
+        const char* name;
+        const char* source;
+        FormulaParameter pixel;
+        formula::ExpressionContext fixed;
+        double centerRe = 0.0;
+        double centerIm = 0.0;
+        double scale = 1.0;
+        double bailout = 4.0;
+        int mxit = 80;
+    };
+
+    std::vector<Case> cases;
+    Case arithmetic{
+        "arithmetic-jit", "z*z+c+p0*z", FormulaParameter::C
+    };
+    arithmetic.fixed.parameters[0] = { 0.1, -0.05 };
+    arithmetic.centerRe = -0.4;
+    cases.push_back(arithmetic);
+    Case arithmeticZ0 = arithmetic;
+    arithmeticZ0.name = "arithmetic-jit-z0";
+    arithmeticZ0.pixel = FormulaParameter::InitialZ;
+    arithmeticZ0.fixed.c = { -0.35, 0.62 };
+    arithmeticZ0.centerRe = 0.0;
+    cases.push_back(arithmeticZ0);
+    Case transcendental{
+        "transcendental-hybrid", "sin(z)+c", FormulaParameter::C
+    };
+    transcendental.fixed.z0 = { 0.1, -0.05 };
+    transcendental.bailout = 8.0;
+    cases.push_back(transcendental);
+    Case invariant{
+        "orbit-plan-jit", "0.5*z+0.1*sin(c)", FormulaParameter::C
+    };
+    invariant.mxit = 120;
+    cases.push_back(invariant);
+    Case powerC{
+        "integer-power-c", "z*z*z+c", FormulaParameter::C
+    };
+    cases.push_back(powerC);
+    Case powerZ0{
+        "integer-power-z0", "z*z*z+c", FormulaParameter::InitialZ
+    };
+    powerZ0.fixed.c = { -0.35, 0.62 };
+    powerZ0.scale = 0.8;
+    cases.push_back(powerZ0);
+    Case interior{
+        "interior", "0.5*z", FormulaParameter::C
+    };
+    interior.fixed.z0 = {};
+    interior.scale = 4.0;
+    interior.mxit = 20;
+    cases.push_back(interior);
+    Case initialEscape{
+        "initial-escape", "z*z+c", FormulaParameter::InitialZ
+    };
+    initialEscape.fixed.c = { -0.8, 0.156 };
+    initialEscape.scale = 0.4;
+    cases.push_back(initialEscape);
+    Case domain{
+        "domain-nonfinite", "log(z)+c", FormulaParameter::C
+    };
+    domain.fixed.z0 = {};
+    domain.bailout = 8.0;
+    cases.push_back(domain);
+
+    constexpr int width = 7;
+    constexpr int height = 5;
+    int failures = 0;
+    int comparisons = 0;
+    int mismatches = 0;
+    int sentinelCollisions = 0;
+    printf("=== universal expression coloring\n");
+
+    for (const Case& test : cases) {
+        formula::ExpressionProgram source;
+        formula::ExpressionProgram runtime;
+        formula::ExpressionOrbitPlan plan;
+        formula::ExpressionError error;
+        if (!source.compile(test.source, &error) ||
+            !source.specialize(test.fixed, test.pixel, runtime, &error) ||
+            !plan.build(runtime, &error)) {
+            ++failures;
+            continue;
+        }
+        formula::ExpressionJit4 jit;
+        bool jitAvailable =
+            runtime.fastPath() ==
+                formula::ExpressionProgram::FastPath::None &&
+            (plan.profitable()
+                ? jit.compile(plan) : jit.compile(runtime));
+        const formula::ExpressionOrbitPlan* activePlan =
+            plan.profitable() ? &plan : nullptr;
+
+        for (formula::ExpressionColoring coloring :
+             { formula::ExpressionColoring::Raw,
+               formula::ExpressionColoring::Feather,
+               formula::ExpressionColoring::OrbitTrap }) {
+            std::vector<float> reference;
+            if (!renderExpressionColorReference(
+                    runtime, test.fixed, test.pixel,
+                    test.centerRe, test.centerIm, test.scale,
+                    width, height, test.mxit, test.bailout,
+                    coloring, reference)) {
+                ++failures;
+                continue;
+            }
+            struct Path {
+                bool vector;
+                bool refill;
+                bool powerSimd;
+                bool useJit;
+            };
+            const Path paths[] = {
+                { false, true, false, false },
+                { true, true, true, false },
+                { true, false, true, false },
+                { true, true, true, true },
+                { true, false, true, true }
+            };
+            for (const Path& path : paths) {
+                if (path.useJit && !jitAvailable) continue;
+                std::vector<float> actual(
+                    (size_t)width * height, EMPTYPIXEL);
+                Mandel renderer(
+                    width, height, test.mxit, 1, actual.data());
+                mpf_t centerRe, centerIm, scale;
+                mpf_init_set_d(centerRe, test.centerRe);
+                mpf_init_set_d(centerIm, test.centerIm);
+                mpf_init_set_d(scale, test.scale);
+                _putenv_s(
+                    "MANDEL_EXPR_VECTOR", path.vector ? "1" : "0");
+                _putenv_s(
+                    "MANDEL_EXPR_HYBRID_REFILL",
+                    path.refill ? "1" : "0");
+                _putenv_s(
+                    "MANDEL_EXPR_POWER_SIMD",
+                    path.powerSimd ? "1" : "0");
+                bool okay = renderer.ComputeExpression(
+                    centerRe, centerIm, scale,
+                    runtime, test.fixed, test.pixel,
+                    test.mxit, test.bailout, coloring,
+                    path.useJit ? &jit : nullptr, activePlan);
+                mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+                ++comparisons;
+                if (!okay) {
+                    ++failures;
+                    continue;
+                }
+                for (size_t index = 0;
+                     index < actual.size(); ++index) {
+                    if (std::memcmp(
+                            &actual[index], &reference[index],
+                            sizeof(float)) != 0)
+                        ++mismatches;
+                    if (coloring ==
+                            formula::ExpressionColoring::OrbitTrap) {
+                        if (!(actual[index] >= 0.0f) ||
+                            actual[index] == EMPTYPIXEL ||
+                            actual[index] == -2.0f)
+                            ++sentinelCollisions;
+                    } else if (coloring ==
+                               formula::ExpressionColoring::Feather) {
+                        if (actual[index] != -2.0f &&
+                            !(actual[index] >= 0.0f))
+                            ++sentinelCollisions;
+                    }
+                }
+            }
+        }
+    }
+
+    if (expressionColoringFromMethod(0, false) !=
+            formula::ExpressionColoring::Raw ||
+        expressionColoringFromMethod(0, true) !=
+            formula::ExpressionColoring::Smooth ||
+        expressionColoringFromMethod(
+            ColoringMethod::EXTERIOR_DIST_EST, true) !=
+            formula::ExpressionColoring::Distance ||
+        expressionColoringFromMethod(
+            ColoringMethod::STRIPE_AVERAGE, false) !=
+            formula::ExpressionColoring::Feather ||
+        expressionColoringFromMethod(
+            ColoringMethod::ORBIT_TRAP, false) !=
+            formula::ExpressionColoring::OrbitTrap)
+        ++failures;
+    for (int index = 0; index < 7; ++index) {
+        bool genericExpected =
+            index == 0 || index == 2 || index == 5;
+        bool powerExpected = genericExpected || index == 1;
+        if (expressionColoringIndexSupported(index, false) !=
+                genericExpected ||
+            expressionColoringIndexSupported(index, true) !=
+                powerExpected)
+            ++failures;
+    }
+
+    auto median = [](std::vector<double> values) {
+        std::sort(values.begin(), values.end());
+        return values[values.size() / 2];
+    };
+    formula::ExpressionProgram profileSource;
+    formula::ExpressionProgram profileRuntime;
+    formula::ExpressionOrbitPlan profilePlan;
+    formula::ExpressionContext profileFixed;
+    formula::ExpressionError profileError;
+    double medians[3] = {};
+    const formula::ExpressionColoring profileColorings[] = {
+        formula::ExpressionColoring::Raw,
+        formula::ExpressionColoring::Feather,
+        formula::ExpressionColoring::OrbitTrap
+    };
+    if (!profileSource.compile(
+            "0.5*z+0.1*sin(c)", &profileError) ||
+        !profileSource.specialize(
+            profileFixed, FormulaParameter::C,
+            profileRuntime, &profileError) ||
+        !profilePlan.build(profileRuntime, &profileError)) {
+        ++failures;
+    } else {
+        formula::ExpressionJit4 profileJit;
+        bool profileJitAvailable = profilePlan.profitable()
+            ? profileJit.compile(profilePlan)
+            : profileJit.compile(profileRuntime);
+        for (int colorIndex = 0; colorIndex < 3; ++colorIndex) {
+            std::vector<double> times;
+            std::vector<float> frame(64 * 48, EMPTYPIXEL);
+            for (int sample = 0; sample < 5; ++sample) {
+                Mandel renderer(64, 48, 300, 1, frame.data());
+                mpf_t re, im, scale;
+                mpf_init_set_ui(re, 0);
+                mpf_init_set_ui(im, 0);
+                mpf_init_set_ui(scale, 1);
+                auto begin = Clock::now();
+                bool okay = renderer.ComputeExpression(
+                    re, im, scale, profileRuntime, profileFixed,
+                    FormulaParameter::C, 300, 4.0,
+                    profileColorings[colorIndex],
+                    profileJitAvailable ? &profileJit : nullptr,
+                    profilePlan.profitable() ? &profilePlan : nullptr);
+                times.push_back(since(begin));
+                mpf_clears(re, im, scale, (mpf_ptr)0);
+                if (!okay) ++failures;
+            }
+            medians[colorIndex] = median(times);
+        }
+    }
+
+    _putenv_s("MANDEL_EXPR_VECTOR", "");
+    _putenv_s("MANDEL_EXPR_HYBRID_REFILL", "");
+    _putenv_s("MANDEL_EXPR_POWER_SIMD", "");
+    failures += mismatches != 0;
+    failures += sentinelCollisions != 0;
+    printf("  scalar/AVX2/Hybrid/JIT comparisons=%d mismatches=%d sentinels=%d\n",
+           comparisons, mismatches, sentinelCollisions);
+    printf("  repeated medians raw/feather/trap %.4f/%.4f/%.4f s"
+           " (colored costs reported, not gated)\n",
+           medians[0], medians[1], medians[2]);
+    printf("  => %s\n\n",
+           failures == 0 ? "PASS"
+                         : "CHECK (expression coloring failure)");
+    return failures == 0 ? 0 : 1;
+}
+
 static int runExpressionOrbitCase() {
     using formula::Complex;
     using formula::ExpressionContext;
@@ -3237,15 +3589,21 @@ static int runMultibrotCase() {
     const formula::ExpressionColoring colorings[] = {
         formula::ExpressionColoring::Raw,
         formula::ExpressionColoring::Smooth,
-        formula::ExpressionColoring::Distance
+        formula::ExpressionColoring::Distance,
+        formula::ExpressionColoring::Feather,
+        formula::ExpressionColoring::OrbitTrap
     };
-    const char* coloringNames[] = { "raw", "smooth", "distance" };
+    const char* coloringNames[] = {
+        "raw", "smooth", "distance", "feather", "trap"
+    };
 
     printf("=== integer Multibrot AVX2 correctness\n");
     for (int power = 2; power <= 8; ++power) {
         for (FormulaParameter pixel :
              { FormulaParameter::C, FormulaParameter::InitialZ }) {
-            for (int coloringIndex = 0; coloringIndex < 3; ++coloringIndex) {
+            for (int coloringIndex = 0;
+                 coloringIndex < (int)std::size(colorings);
+                 ++coloringIndex) {
                 std::vector<float> scalar;
                 std::vector<float> simd;
                 if (!renderIntegerPowerFrame(
@@ -3881,6 +4239,7 @@ static int runMultibrotCase() {
     int backendDisabledMismatches = 0;
     int backendZ0Mismatches = 0;
     int backendPartialMismatches = 0;
+    int backendColoredMismatches = 0;
     {
         constexpr int PW = 160, PH = 108, PMIT = 3000;
         formula::ExpressionContext fixed;
@@ -3987,6 +4346,30 @@ static int runMultibrotCase() {
             ++failures;
         _putenv_s("MANDEL_EXPR_RESIDUAL_POWER", "");
 
+        for (formula::ExpressionColoring coloring :
+             { formula::ExpressionColoring::Feather,
+               formula::ExpressionColoring::OrbitTrap }) {
+            request.expressionColoring = coloring;
+            expectedOkay = expectedRenderer.ComputeExpression(
+                centerRe, centerIm, scale, cubicProgram, fixed,
+                FormulaParameter::C, PMIT, 4.0, coloring);
+            std::fill(
+                dispatched.begin(), dispatched.end(), EMPTYPIXEL);
+            backend->resetCancellation();
+            backendOkay = backend->compute(request);
+            for (size_t i = 0; i < expected.size(); ++i) {
+                if (std::memcmp(
+                        &expected[i], &dispatched[i],
+                        sizeof(float)) != 0)
+                    ++backendColoredMismatches;
+            }
+            if (!expectedOkay || !backendOkay ||
+                backendColoredMismatches)
+                ++failures;
+        }
+        request.expressionColoring =
+            formula::ExpressionColoring::Smooth;
+
         fixed.c = { 0.0, 0.0 };
         request.expressionPixel = FormulaParameter::InitialZ;
         mpf_set_ui(centerRe, 1);
@@ -4026,11 +4409,11 @@ static int runMultibrotCase() {
            shallowSeriesIterations, shallowMismatches);
     printf("  cubic production threshold candidate=%.0e\n",
            firstProfitableScale);
-    printf("  cubic backend deep/shallow/partial/disabled/z0"
-           " bits=%d/%d/%d/%d/%d\n",
+    printf("  cubic backend deep/shallow/partial/disabled/z0/colored"
+           " bits=%d/%d/%d/%d/%d/%d\n",
            backendDeepMismatches, backendShallowMismatches,
            backendPartialMismatches, backendDisabledMismatches,
-           backendZ0Mismatches);
+           backendZ0Mismatches, backendColoredMismatches);
     printf("  => %s\n\n",
            failures == 0 ? "PASS"
                          : "CHECK (Multibrot correctness/performance)");
@@ -4198,8 +4581,6 @@ static int runBackendCase() {
             runtimeExpression, &compileError)) {
         ++failures;
     } else {
-        directMandel.ComputeExpression(centerRe, centerIm, scale, expression,
-                                       fixed, FormulaParameter::C, MXIT, 4.0);
         request.mode = ComputeMode::Expression;
         request.expression = &runtimeExpression;
         request.expressionFixed = &fixed;
@@ -4214,10 +4595,23 @@ static int runBackendCase() {
                 ? &runtimeExpressionJit : nullptr;
         request.expressionPixel = FormulaParameter::C;
         request.expressionBailout = 4.0;
-        request.expressionColoring = formula::ExpressionColoring::Raw;
         request.fixedCRe = request.fixedCIm = nullptr;
-        backend->resetCancellation();
-        if (!backend->compute(request) || !same(direct, dispatched)) ++failures;
+        for (formula::ExpressionColoring coloring :
+             { formula::ExpressionColoring::Raw,
+               formula::ExpressionColoring::Feather,
+               formula::ExpressionColoring::OrbitTrap }) {
+            if (!directMandel.ComputeExpression(
+                    centerRe, centerIm, scale, runtimeExpression,
+                    fixed, FormulaParameter::C, MXIT, 4.0,
+                    coloring, request.expressionJit,
+                    request.expressionPlan))
+                ++failures;
+            request.expressionColoring = coloring;
+            backend->resetCancellation();
+            if (!backend->compute(request) ||
+                !same(direct, dispatched))
+                ++failures;
+        }
     }
 
     ComputeRequest invalid;
@@ -4488,6 +4882,8 @@ static int runBackendCase() {
     cancelRequest.expressionPlan = &cancelPlan;
     cancelRequest.expressionJit = &cancelJit;
     cancelRequest.expressionPixel = FormulaParameter::C;
+    cancelRequest.expressionColoring =
+        formula::ExpressionColoring::OrbitTrap;
     backend->resetCancellation();
     auto start = Clock::now();
     std::future<bool> running = std::async(std::launch::async, [&] {
@@ -4753,7 +5149,11 @@ int main(int argc, char** argv) {
     if (which == "julia-ede")                  rc |= runJuliaCase(true);
     if (which == "julia-dendrite")             rc |= runJuliaCase(false, true);
     if (which == "julia-critical")             rc |= runJuliaCase(false, true, true);
-    if (which == "expression")                 rc |= runExpressionCoreCase();
+    if (which == "expression") {
+        rc |= runExpressionCoreCase();
+        rc |= runExpressionColoringCase();
+    }
+    if (which == "expression-coloring")        rc |= runExpressionColoringCase();
     if (which == "expression-orbit")           rc |= runExpressionOrbitCase();
     if (which == "expression-oracle")          rc |= runExpressionOracleCase();
     if (which == "expression-suite")           rc |= runFormulaRegressionSuite();

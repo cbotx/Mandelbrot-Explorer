@@ -156,12 +156,8 @@ void MandelNavigator::StartCompute() {
 #endif
             request.expressionPixel = this->_expressionPixel;
             request.expressionBailout = this->_expressionBailout;
-            request.expressionColoring =
-                this->_expressionProgram.fastIntegerPower() >= 2
-                    ? ((method & ColoringMethod::EXTERIOR_DIST_EST)
-                        ? formula::ExpressionColoring::Distance
-                        : formula::ExpressionColoring::Smooth)
-                    : formula::ExpressionColoring::Raw;
+            request.expressionColoring = expressionColoringFromMethod(
+                method, this->ExpressionSupportsDistance());
         } else if (this->IsJulia()) {
             request.mode = ComputeMode::Julia;
             request.fixedCRe = this->_julia_c_re;
@@ -689,6 +685,8 @@ bool MandelNavigator::SetExpressionFormula(
 #endif
 
     InterruptCompute();
+    bool wasExpression = IsExpression();
+    int previousMethod = _c_method;
     if (IsJulia() && !IsExpression()) RestoreMandelbrotMode();
     if (!IsExpression()) SaveMandelbrotState();
     bool planeChanged = IsExpression() && _expressionPixel != pixel;
@@ -705,7 +703,13 @@ bool MandelNavigator::SetExpressionFormula(
     _expressionBailout = bailout;
     _formula = expressionFormula();
     _formula.slice.pixel = pixel;
-    _c_method = 0;
+    bool supportsDistance =
+        _expressionProgram.fastIntegerPower() >= 2 &&
+        _expressionBailout >= 1.0;
+    _c_method = wasExpression
+        ? (previousMethod &
+           expressionColoringMethodMask(supportsDistance))
+        : 0;
     if (planeChanged || pixel == FormulaParameter::InitialZ) {
         mpf_set_ui(_z_re, 0); mpf_set_ui(_z_im, 0); mpf_set_ui(_scale, 1);
     } else if (mpf_cmp_d(_scale, 1e12) > 0) {
@@ -777,8 +781,9 @@ void MandelNavigator::SetCMethod(int c_method) {
         ? (c_method & ColoringMethod::EXTERIOR_DIST_EST)
         : c_method;
     if (IsExpression())
-        _c_method = ExpressionSupportsDistance()
-            ? (c_method & ColoringMethod::EXTERIOR_DIST_EST) : 0;
+        _c_method =
+            c_method &
+            expressionColoringMethodMask(ExpressionSupportsDistance());
 }
 
 void MandelNavigator::SetRedisplay() {

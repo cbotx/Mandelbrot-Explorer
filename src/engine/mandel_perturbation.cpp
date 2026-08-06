@@ -21,6 +21,7 @@
 #include "mandel_perturbation.h"
 #include "float_math.h"
 #include "dll_interface.h"
+#include "orbit_coloring.h"
 
 // BLA profiling: per-thread padded counters (no false sharing / contention).
 // [tid][0]=iterations skipped, [1]=BLA applies, [2]=normal steps.
@@ -38,84 +39,9 @@ static inline double nowSec() {
         std::chrono::high_resolution_clock::now().time_since_epoch()).count();
 }
 
-// Stripe Average Coloring window. Averaging the stripe term over the whole orbit
-// washes out at deep zoom (orbits are long and nearly identical, so Feather goes
-// flat); the per-pixel structure lives in the escaping tail. Weighting recent
-// iterations recovers it, and since it is a pure function of the orbit it stays
-// pan-invariant (no reference halo). A rectangular "last W" window steps sharply
-// when the escape count shifts a feature past its hard far edge (a visible
-// brightness line); an exponential window has infinite support so a BLA-skip
-// reset leaks a decayed tail (a faint halo). A triangular (Bartlett) window fixes
-// both: its weight fades linearly to 0 at age W, so there is no far-edge cliff
-// AND its support is finite (age>=W has weight 0), so it stays reference-clean.
-// MANDEL_SACWIN<=0 restores the classic full average.
-static int g_sac_win = -2;   // -2 = unread
-static inline int sacWindow() {
-    if (g_sac_win == -2) { const char* e = getenv("MANDEL_SACWIN"); g_sac_win = e ? atoi(e) : 256; }
-    return g_sac_win;
-}
-namespace {
-struct SacAccum {
-    static const int MAXW = 1024;
-    double ring[MAXW];
-    double RS = 0.0, TS = 0.0, full = 0.0, last = 0.0;   // rect sum, triangular-weighted sum
-    int W = 0, pos = 0, fill = 0, cnt = 0;
-    void init(int w) { W = w > MAXW ? MAXW : (w < 0 ? 0 : w); RS = TS = full = last = 0.0; pos = fill = cnt = 0; }
-    inline void push(double zr, double zi) {
-        double t = 0.5 + 0.5 * sin(7.0 * atan2(zi, zr));
-        full += t; last = t; ++cnt;
-        if (W > 0) {
-            double evicted = (fill == W) ? ring[pos] : (++fill, 0.0);
-            TS += (double)W * t - RS;         // newest gets weight W; every other weight -1
-            RS += t - evicted;
-            ring[pos] = t; pos = (pos + 1) % W;
-        }
-    }
-    inline void reset_window() { RS = TS = 0.0; pos = fill = 0; }   // a BLA skip breaks the tail
-    inline void add_full(double stripeSum, int n) { full += stripeSum; cnt += n; }  // W==0 skip restore
-    inline float value(double zrad, double R) const {
-        double frac = 1.0 - log(log(zrad) * 0.5 / log(R)) / log(2.0);
-        frac -= floor(frac);
-        double S, WS;   // weighted stripe sum and total weight
-        if (W > 0) { S = TS; WS = (double)fill * W - (double)fill * (fill - 1) / 2.0; }   // triangular weights
-        else       { S = full; WS = cnt; }
-        double a1 = WS > 0 ? S / WS : 0.0;
-        double lw = W > 0 ? (double)W : 1.0;                       // the last term's weight
-        double a2 = WS > lw ? (S - lw * last) / (WS - lw) : a1;    // average without the newest term
-        return (float)(a2 + (a1 - a2) * frac);
-    }
-};
-// Orbit-trap accumulator: tracks the orbit's closest approach to a composite trap
-// (a point at 0, the Pickover cross x=0/y=0, and the ring |z|=0.5) plus the angle
-// at the point-trap minimum, and maps them to a palette coordinate. Deterministic
-// (no randomness); the trap shape is the design parameter.
-struct TrapAccum {
-    double minPoint = 1e300, trapAngle = 0.0, minCross = 1e300, minCircle = 1e300;
-    inline void push(double zr, double zi) {
-        double m2 = zr * zr + zi * zi;
-        if (m2 < minPoint) { minPoint = m2; trapAngle = atan2(zi, zr); }
-        double cross = std::min(std::fabs(zr), std::fabs(zi));
-        if (cross < minCross) minCross = cross;
-        double circle = std::fabs(std::sqrt(m2) - 0.5);
-        if (circle < minCircle) minCircle = circle;
-    }
-    inline float value(double mu) const {
-        double d = std::min(std::min(std::sqrt(minPoint), minCross * 1.5), minCircle);
-        // Clamp so -log10(d) >= 0: beyond ~1 the orbit never came near a trap, so there
-        // is no "hit" (trap = 0). This ALSO keeps the returned value non-negative --
-        // a negative colour value would collide with the baseU<0 interior sentinel in
-        // the AA re-colour path and paint far-field pixels solid black.
-        if (d > 1.0) d = 1.0;
-        double trap = -std::log10(std::max(d, 1e-14));      // >= 0
-        if (mu < 0) mu = 0;                                 // far-field fast escapes
-        // NB: no atan2(trapAngle) term -- a wrapping angle added to a linear palette
-        // coordinate seams at the +/-pi branch cut (a visible left/right divide when the
-        // closest-point direction crosses the negative real axis). Distance + smooth
-        // count already give a rich, seamless trap.
-        return (float)(0.17 * trap + 0.025 * mu);           // always >= 0, seamless
-    }
-};
-}
+using orbitcolor::SacAccum;
+using orbitcolor::TrapAccum;
+static inline int sacWindow() { return orbitcolor::stripeWindow(); }
 
 // GMP mpf -> floatexp (m * 2^e, 0.5 <= |m| < 1), no underflow.
 static inline FloatExp mpf_to_fe(mpf_srcptr x) {

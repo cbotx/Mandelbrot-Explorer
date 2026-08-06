@@ -45,6 +45,32 @@ enum ColoringMethod {
     DE_OVERLAY = 64
 };
 
+inline bool expressionColoringIndexSupported(
+        int index, bool supportsDistance) {
+    return index == 0 || index == 2 || index == 5 ||
+           (index == 1 && supportsDistance);
+}
+
+inline int expressionColoringMethodMask(bool supportsDistance) {
+    return ColoringMethod::STRIPE_AVERAGE |
+           ColoringMethod::ORBIT_TRAP |
+           (supportsDistance ? ColoringMethod::EXTERIOR_DIST_EST : 0);
+}
+
+inline formula::ExpressionColoring expressionColoringFromMethod(
+        int method, bool supportsDistance) {
+    if (method & ColoringMethod::STRIPE_AVERAGE)
+        return formula::ExpressionColoring::Feather;
+    if (method & ColoringMethod::ORBIT_TRAP)
+        return formula::ExpressionColoring::OrbitTrap;
+    if (supportsDistance) {
+        return method & ColoringMethod::EXTERIOR_DIST_EST
+            ? formula::ExpressionColoring::Distance
+            : formula::ExpressionColoring::Smooth;
+    }
+    return formula::ExpressionColoring::Raw;
+}
+
 class Mandel {
 public:
     typedef double Float;
@@ -63,8 +89,8 @@ public:
                       int mxit, int c_method = 0);
     // Generic direct-expression backend. Each pixel can bind either c or z0;
     // other context values/parameters stay fixed. Returns false for invalid
-    // bytecode/bindings. Output is raw escape iteration (no formula-specific
-    // smoothing/DE/perturbation claims).
+    // bytecode/bindings. Raw, stripe-average and orbit-trap coloring are
+    // universal; recognized integer powers additionally support Smooth/EDE.
     bool ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
                            const formula::ExpressionProgram& program,
                            const formula::ExpressionContext& fixed,

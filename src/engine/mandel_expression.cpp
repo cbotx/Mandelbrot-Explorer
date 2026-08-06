@@ -10,6 +10,7 @@
 #include <memory>
 
 #include "float_math.h"
+#include "orbit_coloring.h"
 #if defined(MANDEL_ENABLE_ASMJIT)
 #include "formula_expression_jit.h"
 #endif
@@ -155,6 +156,27 @@ float initialPowerResult(formula::Complex z, FormulaParameter pixelParameter,
     return 0.0f;
 }
 
+inline bool isUniversalColoring(formula::ExpressionColoring coloring) {
+    return coloring == formula::ExpressionColoring::Feather ||
+           coloring == formula::ExpressionColoring::OrbitTrap;
+}
+
+inline orbitcolor::FormulaColorMode formulaColorMode(
+        formula::ExpressionColoring coloring) {
+    return coloring == formula::ExpressionColoring::OrbitTrap
+        ? orbitcolor::FormulaColorMode::OrbitTrap
+        : orbitcolor::FormulaColorMode::Feather;
+}
+
+template<bool Enabled>
+struct FormulaColorState {};
+
+template<>
+struct FormulaColorState<true> {
+    orbitcolor::FormulaColorAccum lanes[4];
+};
+
+template<bool Colored>
 bool solveIntegerPowerSimdRow(
         double startRe, double dx, double pixelIm, int count,
         int power, FormulaParameter pixelParameter,
@@ -176,6 +198,7 @@ bool solveIntegerPowerSimdRow(
     int lanePixel[4] = { -1, -1, -1, -1 };
     int nextPixel = 0;
     int activeCount = 0;
+    FormulaColorState<Colored> colorState;
 
     auto loadLane = [&](int lane) {
         lanePixel[lane] = -1;
@@ -194,6 +217,8 @@ bool solveIntegerPowerSimdRow(
                 output[pixelIndex] = initial;
                 continue;
             }
+            if constexpr (Colored)
+                colorState.lanes[lane].init(formulaColorMode(coloring));
             cr_[lane] = c.real();
             ci_[lane] = c.imag();
             zr_[lane] = z.real();
@@ -269,6 +294,14 @@ bool solveIntegerPowerSimdRow(
         zi = nextZi;
         dr = nextDr;
         di = nextDi;
+        if constexpr (Colored) {
+            _mm256_store_pd(zr_, zr);
+            _mm256_store_pd(zi_, zi);
+            for (int lane = 0; lane < 4; ++lane) {
+                if (lanePixel[lane] >= 0)
+                    colorState.lanes[lane].push(zr_[lane], zi_[lane]);
+            }
+        }
 
         __m256d magnitudeSquared = _mm256_add_pd(
             _mm256_mul_pd(zr, zr), _mm256_mul_pd(zi, zi));
@@ -316,7 +349,11 @@ bool solveIntegerPowerSimdRow(
             float result = -2.0f;
             if ((escaped | nonfinite) & bit) {
                 double magnitude = std::hypot(zr_[lane], zi_[lane]);
-                if (coloring == formula::ExpressionColoring::Smooth &&
+                if constexpr (Colored) {
+                    result = colorState.lanes[lane].escaped(
+                        (int)iteration_[lane] + 1, magnitude,
+                        power, bailout);
+                } else if (coloring == formula::ExpressionColoring::Smooth &&
                     std::isfinite(magnitude) && magnitude > 1.0) {
                     result = (float)(iteration_[lane] + 1.0 -
                         std::log(std::log(magnitude)) / logPower);
@@ -333,6 +370,8 @@ bool solveIntegerPowerSimdRow(
                 } else {
                     result = (float)(iteration_[lane] + 1.0);
                 }
+            } else if constexpr (Colored) {
+                result = colorState.lanes[lane].interior();
             }
             output[lanePixel[lane]] = result;
             --activeCount;
@@ -358,13 +397,14 @@ struct HybridPreparedState<true> {
     formula::ExpressionOrbitPlan::Prepared values[4]{};
 };
 
-template<bool UsePlan>
+template<bool UsePlan, bool Colored>
 bool solveExpressionHybridRow(
         double startRe, double dx, double pixelIm, int count,
         const formula::ExpressionProgram& program,
         const formula::ExpressionOrbitPlan* plan,
         const formula::ExpressionContext& fixed,
         FormulaParameter pixelParameter, int mxit, double bailout,
+        formula::ExpressionColoring coloring, int integerPower,
         float* output, volatile bool* halt) {
     formula::ExpressionContext contexts[4] = {
         fixed, fixed, fixed, fixed
@@ -376,6 +416,7 @@ bool solveExpressionHybridRow(
     int nextPixel = 0;
     int activeCount = 0;
     bool preparationFailed = false;
+    FormulaColorState<Colored> colorState;
 
     auto loadLane = [&](int lane) {
         lanePixel[lane] = -1;
@@ -400,6 +441,8 @@ bool solveExpressionHybridRow(
                 output[pixelIndex] = 0.0f;
                 continue;
             }
+            if constexpr (Colored)
+                colorState.lanes[lane].init(formulaColorMode(coloring));
             if constexpr (UsePlan) {
                 if (!plan->prepare(
                         contexts[lane],
@@ -443,10 +486,20 @@ bool solveExpressionHybridRow(
             contexts[lane].z = nextValues[lane];
             double re = nextValues[lane].real();
             double im = nextValues[lane].imag();
+            if constexpr (Colored)
+                colorState.lanes[lane].push(re, im);
             if (!std::isfinite(re) || !std::isfinite(im) ||
                 std::hypot(re, im) > bailout) {
-                output[lanePixel[lane]] =
-                    (float)(laneIteration[lane] + 1);
+                if constexpr (Colored) {
+                    output[lanePixel[lane]] =
+                        colorState.lanes[lane].escaped(
+                            laneIteration[lane] + 1,
+                            std::hypot(re, im),
+                            integerPower, bailout);
+                } else {
+                    output[lanePixel[lane]] =
+                        (float)(laneIteration[lane] + 1);
+                }
                 --activeCount;
                 loadLane(lane);
                 if (preparationFailed) return false;
@@ -454,7 +507,11 @@ bool solveExpressionHybridRow(
             }
             ++laneIteration[lane];
             if (laneIteration[lane] >= mxit) {
-                output[lanePixel[lane]] = -2.0f;
+                if constexpr (Colored)
+                    output[lanePixel[lane]] =
+                        colorState.lanes[lane].interior();
+                else
+                    output[lanePixel[lane]] = -2.0f;
                 --activeCount;
                 loadLane(lane);
                 if (preparationFailed) return false;
@@ -465,14 +522,16 @@ bool solveExpressionHybridRow(
 }
 
 #if defined(MANDEL_ENABLE_ASMJIT)
+template<bool Colored>
 bool solveExpressionJitRow(
         double startRe, double dx, double pixelIm, int count,
         const formula::ExpressionJit4& jit,
-        const formula::ExpressionOrbitPlan& plan,
+        const formula::ExpressionOrbitPlan* plan,
         const formula::ExpressionContext& fixed,
         FormulaParameter pixelParameter, int mxit, double bailout,
+        formula::ExpressionColoring coloring, int integerPower,
         float* output, volatile bool* halt) {
-    if (!jit.supports(plan)) return false;
+    if (plan ? !jit.supports(*plan) : !jit.valid()) return false;
     formula::ExpressionContext contexts[4] = {
         fixed, fixed, fixed, fixed
     };
@@ -485,6 +544,7 @@ bool solveExpressionJitRow(
     int nextPixel = 0;
     int activeCount = 0;
     bool preparationFailed = false;
+    FormulaColorState<Colored> colorState;
 
     auto loadLane = [&](int lane) {
         lanePixel[lane] = -1;
@@ -509,13 +569,17 @@ bool solveExpressionJitRow(
                 output[pixelIndex] = 0.0f;
                 continue;
             }
-            if (!plan.prepare(contexts[lane], prepared[lane])) {
+            if (plan && !plan->prepare(contexts[lane], prepared[lane])) {
                 preparationFailed = true;
                 return;
             }
+            if constexpr (Colored)
+                colorState.lanes[lane].init(formulaColorMode(coloring));
             input.setContextLane(lane, contexts[lane]);
-            invariantInput.setPreparedLane(
-                lane, plan, prepared[lane]);
+            if (plan) {
+                invariantInput.setPreparedLane(
+                    lane, *plan, prepared[lane]);
+            }
             lanePixel[lane] = pixelIndex;
             laneIteration[lane] = 0;
             ++activeCount;
@@ -526,8 +590,10 @@ bool solveExpressionJitRow(
         contexts[lane].iteration = 0;
         prepared[lane] = {};
         input.setContextLane(lane, contexts[lane]);
-        invariantInput.setPreparedLane(
-            lane, plan, prepared[lane]);
+        if (plan) {
+            invariantInput.setPreparedLane(
+                lane, *plan, prepared[lane]);
+        }
     };
     for (int lane = 0; lane < 4; ++lane) loadLane(lane);
     if (preparationFailed) return false;
@@ -538,7 +604,7 @@ bool solveExpressionJitRow(
         for (int lane = 0; lane < 4; ++lane)
             input.vectors[formula::ExpressionJitInput4::N_RE][lane] =
                 (double)laneIteration[lane];
-        jit.evaluate(input, &invariantInput, nextValues);
+        jit.evaluate(input, plan ? &invariantInput : nullptr, nextValues);
         for (int lane = 0; lane < 4; ++lane) {
             if (lanePixel[lane] < 0) continue;
             double re = nextValues.re[lane];
@@ -546,10 +612,20 @@ bool solveExpressionJitRow(
             contexts[lane].z = { re, im };
             input.vectors[formula::ExpressionJitInput4::Z_RE][lane] = re;
             input.vectors[formula::ExpressionJitInput4::Z_IM][lane] = im;
+            if constexpr (Colored)
+                colorState.lanes[lane].push(re, im);
             if (!std::isfinite(re) || !std::isfinite(im) ||
                 std::hypot(re, im) > bailout) {
-                output[lanePixel[lane]] =
-                    (float)(laneIteration[lane] + 1);
+                if constexpr (Colored) {
+                    output[lanePixel[lane]] =
+                        colorState.lanes[lane].escaped(
+                            laneIteration[lane] + 1,
+                            std::hypot(re, im),
+                            integerPower, bailout);
+                } else {
+                    output[lanePixel[lane]] =
+                        (float)(laneIteration[lane] + 1);
+                }
                 --activeCount;
                 loadLane(lane);
                 if (preparationFailed) return false;
@@ -557,7 +633,11 @@ bool solveExpressionJitRow(
             }
             ++laneIteration[lane];
             if (laneIteration[lane] >= mxit) {
-                output[lanePixel[lane]] = -2.0f;
+                if constexpr (Colored)
+                    output[lanePixel[lane]] =
+                        colorState.lanes[lane].interior();
+                else
+                    output[lanePixel[lane]] = -2.0f;
                 --activeCount;
                 loadLane(lane);
                 if (preparationFailed) return false;
@@ -567,6 +647,203 @@ bool solveExpressionJitRow(
     return true;
 }
 #endif
+
+bool solveExpressionColoredFixedBatchRow(
+        double startRe, double dx, double pixelIm, int count,
+        const formula::ExpressionProgram& program,
+        const formula::ExpressionOrbitPlan* plan,
+        const formula::ExpressionJit4* jit,
+        bool effectiveAvx2,
+        const formula::ExpressionContext& fixed,
+        FormulaParameter pixelParameter, int mxit, double bailout,
+        formula::ExpressionColoring coloring,
+        float* output, volatile bool* halt) {
+    std::unique_ptr<formula::ExpressionOrbitPlan::Prepared[]> prepared =
+        plan
+            ? std::make_unique<
+                formula::ExpressionOrbitPlan::Prepared[]>(4)
+            : nullptr;
+    for (int pixelBase = 0; pixelBase < count; pixelBase += 4) {
+        if (*halt) return false;
+        int lanes = std::min(4, count - pixelBase);
+        formula::ExpressionContext contexts[4] = {
+            fixed, fixed, fixed, fixed
+        };
+        formula::Complex nextValues[4]{};
+        bool active[4] = { false, false, false, false };
+        float results[4] = {};
+        orbitcolor::FormulaColorAccum accumulators[4];
+        int activeCount = 0;
+        for (int lane = 0; lane < lanes; ++lane) {
+            formula::Complex pixel{
+                startRe + dx * (pixelBase + lane), pixelIm
+            };
+            if (pixelParameter == FormulaParameter::C)
+                contexts[lane].c = pixel;
+            else
+                contexts[lane].z0 = pixel;
+            contexts[lane].z = contexts[lane].z0;
+            double re = contexts[lane].z.real();
+            double im = contexts[lane].z.imag();
+            if (!std::isfinite(re) || !std::isfinite(im) ||
+                std::hypot(re, im) > bailout) {
+                results[lane] = 0.0f;
+                continue;
+            }
+            accumulators[lane].init(formulaColorMode(coloring));
+            active[lane] = true;
+            ++activeCount;
+        }
+        if (plan) {
+            uint8_t activeMask = 0;
+            for (int lane = 0; lane < lanes; ++lane) {
+                if (active[lane])
+                    activeMask |= static_cast<uint8_t>(1u << lane);
+            }
+            if (!plan->prepare4(contexts, activeMask, prepared.get()))
+                return false;
+        }
+
+        for (int iteration = 0;
+             iteration < mxit && activeCount > 0; ++iteration) {
+            if ((iteration & 255) == 0 && *halt) return false;
+            for (int lane = 0; lane < 4; ++lane)
+                contexts[lane].iteration = iteration;
+            bool evaluated = false;
+#if defined(MANDEL_ENABLE_ASMJIT)
+            if (jit && !plan)
+                evaluated = jit->evaluate(contexts, nextValues);
+#else
+            (void)jit;
+#endif
+            if (!evaluated) {
+                evaluated = plan
+                    ? (effectiveAvx2
+                        ? plan->evaluate4(
+                            contexts, prepared.get(), nextValues)
+                        : plan->evaluate4Hybrid(
+                            contexts, prepared.get(), nextValues))
+                    : (program.avx2Compatible()
+                        ? program.evaluate4(contexts, nextValues)
+                        : program.evaluate4Hybrid(contexts, nextValues));
+            }
+            if (!evaluated) return false;
+            for (int lane = 0; lane < lanes; ++lane) {
+                if (!active[lane]) continue;
+                double re = nextValues[lane].real();
+                double im = nextValues[lane].imag();
+                contexts[lane].z = nextValues[lane];
+                accumulators[lane].push(re, im);
+                double magnitude = std::hypot(re, im);
+                if (!std::isfinite(re) || !std::isfinite(im) ||
+                    magnitude > bailout) {
+                    results[lane] = accumulators[lane].escaped(
+                        iteration + 1, magnitude, 0, bailout);
+                    active[lane] = false;
+                    --activeCount;
+                }
+            }
+        }
+        for (int lane = 0; lane < lanes; ++lane) {
+            if (active[lane])
+                results[lane] = accumulators[lane].interior();
+            output[pixelBase + lane] = results[lane];
+        }
+    }
+    return true;
+}
+
+bool solveExpressionColoredScalarRow(
+        double startRe, double dx, double pixelIm, int count,
+        const formula::ExpressionProgram& program,
+        const formula::ExpressionOrbitPlan* plan,
+        const formula::ExpressionContext& fixed,
+        FormulaParameter pixelParameter, int mxit, double bailout,
+        formula::ExpressionColoring coloring, int integerPower,
+        float* output, volatile bool* halt) {
+    std::unique_ptr<formula::ExpressionOrbitPlan::Prepared> prepared =
+        plan
+            ? std::make_unique<
+                formula::ExpressionOrbitPlan::Prepared>()
+            : nullptr;
+    for (int pixelIndex = 0; pixelIndex < count; ++pixelIndex) {
+        if (*halt) return false;
+        formula::ExpressionContext context = fixed;
+        formula::Complex pixel{
+            startRe + dx * pixelIndex, pixelIm
+        };
+        if (pixelParameter == FormulaParameter::C)
+            context.c = pixel;
+        else
+            context.z0 = pixel;
+        context.z = context.z0;
+        double initialRe = context.z.real();
+        double initialIm = context.z.imag();
+        if (!std::isfinite(initialRe) ||
+            !std::isfinite(initialIm) ||
+            std::hypot(initialRe, initialIm) > bailout) {
+            output[pixelIndex] = 0.0f;
+            continue;
+        }
+
+        orbitcolor::FormulaColorAccum accumulator;
+        accumulator.init(formulaColorMode(coloring));
+        bool escaped = false;
+        if (integerPower >= 2) {
+            formula::Complex z = context.z;
+            const formula::Complex c = context.c;
+            for (int iteration = 0; iteration < mxit; ++iteration) {
+                if ((iteration & 255) == 0 && *halt) return false;
+                formula::Complex powerMinusOne = z;
+                for (int exponent = 1;
+                     exponent < integerPower - 1; ++exponent)
+                    powerMinusOne *= z;
+                z = powerMinusOne * z + c;
+                accumulator.push(z.real(), z.imag());
+                double magnitude = std::hypot(z.real(), z.imag());
+                if (!std::isfinite(z.real()) ||
+                    !std::isfinite(z.imag()) ||
+                    magnitude > bailout) {
+                    output[pixelIndex] = accumulator.escaped(
+                        iteration + 1, magnitude,
+                        integerPower, bailout);
+                    escaped = true;
+                    break;
+                }
+            }
+        } else {
+            if (plan && !plan->prepare(context, *prepared))
+                return false;
+            std::array<formula::Complex,
+                       formula::ExpressionProgram::MAX_STACK> stack;
+            for (int iteration = 0; iteration < mxit; ++iteration) {
+                if ((iteration & 255) == 0 && *halt) return false;
+                context.iteration = iteration;
+                context.z = plan
+                    ? plan->evaluate(
+                        context, *prepared, stack.data(),
+                        plan->bodyStackDepth())
+                    : program.evaluate(
+                        context, stack.data(),
+                        program.stackDepth());
+                double re = context.z.real();
+                double im = context.z.imag();
+                accumulator.push(re, im);
+                double magnitude = std::hypot(re, im);
+                if (!std::isfinite(re) || !std::isfinite(im) ||
+                    magnitude > bailout) {
+                    output[pixelIndex] = accumulator.escaped(
+                        iteration + 1, magnitude, 0, bailout);
+                    escaped = true;
+                    break;
+                }
+            }
+        }
+        if (!escaped)
+            output[pixelIndex] = accumulator.interior();
+    }
+    return true;
+}
 
 } // namespace
 
@@ -626,7 +903,9 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
         integerPower >= 2 && integerPower <= 8 &&
         bailoutSquared >= DBL_MIN && std::isfinite(bailoutSquared) &&
         (!powerSimdSetting || std::atoi(powerSimdSetting) != 0);
-    if (integerPower < 2 || bailout < 1.0)
+    if ((coloring == formula::ExpressionColoring::Smooth ||
+         coloring == formula::ExpressionColoring::Distance) &&
+        (integerPower < 2 || bailout < 1.0))
         coloring = formula::ExpressionColoring::Raw;
     // Reserve the final progress slot for the successful completion commit.
     // Completed rows alone can therefore never publish exactly 100%.
@@ -636,8 +915,61 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
         if (_flag_halt) continue;
         bool rowCompleted = true;
         const double pixelIm = startIm + dy * i;
+        if (isUniversalColoring(coloring)) {
+            if (powerSimd) {
+                rowCompleted = solveIntegerPowerSimdRow<true>(
+                    startRe, dx, pixelIm, _w, integerPower,
+                    pixelParameter, fixed, mxit, bailout, coloring,
+                    _iter + (size_t)i * _w, &_flag_halt);
+            } else if (integerPower >= 2) {
+                rowCompleted = solveExpressionColoredScalarRow(
+                    startRe, dx, pixelIm, _w, program, nullptr,
+                    fixed, pixelParameter, mxit, bailout,
+                    coloring, integerPower,
+                    _iter + (size_t)i * _w, &_flag_halt);
+            } else if (effectiveBatch && vectorEnabled) {
+#if defined(MANDEL_ENABLE_ASMJIT)
+                if (orbitPlan && jit && jit->supports(*orbitPlan)) {
+                    rowCompleted = solveExpressionJitRow<true>(
+                        startRe, dx, pixelIm, _w, *jit, orbitPlan,
+                        fixed, pixelParameter, mxit, bailout,
+                        coloring, 0,
+                        _iter + (size_t)i * _w, &_flag_halt);
+                } else
+#endif
+                if (!effectiveAvx2 && hybridRefill) {
+                    rowCompleted = orbitPlan
+                        ? solveExpressionHybridRow<true, true>(
+                            startRe, dx, pixelIm, _w,
+                            program, orbitPlan, fixed,
+                            pixelParameter, mxit, bailout,
+                            coloring, 0,
+                            _iter + (size_t)i * _w, &_flag_halt)
+                        : solveExpressionHybridRow<false, true>(
+                            startRe, dx, pixelIm, _w,
+                            program, nullptr, fixed,
+                            pixelParameter, mxit, bailout,
+                            coloring, 0,
+                            _iter + (size_t)i * _w, &_flag_halt);
+                } else {
+                    rowCompleted = solveExpressionColoredFixedBatchRow(
+                        startRe, dx, pixelIm, _w,
+                        program, orbitPlan, jit, effectiveAvx2,
+                        fixed, pixelParameter, mxit, bailout, coloring,
+                        _iter + (size_t)i * _w, &_flag_halt);
+                }
+            } else {
+                rowCompleted = solveExpressionColoredScalarRow(
+                    startRe, dx, pixelIm, _w, program, orbitPlan,
+                    fixed, pixelParameter, mxit, bailout,
+                    coloring, 0,
+                    _iter + (size_t)i * _w, &_flag_halt);
+            }
+            if (rowCompleted) progressAdvance();
+            continue;
+        }
         if (powerSimd) {
-            rowCompleted = solveIntegerPowerSimdRow(
+            rowCompleted = solveIntegerPowerSimdRow<false>(
                 startRe, dx, pixelIm, _w, integerPower,
                 pixelParameter, fixed, mxit, bailout, coloring,
                 _iter + (size_t)i * _w, &_flag_halt);
@@ -647,9 +979,10 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
         if (integerPower == 0 && effectiveBatch && vectorEnabled) {
 #if defined(MANDEL_ENABLE_ASMJIT)
             if (orbitPlan && jit && jit->supports(*orbitPlan)) {
-                rowCompleted = solveExpressionJitRow(
-                    startRe, dx, pixelIm, _w, *jit, *orbitPlan,
+                rowCompleted = solveExpressionJitRow<false>(
+                    startRe, dx, pixelIm, _w, *jit, orbitPlan,
                     fixed, pixelParameter, mxit, bailout,
+                    coloring, 0,
                     _iter + (size_t)i * _w, &_flag_halt);
                 if (rowCompleted) progressAdvance();
                 continue;
@@ -657,15 +990,17 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale,
 #endif
             if (!effectiveAvx2 && hybridRefill) {
                 rowCompleted = orbitPlan
-                    ? solveExpressionHybridRow<true>(
+                    ? solveExpressionHybridRow<true, false>(
                         startRe, dx, pixelIm, _w,
                         program, orbitPlan, fixed,
                         pixelParameter, mxit, bailout,
+                        coloring, 0,
                         _iter + (size_t)i * _w, &_flag_halt)
-                    : solveExpressionHybridRow<false>(
+                    : solveExpressionHybridRow<false, false>(
                         startRe, dx, pixelIm, _w,
                         program, nullptr, fixed,
                         pixelParameter, mxit, bailout,
+                        coloring, 0,
                         _iter + (size_t)i * _w, &_flag_halt);
                 if (rowCompleted) progressAdvance();
                 continue;
@@ -896,7 +1231,14 @@ bool Mandel::ComputeExpressionResidual(
          pixelParameter != FormulaParameter::InitialZ))
         return false;
     if (_flag_halt) return false;
-    if (bailout < 1.0)
+    if (isUniversalColoring(coloring)) {
+        return ComputeExpression(
+            center_re, center_im, scale, program, fixed,
+            pixelParameter, mxit, bailout, coloring, nullptr);
+    }
+    if (bailout < 1.0 &&
+        (coloring == formula::ExpressionColoring::Smooth ||
+         coloring == formula::ExpressionColoring::Distance))
         coloring = formula::ExpressionColoring::Raw;
 
     mpf_t dw, dh;

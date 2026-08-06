@@ -697,7 +697,18 @@ public:
         if (orbitWorker) orbitWorker->cancel();
         orbitResult = OrbitResult{};
         ssOn = false;
-        coloringIdx = 0;
+        if (entering ||
+            !expressionColoringIndexSupported(
+                coloringIdx, nav->ExpressionSupportsDistance()))
+            coloringIdx = 0;
+        int expressionMethod = 0;
+        if (coloringIdx == 1)
+            expressionMethod = ColoringMethod::EXTERIOR_DIST_EST;
+        else if (coloringIdx == 2)
+            expressionMethod = ColoringMethod::STRIPE_AVERAGE;
+        else if (coloringIdx == 5)
+            expressionMethod = ColoringMethod::ORBIT_TRAP;
+        nav->SetCMethod(expressionMethod);
         relief_on = normal_light_on = de_overlay_on = 0;
         layout();
         needFull = true;
@@ -1367,7 +1378,8 @@ public:
                   coloringOpen ? CLR_ACCENT : CLR_BORDER, S(8));
         RECT tr = rcColoringDD; tr.left += S(12); tr.right -= S(28);
         const wchar_t* currentName =
-            nav->IsExpression() && !nav->ExpressionSupportsDistance()
+            nav->IsExpression() && coloringIdx == 0 &&
+                    !nav->ExpressionSupportsDistance()
                 ? L"Iteration (raw)" : coloringName(coloringIdx);
         drawText(dc, tr, currentName, CLR_TEXT, fUi,
                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -1382,19 +1394,26 @@ public:
             RECT ir = { lr.left, lr.top + i * ih, lr.right, lr.top + (i + 1) * ih };
             if (i == coloringHover) fillRect(dc, { ir.left + S(3), ir.top, ir.right - S(3), ir.bottom }, CLR_CARD_HOV);
             RECT tr = ir; tr.left += S(14);
-            COLORREF color = ((nav->IsJulia() && i > 1) ||
+            COLORREF color = ((nav->IsJulia() && !nav->IsExpression() &&
+                               i > 1) ||
                               (nav->IsExpression() &&
-                               (i > 1 || (i == 1 &&
-                                          !nav->ExpressionSupportsDistance()))))
+                               !expressionColoringIndexSupported(
+                                   i, nav->ExpressionSupportsDistance())))
                 ? CLR_TEXT_DIM : (i == coloringIdx ? CLR_ACCENT : CLR_TEXT);
-            drawText(dc, tr, coloringName(i), color, fUi, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            const wchar_t* name =
+                nav->IsExpression() && i == 0 &&
+                        !nav->ExpressionSupportsDistance()
+                    ? L"Iteration (raw)" : coloringName(i);
+            drawText(dc, tr, name, color, fUi,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
     }
     void selectColoring(int idx) {
         if (idx < 0 || idx > 6) return;
-        if (nav->IsJulia() && idx > 1) return;
+        if (nav->IsJulia() && !nav->IsExpression() && idx > 1) return;
         if (nav->IsExpression() &&
-            (idx > 1 || (idx == 1 && !nav->ExpressionSupportsDistance())))
+            !expressionColoringIndexSupported(
+                idx, nav->ExpressionSupportsDistance()))
             return;
         coloringIdx = idx;
         relief_on = (idx == 3) ? 1 : 0;
