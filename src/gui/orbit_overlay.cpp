@@ -30,7 +30,8 @@ void OrbitWorker::request(mpf_srcptr centerRe, mpf_srcptr centerIm, mpf_srcptr s
                           int pixelX, int pixelY, int width, int height,
                           int maxIterations, FormulaContext formulaContext,
                           std::shared_ptr<const formula::ExpressionOrbitSnapshot>
-                              expression) {
+                              expression,
+                          formula::CustomDeepZoomPlan customDeepZoom) {
     const mp_bitcnt_t precision = std::max({ mpf_get_prec(centerRe),
                                              mpf_get_prec(centerIm),
                                              mpf_get_prec(scale) });
@@ -56,6 +57,7 @@ void OrbitWorker::request(mpf_srcptr centerRe, mpf_srcptr centerIm, mpf_srcptr s
         _maxIterations = std::max(1, std::min(maxIterations, 2048));
         _formula = formulaContext;
         _expression = std::move(expression);
+        _customDeepZoom = customDeepZoom;
         _pendingGeneration = generation;
         _hasRequest = true;
     }
@@ -92,6 +94,7 @@ void OrbitWorker::run() {
         uint64_t generation;
         FormulaContext formulaContext;
         std::shared_ptr<const formula::ExpressionOrbitSnapshot> expression;
+        formula::CustomDeepZoomPlan customDeepZoom;
         mpf_t centerRe, centerIm, scale;
 
         {
@@ -113,6 +116,7 @@ void OrbitWorker::run() {
             generation = _pendingGeneration;
             formulaContext = _formula;
             expression = _expression;
+            customDeepZoom = _customDeepZoom;
             _hasRequest = false;
         }
 
@@ -120,10 +124,12 @@ void OrbitWorker::run() {
         result.generation = generation;
         auto begin = Clock::now();
 
-        mpf_t dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni, zr2, zi2;
+        mpf_t dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni, zr2, zi2,
+              escapeSquared;
         mpf_inits(dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni, zr2, zi2,
-                  (mpf_ptr)0);
-        for (mpf_ptr value : { dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni, zr2, zi2 })
+                  escapeSquared, (mpf_ptr)0);
+        for (mpf_ptr value : { dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni,
+                               zr2, zi2, escapeSquared })
             mpf_set_prec(value, precision);
 
         mpf_set_ui(dw, 2);
@@ -150,10 +156,19 @@ void OrbitWorker::run() {
         result.pixelParameter = expression
             ? expression->pixelParameter : formulaContext.slice.pixel;
 
-        // The current specialized kernel is the quadratic Mandelbrot c-plane.
-        if (formulaContext.formula.id == FormulaId::PowerPlusC &&
+        const bool regularQuadratic =
+            formulaContext.formula.id == FormulaId::PowerPlusC &&
             formulaContext.formula.power == 2 &&
-            formulaContext.slice.pixel == FormulaParameter::C) {
+            formulaContext.slice.pixel == FormulaParameter::C;
+        const bool customDeepQuadratic =
+            formulaContext.formula.id == FormulaId::Expression &&
+            customDeepZoom.usesQuadraticPerturbation();
+        if (regularQuadratic || customDeepQuadratic) {
+            const double escapeRadius =
+                customDeepQuadratic ? customDeepZoom.escapeRadius : 4.0;
+            mpf_set_d(escapeSquared, escapeRadius);
+            mpf_mul(escapeSquared, escapeSquared, escapeSquared);
+            result.usedGmpQuadratic = true;
             mpf_set_ui(zr, 0);
             mpf_set_ui(zi, 0);
             result.points.reserve((size_t)maxIterations + 1);
@@ -174,7 +189,7 @@ void OrbitWorker::run() {
                 mpf_mul(zr2, zr, zr);
                 mpf_mul(zi2, zi, zi);
                 mpf_add(t, zr2, zi2);
-                if (mpf_cmp_ui(t, 16) > 0) {
+                if (mpf_cmp(t, escapeSquared) > 0) {
                     result.escaped = true;
                     break;
                 }
@@ -200,7 +215,7 @@ void OrbitWorker::run() {
         result.computeMs = std::chrono::duration<double, std::milli>(
             Clock::now() - begin).count();
         mpf_clears(dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni, zr2, zi2,
-                   (mpf_ptr)0);
+                   escapeSquared, (mpf_ptr)0);
         mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
 
         {

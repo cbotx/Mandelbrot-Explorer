@@ -310,6 +310,10 @@ public:
     bool lastComputeUsedGpuPath() const override {
         return _lastComputeUsedGpuPath.load(std::memory_order_acquire);
     }
+    bool lastComputeUsedCustomDeepPath() const override {
+        return _lastComputeUsedCustomDeepPath.load(
+            std::memory_order_acquire);
+    }
 
     bool compute(const ComputeRequest& request) override {
         bool expected = false;
@@ -317,6 +321,8 @@ public:
             return false;
         ComputeGuard guard{_computing};
         _lastComputeUsedGpuPath.store(false, std::memory_order_release);
+        _lastComputeUsedCustomDeepPath.store(
+            false, std::memory_order_release);
         if (_cancelRequested.load(std::memory_order_acquire))
             return false;
 
@@ -359,6 +365,7 @@ private:
     std::atomic_bool _computing{false};
     std::atomic_bool _cancelRequested{false};
     std::atomic_bool _lastComputeUsedGpuPath{false};
+    std::atomic_bool _lastComputeUsedCustomDeepPath{false};
 
     D3D_FEATURE_LEVEL _featureLevel = D3D_FEATURE_LEVEL_9_1;
     ComPtr<ID3D11Device> _device;
@@ -381,7 +388,11 @@ private:
             _cpu->cancel();
         else
             _cpu->resetCancellation();
-        return _cpu->compute(request);
+        bool result = _cpu->compute(request);
+        _lastComputeUsedCustomDeepPath.store(
+            _cpu->lastComputeUsedCustomDeepPath(),
+            std::memory_order_release);
+        return result;
     }
 
     static bool eligible(const ComputeRequest& request) {

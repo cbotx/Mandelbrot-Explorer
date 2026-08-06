@@ -146,6 +146,7 @@ void MandelNavigator::StartCompute() {
         request.normal = this->_normal;
         if (this->IsExpression()) {
             request.mode = ComputeMode::Expression;
+            request.expressionSource = &this->_expressionProgram;
             request.expression = &this->_expressionRuntimeProgram;
             request.expressionFixed = &this->_expressionFixed;
             request.expressionPlan = this->_expressionOrbitPlan.profitable()
@@ -212,7 +213,8 @@ std::string MandelNavigator::GetLocationText() const {
 }
 
 bool MandelNavigator::SetLocation(const std::string& xs, const std::string& ys, const std::string& ss) {
-    int prec = (int)(std::max(xs.size(), ys.size()) * 3.3219) + 40;
+    int prec = (int)(std::max({ xs.size(), ys.size(), ss.size() }) *
+                     3.3219) + 40;
     if (prec < 64) prec = 64;
     mpf_t newScale, newRe, newIm;
     mpf_init2(newScale, prec); mpf_init2(newRe, prec); mpf_init2(newIm, prec);
@@ -223,7 +225,16 @@ bool MandelNavigator::SetLocation(const std::string& xs, const std::string& ys, 
         mpf_clears(newScale, newRe, newIm, (mpf_ptr)0);
         return false;
     }
-    if (!IsMandelbrot() && mpf_cmp_d(newScale, 1e12) > 0) mpf_set_d(newScale, 1e12);
+    const bool unrestricted =
+        IsMandelbrot() ||
+        (IsExpression() &&
+         BuildCustomDeepZoomPlan(
+             newScale, _c_method, newRe, newIm)
+             .canZoomBeyondDirectLimit());
+    if (!unrestricted &&
+        mpf_cmp_d(newScale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) > 0) {
+        mpf_set_d(newScale, formula::CUSTOM_DIRECT_ZOOM_LIMIT);
+    }
     mpf_set_prec(_scale, prec); mpf_set(_scale, newScale);
     mpf_set_prec(_z_re, prec); mpf_set(_z_re, newRe);
     mpf_set_prec(_z_im, prec); mpf_set(_z_im, newIm);
@@ -236,34 +247,107 @@ bool MandelNavigator::SetLocation(const std::string& xs, const std::string& ys, 
 
 void MandelNavigator::UpdateCoords() {
     double effectiveK = _k;
-    if (!IsMandelbrot() && _k > 1.0) {
-        double scale = mpf_get_d(_scale);
-        if (scale > 0.0) effectiveK = std::min(_k, 1e12 / scale);
-    }
     double effectiveDisplayDx = _display_dx, effectiveDisplayDy = _display_dy;
-    if (effectiveK != _k && _k != 1.0) {
-        double zoomX = _dx - (_display_dx - _dx) / (_k - 1.0);
-        double zoomY = _dy - (_display_dy - _dy) / (_k - 1.0);
-        effectiveDisplayDx = _dx - (zoomX - _dx) * (effectiveK - 1.0);
-        effectiveDisplayDy = _dy - (zoomY - _dy) * (effectiveK - 1.0);
-    }
-    mpf_set_d(_t, effectiveK);
-    mpf_mul(_scale, _scale, _t);
-    if (IsJulia() && mpf_cmp_d(_scale, 1e12) > 0) mpf_set_d(_scale, 1e12);
-    int precision = std::abs(get_exp(_scale)) + 30;
-    mpf_set_prec(_scale, precision);
-    mpf_set_prec(_z_re, precision);
-    mpf_set_prec(_z_im, precision);
-    mpf_set_prec(_t, precision);
-    _mandel->setPrecision(precision);
-    mpf_set_d(_t, 2.0 * (effectiveK - 1.0 + 2.0 * effectiveDisplayDx / _w));
-    mpf_div(_t, _t, _scale);
-    mpf_sub(_z_re, _z_re, _t);
+    mpf_t candidateScale, candidateRe, candidateIm, candidateT;
+    const mp_bitcnt_t scalePrecision = mpf_get_prec(_scale);
+    const mp_bitcnt_t rePrecision = mpf_get_prec(_z_re);
+    const mp_bitcnt_t imPrecision = mpf_get_prec(_z_im);
+    const mp_bitcnt_t temporaryPrecision = mpf_get_prec(_t);
+    mpf_init2(candidateScale, scalePrecision);
+    mpf_init2(candidateRe, rePrecision);
+    mpf_init2(candidateIm, imPrecision);
+    mpf_init2(candidateT, temporaryPrecision);
+    int precision = 0;
 
-    mpf_set_d(_t, 2.0 * _h / _w *
-                  (effectiveK - 1.0 + 2.0 * effectiveDisplayDy / _h));
-    mpf_div(_t, _t, _scale);
-    mpf_sub(_z_im, _z_im, _t);
+    auto updateDisplayAnchor = [&] {
+        effectiveDisplayDx = _display_dx;
+        effectiveDisplayDy = _display_dy;
+        if (effectiveK != _k && _k != 1.0) {
+            double zoomX =
+                _dx - (_display_dx - _dx) / (_k - 1.0);
+            double zoomY =
+                _dy - (_display_dy - _dy) / (_k - 1.0);
+            effectiveDisplayDx =
+                _dx - (zoomX - _dx) * (effectiveK - 1.0);
+            effectiveDisplayDy =
+                _dy - (zoomY - _dy) * (effectiveK - 1.0);
+        }
+    };
+    auto buildCandidate = [&](bool clampToDirectLimit) {
+        mpf_set_prec(candidateScale, scalePrecision);
+        mpf_set_prec(candidateRe, rePrecision);
+        mpf_set_prec(candidateIm, imPrecision);
+        mpf_set_prec(candidateT, temporaryPrecision);
+        mpf_set(candidateScale, _scale);
+        mpf_set(candidateRe, _z_re);
+        mpf_set(candidateIm, _z_im);
+
+        mpf_set_d(candidateT, effectiveK);
+        mpf_mul(candidateScale, candidateScale, candidateT);
+        if (clampToDirectLimit &&
+            mpf_cmp_d(candidateScale,
+                      formula::CUSTOM_DIRECT_ZOOM_LIMIT) > 0) {
+            mpf_set_d(
+                candidateScale, formula::CUSTOM_DIRECT_ZOOM_LIMIT);
+        }
+        precision = std::abs(get_exp(candidateScale)) + 30;
+        mpf_set_prec(candidateScale, precision);
+        mpf_set_prec(candidateRe, precision);
+        mpf_set_prec(candidateIm, precision);
+        mpf_set_prec(candidateT, precision);
+
+        mpf_set_d(
+            candidateT,
+            2.0 * (effectiveK - 1.0 +
+                   2.0 * effectiveDisplayDx / _w));
+        mpf_div(candidateT, candidateT, candidateScale);
+        mpf_sub(candidateRe, candidateRe, candidateT);
+
+        mpf_set_d(
+            candidateT,
+            2.0 * _h / _w *
+                (effectiveK - 1.0 +
+                 2.0 * effectiveDisplayDy / _h));
+        mpf_div(candidateT, candidateT, candidateScale);
+        mpf_sub(candidateIm, candidateIm, candidateT);
+    };
+    auto candidateAllowed = [&] {
+        if (IsMandelbrot() ||
+            mpf_cmp_d(candidateScale,
+                      formula::CUSTOM_DIRECT_ZOOM_LIMIT) <= 0) {
+            return true;
+        }
+        return IsExpression() &&
+               BuildCustomDeepZoomPlan(
+                   candidateScale, _c_method,
+                   candidateRe, candidateIm)
+                   .canZoomBeyondDirectLimit();
+    };
+
+    updateDisplayAnchor();
+    buildCandidate(false);
+    if (!candidateAllowed()) {
+        double scale = mpf_get_d(_scale);
+        if (scale > 0.0) {
+            effectiveK = std::min(
+                _k, formula::CUSTOM_DIRECT_ZOOM_LIMIT / scale);
+        }
+        updateDisplayAnchor();
+        buildCandidate(true);
+    }
+
+    mpf_set_prec(_scale, precision);
+    mpf_set(_scale, candidateScale);
+    mpf_set_prec(_z_re, precision);
+    mpf_set(_z_re, candidateRe);
+    mpf_set_prec(_z_im, precision);
+    mpf_set(_z_im, candidateIm);
+    mpf_set_prec(_t, precision);
+    mpf_set(_t, candidateT);
+    _mandel->setPrecision(precision);
+    mpf_clears(
+        candidateScale, candidateRe, candidateIm, candidateT,
+        (mpf_ptr)0);
     gmp_printf("\nx: %.*Ff\ny: %.*Ff\nzoom: %.2Fe\n", (int)(precision * log(2) / log(10)), _z_re, (int)(precision * log(2) / log(10)), _z_im, _scale);
 }
 
@@ -684,10 +768,23 @@ bool MandelNavigator::SetExpressionFormula(
             : runtimeJit.compile(runtime));
 #endif
 
-    InterruptCompute();
     bool wasExpression = IsExpression();
     int previousMethod = _c_method;
+    const bool supportsDistance =
+        compiled.fastIntegerPower() >= 2 && bailout >= 1.0;
+    int candidateMethod = wasExpression
+        ? (previousMethod &
+           expressionColoringMethodMask(supportsDistance))
+        : 0;
+    formula::ExpressionColoring candidateColoring =
+        expressionColoringFromMethod(candidateMethod, supportsDistance);
+
+    InterruptCompute();
     if (IsJulia() && !IsExpression()) RestoreMandelbrotMode();
+    formula::CustomDeepZoomPlan candidateDeepZoom =
+        formula::makeCustomDeepZoomPlan(
+            compiled, runtime, fixed, pixel, bailout,
+            candidateColoring, _scale, _z_re, _z_im, _w, _h);
     if (!IsExpression()) SaveMandelbrotState();
     bool planeChanged = IsExpression() && _expressionPixel != pixel;
     _expressionProgram = std::move(compiled);
@@ -703,17 +800,16 @@ bool MandelNavigator::SetExpressionFormula(
     _expressionBailout = bailout;
     _formula = expressionFormula();
     _formula.slice.pixel = pixel;
-    bool supportsDistance =
-        _expressionProgram.fastIntegerPower() >= 2 &&
-        _expressionBailout >= 1.0;
     _c_method = wasExpression
         ? (previousMethod &
            expressionColoringMethodMask(supportsDistance))
         : 0;
     if (planeChanged || pixel == FormulaParameter::InitialZ) {
         mpf_set_ui(_z_re, 0); mpf_set_ui(_z_im, 0); mpf_set_ui(_scale, 1);
-    } else if (mpf_cmp_d(_scale, 1e12) > 0) {
-        mpf_set_d(_scale, 1e12);
+    } else if (mpf_cmp_d(
+                   _scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) > 0 &&
+               !candidateDeepZoom.canZoomBeyondDirectLimit()) {
+        mpf_set_d(_scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT);
     }
     JumpReset();
     ConfigureSampling();
@@ -724,6 +820,10 @@ bool MandelNavigator::SetExpressionFormula(
 
 std::string MandelNavigator::GetExpressionAccelerationText() const {
     if (!IsExpression()) return {};
+    if (BuildCustomDeepZoomPlan(_scale, _c_method)
+            .usesQuadraticPerturbation()) {
+        return "deep quadratic perturbation / SA / BLA";
+    }
     if (_expressionProgram.fastPath() !=
         formula::ExpressionProgram::FastPath::None) {
         int power = _expressionProgram.fastIntegerPower();
@@ -745,7 +845,7 @@ std::string MandelNavigator::GetExpressionAccelerationText() const {
                 return "cubic SA / AVX2 adaptive";
         }
         return power <= 8
-            ? "integer-power AVX2" : "integer-power scalar";
+            ? "direct integer-power AVX2" : "direct integer-power scalar";
     }
 #if defined(MANDEL_ENABLE_ASMJIT)
     if (_expressionUseJit)
@@ -777,13 +877,43 @@ int MandelNavigator::GetCMethod() {
 }
 
 void MandelNavigator::SetCMethod(int c_method) {
-    _c_method = !IsMandelbrot()
+    int candidate = !IsMandelbrot()
         ? (c_method & ColoringMethod::EXTERIOR_DIST_EST)
         : c_method;
     if (IsExpression())
-        _c_method =
+        candidate =
             c_method &
             expressionColoringMethodMask(ExpressionSupportsDistance());
+    const bool clamp =
+        IsExpression() &&
+        mpf_cmp_d(_scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) > 0 &&
+        !BuildCustomDeepZoomPlan(_scale, candidate)
+             .canZoomBeyondDirectLimit();
+    if (clamp) InterruptCompute();
+    _c_method = candidate;
+    if (clamp) {
+        mpf_set_d(_scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT);
+        JumpReset();
+    }
+}
+
+formula::CustomDeepZoomPlan MandelNavigator::BuildCustomDeepZoomPlan(
+        mpf_srcptr scale, int method,
+        mpf_srcptr centerRe, mpf_srcptr centerIm) const {
+    if (!IsExpression()) return {};
+    if (!centerRe) centerRe = _z_re;
+    if (!centerIm) centerIm = _z_im;
+    return formula::makeCustomDeepZoomPlan(
+        _expressionProgram, _expressionRuntimeProgram,
+        _expressionFixed, _expressionPixel, _expressionBailout,
+        expressionColoringFromMethod(
+            method, ExpressionSupportsDistance()),
+        scale, centerRe, centerIm, _w, _h);
+}
+
+formula::CustomDeepZoomPlan
+MandelNavigator::GetCustomDeepZoomPlan() const {
+    return BuildCustomDeepZoomPlan(_scale, _c_method);
 }
 
 void MandelNavigator::SetRedisplay() {

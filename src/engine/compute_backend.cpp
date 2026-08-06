@@ -33,9 +33,13 @@ public:
 
     const ComputeBackendInfo& info() const override { return _info; }
     bool lastComputeUsedGpuPath() const override { return false; }
+    bool lastComputeUsedCustomDeepPath() const override {
+        return _lastCustomDeep.load(std::memory_order_acquire);
+    }
 
     bool compute(const ComputeRequest& request) override {
         if (!valid(request)) return false;
+        _lastCustomDeep.store(false, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lock(_mutex);
             if (_active) return false;
@@ -64,6 +68,43 @@ public:
             break;
         case ComputeMode::Expression:
         {
+            formula::CustomDeepZoomPlan deepZoom;
+            if (request.expressionSource) {
+                deepZoom = formula::makeCustomDeepZoomPlan(
+                    *request.expressionSource, *request.expression,
+                    *request.expressionFixed, request.expressionPixel,
+                    request.expressionBailout, request.expressionColoring,
+                    request.scale, request.centerRe, request.centerIm,
+                    request.width, request.height);
+            }
+            if (deepZoom.usesQuadraticPerturbation()) {
+                const bool methodMatches =
+                    (deepZoom.outputAdapter ==
+                         formula::CustomDeepZoomOutputAdapter::
+                             SmoothExpression &&
+                     request.coloringMethod == 0) ||
+                    (deepZoom.outputAdapter ==
+                         formula::CustomDeepZoomOutputAdapter::
+                             DistanceExpression &&
+                     request.coloringMethod ==
+                         ColoringMethod::EXTERIOR_DIST_EST);
+                if (!methodMatches) {
+                    result = false;
+                    break;
+                }
+                Mandel::ScopedCustomCompute customCompute(
+                    *request.cpuEngine, deepZoom.escapeRadius,
+                    deepZoom.outputAdapter);
+                if (!customCompute.active()) {
+                    result = false;
+                    break;
+                }
+                request.cpuEngine->Compute(
+                    request.centerRe, request.centerIm, request.scale,
+                    request.maxIterations, request.coloringMethod);
+                _lastCustomDeep.store(true, std::memory_order_release);
+                break;
+            }
             const char* cubicSetting =
                 std::getenv("MANDEL_CUBIC_RESIDUAL");
             const char* residualPowerSetting =
@@ -119,6 +160,7 @@ public:
 
 private:
     ComputeBackendInfo _info;
+    std::atomic_bool _lastCustomDeep{false};
     struct ActiveGuard {
         CpuComputeBackend* backend;
         ~ActiveGuard() { backend->clearActive(); }

@@ -8,6 +8,7 @@
 #include "bigfixed.h"
 #include "formula_spec.h"
 #include "formula_expression.h"
+#include "custom_deep_zoom.h"
 
 #include <set>
 #include <algorithm>
@@ -137,10 +138,49 @@ public:
 
     void SetHalt(bool flag);
     void SetProgress(std::atomic<float>* progress, float offset = 0.0f, float scale = 1.0f);
-    double escapeRadius() const { return _ESCAPE_RADIUS; }
+    double escapeRadius() const {
+        return _customEscapeRadiusActive
+            ? _customEscapeRadius : static_cast<double>(_ESCAPE_RADIUS);
+    }
     double escapeRadiusSquared() const {
+        if (_customEscapeRadiusActive)
+            return _customEscapeRadius * _customEscapeRadius;
         return static_cast<double>(_ESCAPE_RADIUS * _ESCAPE_RADIUS);
     }
+    class ScopedCustomCompute {
+    public:
+        ScopedCustomCompute(
+                Mandel& engine, double escapeRadius,
+                formula::CustomDeepZoomOutputAdapter outputAdapter)
+            : _engine(&engine),
+              _previousRadiusActive(engine._customEscapeRadiusActive),
+              _previousRadius(engine._customEscapeRadius),
+              _previousAdapter(engine._customOutputAdapter) {
+            if (!formula::isCustomDeepEscapeRadiusSupported(
+                    escapeRadius)) {
+                _engine = nullptr;
+                return;
+            }
+            engine._customEscapeRadiusActive = true;
+            engine._customEscapeRadius = escapeRadius;
+            engine._customOutputAdapter = outputAdapter;
+        }
+        ~ScopedCustomCompute() {
+            if (!_engine) return;
+            _engine->_customEscapeRadiusActive = _previousRadiusActive;
+            _engine->_customEscapeRadius = _previousRadius;
+            _engine->_customOutputAdapter = _previousAdapter;
+        }
+        ScopedCustomCompute(const ScopedCustomCompute&) = delete;
+        ScopedCustomCompute& operator=(const ScopedCustomCompute&) = delete;
+        bool active() const { return _engine != nullptr; }
+
+    private:
+        Mandel* _engine;
+        bool _previousRadiusActive;
+        double _previousRadius;
+        formula::CustomDeepZoomOutputAdapter _previousAdapter;
+    };
 
     // Palette density, used only by the SAC/Feather adaptive-supersampling
     // detector to flag pixels by their actual colour change (colour-index change
@@ -207,6 +247,8 @@ private:
     bool _use_bla = false;
     int _bla_minlevel = 0;        // only apply BLAs with skip >= 2^_bla_minlevel
     bool _ref_bounded = false;    // reference orbit never escapes (minibrot center)
+    bool _ref_escaped = false;
+    int _ref_escape_iteration = 0;
     bool _use_interior = false;   // periodicity-based interior detection
     double _interior_eps2 = 0.0;  // |z_n - z_saved|^2 threshold for a detected cycle
     int _interior_confirm = 30;   // consecutive shrinking periods required to confirm
@@ -240,7 +282,8 @@ private:
     // glitch-prone under a bounded reference) when this is below ~one pixel. Pure
     // FloatExp over the existing orbit, so essentially free.
     FloatExp nucleusSizeMag() const;
-    bool calCoefficient(int i, int pr_it, int c_method = 0);
+    bool calCoefficient(int i, int pr_it, int c_method = 0,
+                        bool continuePastEscape = false);
     // Deep-zoom rescaled perturbation (Zhuoran z = S w): the delta w stays an
     // O(1) double while the floatexp scale S carries the deep exponent, so the
     // inner loop is native-double yet correct far past double's ~1e320 underflow.
@@ -253,7 +296,12 @@ private:
     void solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g, int lanes,
                             int mx_ref_it, int mxit, int c_method, float* out) const;
     int SACheckMagnitude() const;
-    float accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_method = 0) const;
+    float accuratePointCompute(
+        mpf_t c_re, mpf_t c_im, int mxit, int c_method = 0,
+        bool* cancelled = nullptr) const;
+    float accuratePixelCompute(const std::array<int, 4>& pixel,
+                               int mxit, int c_method,
+                               bool* cancelled = nullptr) const;
     bool refTailEscapes(int last, int extra) const;
     // Builds the deep-zoom reference orbit (periodic-nucleus or full), applies the
     // content-aware floatexp escalation and the mxit-boundary sensitivity rebuild,
@@ -273,6 +321,10 @@ private:
     double _progress_begin = 0.0, _progress_span = 1.0;
     volatile bool _sub_flag;
     float _ESCAPE_RADIUS = 1e8f;
+    bool _customEscapeRadiusActive = false;
+    double _customEscapeRadius = 0.0;
+    formula::CustomDeepZoomOutputAdapter _customOutputAdapter =
+        formula::CustomDeepZoomOutputAdapter::None;
     const double _TOL = 1e12;
     static const int _SA_N = 30;
 

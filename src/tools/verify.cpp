@@ -11,7 +11,7 @@
 //          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
 //          expression | expression-coloring | expression-orbit |
-//          expression-oracle | expression-suite |
+//          expression-oracle | custom-deep | expression-suite |
 //          expression-residual | formula-bench | multibrot | backend | gpu | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -42,8 +43,10 @@
 #include "formula_expression_orbit.h"
 #include "formula_expression_jit.h"
 #include "formula_expression_oracle.h"
+#include "custom_deep_zoom.h"
 #include "orbit_coloring.h"
 #include "orbit_overlay.h"
+#include "mandel_navigator.h"
 #include "test_cases.h"
 
 using Clock = std::chrono::high_resolution_clock;
@@ -4526,6 +4529,790 @@ static int runExpressionResidualSuite() {
     return failures == 0 ? 0 : 1;
 }
 
+static int runCustomDeepZoomCase() {
+    using formula::Complex;
+    using formula::CustomDeepZoomOutputAdapter;
+    using formula::ExpressionColoring;
+    using formula::ExpressionContext;
+    using formula::ExpressionError;
+    using formula::ExpressionProgram;
+
+    struct PreparedFormula {
+        ExpressionProgram source;
+        ExpressionProgram runtime;
+        ExpressionContext fixed;
+    };
+    auto prepare = [](const char* source, Complex z0 = {}) {
+        PreparedFormula prepared;
+        prepared.fixed.z0 = z0;
+        ExpressionError error;
+        if (!prepared.source.compile(source, &error) ||
+            !prepared.source.specialize(
+                prepared.fixed, FormulaParameter::C,
+                prepared.runtime, &error)) {
+            fprintf(stderr, "custom-deep compile failed: %s\n",
+                    error.message.c_str());
+        }
+        return prepared;
+    };
+
+    int failures = 0;
+    float radiusBuffer[4]{};
+    Mandel radiusProbe(2, 2, 16, 1, radiusBuffer);
+    const double productionRadius = radiusProbe.escapeRadius();
+    const double bailout = 4.0;
+    PreparedFormula quadratic = prepare("z*z+c");
+    mpf_t capabilityCenterRe, capabilityCenterIm;
+    mpf_init_set_ui(capabilityCenterRe, 0);
+    mpf_init_set_ui(capabilityCenterIm, 0);
+
+    auto plan = [&](const PreparedFormula& prepared,
+                    FormulaParameter pixel, double bailout,
+                    ExpressionColoring coloring, mpf_srcptr scale = nullptr,
+                    mpf_srcptr centerRe = nullptr,
+                    mpf_srcptr centerIm = nullptr) {
+        if (!centerRe) centerRe = capabilityCenterRe;
+        if (!centerIm) centerIm = capabilityCenterIm;
+        return formula::makeCustomDeepZoomPlan(
+            prepared.source, prepared.runtime, prepared.fixed,
+            pixel, bailout, coloring, scale,
+            centerRe, centerIm, 48, 32);
+    };
+    auto expect = [&](bool condition, const char* name) {
+        if (!condition) {
+            ++failures;
+            printf("  FAIL: %s\n", name);
+        }
+    };
+
+    mpf_t below, at, above;
+    mpf_init_set_d(below, 9.99999999999e11);
+    mpf_init_set_d(at, formula::CUSTOM_DIRECT_ZOOM_LIMIT);
+    mpf_init_set_d(above, 1.000000000001e12);
+    auto acceptedBelow =
+        plan(quadratic, FormulaParameter::C, bailout,
+             ExpressionColoring::Smooth, below);
+    auto acceptedAt =
+        plan(quadratic, FormulaParameter::C, bailout,
+             ExpressionColoring::Smooth, at);
+    auto acceptedAbove =
+        plan(quadratic, FormulaParameter::C, bailout,
+             ExpressionColoring::Smooth, above);
+    expect(acceptedBelow.canZoomBeyondDirectLimit() &&
+           !acceptedBelow.usesQuadraticPerturbation(),
+           "compatible formula stays direct below crossover");
+    expect(acceptedAt.canZoomBeyondDirectLimit() &&
+           !acceptedAt.usesQuadraticPerturbation(),
+           "compatible formula stays direct through crossover");
+    expect(acceptedAbove.usesQuadraticPerturbation(),
+           "default bailout-4 formula dispatches above crossover");
+    PreparedFormula canonicalSquare = prepare("sqr(z)+c");
+    expect(plan(canonicalSquare, FormulaParameter::C, bailout,
+                ExpressionColoring::Smooth, above)
+               .usesQuadraticPerturbation(),
+           "canonical square opcode accepted");
+    expect(plan(quadratic, FormulaParameter::C, bailout,
+                ExpressionColoring::Distance, above)
+               .usesQuadraticPerturbation(),
+           "distance dispatch accepted");
+    expect(!plan(quadratic, FormulaParameter::C, bailout,
+                 ExpressionColoring::Raw, above)
+                .canZoomBeyondDirectLimit(),
+           "raw rejected");
+    expect(!plan(quadratic, FormulaParameter::C, bailout,
+                 ExpressionColoring::Feather, above)
+                .canZoomBeyondDirectLimit(),
+           "feather rejected until z1 adapter exists");
+    expect(!plan(quadratic, FormulaParameter::C, bailout,
+                 ExpressionColoring::OrbitTrap, above)
+                .canZoomBeyondDirectLimit(),
+           "orbit trap rejected until z1 adapter exists");
+    expect(!plan(quadratic, FormulaParameter::InitialZ, bailout,
+                 ExpressionColoring::Smooth, above)
+                .canZoomBeyondDirectLimit(),
+           "z0-plane rejected");
+    expect(plan(quadratic, FormulaParameter::C, 2.0,
+                ExpressionColoring::Smooth, above)
+               .usesQuadraticPerturbation(),
+           "minimum safe bailout accepted independently of production radius");
+    expect(!plan(quadratic, FormulaParameter::C,
+                 std::nextafter(2.0, 0.0),
+                 ExpressionColoring::Smooth, above)
+                .canZoomBeyondDirectLimit(),
+           "tiny bailout rejected");
+    expect(plan(quadratic, FormulaParameter::C,
+                formula::customDeepMaxEscapeRadius(),
+                ExpressionColoring::Smooth, above)
+               .usesQuadraticPerturbation(),
+           "maximum overflow-safe bailout accepted");
+    expect(!plan(quadratic, FormulaParameter::C,
+                 std::nextafter(
+                     formula::customDeepMaxEscapeRadius(),
+                     std::numeric_limits<double>::infinity()),
+                 ExpressionColoring::Smooth, above)
+                .canZoomBeyondDirectLimit(),
+           "overflowing bailout rejected");
+    expect(!plan(quadratic, FormulaParameter::C,
+                 std::numeric_limits<double>::infinity(),
+                 ExpressionColoring::Smooth, above)
+                .canZoomBeyondDirectLimit(),
+           "infinite bailout rejected");
+    expect(!plan(quadratic, FormulaParameter::C,
+                 std::numeric_limits<double>::quiet_NaN(),
+                 ExpressionColoring::Smooth, above)
+                .canZoomBeyondDirectLimit(),
+           "NaN bailout rejected");
+    expect(!plan(quadratic, FormulaParameter::C,
+                 std::numeric_limits<double>::max(),
+                 ExpressionColoring::Smooth, above)
+                .canZoomBeyondDirectLimit(),
+           "radius with non-finite square rejected");
+
+    PreparedFormula nonzeroZ0 = prepare("z*z+c", { 1e-300, 0.0 });
+    PreparedFormula negativeZeroRe = prepare("z*z+c", { -0.0, 0.0 });
+    PreparedFormula negativeZeroIm = prepare("z*z+c", { 0.0, -0.0 });
+    expect(!plan(nonzeroZ0, FormulaParameter::C, bailout,
+                 ExpressionColoring::Smooth, above)
+                .canZoomBeyondDirectLimit(),
+           "nonzero z0 rejected");
+    expect(!plan(negativeZeroRe, FormulaParameter::C, bailout,
+                 ExpressionColoring::Smooth, above)
+                .canZoomBeyondDirectLimit(),
+           "negative-zero real z0 rejected");
+    expect(!plan(negativeZeroIm, FormulaParameter::C, bailout,
+                 ExpressionColoring::Smooth, above)
+                .canZoomBeyondDirectLimit(),
+           "negative-zero imaginary z0 rejected");
+
+    PreparedFormula reordered = prepare("c+z*z");
+    PreparedFormula parameterized = prepare("z*z+c+p0");
+    parameterized.fixed.parameters[0] = {};
+    ExpressionError parameterError;
+    parameterized.source.specialize(
+        parameterized.fixed, FormulaParameter::C,
+        parameterized.runtime, &parameterError);
+    expect(!plan(reordered, FormulaParameter::C, bailout,
+                 ExpressionColoring::Smooth, above)
+                .canZoomBeyondDirectLimit(),
+           "algebraically reordered recurrence rejected");
+    expect(!plan(parameterized, FormulaParameter::C, bailout,
+                 ExpressionColoring::Smooth, above)
+                .canZoomBeyondDirectLimit(),
+           "folded custom parameter recurrence rejected");
+    PreparedFormula unusedParameters = quadratic;
+    unusedParameters.fixed.parameters[0] = { 9.0, -4.0 };
+    expect(plan(unusedParameters, FormulaParameter::C, bailout,
+                ExpressionColoring::Smooth, above)
+               .canZoomBeyondDirectLimit(),
+           "unused parameters do not affect semantics");
+    mpf_t outsideCenter;
+    mpf_init_set_d(outsideCenter, bailout * 2.0);
+    expect(!plan(quadratic, FormulaParameter::C, bailout,
+                 ExpressionColoring::Smooth, above,
+                 outsideCenter, capabilityCenterIm)
+                .canZoomBeyondDirectLimit(),
+           "z1 outside Custom bailout rejected");
+    mpf_clear(outsideCenter);
+    mpf_clears(below, at, above, (mpf_ptr)0);
+
+    {
+        MandelNavigator nav(16, 12, 1, 1000, 1.0, 1000.0);
+        std::array<Complex, 8> parameters{};
+        ExpressionError error;
+        expect(nav.SetLocation("-0.75", "0", "1000000000000000"),
+               "Mandel location setup");
+        expect(nav.SetExpressionFormula(
+                   "z*z+c", FormulaParameter::C, {}, {}, parameters,
+                   bailout, &error),
+               "compatible formula apply");
+        mpf_t re, im, scale;
+        mpf_inits(re, im, scale, (mpf_ptr)0);
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(scale, 1e15) == 0,
+               "compatible apply preserves deep view");
+        expect(nav.GetCustomDeepZoomPlan().usesQuadraticPerturbation(),
+               "navigator reports deep dispatch");
+        expect(nav.GetExpressionAccelerationText().find(
+                   "deep quadratic perturbation") != std::string::npos,
+               "deep status text");
+        expect(nav.SetExpressionFormula(
+                   "z*z+c+0", FormulaParameter::C, {}, {}, parameters,
+                   bailout, &error),
+               "incompatible formula apply succeeds");
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(
+                   scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0,
+               "incompatible apply clamps transactionally");
+        nav.ZoomIn(8, 6);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        nav.Update();
+        nav.UpdateCoords();
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(
+                   scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0,
+               "incompatible interactive zoom remains capped");
+        nav.JumpReset();
+
+        expect(nav.SetExpressionFormula(
+                   "z*z+c", FormulaParameter::C, {}, {}, parameters,
+                   bailout, &error),
+               "compatible formula reapply");
+        nav.ZoomIn(8, 6);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        nav.Update();
+        nav.UpdateCoords();
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(
+                   scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) > 0,
+               "compatible interactive zoom crosses cap");
+        nav.JumpReset();
+        expect(nav.SetLocation(
+                   "8", "0", "1000000000000"),
+               "outside-bailout cap-boundary setup");
+        nav.ZoomIn(0, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        nav.Update();
+        nav.UpdateCoords();
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(
+                   scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0 &&
+               mpf_cmp_d(re, 8.0) == 0,
+               "outside-bailout interactive crossing stays capped");
+        nav.JumpReset();
+        expect(nav.SetLocation(
+                   "-0.75", "0",
+                   "1000000000000000000000000000000"),
+               "compatible paste above cap");
+        nav.GetView(re, im, scale);
+        mpf_t expectedScale;
+        mpf_init2(expectedScale, nav.GetViewPrecision());
+        mpf_set_str(
+            expectedScale, "1000000000000000000000000000000", 10);
+        expect(mpf_cmp(scale, expectedScale) == 0 &&
+               nav.GetViewPrecision() > 120,
+               "compatible SetLocation preserves pasted scale");
+        mpf_clear(expectedScale);
+        nav.SetCMethod(ColoringMethod::STRIPE_AVERAGE);
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(
+                   scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0,
+               "unsupported coloring switch clamps");
+        expect(nav.GetExpressionAccelerationText().find(
+                   "direct integer-power AVX2") != std::string::npos,
+               "direct status text");
+
+        expect(nav.SetLocation("-0.75", "0", "1000000000000001"),
+               "incompatible paste accepted with clamp");
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(
+                   scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0,
+               "incompatible SetLocation clamps");
+        mpf_clears(re, im, scale, (mpf_ptr)0);
+    }
+    {
+        MandelNavigator julia(16, 12, 1, 1000, 1.0, 1.0);
+        julia.SetJuliaMode(true);
+        expect(julia.SetLocation("0", "0", "1000000000000001"),
+               "Julia SetLocation accepted");
+        mpf_t re, im, scale;
+        mpf_inits(re, im, scale, (mpf_ptr)0);
+        julia.GetView(re, im, scale);
+        expect(mpf_cmp_d(
+                   scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0,
+               "Julia remains capped");
+        mpf_clears(re, im, scale, (mpf_ptr)0);
+    }
+    {
+        MandelNavigator fromJulia(16, 12, 1, 1000, 1.0, 1.0);
+        std::array<Complex, 8> parameters{};
+        ExpressionError error;
+        expect(fromJulia.SetLocation(
+                   "-0.75", "0", "1000000000000000"),
+               "Julia transition Mandel setup");
+        fromJulia.SetJuliaMode(true);
+        expect(fromJulia.SetExpressionFormula(
+                   "z*z+c", FormulaParameter::C, {}, {}, parameters,
+                   bailout, &error),
+               "compatible formula apply from Julia");
+        mpf_t re, im, scale;
+        mpf_inits(re, im, scale, (mpf_ptr)0);
+        fromJulia.GetView(re, im, scale);
+        expect(mpf_cmp_d(scale, 1e15) == 0 &&
+               fromJulia.GetCustomDeepZoomPlan()
+                   .usesQuadraticPerturbation(),
+               "Julia-to-Custom preserves compatible saved deep view");
+        mpf_clears(re, im, scale, (mpf_ptr)0);
+    }
+
+    struct OverlapResult {
+        int classMismatch = 0;
+        int floorMismatch = 0;
+        double maxDelta = 0.0;
+        double maxRelative = 0.0;
+    };
+    auto compareOverlap = [&](ExpressionColoring coloring) {
+        constexpr int W = 48, H = 32, MXIT = 4000;
+        std::vector<float> direct((size_t)W * H, EMPTYPIXEL);
+        std::vector<float> deep((size_t)W * H, EMPTYPIXEL);
+        Mandel directEngine(W, H, MXIT, 1, direct.data());
+        Mandel deepEngine(W, H, MXIT, 1, deep.data());
+        mpf_t re, im, scale;
+        mpf_init2(re, 256); mpf_init2(im, 256); mpf_init2(scale, 256);
+        mpf_set_str(re, "-0.75", 10);
+        mpf_set_str(im, "0.1", 10);
+        mpf_set_str(scale, "1000000000000", 10);
+        int method = coloring == ExpressionColoring::Distance
+            ? ColoringMethod::EXTERIOR_DIST_EST
+            : coloring == ExpressionColoring::Feather
+                ? ColoringMethod::STRIPE_AVERAGE
+                : coloring == ExpressionColoring::OrbitTrap
+                    ? ColoringMethod::ORBIT_TRAP : 0;
+        bool okay = directEngine.ComputeExpression(
+            re, im, scale, quadratic.runtime, quadratic.fixed,
+            FormulaParameter::C, MXIT, bailout, coloring);
+        CustomDeepZoomOutputAdapter adapter =
+            coloring == ExpressionColoring::Smooth
+                ? CustomDeepZoomOutputAdapter::SmoothExpression
+                : coloring == ExpressionColoring::Distance
+                    ? CustomDeepZoomOutputAdapter::DistanceExpression
+                    : CustomDeepZoomOutputAdapter::None;
+        {
+            Mandel::ScopedCustomCompute customCompute(
+                deepEngine, bailout, adapter);
+            okay = okay && customCompute.active();
+            if (customCompute.active())
+                deepEngine.Compute(re, im, scale, MXIT, method);
+        }
+        mpf_clears(re, im, scale, (mpf_ptr)0);
+
+        OverlapResult result;
+        for (size_t i = 0; i < direct.size(); ++i) {
+            if (coloring != ExpressionColoring::OrbitTrap &&
+                isInterior(direct[i]) != isInterior(deep[i])) {
+                ++result.classMismatch;
+                continue;
+            }
+            if (coloring == ExpressionColoring::Smooth &&
+                !isInterior(direct[i]) &&
+                std::floor(direct[i]) != std::floor(deep[i])) {
+                ++result.floorMismatch;
+            }
+            double delta = std::fabs((double)direct[i] - deep[i]);
+            result.maxDelta = std::max(result.maxDelta, delta);
+            double denominator = std::max(
+                1e-30, std::fabs((double)direct[i]));
+            result.maxRelative = std::max(
+                result.maxRelative, delta / denominator);
+        }
+        if (!okay) ++failures;
+        return result;
+    };
+
+    OverlapResult smooth = compareOverlap(ExpressionColoring::Smooth);
+    OverlapResult distance = compareOverlap(ExpressionColoring::Distance);
+    OverlapResult feather = compareOverlap(ExpressionColoring::Feather);
+    OverlapResult trap = compareOverlap(ExpressionColoring::OrbitTrap);
+    expect(smooth.classMismatch == 0 && smooth.floorMismatch == 0 &&
+           smooth.maxDelta <= 0.05,
+           "smooth overlap class/floor/value");
+    expect(distance.classMismatch == 0 &&
+           distance.maxDelta <= 0.01,
+           "distance overlap class/value");
+    expect(feather.classMismatch == 0 &&
+           std::isfinite(feather.maxDelta) && feather.maxDelta <= 2.0,
+           "feather overlap remains bounded while unrouted");
+    expect(std::isfinite(trap.maxDelta) && trap.maxDelta <= 100.0,
+           "orbit-trap overlap remains bounded while unrouted");
+
+    {
+        constexpr int W = 4, H = 4, MXIT = 16;
+        const double upperBailout =
+            formula::customDeepMaxEscapeRadius();
+        mpf_t re, im, scale;
+        mpf_init2(re, 256); mpf_init2(im, 256);
+        mpf_init2(scale, 256);
+        mpf_set_str(re, "0.65", 10);
+        mpf_set_ui(im, 0);
+        mpf_set_str(scale, "1000000000001", 10);
+        auto compareUpperBailout =
+            [&](ExpressionColoring coloring) {
+                int method =
+                    coloring == ExpressionColoring::Distance
+                        ? ColoringMethod::EXTERIOR_DIST_EST : 0;
+                CustomDeepZoomOutputAdapter adapter =
+                    coloring == ExpressionColoring::Distance
+                        ? CustomDeepZoomOutputAdapter::
+                              DistanceExpression
+                        : CustomDeepZoomOutputAdapter::
+                              SmoothExpression;
+                std::vector<float> direct(
+                    (size_t)W * H, EMPTYPIXEL);
+                std::vector<float> highPrecision(
+                    (size_t)W * H, EMPTYPIXEL);
+                Mandel directEngine(
+                    W, H, MXIT, 1, direct.data());
+                Mandel highPrecisionEngine(
+                    W, H, MXIT, 1, highPrecision.data());
+                bool okay = directEngine.ComputeExpression(
+                    re, im, scale, quadratic.runtime,
+                    quadratic.fixed, FormulaParameter::C,
+                    MXIT, upperBailout, coloring);
+                {
+                    Mandel::ScopedCustomCompute customCompute(
+                        highPrecisionEngine, upperBailout,
+                        adapter);
+                    okay = okay && customCompute.active();
+                    if (customCompute.active()) {
+                        highPrecisionEngine.Compute(
+                            re, im, scale, MXIT, method);
+                    }
+                }
+                double maxRelative = 0.0;
+                for (size_t i = 0; i < direct.size(); ++i) {
+                    double expected = direct[i];
+                    double actual = highPrecision[i];
+                    if (!(std::isfinite(expected) &&
+                          std::isfinite(actual) &&
+                          expected > 0.0 && actual > 0.0)) {
+                        return std::numeric_limits<double>::
+                            infinity();
+                    }
+                    maxRelative = std::max(
+                        maxRelative,
+                        std::fabs(actual - expected) /
+                            std::max(1.0, std::fabs(expected)));
+                }
+                return okay ? maxRelative :
+                    std::numeric_limits<double>::infinity();
+            };
+        double upperSmooth =
+            compareUpperBailout(ExpressionColoring::Smooth);
+        double upperDistance =
+            compareUpperBailout(ExpressionColoring::Distance);
+        expect(upperSmooth <= 1e-5,
+               "upper bailout Smooth matches direct reference");
+        expect(upperDistance <= 1e-5,
+               "upper bailout Distance matches high-precision fallback");
+        printf("  upper bailout smooth/distance relative=%.9g/%.9g\n",
+               upperSmooth, upperDistance);
+        mpf_clears(re, im, scale, (mpf_ptr)0);
+    }
+
+    auto adaptExpected = [](std::vector<float>& values,
+                            CustomDeepZoomOutputAdapter adapter) {
+        const float offset = static_cast<float>(
+            -std::log(std::log(2.0)) / std::log(2.0));
+        for (float& value : values) {
+            if (value < 0.0f) continue;
+            if (adapter ==
+                CustomDeepZoomOutputAdapter::SmoothExpression) {
+                value += offset;
+            } else if (adapter ==
+                       CustomDeepZoomOutputAdapter::DistanceExpression) {
+                value *= 0.5f;
+            }
+        }
+    };
+    auto deepParity = [&](const char* name, const char* centerRe,
+                          const char* centerIm, const char* scaleText,
+                          int mxit) {
+        constexpr int W = 20, H = 14;
+        mp_bitcnt_t precision =
+            std::max<mp_bitcnt_t>(256, strlen(scaleText) * 4 + 64);
+        mpf_t re, im, scale;
+        mpf_init2(re, precision); mpf_init2(im, precision);
+        mpf_init2(scale, precision);
+        mpf_set_str(re, centerRe, 10);
+        mpf_set_str(im, centerIm, 10);
+        mpf_set_str(scale, scaleText, 10);
+        std::vector<float> ordinary((size_t)W * H, EMPTYPIXEL);
+        std::vector<float> custom((size_t)W * H, EMPTYPIXEL);
+        Mandel ordinaryEngine(W, H, mxit, 1, ordinary.data());
+        Mandel customEngine(W, H, mxit, 1, custom.data());
+        ordinaryEngine.setPrecision((int)precision);
+        customEngine.setPrecision((int)precision);
+        {
+            Mandel::ScopedCustomCompute ordinaryCustom(
+                ordinaryEngine, bailout,
+                CustomDeepZoomOutputAdapter::SmoothExpression);
+            if (ordinaryCustom.active())
+                ordinaryEngine.Compute(re, im, scale, mxit, 0);
+        }
+
+        std::unique_ptr<IComputeBackend> backend =
+            createComputeBackend("cpu");
+        ComputeRequest request;
+        request.mode = ComputeMode::Expression;
+        request.cpuEngine = &customEngine;
+        request.centerRe = re; request.centerIm = im;
+        request.scale = scale;
+        request.width = W; request.height = H; request.sub = 1;
+        request.maxIterations = mxit;
+        request.coloringMethod = 0;
+        request.iterations = custom.data();
+        request.expressionSource = &quadratic.source;
+        request.expression = &quadratic.runtime;
+        request.expressionFixed = &quadratic.fixed;
+        request.expressionPixel = FormulaParameter::C;
+        request.expressionBailout = bailout;
+        request.expressionColoring = ExpressionColoring::Smooth;
+        backend->resetCancellation();
+        bool okay = backend->compute(request);
+        bool usedDeep = backend->lastComputeUsedCustomDeepPath();
+        bool sameDeep = ordinary.size() == custom.size() &&
+                    std::memcmp(
+                        ordinary.data(), custom.data(),
+                        ordinary.size() * sizeof(float)) == 0;
+        bool restored =
+            customEngine.escapeRadius() == productionRadius;
+
+        std::fill(ordinary.begin(), ordinary.end(), EMPTYPIXEL);
+        std::fill(custom.begin(), custom.end(), EMPTYPIXEL);
+        mpf_set_d(re, -0.5);
+        mpf_set_ui(im, 0);
+        mpf_set_ui(scale, 1);
+        const int ordinaryMxit = std::min(mxit, 500);
+        ordinaryEngine.Compute(re, im, scale, ordinaryMxit, 0);
+        request.mode = ComputeMode::Mandelbrot;
+        request.maxIterations = ordinaryMxit;
+        backend->resetCancellation();
+        bool ordinaryOkay = backend->compute(request);
+        bool sameOrdinary = ordinary.size() == custom.size() &&
+            std::memcmp(
+                ordinary.data(), custom.data(),
+                ordinary.size() * sizeof(float)) == 0;
+        expect(okay && usedDeep && sameDeep && restored &&
+               ordinaryOkay && sameOrdinary &&
+               !backend->lastComputeUsedCustomDeepPath(),
+               name);
+        mpf_clears(re, im, scale, (mpf_ptr)0);
+    };
+    deepParity("1e13 custom/ordinary byte parity",
+               "-0.743643887037151", "0.13182590420533",
+               "10000000000000", 5000);
+    deepParity("1e31 custom/ordinary byte parity",
+               "-0.749139567333446841955467474699747367338762518832278501811",
+               "0.040823298514634751035521346975478853963578400940553676068",
+               "73541770000000000000000000000000", 50000);
+
+    {
+        constexpr int W = 12, H = 8, MXIT = 2000000, STEP = 4;
+        const char* scaleText =
+            "3831277000000000000000000000000000000000000000000000";
+        mp_bitcnt_t precision = 384;
+        mpf_t re, im, scale;
+        mpf_init2(re, precision); mpf_init2(im, precision);
+        mpf_init2(scale, precision);
+        mpf_set_str(re, testcases::deep51_x, 10);
+        mpf_set_str(im, testcases::deep51_y, 10);
+        mpf_set_str(scale, scaleText, 10);
+        std::vector<float> deep((size_t)W * H, EMPTYPIXEL);
+        std::vector<float> oracle((size_t)W * H, EMPTYPIXEL);
+        Mandel engine(W, H, MXIT, 1, deep.data());
+        engine.setPrecision((int)precision);
+        std::unique_ptr<IComputeBackend> backend =
+            createComputeBackend("cpu");
+        ComputeRequest request;
+        request.mode = ComputeMode::Expression;
+        request.cpuEngine = &engine;
+        request.centerRe = re; request.centerIm = im;
+        request.scale = scale;
+        request.width = W; request.height = H; request.sub = 1;
+        request.maxIterations = MXIT;
+        request.coloringMethod = 0;
+        request.iterations = deep.data();
+        request.expressionSource = &quadratic.source;
+        request.expression = &quadratic.runtime;
+        request.expressionFixed = &quadratic.fixed;
+        request.expressionPixel = FormulaParameter::C;
+        request.expressionBailout = bailout;
+        request.expressionColoring = ExpressionColoring::Smooth;
+        backend->resetCancellation();
+        bool deepOkay = backend->compute(request);
+        bool oracleScopeActive = false;
+        {
+            Mandel::ScopedCustomCompute oracleScope(
+                engine, bailout,
+                CustomDeepZoomOutputAdapter::None);
+            oracleScopeActive = oracleScope.active();
+            if (oracleScopeActive)
+                engine.ComputeDirect(MXIT, oracle.data(), STEP, 0);
+        }
+        adaptExpected(
+            oracle, CustomDeepZoomOutputAdapter::SmoothExpression);
+        int classMismatch = 0, floorMismatch = 0;
+        double maxDelta = 0.0;
+        for (int y = 0; y < H; y += STEP) {
+            for (int x = 0; x < W; x += STEP) {
+                size_t index = (size_t)y * W + x;
+                if (isInterior(deep[index]) !=
+                    isInterior(oracle[index])) {
+                    ++classMismatch;
+                    continue;
+                }
+                if (!isInterior(deep[index])) {
+                    if (std::floor(deep[index]) !=
+                        std::floor(oracle[index]))
+                        ++floorMismatch;
+                    maxDelta = std::max(
+                        maxDelta,
+                        std::fabs(
+                            (double)deep[index] - oracle[index]));
+                }
+            }
+        }
+        bool oraclePassed =
+            deepOkay && oracleScopeActive &&
+            backend->lastComputeUsedCustomDeepPath() &&
+            engine.escapeRadius() == productionRadius &&
+            classMismatch == 0 && floorMismatch == 0 &&
+            maxDelta <= 0.05;
+        expect(oraclePassed,
+               "1e51 deep frame matches sampled GMP bailout-4 oracle");
+        if (!oraclePassed) {
+            printf("  1e51 oracle class/floor/max=%d/%d/%.9g\n",
+                   classMismatch, floorMismatch, maxDelta);
+        }
+        mpf_clears(re, im, scale, (mpf_ptr)0);
+    }
+
+    {
+        constexpr int W = 5, H = 5, MXIT = 50000000;
+        mpf_t re, im, scale;
+        mpf_init2(re, 256);
+        mpf_init2(im, 256);
+        mpf_init2(scale, 256);
+        mpf_set_str(scale, "1000000000001", 10);
+        mpf_set_ui(re, 1);
+        mpf_div(re, re, scale);
+        mpf_set_ui(im, 1);
+        std::vector<float> output((size_t)W * H, EMPTYPIXEL);
+        Mandel engine(W, H, MXIT, 1, output.data());
+        engine.setPrecision(256);
+        std::unique_ptr<IComputeBackend> backend =
+            createComputeBackend("cpu");
+        ComputeRequest request;
+        request.mode = ComputeMode::Expression;
+        request.cpuEngine = &engine;
+        request.centerRe = re; request.centerIm = im;
+        request.scale = scale;
+        request.width = W; request.height = H; request.sub = 1;
+        request.maxIterations = MXIT;
+        request.coloringMethod = 0;
+        request.iterations = output.data();
+        request.expressionSource = &quadratic.source;
+        request.expression = &quadratic.runtime;
+        request.expressionFixed = &quadratic.fixed;
+        request.expressionPixel = FormulaParameter::C;
+        request.expressionBailout = bailout;
+        request.expressionColoring = ExpressionColoring::Smooth;
+        backend->resetCancellation();
+        auto future = std::async(std::launch::async, [&] {
+            return backend->compute(request);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        auto cancelStart = std::chrono::steady_clock::now();
+        backend->cancel();
+        bool completed = future.wait_for(std::chrono::seconds(3)) ==
+                         std::future_status::ready;
+        double cancelSeconds =
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - cancelStart)
+                .count();
+        bool result = completed ? future.get() : true;
+        int empty = (int)std::count(
+            output.begin(), output.end(), EMPTYPIXEL);
+        bool usedCustom = backend->lastComputeUsedCustomDeepPath();
+        bool radiusRestored =
+            engine.escapeRadius() == productionRadius;
+        expect(completed && cancelSeconds < 3.0 &&
+               !result && empty > 0 &&
+               usedCustom && radiusRestored,
+               "GMP fallback cancellation is bounded and restores state");
+        printf("  GMP cancellation completed/result/empty/time/restored="
+               "%d/%d/%d/%.3f/%d\n",
+               completed ? 1 : 0, result ? 1 : 0, empty,
+               cancelSeconds, radiusRestored ? 1 : 0);
+        backend->resetCancellation();
+
+        std::vector<float> ordinary((size_t)W * H, EMPTYPIXEL);
+        Mandel ordinaryEngine(W, H, 200, 1, ordinary.data());
+        std::fill(output.begin(), output.end(), EMPTYPIXEL);
+        mpf_set_d(re, -0.5);
+        mpf_set_ui(im, 0);
+        mpf_set_ui(scale, 1);
+        ordinaryEngine.Compute(re, im, scale, 200, 0);
+        request.mode = ComputeMode::Mandelbrot;
+        request.maxIterations = 200;
+        bool ordinaryOkay = backend->compute(request);
+        bool ordinarySame =
+            std::memcmp(
+                ordinary.data(), output.data(),
+                ordinary.size() * sizeof(float)) == 0;
+        expect(ordinaryOkay && ordinarySame &&
+               engine.escapeRadius() == productionRadius &&
+               !backend->lastComputeUsedCustomDeepPath(),
+               "cancelled Custom frame leaves no ordinary-frame state");
+        mpf_clears(re, im, scale, (mpf_ptr)0);
+    }
+
+    {
+        mpf_t re, im, scale;
+        mpf_init2(re, 256); mpf_init2(im, 256); mpf_init2(scale, 256);
+        mpf_set_ui(re, 1);
+        mpf_set_ui(im, 0);
+        mpf_set_str(scale, "10000000000000", 10);
+        formula::ExpressionOrbitSnapshot snapshot;
+        snapshot.program = quadratic.runtime;
+        snapshot.fixed = quadratic.fixed;
+        snapshot.pixelParameter = FormulaParameter::C;
+        snapshot.bailout = bailout;
+        FormulaContext customFormula = expressionFormula();
+        customFormula.slice.pixel = FormulaParameter::C;
+        OrbitWorker worker;
+        OrbitResult orbit;
+        worker.request(
+            re, im, scale, 3, 3, 7, 7, 16, customFormula,
+            std::make_shared<const formula::ExpressionOrbitSnapshot>(
+                snapshot),
+            plan(quadratic, FormulaParameter::C, bailout,
+                 ExpressionColoring::Smooth, scale, re, im));
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(3);
+        while (!worker.takeLatest(orbit) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        expect(orbit.generation != 0 && orbit.usedGmpQuadratic &&
+               orbit.pixelParameter == FormulaParameter::C &&
+               orbit.points.size() == (size_t)orbit.iterations + 1 &&
+               orbit.escaped && orbit.iterations == 3 &&
+               orbit.points.back().re == 5.0f &&
+               orbit.points.back().im == 0.0f,
+               "Custom deep GMP orbit uses bailout squared");
+        mpf_clears(re, im, scale, (mpf_ptr)0);
+    }
+
+    printf("=== Custom deep-zoom stage 1\n");
+    printf("  Custom bailout=%.9g production bailout=%.9g"
+           " direct limit=%.0e\n",
+           bailout, productionRadius,
+           formula::CUSTOM_DIRECT_ZOOM_LIMIT);
+    printf("  overlap smooth class/floor/max=%d/%d/%.6g"
+           " distance class/max/rel=%d/%.6g/%.6g\n",
+           smooth.classMismatch, smooth.floorMismatch, smooth.maxDelta,
+           distance.classMismatch, distance.maxDelta,
+           distance.maxRelative);
+    printf("  unrouted feather/trap max delta=%.6g/%.6g\n",
+           feather.maxDelta, trap.maxDelta);
+    printf("  => %s\n\n",
+           failures == 0 ? "PASS"
+                         : "CHECK (Custom deep-zoom failure)");
+    mpf_clears(
+        capabilityCenterRe, capabilityCenterIm, (mpf_ptr)0);
+    return failures == 0 ? 0 : 1;
+}
+
 static int runBackendCase() {
     constexpr int W = 96, H = 64, MXIT = 500;
     mpf_set_default_prec(256);
@@ -4582,6 +5369,7 @@ static int runBackendCase() {
         ++failures;
     } else {
         request.mode = ComputeMode::Expression;
+        request.expressionSource = &expression;
         request.expression = &runtimeExpression;
         request.expressionFixed = &fixed;
         request.expressionPlan =
@@ -4609,7 +5397,8 @@ static int runBackendCase() {
             request.expressionColoring = coloring;
             backend->resetCancellation();
             if (!backend->compute(request) ||
-                !same(direct, dispatched))
+                !same(direct, dispatched) ||
+                backend->lastComputeUsedCustomDeepPath())
                 ++failures;
         }
     }
@@ -5157,6 +5946,7 @@ int main(int argc, char** argv) {
     if (which == "expression-orbit")           rc |= runExpressionOrbitCase();
     if (which == "expression-oracle")          rc |= runExpressionOracleCase();
     if (which == "expression-suite")           rc |= runFormulaRegressionSuite();
+    if (which == "custom-deep")                rc |= runCustomDeepZoomCase();
     if (which == "expression-residual")        rc |= runExpressionResidualSuite();
     if (which == "formula-bench")              rc |= runGenericFormulaProfile();
     if (which == "multibrot")                  rc |= runMultibrotCase();

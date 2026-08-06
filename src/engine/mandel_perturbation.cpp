@@ -276,7 +276,7 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method,
         if (trap) trapc.push((double)z_re, (double)z_im);
 
         tmp = z_re * z_re + z_im * z_im;
-        if (tmp > _ESCAPE_RADIUS * _ESCAPE_RADIUS) {
+        if (tmp > escapeRadiusSquared()) {
             if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
                 return sqrt(tmp) * log(tmp) / sqrt(dc_re * dc_re + dc_im * dc_im);
             } else if (normal) {
@@ -290,7 +290,7 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method,
             } else if (trap) {
                 return trapc.value(i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
             } else if (sac) {
-                return sacc.value((double)tmp, (double)_ESCAPE_RADIUS);
+                return sacc.value((double)tmp, escapeRadius());
             } else {
                 return (i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
             }
@@ -511,7 +511,7 @@ float Mandel::accurateJuliaPoint(mpf_t z0_re, mpf_t z0_im, mpf_t c_re, mpf_t c_i
     // squarings of a tiny interior value.
     if (mpf_sgn(c_re) == 0 && mpf_sgn(c_im) == 0 && mpf_cmp_ui(mag, 1) <= 0) {
         result = -2.0f;
-    } else if (mpf_cmp_d(mag, (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS) > 0) {
+    } else if (mpf_cmp_d(mag, escapeRadiusSquared()) > 0) {
         double zrad = mpf_get_d(mag);
         result = ede
             ? (float)(sqrt(zrad) * log(zrad))   // D0=1
@@ -532,7 +532,7 @@ float Mandel::accurateJuliaPoint(mpf_t z0_re, mpf_t z0_im, mpf_t c_re, mpf_t c_i
             mpf_set(zr, nzr); mpf_set(zi, nzi);
             if (ede) { mpf_set(dr, ndr); mpf_set(di, ndi); }
             mpf_mul(t1, zr, zr); mpf_mul(t2, zi, zi); mpf_add(mag, t1, t2);
-            if (mpf_cmp_d(mag, (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS) > 0) {
+            if (mpf_cmp_d(mag, escapeRadiusSquared()) > 0) {
                 double zrad = mpf_get_d(mag);
                 if (ede) {
                     mpf_mul(t1, dr, dr); mpf_mul(t2, di, di); mpf_add(dmag, t1, t2);
@@ -552,7 +552,10 @@ float Mandel::accurateJuliaPoint(mpf_t z0_re, mpf_t z0_im, mpf_t c_re, mpf_t c_i
     return result;
 }
 
-float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_method) const {
+float Mandel::accuratePointCompute(
+        mpf_t c_re, mpf_t c_im, int mxit, int c_method,
+        bool* cancelled) const {
+    if (cancelled) *cancelled = false;
     // Oracle WORKING precision. Brute-force iteration accumulates rounding error, so
     // near a boundary / a nucleus the ground truth needs MORE precision than the
     // render's pixel-distinguishing precision (e.g. deep1 spuriously "escapes" below
@@ -595,6 +598,11 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
     int i = 1;
     float res = -2;
     while (i < mxit) {
+        if ((i & 255) == 0 && _flag_halt) {
+            if (cancelled) *cancelled = true;
+            res = EMPTYPIXEL;
+            break;
+        }
         // d = 2.0 * d * z;   (interior early-out only; skipped when track_d is false)
         if (track_d) {
             mpf_mul(t1, d_re, z_im);
@@ -636,7 +644,7 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
         
         double rad = mpf_get_d(t1);
 
-        if (rad > _ESCAPE_RADIUS * _ESCAPE_RADIUS) {
+        if (rad > escapeRadiusSquared()) {
             if (ede) {
                 // EDE distance estimate = |z| * log(|z|^2) / (dx * |dz/dc|), PIXEL-
                 // NORMALISED exactly like the perturbation path (pixelRescaled divides
@@ -648,12 +656,15 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
                 mpf_mul(e1, dc_re, dc_re); mpf_mul(e2, dc_im, dc_im);
                 mpf_add(e1, e1, e2); mpf_sqrt(e1, e1);        // |dz/dc|
                 mpf_abs(t1, _dx); mpf_mul(e1, e1, t1);        // * pixel size -> pixel-normalised
-                double num = (rad > 0.0 && rad < 1e300) ? sqrt(rad) * log(rad) : 0.0;
+                double num =
+                    std::isfinite(rad) && rad > 0.0
+                        ? std::sqrt(rad) * std::log(rad)
+                        : 0.0;
                 mpf_set_d(e2, num);
                 if (mpf_sgn(e1) != 0) { mpf_div(e1, e2, e1); res = (float)mpf_get_d(e1); }
                 else res = 0.f;
             } else if (sac) {
-                res = sacc.value(rad, (double)_ESCAPE_RADIUS);
+                res = sacc.value(rad, escapeRadius());
             } else if (trap) {
                 res = trapc.value((double)i + 1 - log(log(rad) / 2 / log(2)) / log(2));
             } else {
@@ -687,6 +698,37 @@ float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_metho
     return res;
 }
 
+float Mandel::accuratePixelCompute(
+        const std::array<int, 4>& pixel,
+        int mxit, int c_method, bool* cancelled) const {
+    mpf_t cre, cim, offset, signedOffset;
+    mpf_init_set(cre, _c0_re);
+    mpf_init_set(cim, _c0_im);
+    mpf_init(offset);
+    mpf_init(signedOffset);
+    mpf_mul_ui(offset, _dx, pixel[1]);
+    mpf_add(cre, cre, offset);
+    mpf_mul_ui(offset, _dx, abs(pixel[3]));
+    mpf_set(signedOffset, offset);
+    if (pixel[3] < 0)
+        mpf_neg(signedOffset, signedOffset);
+    mpf_div_ui(signedOffset, signedOffset, _sub);
+    mpf_add(cre, cre, signedOffset);
+    mpf_mul_ui(offset, _dy, pixel[0]);
+    mpf_add(cim, cim, offset);
+    mpf_mul_ui(offset, _dy, abs(pixel[2]));
+    mpf_set(signedOffset, offset);
+    if (pixel[2] < 0)
+        mpf_neg(signedOffset, signedOffset);
+    mpf_div_ui(signedOffset, signedOffset, _sub);
+    mpf_add(cim, cim, signedOffset);
+    float result =
+        accuratePointCompute(
+            cre, cim, mxit, c_method, cancelled);
+    mpf_clears(cre, cim, offset, signedOffset, (mpf_ptr)0);
+    return result;
+}
+
 // Sensitivity helper for the mxit-boundary check: instead of re-running a full
 // accuratePointCompute of the whole reference orbit (mxit+64 GMP iterations) just
 // to learn whether the reference escapes just past mxit, CONTINUE the orbit we
@@ -698,7 +740,7 @@ bool Mandel::refTailEscapes(int last, int extra) const {
     mpf_init(zr); mpf_init(zi); mpf_init(t1); mpf_init(t2);
     if (_use_bigfixed) { bf_to_mpf(zr, _bz_re[last & 1]); bf_to_mpf(zi, _bz_im[last & 1]); }
     else { mpf_set(zr, _z_re[last & 1]); mpf_set(zi, _z_im[last & 1]); }
-    const double R2 = (double)_ESCAPE_RADIUS * (double)_ESCAPE_RADIUS;
+    const double R2 = escapeRadiusSquared();
     bool esc = false;
     for (int k = 0; k < extra && !esc; ++k) {
         mpf_mul(t1, zr, zi);            // zr*zi
@@ -733,11 +775,15 @@ void Mandel::ComputeDirect(int mxit, float* out, int step, int c_method) {
         mpf_init(cim);
         mpf_init(tmp);
         for (int j = 0; j < _w; j += step) {
+            if (_flag_halt) break;
             mpf_mul_ui(tmp, _dx, j);
             mpf_add(cre, _c0_re, tmp);
             mpf_mul_ui(tmp, _dy, i);
             mpf_add(cim, _c0_im, tmp);
-            float v = accuratePointCompute(cre, cim, mxit, c_method);
+            bool cancelled = false;
+            float v = accuratePointCompute(
+                cre, cim, mxit, c_method, &cancelled);
+            if (cancelled) break;
             out[i * _w + j] = v;
         }
         mpf_clear(cre);
@@ -847,6 +893,8 @@ int Mandel::createPeriodicRef(int period, int mxit, int c_method) {
     // delta loop then indexes it modulo p (Z_i = Z_{i-p}), so no mxit-long orbit is
     // materialised.  _ref_z is already the nucleus.
     (void)mxit;
+    _ref_escaped = false;
+    _ref_escape_iteration = 0;
     _ref_z_f = Comp{ mpf_get_ld(_ref_z_re), mpf_get_ld(_ref_z_im) };
     _ref_virtual = true;   // the nucleus is not a rendered pixel (skip centre-pixel erase; every pixel is computed)
     // Fractional pixel coordinate of the nucleus. The floatexp dc = _dxfe*(px-_ref_x)
@@ -1044,7 +1092,9 @@ int Mandel::buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, in
                 tk = nowSec(); ref_it = createRef(s, mxit, mxit, true, c_method, true); pf_ref += nowSec() - tk;
             }
         }
-        if (_use_floatexp && ref_it >= mxit - 16) {
+        if (_use_floatexp &&
+            (!_ref_escaped ||
+             _ref_escape_iteration >= mxit - 16)) {
             // "Sensitive" = the reference escapes at or just beyond mxit (its
             // classification then depends on accumulated double rounding), so it is
             // rebuilt from the exact geometric centre. Continue the orbit we already
@@ -1052,7 +1102,8 @@ int Mandel::buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, in
             // accuratePointCompute of the whole orbit + derivative (which cost ~3s at
             // 1e876, dwarfing the reference build). refTailEscapes uses the
             // reference's own representation so it is exact and at least as sensitive.
-            bool sensitive = ref_it < mxit || refTailEscapes(ref_it, 80);
+            bool sensitive =
+                _ref_escaped || refTailEscapes(ref_it, 80);
             if (sensitive) {
                 // Rebuild from the exact geometric centre so the result cannot depend
                 // on which centre pixel exists for even/odd dimensions.
@@ -1060,7 +1111,7 @@ int Mandel::buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, in
                 tk = nowSec(); ref_it = createRef(s, mxit, mxit, true, c_method, true); pf_ref += nowSec() - tk;
             }
         }
-        _ref_bounded = (ref_it >= mxit);
+        _ref_bounded = !_ref_escaped;
         if (_use_floatexp && !_ref_bounded) {
             for (int q = 0; q <= ref_it; ++q) {
                 if (_zfr[q] == 0.0 && _zfi[q] == 0.0 &&
@@ -1239,6 +1290,30 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         Float c0_im_f = mpf_get_ld(_c0_im);
         floatPointCompute(c0_re_f, c0_im_f, mxit, c_method);
         ref_it = buildReferenceOrbit(s, scale, mxit, c_method, profile, pf_ref);
+        if (_customEscapeRadiusActive &&
+            _ref_escaped && _ref_escape_iteration < mxit) {
+            const int customDirectThreshold =
+                std::max(2048, std::min(mxit, 100000));
+            if (_ref_escape_iteration < customDirectThreshold) {
+                progressBegin(_h, 0.0, 1.0);
+#pragma omp parallel for schedule(dynamic, 1)
+                for (int i = 0; i < _h; ++i) {
+                    if (_flag_halt) continue;
+                    for (int j = 0; j < _w; ++j) {
+                        if (_flag_halt) break;
+                        std::array<int, 4> pixel{ i, j, 0, 0 };
+                        bool cancelled = false;
+                        float value = accuratePixelCompute(
+                            pixel, mxit, c_method, &cancelled);
+                        if (cancelled) break;
+                        setPixel(pixel, value);
+                    }
+                    progressAdvance();
+                }
+                if (!_flag_halt) progressSet(1.0);
+                return;
+            }
+        }
         // Sub-pixel nucleus: the BLA skip damps the near-nucleus atom-domain divergence
         // and paints a false-interior body (the true frame is all-exterior save the
         // single nucleus pixel). Disabling BLA lets those pixels iterate to their real
@@ -1347,7 +1422,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             if (_flag_halt) return;
             if (s.empty()) break;
             tk = now(); ref_it = createRef(s, mxit, mxit, false, c_method); pf_ref += now() - tk;
-            _ref_bounded = (ref_it >= mxit);
+            _ref_bounded = !_ref_escaped;
             // createRef removes the chosen reference pixel from s. If it was the
             // final unresolved base pixel AND no adaptive-SS pass follows, there is
             // no next delta pass, so building a potentially mxit-long BLA table is
@@ -1611,7 +1686,9 @@ void Mandel::setPrecision(int precision) {
     }
 }
 
-inline bool Mandel::escape(Comp& z) const { return (std::abs(z) > _ESCAPE_RADIUS); }
+inline bool Mandel::escape(Comp& z) const {
+    return std::abs(z) > escapeRadius();
+}
 inline bool Mandel::escape(mpf_t& z_re, mpf_t& z_im) const {
     // auto ri = z.get_real_imag();
     mpf_t t1, t2;
@@ -1623,7 +1700,7 @@ inline bool Mandel::escape(mpf_t& z_re, mpf_t& z_im) const {
     double rad = mpf_get_d(t1);
     mpf_clear(t1);
     mpf_clear(t2);
-    return (rad > _ESCAPE_RADIUS);
+    return rad > escapeRadiusSquared();
 }
 
 inline float Mandel::getEscapeTime(Comp& z, int i) const {
@@ -1643,6 +1720,17 @@ inline float Mandel::getEscapeTime(mpf_t& z_re, mpf_t& z_im, int i) {
 }
 
 void Mandel::setPixel(std::array<int, 4> p, float iteration) const {
+    if (iteration >= 0.0f) {
+        if (_customOutputAdapter ==
+            formula::CustomDeepZoomOutputAdapter::SmoothExpression) {
+            static const float offset = static_cast<float>(
+                -std::log(std::log(2.0)) / std::log(2.0));
+            iteration += offset;
+        } else if (_customOutputAdapter ==
+                   formula::CustomDeepZoomOutputAdapter::DistanceExpression) {
+            iteration *= 0.5f;
+        }
+    }
     _iter[getIndex(p)] = iteration;
 }
 
@@ -1707,19 +1795,11 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         auto finalize = [&](int i) {
             auto arr = v[i];
             float value = val[i];
-            if (_fe_cutoff_sensitive && (value < 0 || value > mxit - 16)) {
-                mpf_t cre, cim, t;
-                mpf_init_set(cre, _c0_re); mpf_init_set(cim, _c0_im); mpf_init(t);
-                mpf_mul_ui(t, _dx, arr[1]); mpf_add(cre, cre, t);
-                mpf_mul_ui(t, _dx, abs(arr[3]));
-                if (arr[3] < 0) mpf_neg(t, t);
-                mpf_div_ui(t, t, _sub); mpf_add(cre, cre, t);
-                mpf_mul_ui(t, _dy, arr[0]); mpf_add(cim, cim, t);
-                mpf_mul_ui(t, _dy, abs(arr[2]));
-                if (arr[2] < 0) mpf_neg(t, t);
-                mpf_div_ui(t, t, _sub); mpf_add(cim, cim, t);
-                value = accuratePointCompute(cre, cim, mxit, c_method);
-                mpf_clears(cre, cim, t, (mpf_ptr)0);
+            if (value == EMPTYPIXEL ||
+                (_fe_cutoff_sensitive &&
+                 (value < 0 || value > mxit - 16))) {
+                value = accuratePixelCompute(
+                    arr, mxit, c_method);
 #pragma omp atomic
                 ++g_fe_fallback;
             }
@@ -1917,7 +1997,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                 // valid -- avoids the per-iteration lookup cost when dz is large.
                 // BLA start index s = k-1 (loop-top invariant: dz is at ref index k-1).
                 int skip = tryBLA(rkm1, dzr, dzi, ddr, ddi, dcr, dci, deriv,
-                                  _ESCAPE_RADIUS * _ESCAPE_RADIUS, mx_ref_it);
+                                  escapeRadiusSquared(), mx_ref_it);
                 if (skip > 0) {
                     int tid = omp_get_thread_num() & 63;
                     g_bla_stat[tid][0] += skip; ++g_bla_stat[tid][1];
@@ -1968,7 +2048,15 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
 
             ++k;
             rkm1 = rk; if (per) { if (++rk == per) rk = 0; } else rk = k;
-            if (zrad > _ESCAPE_RADIUS * _ESCAPE_RADIUS) {
+            if (_customEscapeRadiusActive && !per &&
+                k >= _ref_escape_iteration) {
+                setPixel(
+                    arr,
+                    accuratePixelCompute(arr, mxit, c_method));
+                markDone(i);
+                break;
+            }
+            if (zrad > escapeRadiusSquared()) {
                 
                 if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
                     setPixel(arr, sqrt(zrad) / dxf * log(zrad) / sqrt(dr * dr + di * di));
@@ -1983,7 +2071,8 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                 } else if (trap) {
                     setPixel(arr, trapc.value(j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2)));
                 } else if (sac) {
-                    setPixel(arr, sacc.value((double)zrad, (double)_ESCAPE_RADIUS));
+                    setPixel(arr, sacc.value(
+                        (double)zrad, escapeRadius()));
                 } else {
                     setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
                 }
@@ -2431,7 +2520,7 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
                         const double* Adcr, const double* Adci,
                         const double* Adzr, const double* Adzi,
                         int mx_ref_it, int mxit, Float* glitch_p) {
-    const double ESC2 = (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS;
+    const double ESC2 = escapeRadiusSquared();
     const double LG2 = log(2.0);
 
     alignas(32) double dzr_[4] = { 0,0,0,0 }, dzi_[4] = { 0,0,0,0 };
@@ -2557,6 +2646,9 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
             if (!act[l] || (blaSkipped & (1 << l))) continue;   // not a stepping lane
             int bit = 1 << l;
             ++k_[l];
+            if (_customEscapeRadiusActive &&
+                k_[l] >= _ref_escape_iteration)
+                need |= bit;
             if (em & bit) need |= bit;
             else if (rm & bit) need |= bit;
             if (k_[l] == mx_ref_it) { refit |= bit; need |= bit; }
@@ -2584,6 +2676,16 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
         bool changed = false;
         for (int l = 0; l < lanes; ++l) {
             if (!act[l] || (blaSkipped & (1 << l))) continue;
+            if (_customEscapeRadiusActive &&
+                k_[l] >= _ref_escape_iteration) {
+                setPixel(
+                    v[g + l],
+                    accuratePixelCompute(
+                        v[g + l], mxit, 0));
+                markDone(g + l);
+                act[l] = false;
+                continue;
+            }
             if (em & (1 << l)) {                         // escape (checked first)
                 setPixel(v[g + l], (float)(j_[l] + 1 - log(log(zrad_[l]) / 2 / LG2) / LG2));
                 markDone(g + l); act[l] = false; continue;
@@ -2637,7 +2739,7 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
 // w stays an O(1) double, the floatexp scale S carries the deep exponent, so the
 // inner loop is native-double yet correct far past double's ~1e320 underflow.
 float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit, int c_method, float* normalOut) const {
-    const double ESC2 = (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS;
+    const double ESC2 = escapeRadiusSquared();
     const double LG2 = log(2.0);
     struct FeStat { long long* s; long long sk = 0, skl = 0, st = 0;
         FeStat(long long* p) : s(p) {} ~FeStat() { s[0] += skl; s[1] += sk; s[2] += st; } }
@@ -2770,6 +2872,9 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         }
         ++m; ++iter; g.st++;
         rm++; if (per && rm == per) rm = 0;             // advance the (mod-per) ref index
+        if (_customEscapeRadiusActive && !per &&
+            m >= _ref_escape_iteration)
+            return EMPTYPIXEL;
         if (deriv) {
             // J_{m+1} = 2 z_m J_m + 1 (exact; z_m is the reconstructed value).
             if (deriv_underflow) {
@@ -2818,8 +2923,11 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
             }
             if (!sac)
                 return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
-            return sacc.value(zrad, (double)_ESCAPE_RADIUS);
+            return sacc.value(zrad, escapeRadius());
         }
+        if (_customEscapeRadiusActive && !per &&
+            m >= reflen)
+            return EMPTYPIXEL;
 
         if (_use_interior) {
             if (conf_P > 0) {
@@ -2887,7 +2995,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
 // events. Mirrors pixelRescaled op-for-op (see that function for the math).
 void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g, int lanes,
                                 int mx_ref_it, int mxit, int c_method, float* out) const {
-    const double ESC2 = (double)_ESCAPE_RADIUS * _ESCAPE_RADIUS;
+    const double ESC2 = escapeRadiusSquared();
     const double LG2 = log(2.0);
     const int reflen = mx_ref_it + 1;
 
@@ -2993,10 +3101,22 @@ void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g,
                 wr[l] = nwr_[l]; wi[l] = nwi_[l];
             }
             ++m[l]; ++iter[l];
+            if (_customEscapeRadiusActive &&
+                m[l] >= _ref_escape_iteration) {
+                out[g + l] = EMPTYPIXEL;
+                act[l] = false;
+                continue;
+            }
             double zrl = zrad_[l];
             if (zrl > ESC2) {
                 out[g + l] = (float)((double)iter[l] - log(log(zrl) / 2.0 / LG2) / LG2);
                 act[l] = false; continue;
+            }
+            if (_customEscapeRadiusActive &&
+                m[l] >= reflen) {
+                out[g + l] = EMPTYPIXEL;
+                act[l] = false;
+                continue;
             }
             double wm = wmag2_[l];
             if (wm > 1e16 || (wm < 1e-16 && wm > 0.0)) {          // keep |w| ~ O(1)
@@ -3037,6 +3157,8 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
                       int c_method, bool view_center) {
     if (s.empty()) return false;
     _ref_period = 0;   // a normal (non-periodic) reference; delta loop indexes linearly
+    _ref_escaped = false;
+    _ref_escape_iteration = 0;
     ++_ref_cnt;
     std::array<int, 4> p{ _h / 2, _w / 2, 0, 0 };
     if (view_center) {
@@ -3140,6 +3262,8 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
     for (int i = 1; i <= mxit; ++i) {
         if (_flag_halt) break;
         if (!calCoefficient(i, pr_it, c_method)) {
+            _ref_escaped = true;
+            _ref_escape_iteration = i;
             if (_ref_virtual && _use_floatexp && i >= mxit - 16)
                 _fe_cutoff_sensitive = true;
             if (!_ref_virtual) {
@@ -3155,6 +3279,15 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
                     setPixel(_ref, getEscapeTime(_z_re[i & 1], _z_im[i & 1], i));
                 }
             }
+            // The delta loops reserve one reference entry as end-of-orbit
+            // lookahead. Preserve the first escaped entry by building one extra
+            // coefficient after the Custom bailout crossing; the crossing itself
+            // still determines the reference pixel's escape value.
+            if (_customEscapeRadiusActive && i < mxit && !_flag_halt) {
+                calCoefficient(
+                    i + 1, 0, c_method, true);
+                return i + 1;
+            }
             return i;
         }
     }
@@ -3169,7 +3302,8 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
     return mxit;
 }
 
-bool Mandel::calCoefficient(int i, int pr_it, int c_method) {
+bool Mandel::calCoefficient(int i, int pr_it, int c_method,
+                            bool continuePastEscape) {
     // Track the reference derivative for EDE (|D|), the normal map (arg D) and the
     // DE overlay (|D|).
     const bool deriv = (c_method & ColoringMethod::EXTERIOR_DIST_EST)
@@ -3245,7 +3379,7 @@ bool Mandel::calCoefficient(int i, int pr_it, int c_method) {
         _df[i] = Comp{ _dfr[i], _dfi[i] };
     }
 
-    if (escape(_zf[i])) return false;
+    if (escape(_zf[i]) && !continuePastEscape) return false;
     if (i <= pr_it) {
         if (_SA_flag) {
             for (int j = 0; j < _SA_N; ++j) {

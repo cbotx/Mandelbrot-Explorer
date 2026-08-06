@@ -514,6 +514,20 @@ bool ExpressionProgram::analyze(ExpressionError* error) {
     return true;
 }
 
+bool ExpressionProgram::isCanonicalQuadraticPlusC() const {
+    if (!_valid) return false;
+    const auto is = [&](size_t index, Op op) {
+        return index < _code.size() && _code[index].op == op;
+    };
+    return (_code.size() == 5 &&
+            is(0, Op::Z) && is(1, Op::Z) &&
+            is(2, Op::Multiply) && is(3, Op::C) &&
+            is(4, Op::Add)) ||
+           (_code.size() == 4 &&
+            is(0, Op::Z) && is(1, Op::Square) &&
+            is(2, Op::C) && is(3, Op::Add));
+}
+
 bool ExpressionProgram::compile(const std::string& source, ExpressionError* error) {
     _valid = false;
     _source.clear();

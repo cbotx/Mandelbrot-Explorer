@@ -13,6 +13,7 @@
 
 #include "formula_expression_orbit.h"
 #include "formula_spec.h"
+#include "custom_deep_zoom.h"
 
 struct OrbitPoint {
     float re;
@@ -27,6 +28,7 @@ struct OrbitResult {
     double computeMs = 0.0;
     int iterations = 0;
     bool escaped = false;
+    bool usedGmpQuadratic = false;
     uint64_t generation = 0;
 };
 
@@ -42,7 +44,8 @@ public:
                  int pixelX, int pixelY, int width, int height, int maxIterations,
                  FormulaContext formulaContext,
                  std::shared_ptr<const formula::ExpressionOrbitSnapshot>
-                     expression = nullptr);
+                     expression = nullptr,
+                 formula::CustomDeepZoomPlan customDeepZoom = {});
     bool takeLatest(OrbitResult& result);
     void cancel();
 
@@ -59,6 +62,7 @@ private:
     int _pixelX = 0, _pixelY = 0, _width = 1, _height = 1, _maxIterations = 1;
     FormulaContext _formula = quadraticMandelbrot();
     std::shared_ptr<const formula::ExpressionOrbitSnapshot> _expression;
+    formula::CustomDeepZoomPlan _customDeepZoom;
     uint64_t _pendingGeneration = 0;
     std::atomic<uint64_t> _requestedGeneration{0};
 

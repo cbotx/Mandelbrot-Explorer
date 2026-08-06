@@ -3,6 +3,7 @@
 
 #include <gmp.h>
 
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -35,6 +36,7 @@ struct ComputeRequest {
     float* iterations = nullptr;
     float* normal = nullptr;
 
+    const formula::ExpressionProgram* expressionSource = nullptr;
     const formula::ExpressionProgram* expression = nullptr;
     const formula::ExpressionContext* expressionFixed = nullptr;
     const formula::ExpressionOrbitPlan* expressionPlan = nullptr;
@@ -57,6 +59,7 @@ public:
     virtual ~IComputeBackend() = default;
     virtual const ComputeBackendInfo& info() const = 0;
     virtual bool lastComputeUsedGpuPath() const = 0;
+    virtual bool lastComputeUsedCustomDeepPath() const { return false; }
     virtual bool compute(const ComputeRequest& request) = 0;
     virtual void cancel() = 0;
     virtual void resetCancellation() = 0;

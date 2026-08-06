@@ -78,6 +78,7 @@ public:
     size_t stackDepth() const { return _stackDepth; }
     FastPath fastPath() const { return _fastPath; }
     int fastIntegerPower() const { return _fastIntegerPower; }
+    bool isCanonicalQuadraticPlusC() const;
     bool avx2Compatible() const { return _avx2Compatible; }
     bool batchCompatible() const { return _batchCompatible; }
     bool derivativeCompatible() const { return _derivativeCompatible; }

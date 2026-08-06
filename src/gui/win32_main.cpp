@@ -443,7 +443,8 @@ public:
         mpf_init2(re, precision); mpf_init2(im, precision); mpf_init2(scale, precision);
         nav->GetView(re, im, scale);
         orbitWorker->request(re, im, scale, p.x, p.y, renderW, renderH, maxIter,
-                             nav->GetFormulaContext(), std::move(expression));
+                             nav->GetFormulaContext(), std::move(expression),
+                             nav->GetCustomDeepZoomPlan());
         mpf_clear(re); mpf_clear(im); mpf_clear(scale);
         lastOrbitRequest = now; lastOrbitX = x; lastOrbitY = y;
     }

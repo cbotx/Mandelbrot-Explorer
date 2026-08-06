@@ -84,6 +84,26 @@ shifts $\mu$ by the constant $\log_2\ln 2$.)
 Everything below exists to compute the escaping $n$ and $r$ (and, for the derived
 modes, $J_n$) **fast and accurately at extreme zoom**.
 
+### 1.3 Custom quadratic deep-zoom compatibility
+
+Custom frames stay on the direct expression AVX2 path through zoom $10^{12}$.
+Above that boundary they use this quadratic perturbation/SA/BLA engine only when
+the compiled source and specialized runtime are the exact recognized `z*z+c`
+recurrence in the c-plane, fixed `z0` is positive zero in both components, and the
+Custom bailout is finite, at least 1, and has a finite squared value. A scoped
+per-frame override makes the reference orbit, SA/BLA, perturbation loops, and
+direct fallbacks use that bailout without changing ordinary Mandelbrot frames.
+The whole frame must also have $z_1=c$ inside the bailout disk because the
+optimized engine starts testing at $z_2$.
+
+The two renderers historically expose slightly different numeric conventions.
+The deep Custom writer therefore adds the constant
+$-\log(\log 2)/\log 2$ for Smooth and halves Distance (the production engine uses
+$\log |z|^2$ where Custom uses $\log |z|$). Feather and OrbitTrap are not routed
+in stage 1 because Custom includes $z_1=c$ in their accumulators while the
+production quadratic accumulators begin at $z_2$; Raw also remains direct. Those
+modes and every incompatible formula retain the $10^{12}$ cap.
+
 ---
 
 ## 2. Perturbation

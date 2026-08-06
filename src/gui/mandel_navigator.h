@@ -107,6 +107,9 @@ public:
     bool LastComputeUsedGpuPath() const {
         return _backend->lastComputeUsedGpuPath();
     }
+    bool LastComputeUsedCustomDeepPath() const {
+        return _backend->lastComputeUsedCustomDeepPath();
+    }
     // Copy the current view: center (re/im) and scale into caller-owned mpf_t.
     void GetView(mpf_t re, mpf_t im, mpf_t scale) const;
     mp_bitcnt_t GetViewPrecision() const { return mpf_get_prec(_scale); }
@@ -124,6 +127,7 @@ public:
         return IsExpression() && _expressionProgram.fastIntegerPower() >= 2 &&
                _expressionBailout >= 1.0;
     }
+    formula::CustomDeepZoomPlan GetCustomDeepZoomPlan() const;
     std::string GetExpressionAccelerationText() const;
     void SetJuliaMode(bool enabled);
     bool SetExpressionFormula(const std::string& source, FormulaParameter pixel,
@@ -151,6 +155,10 @@ public:
 
 private:
     void SaveMandelbrotState();
+    formula::CustomDeepZoomPlan BuildCustomDeepZoomPlan(
+        mpf_srcptr scale, int method,
+        mpf_srcptr centerRe = nullptr,
+        mpf_srcptr centerIm = nullptr) const;
     void ConfigureSampling();
     void SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method);
     // SS phase cache: fill per-subpixel base palette indices for a SmoothColor
