@@ -49,6 +49,7 @@
 #include "custom_deep_zoom.h"
 #include "orbit_coloring.h"
 #include "orbit_overlay.h"
+#include "orbit_thumbnail.h"
 #include "mandel_navigator.h"
 #include "test_cases.h"
 
@@ -1213,7 +1214,7 @@ static int runExpressionCoreCase() {
                     ++orbitPlanBatchMismatches;
 
             formula::ExpressionJit4 planJit;
-            bool compiled = planJit.compile(plan);
+            bool compiled = VERIFY_JIT && planJit.compile(plan);
             if (compiled !=
                     (VERIFY_JIT && test.expectJit)) {
                 ++orbitPlanFailures;
@@ -1259,7 +1260,7 @@ static int runExpressionCoreCase() {
             return;
         }
         formula::ExpressionJit4 planJit;
-        bool jitAvailable = planJit.compile(plan);
+        bool jitAvailable = VERIFY_JIT && planJit.compile(plan);
         if (jitAvailable != expectJit)
             ++orbitPlanFailures;
         constexpr int PW = 37, PH = 23, PMXIT = 90;
@@ -3180,8 +3181,101 @@ static int runExpressionOrbitCase() {
     }
     mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
 
+    {
+        OrbitThumbnailPixel pixel;
+        if (!classifyOrbitThumbnailPixel(
+                nullptr, { 2.0, 0.0 }, 2, pixel) ||
+            !pixel.escaped || pixel.iterations != 2)
+            ++failures;
+        if (!classifyOrbitThumbnailPixel(
+                nullptr, { 2.0, 0.0 }, 1, pixel) ||
+            pixel.escaped || pixel.iterations != 1)
+            ++failures;
+
+        ExpressionOrbitSnapshot finalEscape;
+        fixed = {};
+        if (makeSnapshot(
+                "z+1", FormulaParameter::C, fixed, 1.5,
+                finalEscape)) {
+            if (!classifyOrbitThumbnailPixel(
+                    &finalEscape, {}, 2, pixel) ||
+                !pixel.escaped || pixel.iterations != 2)
+                ++failures;
+            if (!classifyOrbitThumbnailPixel(
+                    &finalEscape, {}, 1, pixel) ||
+                pixel.escaped || pixel.iterations != 1)
+                ++failures;
+        }
+        if (!classifyOrbitThumbnailPixel(
+                &z0Plane, { 0.5, 0.0 }, 3, pixel) ||
+            pixel.escaped || pixel.iterations != 3)
+            ++failures;
+        if (!classifyOrbitThumbnailPixel(
+                &initialEscape, { 5.0, 0.0 }, 10, pixel) ||
+            !pixel.escaped || pixel.iterations != 0)
+            ++failures;
+        if (!classifyOrbitThumbnailPixel(
+                &domain, {}, 10, pixel) ||
+            !pixel.escaped || pixel.iterations != 1)
+            ++failures;
+        ExpressionOrbitSnapshot parameterAndIteration;
+        fixed = {};
+        fixed.parameters[0] = { 2.0, 0.0 };
+        if (makeSnapshot(
+                "z+p0+n", FormulaParameter::C, fixed, 4.5,
+                parameterAndIteration) &&
+            (!classifyOrbitThumbnailPixel(
+                 &parameterAndIteration, {}, 3, pixel) ||
+             !pixel.escaped || pixel.iterations != 2))
+            ++failures;
+
+        auto waitForThumbnail = [](
+                OrbitThumbnailWorker& worker,
+                OrbitThumbnailResult& result) {
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(5);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (worker.takeLatest(result)) return true;
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(1));
+            }
+            return false;
+        };
+        OrbitThumbnailWorker thumbnailWorker;
+        ExpressionOrbitSnapshot slow, latest;
+        fixed = {};
+        makeSnapshot(
+            "sin(z)+c", FormulaParameter::C, fixed, 100.0, slow);
+        fixed.c = { -0.25, 0.0 };
+        makeSnapshot(
+            "z*z+c", FormulaParameter::InitialZ,
+            fixed, 8.0, latest);
+        uint64_t staleGeneration = thumbnailWorker.request(
+            96, 64, -2.5, 1.0, -1.2, 1.2, 160,
+            std::make_shared<const ExpressionOrbitSnapshot>(slow));
+        uint64_t latestGeneration = thumbnailWorker.request(
+            32, 24, -2.5, 1.0, -1.2, 1.2, 40,
+            std::make_shared<const ExpressionOrbitSnapshot>(latest));
+        OrbitThumbnailResult thumbnail;
+        if (latestGeneration <= staleGeneration ||
+            !waitForThumbnail(thumbnailWorker, thumbnail) ||
+            thumbnail.generation != latestGeneration ||
+            !thumbnail.expression ||
+            thumbnail.pixelParameter != FormulaParameter::InitialZ ||
+            thumbnail.pixels.size() != (size_t)32 * 24 * 3)
+            ++failures;
+
+        uint64_t mandelGeneration = thumbnailWorker.request(
+            16, 12, -2.5, 1.0, -1.2, 1.2, 20, nullptr);
+        if (!waitForThumbnail(thumbnailWorker, thumbnail) ||
+            thumbnail.generation != mandelGeneration ||
+            thumbnail.expression ||
+            thumbnail.pixels.size() != (size_t)16 * 12 * 3)
+            ++failures;
+    }
+
     printf("=== expression orbit overlay\n");
-    printf("  c-plane/z0/n/transcendental/escape/domain/cancel/lifetime/generation/cap\n");
+    printf("  c-plane/z0/n/transcendental/escape/domain/cancel/lifetime/generation/cap/thumbnail\n");
     printf("  => %s\n\n",
            failures == 0 ? "PASS" : "CHECK (expression orbit failure)");
     return failures == 0 ? 0 : 1;

@@ -1011,7 +1011,7 @@ struct FormulaEditorPanel::Impl {
             return false;
         }
         formulaField.setPlaceholder(L"Enter an orbit expression");
-        bailoutField.setPlaceholder(L"4.0");
+        bailoutField.setPlaceholder(L"100");
         realField.setPlaceholder(L"0");
         imaginaryField.setPlaceholder(L"0");
 
@@ -2525,6 +2525,8 @@ struct FormulaEditorPanel::Impl {
                                  const wchar_t* name) {
             if (!condition) failures.emplace_back(name);
         };
+        check(FormulaDialogConfig{}.bailout == 100.0,
+              L"default bailout is 100");
 
         FormulaDialogConfig savedWorking = working;
         FormulaDialogConfig savedApplied = applied;

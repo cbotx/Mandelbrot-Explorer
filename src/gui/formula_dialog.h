@@ -18,7 +18,7 @@ struct FormulaDialogConfig {
     std::complex<double> fixedZ0{};
     std::complex<double> fixedC{};
     std::array<std::complex<double>, 8> parameters{};
-    double bailout = 4.0;
+    double bailout = 100.0;
 };
 
 #endif

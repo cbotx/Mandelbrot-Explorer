@@ -1,5 +1,6 @@
 #include "formula_expression_orbit.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 
@@ -12,11 +13,13 @@ bool ExpressionOrbitSnapshot::valid() const {
            bailout > 0.0 && std::isfinite(bailout);
 }
 
-bool evaluateExpressionOrbit(
+namespace {
+
+template<typename Result, typename RecordPoint>
+bool runExpressionOrbit(
         const ExpressionOrbitSnapshot& snapshot, Complex pixel,
-        int maxIterations, ExpressionOrbitEvaluation& result,
+        int maxIterations, Result& result, RecordPoint&& recordPoint,
         const std::function<bool()>& shouldCancel) {
-    result = ExpressionOrbitEvaluation{};
     if (!snapshot.valid() || maxIterations < 0)
         return false;
 
@@ -27,8 +30,7 @@ bool evaluateExpressionOrbit(
         context.z0 = pixel;
     context.z = context.z0;
 
-    result.points.reserve((size_t)maxIterations + 1);
-    result.points.push_back(context.z);
+    recordPoint(context.z);
     if (!std::isfinite(context.z.real()) ||
         !std::isfinite(context.z.imag()) ||
         std::hypot(context.z.real(), context.z.imag()) > snapshot.bailout) {
@@ -45,7 +47,7 @@ bool evaluateExpressionOrbit(
         context.iteration = n;
         context.z = snapshot.program.evaluate(
             context, stack.data(), snapshot.program.stackDepth());
-        result.points.push_back(context.z);
+        recordPoint(context.z);
         result.iterations = n + 1;
         if (!std::isfinite(context.z.real()) ||
             !std::isfinite(context.z.imag()) ||
@@ -55,6 +57,30 @@ bool evaluateExpressionOrbit(
         }
     }
     return true;
+}
+
+} // namespace
+
+bool evaluateExpressionOrbit(
+        const ExpressionOrbitSnapshot& snapshot, Complex pixel,
+        int maxIterations, ExpressionOrbitEvaluation& result,
+        const std::function<bool()>& shouldCancel) {
+    result = ExpressionOrbitEvaluation{};
+    result.points.reserve((size_t)std::max(0, maxIterations) + 1);
+    return runExpressionOrbit(
+        snapshot, pixel, maxIterations, result,
+        [&result](Complex point) { result.points.push_back(point); },
+        shouldCancel);
+}
+
+bool classifyExpressionOrbit(
+        const ExpressionOrbitSnapshot& snapshot, Complex pixel,
+        int maxIterations, ExpressionOrbitClassification& result,
+        const std::function<bool()>& shouldCancel) {
+    result = ExpressionOrbitClassification{};
+    return runExpressionOrbit(
+        snapshot, pixel, maxIterations, result,
+        [](Complex) {}, shouldCancel);
 }
 
 } // namespace formula

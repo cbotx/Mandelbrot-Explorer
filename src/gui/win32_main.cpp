@@ -38,6 +38,7 @@
 #include "mandel_navigator.h"
 #include "mandel_perturbation.h"
 #include "orbit_overlay.h"
+#include "orbit_thumbnail.h"
 
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -259,7 +260,15 @@ public:
     bool hasSavedMandelUi = false;
     std::unique_ptr<OrbitWorker> orbitWorker;
     OrbitResult orbitResult;
+    std::unique_ptr<OrbitThumbnailWorker> orbitThumbnailWorker;
     std::vector<uint8_t> orbitThumbnail;
+    bool orbitThumbnailBuilding = false;
+    uint64_t orbitThumbnailGeneration = 0;
+    bool orbitThumbnailSmoke = false;
+    int orbitThumbnailSmokeStage = 0;
+    uint64_t orbitThumbnailSmokeFirstGeneration = 0;
+    uint64_t orbitThumbnailSmokeExpectedGeneration = 0;
+    std::chrono::steady_clock::time_point orbitThumbnailSmokeDeadline{};
     std::chrono::steady_clock::time_point lastOrbitRequest{};
     int lastOrbitX = -10000, lastOrbitY = -10000;
     bool paletteOpen = false;              // dropdown expanded
@@ -316,30 +325,33 @@ public:
     static constexpr double ORBIT_Y0 = -1.2;
     static constexpr double ORBIT_Y1 = 1.2;
 
-    void buildOrbitThumbnail() {
-        orbitThumbnail.assign((size_t)ORBIT_W * ORBIT_H * 3, 0);
-#pragma omp parallel for schedule(static)
-        for (int y = 0; y < ORBIT_H; ++y) {
-            double ci = ORBIT_Y1 - (ORBIT_Y1 - ORBIT_Y0) * y / (ORBIT_H - 1);
-            for (int x = 0; x < ORBIT_W; ++x) {
-                double cr = ORBIT_X0 + (ORBIT_X1 - ORBIT_X0) * x / (ORBIT_W - 1);
-                double zr = 0.0, zi = 0.0;
-                int i = 0;
-                for (; i < 160 && zr * zr + zi * zi <= 16.0; ++i) {
-                    double nr = zr * zr - zi * zi + cr;
-                    zi = 2.0 * zr * zi + ci;
-                    zr = nr;
-                }
-                uint8_t* p = &orbitThumbnail[((size_t)y * ORBIT_W + x) * 3];
-                if (i == 160) {
-                    p[0] = 16; p[1] = 13; p[2] = 10;
-                } else {
-                    double t = std::sqrt((double)i / 160.0);
-                    p[0] = (uint8_t)(30 + 95 * t);
-                    p[1] = (uint8_t)(24 + 135 * t);
-                    p[2] = (uint8_t)(20 + 215 * t);
-                }
+    void rebuildOrbitThumbnail() {
+        orbitThumbnail.clear();
+        orbitThumbnailBuilding = false;
+        orbitThumbnailGeneration = 0;
+        if (!orbitThumbnailWorker) return;
+        if (!orbitOn || !nav) {
+            orbitThumbnailWorker->cancel();
+            return;
+        }
+        std::shared_ptr<const formula::ExpressionOrbitSnapshot> expression;
+        if (nav->IsExpression()) {
+            expression = nav->GetExpressionOrbitSnapshot();
+            if (!expression) {
+                orbitThumbnailWorker->cancel();
+                return;
             }
+        }
+        orbitThumbnailGeneration = orbitThumbnailWorker->request(
+            ORBIT_W, ORBIT_H,
+            ORBIT_X0, ORBIT_X1, ORBIT_Y0, ORBIT_Y1,
+            160, std::move(expression));
+        orbitThumbnailBuilding = true;
+        needFull = true;
+        if (hwnd) {
+            RECT dirty = rcOrbitThumb;
+            dirty.top -= S(20);
+            InvalidateRect(hwnd, &dirty, FALSE);
         }
     }
 
@@ -357,25 +369,41 @@ public:
 
     void drawOrbitThumbnail(HDC dc) {
         if (!orbitOn || rcOrbitThumb.right <= rcOrbitThumb.left) return;
+        const wchar_t* thumbnailLabel = L"Orbit in the Mandelbrot set";
+        if (nav && nav->IsExpression()) {
+            auto expression = nav->GetExpressionOrbitSnapshot();
+            FormulaParameter pixelParameter = expression
+                ? expression->pixelParameter : formulaConfig.pixelParameter;
+            thumbnailLabel = pixelParameter == FormulaParameter::InitialZ
+                ? L"Custom z0 initial-value plane"
+                : L"Custom c parameter plane";
+        }
         label(dc, rcOrbitThumb.left, rcOrbitThumb.top - S(20),
-              nav && nav->IsExpression()
-                  ? L"Custom orbit (Mandelbrot backdrop)"
-                  : L"Orbit in the Mandelbrot set");
+              thumbnailLabel);
         fillRound(dc, rcOrbitThumb, CLR_CARD, CLR_BORDER, S(8));
         RECT image = rcOrbitThumb;
         InflateRect(&image, -S(6), -S(6));
-        BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = ORBIT_W; bi.bmiHeader.biHeight = -ORBIT_H;
-        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 24;
-        bi.bmiHeader.biCompression = BI_RGB;
-        SetStretchBltMode(dc, HALFTONE);
-        StretchDIBits(dc, image.left, image.top, image.right - image.left,
-                      image.bottom - image.top, 0, 0, ORBIT_W, ORBIT_H,
-                      orbitThumbnail.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+        const bool hasBackground =
+            orbitThumbnail.size() == (size_t)ORBIT_W * ORBIT_H * 3;
+        if (hasBackground) {
+            BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth = ORBIT_W; bi.bmiHeader.biHeight = -ORBIT_H;
+            bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 24;
+            bi.bmiHeader.biCompression = BI_RGB;
+            SetStretchBltMode(dc, HALFTONE);
+            StretchDIBits(dc, image.left, image.top,
+                          image.right - image.left,
+                          image.bottom - image.top,
+                          0, 0, ORBIT_W, ORBIT_H,
+                          orbitThumbnail.data(), &bi,
+                          DIB_RGB_COLORS, SRCCOPY);
+        } else {
+            fillRound(dc, image, RGB(16, 13, 10), RGB(16, 13, 10), S(4));
+        }
 
         int saved = SaveDC(dc);
         IntersectClipRect(dc, image.left, image.top, image.right, image.bottom);
-        if (orbitResult.points.size() >= 2) {
+        if (hasBackground && orbitResult.points.size() >= 2) {
             std::vector<POINT> points;
             points.reserve(orbitResult.points.size());
             for (const OrbitPoint& p : orbitResult.points) {
@@ -389,16 +417,29 @@ public:
                 Polyline(dc, points.data(), (int)points.size());
             SelectObject(dc, old); DeleteObject(line);
         }
-        POINT cp = orbitMap(orbitResult.pixelRe, orbitResult.pixelIm, image);
-        HBRUSH marker = CreateSolidBrush(CLR_GREEN);
-        HGDIOBJ oldBrush = SelectObject(dc, marker);
-        HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
-        int mr = std::max(2, S(3));
-        Ellipse(dc, cp.x - mr, cp.y - mr, cp.x + mr + 1, cp.y + mr + 1);
-        SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(marker);
+        if (hasBackground && orbitResult.generation != 0) {
+            POINT cp = orbitMap(
+                orbitResult.pixelRe, orbitResult.pixelIm, image);
+            HBRUSH marker = CreateSolidBrush(CLR_GREEN);
+            HGDIOBJ oldBrush = SelectObject(dc, marker);
+            HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+            int mr = std::max(2, S(3));
+            Ellipse(dc, cp.x - mr, cp.y - mr,
+                    cp.x + mr + 1, cp.y + mr + 1);
+            SelectObject(dc, oldPen);
+            SelectObject(dc, oldBrush);
+            DeleteObject(marker);
+        }
         RestoreDC(dc, saved);
 
-        if (orbitResult.generation == 0) {
+        if (!hasBackground) {
+            drawText(dc, image,
+                     orbitThumbnailBuilding
+                         ? L"Building orbit background..."
+                         : L"Background unavailable",
+                     CLR_TEXT, fSmall,
+                     DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else if (orbitResult.generation == 0) {
             drawText(dc, image, L"Move over the main image", CLR_TEXT, fSmall,
                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
@@ -419,7 +460,6 @@ public:
             if (!expression) return;
         }
         if (!orbitWorker) orbitWorker = std::make_unique<OrbitWorker>();
-        if (orbitThumbnail.empty()) buildOrbitThumbnail();
         auto now = std::chrono::steady_clock::now();
         if (lastOrbitRequest.time_since_epoch().count()) {
             double ms = std::chrono::duration<double, std::milli>(
@@ -458,6 +498,84 @@ public:
             ? lastOrbitY : (vr.top + vr.bottom) / 2;
         lastOrbitRequest = {};
         requestOrbit(x, y);
+    }
+
+    void finishOrbitThumbnailSmoke(bool passed, const char* detail) {
+        FILE* file = nullptr;
+        fopen_s(&file, "build\\orbit_thumbnail_smoke.txt", "wb");
+        if (file) {
+            fprintf(file, "%s: %s\n", passed ? "PASS" : "FAIL", detail);
+            fclose(file);
+        }
+        orbitThumbnailSmoke = false;
+        PostQuitMessage(passed ? 0 : 1);
+    }
+
+    void startOrbitThumbnailSmoke() {
+        FormulaDialogConfig first = formulaConfig;
+        first.source = "sin(z)+c+p0";
+        first.pixelParameter = FormulaParameter::C;
+        first.parameters[0] = { 0.125, -0.0625 };
+        first.bailout = 100.0;
+        if (!applyFormulaConfig(first, false)) {
+            finishOrbitThumbnailSmoke(false, "initial Custom formula rejected");
+            return;
+        }
+        orbitThumbnailSmokeFirstGeneration = orbitThumbnailGeneration;
+
+        FormulaDialogConfig latest = first;
+        latest.source = "z*z+c+p0";
+        latest.pixelParameter = FormulaParameter::InitialZ;
+        latest.fixedC = { -0.25, 0.0 };
+        latest.parameters[0] = { 0.015625, 0.0 };
+        latest.bailout = 8.0;
+        if (!applyFormulaConfig(latest, false)) {
+            finishOrbitThumbnailSmoke(false, "latest z0 formula rejected");
+            return;
+        }
+        orbitThumbnailSmokeExpectedGeneration = orbitThumbnailGeneration;
+        if (orbitThumbnailSmokeExpectedGeneration <=
+            orbitThumbnailSmokeFirstGeneration) {
+            finishOrbitThumbnailSmoke(false, "generation did not advance");
+            return;
+        }
+        orbitThumbnailSmokeStage = 0;
+        orbitThumbnailSmokeDeadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    }
+
+    void checkOrbitThumbnailSmoke(const OrbitThumbnailResult& result) {
+        if (!orbitThumbnailSmoke) return;
+        const bool complete =
+            orbitThumbnail.size() ==
+                (size_t)ORBIT_W * ORBIT_H * 3 &&
+            result.width == ORBIT_W && result.height == ORBIT_H;
+        if (orbitThumbnailSmokeStage == 0) {
+            if (!complete || !result.expression ||
+                result.pixelParameter != FormulaParameter::InitialZ ||
+                result.generation !=
+                    orbitThumbnailSmokeExpectedGeneration) {
+                finishOrbitThumbnailSmoke(
+                    false, "latest Custom z0 background mismatch");
+                return;
+            }
+            orbitThumbnailSmokeStage = 1;
+            restoreMandelbrotUi(false);
+            orbitThumbnailSmokeExpectedGeneration =
+                orbitThumbnailGeneration;
+            orbitThumbnailSmokeDeadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(20);
+            return;
+        }
+        if (!complete || result.expression ||
+            result.generation != orbitThumbnailSmokeExpectedGeneration) {
+            finishOrbitThumbnailSmoke(
+                false, "Mandelbrot background restore mismatch");
+            return;
+        }
+        finishOrbitThumbnailSmoke(
+            true, "Custom latest-generation z0 and Mandel restore completed");
     }
 
     // Set the palette phase from a phase-slider x (0..colP over the track).
@@ -635,8 +753,11 @@ public:
             hasSavedMandelUi = true;
         }
         if (orbitWorker) orbitWorker->cancel();
+        if (orbitThumbnailWorker) orbitThumbnailWorker->cancel();
         orbitOn = false;
         orbitResult = OrbitResult{};
+        orbitThumbnail.clear();
+        orbitThumbnailBuilding = false;
         ssOn = false;
         coloringIdx = coloringIdx == 1 ? 1 : 0;
         relief_on = normal_light_on = de_overlay_on = 0;
@@ -660,6 +781,7 @@ public:
         normal_light_on = coloringIdx == 4;
         de_overlay_on = coloringIdx == 6;
         hasSavedMandelUi = false;
+        rebuildOrbitThumbnail();
         layout();
         needFull = true;
         if (render) startRender();
@@ -697,6 +819,7 @@ public:
             formulaEditor->setConfig(formulaConfig);
         if (orbitWorker) orbitWorker->cancel();
         orbitResult = OrbitResult{};
+        rebuildOrbitThumbnail();
         ssOn = false;
         if (entering ||
             !expressionColoringIndexSupported(
@@ -926,6 +1049,7 @@ public:
             }
         }
         nav->UpdateCoords();
+        needFull = true;
         startRender();
         if (orbitOn && inRect(viewRect(), lastOrbitX, lastOrbitY)) {
             lastOrbitRequest = {};
@@ -1177,7 +1301,10 @@ public:
         } else if (!nav->IsMandelbrot()) {
             restoreMandelbrotUi(false);
         }
-        if (nav->SetLocation(xs, ys, scale)) startRender();
+        if (nav->SetLocation(xs, ys, scale)) {
+            needFull = true;
+            startRender();
+        }
     }
     void saveImage() {
         wchar_t file[MAX_PATH]; wcscpy_s(file, defaultSaveName().c_str());
@@ -1501,7 +1628,10 @@ public:
             if (wcscmp(pr[i].name, p.palette) == 0) { paletteIdx = i; palette.load(i); break; }
         layout();   // light sliders appear/disappear with the preset's coloring -> reflow
         std::string scale = expandSci(p.zoom);
-        if (!scale.empty() && nav->SetLocation(p.x, p.y, scale)) startRender();
+        if (!scale.empty() && nav->SetLocation(p.x, p.y, scale)) {
+            needFull = true;
+            startRender();
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
@@ -1910,6 +2040,26 @@ public:
     }
 
     void timer() {
+        if (orbitOn && orbitThumbnailWorker) {
+            OrbitThumbnailResult latest;
+            if (orbitThumbnailWorker->takeLatest(latest)) {
+                orbitThumbnail = std::move(latest.pixels);
+                orbitThumbnailBuilding = false;
+                orbitThumbnailGeneration = latest.generation;
+                fractalOnlyTick = true;
+                RECT dirty = rcOrbitThumb;
+                dirty.top -= S(20);
+                InvalidateRect(hwnd, &dirty, FALSE);
+                checkOrbitThumbnailSmoke(latest);
+            }
+        }
+        if (orbitThumbnailSmoke &&
+            std::chrono::steady_clock::now() >
+                orbitThumbnailSmokeDeadline) {
+            finishOrbitThumbnailSmoke(
+                false, "thumbnail worker timed out");
+            return;
+        }
         if (orbitOn && orbitWorker) {
             OrbitResult latest;
             if (orbitWorker->takeLatest(latest)) {
@@ -2062,14 +2212,17 @@ public:
                 formulaEditor.reset();
             juliaUiEnabled = getenv("MANDEL_EXPERIMENTAL_JULIA") != nullptr ||
                              getenv("MANDEL_GUI_JULIA") != nullptr;
+            orbitThumbnailWorker =
+                std::make_unique<OrbitThumbnailWorker>();
+            orbitThumbnailSmoke =
+                getenv("MANDEL_GUI_ORBIT_THUMBNAIL_SMOKE") != nullptr;
             if (const char* e = getenv("MANDEL_GUI_ORBIT")) orbitOn = atoi(e) != 0;
             orbitBench = getenv("MANDEL_GUI_ORBIT_BENCH") != nullptr;
-            if (orbitBench) orbitOn = true;
-            if (orbitOn) {
-                orbitWorker = std::make_unique<OrbitWorker>();
-                buildOrbitThumbnail();
-            }
-            const bool anyBench = getenv("MANDEL_GUI_BENCH") || orbitBench;
+            if (orbitBench || orbitThumbnailSmoke) orbitOn = true;
+            if (orbitOn) rebuildOrbitThumbnail();
+            const bool anyBench =
+                getenv("MANDEL_GUI_BENCH") ||
+                orbitBench || orbitThumbnailSmoke;
             if (anyBench) {
                 const char* gx = getenv("MANDEL_GUI_CX"), *gy = getenv("MANDEL_GUI_CY");
                 const char* gz = getenv("MANDEL_GUI_ZOOM");
@@ -2116,6 +2269,8 @@ public:
                     switchJuliaMode(false, false);
                 }
             }
+            if (orbitThumbnailSmoke)
+                startOrbitThumbnailSmoke();
             if (getenv("MANDEL_GUI_BENCH")) {
                 benchMode = true;
                 const char* e = getenv("MANDEL_GUI_SS");
@@ -2141,8 +2296,8 @@ public:
                 }
             }
             layout();
-            if (orbitBench) {
-                // The orbit micro-benchmark must not compete with a full frame render.
+            if (orbitBench || orbitThumbnailSmoke) {
+                // Worker smoke/bench runs must not compete with a full frame render.
             } else if (benchMode) {
                 // A hidden benchmark window receives no initial WM_SIZE, so size the
                 // navigator explicitly instead of silently rendering at 900x600.
@@ -2152,7 +2307,7 @@ public:
             } else {
                 startRender();
             }
-            if (orbitOn) {
+            if (orbitOn && !orbitThumbnailSmoke) {
                 RECT vr = viewRect();
                 requestOrbit((vr.left + vr.right) / 2, (vr.top + vr.bottom) / 2);
             }
@@ -2284,7 +2439,7 @@ public:
                 ReleaseCapture();   // phase/speed/relief re-colour only; no fractal recompute
             } else if (h == pressed && h != H_NONE) {
                 switch (h) {
-                case H_RESET: nav->Reset(); renderStart = std::chrono::steady_clock::now(); wasComputing = true; keepLive(); break;
+                case H_RESET: nav->Reset(); needFull = true; renderStart = std::chrono::steady_clock::now(); wasComputing = true; keepLive(); break;
                 case H_RENDER: startRender(); break;
                 case H_SAVE:
                     if (!nav->IsMandelbrot()) saveImage();
@@ -2309,10 +2464,13 @@ public:
                 case H_ORBIT:
                     if (nav->SupportsOrbitOverlay()) orbitOn = !orbitOn;
                     if (orbitOn) {
-                        if (!orbitWorker) orbitWorker = std::make_unique<OrbitWorker>();
-                        if (orbitThumbnail.empty()) buildOrbitThumbnail();
-                    } else if (orbitWorker) {
-                        orbitWorker->cancel();
+                        rebuildOrbitThumbnail();
+                    } else {
+                        if (orbitWorker) orbitWorker->cancel();
+                        if (orbitThumbnailWorker)
+                            orbitThumbnailWorker->cancel();
+                        orbitThumbnail.clear();
+                        orbitThumbnailBuilding = false;
                     }
                     orbitResult = OrbitResult{};
                     layout(); needFull = true;
@@ -2422,7 +2580,7 @@ public:
             return 0;
         }
         case WM_KEYDOWN:
-            if (wp == 'R') { nav->Reset(); renderStart = std::chrono::steady_clock::now(); wasComputing = true; keepLive(); }
+            if (wp == 'R') { nav->Reset(); needFull = true; renderStart = std::chrono::steady_clock::now(); wasComputing = true; keepLive(); }
             else if (wp == VK_SPACE) startRender();
             else if (wp == 'S') saveImage();
             else if (wp == 'C') copyLocation();
@@ -2442,6 +2600,8 @@ public:
         }
         case WM_DESTROY:
             KillTimer(hwnd, TIMER_ID);
+            orbitThumbnailWorker.reset();
+            orbitWorker.reset();
             formulaEditor.reset();
             nav.reset();
             if (memDC) { SelectObject(memDC, memOld); DeleteObject(memBmp); DeleteDC(memDC); memDC = nullptr; }
@@ -2501,7 +2661,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     int wx = wa.left + ((wa.right - wa.left) - winW) / 2;
     int wy = wa.top + ((wa.bottom - wa.top) - winH) / 2;
     const bool benchHeadless =
-        (getenv("MANDEL_GUI_BENCH") || getenv("MANDEL_GUI_ORBIT_BENCH")) &&
+        (getenv("MANDEL_GUI_BENCH") ||
+         getenv("MANDEL_GUI_ORBIT_BENCH") ||
+         getenv("MANDEL_GUI_ORBIT_THUMBNAIL_SMOKE")) &&
         !getenv("MANDEL_GUI_SHOW");
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"Mandelbrot Explorer",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | (benchHeadless ? 0 : WS_VISIBLE),
