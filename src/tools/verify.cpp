@@ -11,7 +11,8 @@
 //          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
 //          expression | expression-coloring | expression-orbit |
-//          expression-centered | expression-oracle | custom-deep | expression-suite |
+//          expression-centered | expression-reference | expression-oracle |
+//          oracle | custom-deep | expression-suite | suite |
 //          expression-residual | formula-bench | multibrot | backend | gpu | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
@@ -42,6 +43,7 @@
 #include "formula_expression.h"
 #include "formula_expression_centered.h"
 #include "formula_expression_orbit.h"
+#include "formula_reference_orbit.h"
 #include "formula_expression_jit.h"
 #include "formula_expression_oracle.h"
 #include "custom_deep_zoom.h"
@@ -51,6 +53,12 @@
 #include "test_cases.h"
 
 using Clock = std::chrono::high_resolution_clock;
+
+#ifdef MANDEL_VERIFY_NO_JIT
+static constexpr bool VERIFY_JIT = false;
+#else
+static constexpr bool VERIFY_JIT = true;
+#endif
 static double since(Clock::time_point t) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t).count() / 1000.0;
 }
@@ -1206,7 +1214,8 @@ static int runExpressionCoreCase() {
 
             formula::ExpressionJit4 planJit;
             bool compiled = planJit.compile(plan);
-            if (compiled != test.expectJit) {
+            if (compiled !=
+                    (VERIFY_JIT && test.expectJit)) {
                 ++orbitPlanFailures;
             } else if (compiled) {
                 formula::ExpressionJitInput4 input;
@@ -1297,9 +1306,9 @@ static int runExpressionCoreCase() {
             ++orbitPlanFailures;
     };
     checkOrbitPlanFrame(
-        "sin(c)+z", FormulaParameter::C, true);
+        "sin(c)+z", FormulaParameter::C, VERIFY_JIT);
     checkOrbitPlanFrame(
-        "sin(z0)+z", FormulaParameter::InitialZ, true);
+        "sin(z0)+z", FormulaParameter::InitialZ, VERIFY_JIT);
     checkOrbitPlanFrame(
         "sin(c)+sin(z)", FormulaParameter::C, false);
     failures += orbitPlanFailures +
@@ -1454,9 +1463,12 @@ static int runExpressionCoreCase() {
     double avxMs = 0.0, jitMs = 0.0, jitRawMs = 0.0;
     int jitMismatch = 0;
     if (!compile(vectorProgram, "z*z+c+p0*z+complex(re(z0),im(c))") ||
-        !vectorProgram.avx2Compatible() || !vectorJit.compile(vectorProgram)) {
+        !vectorProgram.avx2Compatible()) {
         ++failures;
-    } else {
+    } else if (VERIFY_JIT &&
+               !vectorJit.compile(vectorProgram)) {
+        ++failures;
+    } else if (VERIFY_JIT) {
         MEMORY_BASIC_INFORMATION memory{};
         SIZE_T queried = VirtualQuery(vectorJit.codeAddress(), &memory,
                                       sizeof(memory));
@@ -3175,6 +3187,1374 @@ static int runExpressionOrbitCase() {
     return failures == 0 ? 0 : 1;
 }
 
+static int runExpressionReferenceCase() {
+    using formula::Complex;
+    using formula::ExpressionContext;
+    using formula::ExpressionError;
+    using formula::ExpressionOracle;
+    using formula::ExpressionOracleContext;
+    using formula::ExpressionOracleOperation;
+    using formula::ExpressionOracleTrace;
+    using formula::ExpressionOracleTraceNode;
+    using formula::ExpressionOrbitPlan;
+    using formula::ExpressionProgram;
+    using formula::ExpressionReferenceBuildRequest;
+    using formula::ExpressionReferenceBuildStatus;
+    using formula::ExpressionReferenceOrbitResult;
+    using formula::ExpressionReferencePrecisionPolicy;
+    using formula::ExpressionReferenceTapeNode;
+    using formula::MpfrComplex;
+    using formula::ScaledComplexShadow;
+    using formula::ScaledRealShadow;
+
+    int failures = 0;
+    int orbitSamples = 0;
+    int companionChecks = 0;
+    int branchChecks = 0;
+    int defectChecks = 0;
+
+    auto compile = [&](ExpressionProgram& program,
+                       const std::string& source) {
+        ExpressionError error;
+        if (!program.compile(source, &error)) {
+            printf("  reference compile failed @ %zu: %s [%s]\n",
+                   error.position, error.message.c_str(),
+                   source.c_str());
+            ++failures;
+            return false;
+        }
+        return true;
+    };
+    auto specialize = [&](const ExpressionProgram& canonical,
+                          const ExpressionContext& fixed,
+                          FormulaParameter pixel,
+                          ExpressionProgram& runtime) {
+        ExpressionError error;
+        if (!canonical.specialize(
+                fixed, pixel, runtime, &error)) {
+            printf("  reference specialize failed: %s [%s]\n",
+                   error.message.c_str(),
+                   canonical.source().c_str());
+            ++failures;
+            return false;
+        }
+        return true;
+    };
+    auto buildDecimal = [&](
+            const ExpressionProgram& canonical,
+            const ExpressionProgram& runtime,
+            FormulaParameter pixel, const ExpressionContext& fixed,
+            const std::string& real, const std::string& imaginary,
+            int iterations, mpfr_prec_t bits,
+            ExpressionReferenceOrbitResult& result,
+            double bailout = 1e100,
+            mpfr_prec_t guard = 0) {
+        ExpressionReferenceBuildRequest request;
+        request.canonicalProgram = &canonical;
+        request.runtimeProgram = &runtime;
+        request.pixelParameter = pixel;
+        request.fixed = fixed;
+        request.center.realDecimal = real;
+        request.center.imaginaryDecimal = imaginary;
+        request.bailout = bailout;
+        request.maxIterations = iterations;
+        request.precision.requestedBits = bits;
+        request.precision.minimumBits = 53;
+        request.precision.guardBits = guard;
+        request.precision.maximumBits = 8192;
+        if (!formula::buildExpressionReferenceOrbit(
+                request, result)) {
+            printf("  reference build failed: %s [%s]\n",
+                   result.error.c_str(),
+                   canonical.source().c_str());
+            ++failures;
+            return false;
+        }
+        return true;
+    };
+    auto sameRealShadow = [](const ScaledRealShadow& left,
+                             const ScaledRealShadow& right) {
+        uint64_t leftBits = 0, rightBits = 0;
+        std::memcpy(
+            &leftBits, &left.mantissa, sizeof(leftBits));
+        std::memcpy(
+            &rightBits, &right.mantissa, sizeof(rightBits));
+        return leftBits == rightBits &&
+               left.exponent == right.exponent;
+    };
+    auto sameShadow = [&](const ScaledComplexShadow& left,
+                          const ScaledComplexShadow& right) {
+        return sameRealShadow(left.re, right.re) &&
+               sameRealShadow(left.im, right.im);
+    };
+    auto closeMpfr = [](mpfr_srcptr actual, mpfr_srcptr expected,
+                        int bits) {
+        if (mpfr_nan_p(actual) || mpfr_nan_p(expected))
+            return mpfr_nan_p(actual) && mpfr_nan_p(expected);
+        if (mpfr_inf_p(actual) || mpfr_inf_p(expected))
+            return mpfr_inf_p(actual) &&
+                   mpfr_inf_p(expected) &&
+                   mpfr_signbit(actual) ==
+                       mpfr_signbit(expected);
+        if (mpfr_equal_p(actual, expected)) return true;
+        if (mpfr_zero_p(expected)) return mpfr_zero_p(actual);
+        mpfr_prec_t precision = std::max(
+            mpfr_get_prec(actual), mpfr_get_prec(expected));
+        mpfr_t difference, tolerance;
+        mpfr_init2(difference, precision);
+        mpfr_init2(tolerance, precision);
+        mpfr_sub(
+            difference, actual, expected, MPFR_RNDN);
+        mpfr_abs(difference, difference, MPFR_RNDN);
+        mpfr_abs(tolerance, expected, MPFR_RNDN);
+        mpfr_mul_2si(
+            tolerance, tolerance, -bits, MPFR_RNDU);
+        bool close = mpfr_cmp(difference, tolerance) <= 0;
+        mpfr_clear(difference);
+        mpfr_clear(tolerance);
+        return close;
+    };
+    auto closeMpfrComplex = [&](const MpfrComplex& actual,
+                                const MpfrComplex& expected,
+                                int bits) {
+        return closeMpfr(actual.re, expected.re, bits) &&
+               closeMpfr(actual.im, expected.im, bits);
+    };
+    auto configureOracle = [](
+            ExpressionOracleContext& context,
+            const ExpressionContext& fixed,
+            FormulaParameter pixel,
+            const std::string& real,
+            const std::string& imaginary) {
+        context.c.set(fixed.c.real(), fixed.c.imag());
+        context.z0.set(fixed.z0.real(), fixed.z0.imag());
+        for (size_t i = 0; i < fixed.parameters.size(); ++i) {
+            context.parameters[i].set(
+                fixed.parameters[i].real(),
+                fixed.parameters[i].imag());
+        }
+        MpfrComplex center(context.z.precision());
+        if (!center.set(real, imaginary)) return false;
+        if (pixel == FormulaParameter::C)
+            context.c.set(center);
+        else
+            context.z0.set(center);
+        context.z.set(context.z0);
+        return true;
+    };
+
+    {
+        MpfrComplex parsed(256);
+        if (!parsed.set("0.1", "1e-500") ||
+            !mpfr_number_p(parsed.re) ||
+            !mpfr_number_p(parsed.im) ||
+            mpfr_zero_p(parsed.re) ||
+            mpfr_zero_p(parsed.im) ||
+            parsed.set("1e-400000000", "0") ||
+            parsed.set("1e400000000", "0")) {
+            printf("  finite/inexact decimal parse range handling failed\n");
+            ++failures;
+        }
+    }
+
+    std::string deepCoordinate = "1.";
+    deepCoordinate.append(499, '0');
+    deepCoordinate.push_back('1');
+    ExpressionProgram coordinateCanonical, coordinateRuntimeC;
+    ExpressionProgram coordinateRuntimeZ0;
+    ExpressionContext coordinateFixed;
+    if (compile(coordinateCanonical, "z+c") &&
+        specialize(
+            coordinateCanonical, coordinateFixed,
+            FormulaParameter::C, coordinateRuntimeC) &&
+        specialize(
+            coordinateCanonical, coordinateFixed,
+            FormulaParameter::InitialZ, coordinateRuntimeZ0)) {
+        ExpressionReferenceOrbitResult deepC, baseC, deepZ0, baseZ0;
+        bool coordinateOk =
+            buildDecimal(
+                coordinateCanonical, coordinateRuntimeC,
+                FormulaParameter::C, coordinateFixed,
+                deepCoordinate, "1e-500", 1, 1800, deepC) &&
+            buildDecimal(
+                coordinateCanonical, coordinateRuntimeC,
+                FormulaParameter::C, coordinateFixed,
+                "1", "0", 1, 1800, baseC) &&
+            buildDecimal(
+                coordinateCanonical, coordinateRuntimeZ0,
+                FormulaParameter::InitialZ, coordinateFixed,
+                deepCoordinate, "1e-500", 1, 1800, deepZ0,
+                4.0) &&
+            buildDecimal(
+                coordinateCanonical, coordinateRuntimeZ0,
+                FormulaParameter::InitialZ, coordinateFixed,
+                "1", "0", 1, 1800, baseZ0, 4.0);
+        if (coordinateOk) {
+            MpfrComplex reconstructedDeep(2048);
+            MpfrComplex reconstructedBase(2048);
+            if (!formula::reconstructMpfrFromShadows(
+                    reconstructedDeep, deepC.pixel,
+                    deepC.pixelDefect) ||
+                !formula::reconstructMpfrFromShadows(
+                    reconstructedBase, baseC.pixel,
+                    baseC.pixelDefect) ||
+                mpfr_cmp(
+                    reconstructedDeep.re,
+                    reconstructedBase.re) == 0 ||
+                mpfr_zero_p(reconstructedDeep.im) ||
+                !deepC.pixelDefect.re.isFinite() ||
+                deepC.pixel.im.exponent > -1000 ||
+                deepZ0.initialZDefect.re.isZero() ||
+                deepZ0.initialZ.im.exponent > -1000 ||
+                mpfr_get_d(
+                    reconstructedDeep.re, MPFR_RNDN) !=
+                    mpfr_get_d(
+                        reconstructedBase.re, MPFR_RNDN) ||
+                mpfr_get_d(
+                    reconstructedDeep.im, MPFR_RNDN) != 0.0 ||
+                mpfr_get_d(
+                    reconstructedDeep.im, MPFR_RNDN) !=
+                    mpfr_get_d(
+                        reconstructedBase.im, MPFR_RNDN)) {
+                printf("  e500 coordinate shadow preservation failed\n");
+                ++failures;
+            }
+        }
+    }
+
+    if (coordinateRuntimeC.valid()) {
+        auto checkMpfInput = [&](const char* label,
+                                 mpf_srcptr real,
+                                 mpf_srcptr imaginary) {
+            const mpfr_prec_t required = static_cast<mpfr_prec_t>(
+                std::max(mpf_size(real), mpf_size(imaginary)) *
+                GMP_NUMB_BITS);
+            ExpressionReferenceBuildRequest request;
+            request.canonicalProgram = &coordinateCanonical;
+            request.runtimeProgram = &coordinateRuntimeC;
+            request.pixelParameter = FormulaParameter::C;
+            request.center.realMpf = real;
+            request.center.imaginaryMpf = imaginary;
+            request.maxIterations = 1;
+            request.bailout = 1e100;
+            request.precision.minimumBits = 53;
+            request.precision.guardBits = 0;
+            request.precision.maximumBits = 4096;
+            ExpressionReferenceOrbitResult result;
+            MpfrComplex reconstructed(required);
+            if (!formula::buildExpressionReferenceOrbit(
+                    request, result) ||
+                result.precision != required ||
+                !formula::reconstructMpfrFromShadows(
+                    reconstructed, result.pixel,
+                    result.pixelDefect) ||
+                mpfr_cmp_f(reconstructed.re, real) != 0 ||
+                mpfr_cmp_f(reconstructed.im, imaginary) != 0) {
+                printf("  exact used-limb mpf transfer failed [%s]\n",
+                       label);
+                ++failures;
+            }
+            request.precision.maximumBits = required - 1;
+            ExpressionReferenceOrbitResult rejected;
+            if (formula::buildExpressionReferenceOrbit(
+                    request, rejected) ||
+                rejected.status !=
+                    ExpressionReferenceBuildStatus::
+                        PrecisionOutOfRange) {
+                printf("  used-limb precision policy failed [%s]\n",
+                       label);
+                ++failures;
+            }
+        };
+
+        mpf_t carry, zero;
+        mpz_t integer;
+        mpf_init2(carry, 64);
+        mpf_init2(zero, 64);
+        mpz_init(integer);
+        mpz_set_ui(integer, 1);
+        mpz_mul_2exp(integer, integer, 65);
+        mpz_sub_ui(integer, integer, 1);
+        mpf_set_z(carry, integer);
+        if (mpf_size(carry) != 2 ||
+            mpf_get_prec(carry) >=
+                mpf_size(carry) * GMP_NUMB_BITS)
+            ++failures;
+        checkMpfInput("dense carry limb", carry, zero);
+
+        mpf_t rawPrecision;
+        mpf_init2(rawPrecision, 256);
+        mpz_set_ui(integer, 1);
+        mpz_mul_2exp(integer, integer, 192);
+        mpz_add_ui(integer, integer, 1);
+        mpf_set_z(rawPrecision, integer);
+        const mp_bitcnt_t originalPrecision =
+            mpf_get_prec(rawPrecision);
+        mpf_set_prec_raw(rawPrecision, 64);
+        if (mpf_size(rawPrecision) != 4 ||
+            mpf_get_prec(rawPrecision) != 64)
+            ++failures;
+        checkMpfInput(
+            "raw precision live significand",
+            rawPrecision, zero);
+        mpf_set_prec_raw(rawPrecision, originalPrecision);
+
+        mpf_clear(rawPrecision);
+        mpz_clear(integer);
+        mpf_clears(carry, zero, (mpf_ptr)0);
+    }
+
+    struct OrbitFormula {
+        const char* source;
+        FormulaParameter pixel;
+        const char* real;
+        const char* imaginary;
+    };
+    const OrbitFormula orbitFormulas[] = {
+        { "z*z+c", FormulaParameter::C, "-0.2", "0.3" },
+        { "sin(z)+c", FormulaParameter::C, "0.1", "-0.15" },
+        { "exp(z/4)+c/8", FormulaParameter::C, "-0.3", "0.1" },
+        { "(z*z+c)/(z+2)", FormulaParameter::C, "0.2", "0.1" },
+        { "pow(z+1.5,p0)+c", FormulaParameter::C, "-0.15", "0.12" },
+        { "z+c+n/10", FormulaParameter::C, "0.05", "-0.03" },
+        { "sqr(complex(abs(real(z)),abs(imag(z))))+c",
+          FormulaParameter::C, "-0.25", "0.2" }
+    };
+    for (const OrbitFormula& item : orbitFormulas) {
+        ExpressionContext fixed;
+        fixed.z0 = { 0.125, -0.0625 };
+        fixed.parameters[0] = { 0.5, 0.2 };
+        ExpressionProgram canonical, runtime;
+        if (!compile(canonical, item.source) ||
+            !specialize(
+                canonical, fixed, item.pixel, runtime))
+            continue;
+        ExpressionReferenceOrbitResult reference;
+        if (!buildDecimal(
+                canonical, runtime, item.pixel, fixed,
+                item.real, item.imaginary, 7, 256,
+                reference))
+            continue;
+        if (!reference.valid || reference.defectPending ||
+            reference.programSemanticHash !=
+                runtime.semanticHash() ||
+            reference.sampleCount != reference.samples.size()) {
+            ++failures;
+            continue;
+        }
+
+        ExpressionOracleContext same(reference.precision);
+        ExpressionOracleContext higher(512);
+        if (!configureOracle(
+                same, fixed, item.pixel,
+                item.real, item.imaginary) ||
+            !configureOracle(
+                higher, fixed, item.pixel,
+                item.real, item.imaginary)) {
+            ++failures;
+            continue;
+        }
+        MpfrComplex sameNext(reference.precision);
+        MpfrComplex highNext(512);
+        MpfrComplex reconstructed(reference.precision);
+        for (size_t i = 0;
+             i < reference.samples.size(); ++i) {
+            same.iteration = static_cast<int>(i);
+            higher.iteration = static_cast<int>(i);
+            std::string sameError, highError;
+            bool sameOk = ExpressionOracle::evaluate(
+                runtime, same, sameNext, &sameError);
+            bool highOk = ExpressionOracle::evaluate(
+                runtime, higher, highNext, &highError);
+            const auto& sample = reference.samples[i];
+            const auto& root = reference.tape[
+                static_cast<size_t>(sample.tapeOffset) +
+                sample.rootNode];
+            ++orbitSamples;
+            if (!sameOk || !highOk ||
+                !formula::reconstructMpfrFromShadows(
+                    reconstructed, sample.next,
+                    sample.rootDefect) ||
+                !closeMpfrComplex(
+                    reconstructed, sameNext, 94) ||
+                !closeMpfrComplex(
+                    reconstructed, highNext, 90) ||
+                !sameShadow(root.output, sample.next) ||
+                !sameShadow(
+                    root.outputDefect,
+                    sample.rootDefect) ||
+                sample.tapeCount != runtime.instructionCount()) {
+                printf("  root/tape mismatch at %zu [%s]\n",
+                       i, item.source);
+                ++failures;
+                break;
+            }
+            same.z.set(sameNext);
+            higher.z.set(highNext);
+        }
+    }
+
+    ExpressionProgram companionProgram;
+    if (compile(
+            companionProgram,
+            "sin(z)+cos(z)+sinh(z)+cosh(z)+tan(z)+tanh(z)")) {
+        auto companionSource = [](
+                ExpressionOracleOperation operation) {
+            switch (operation) {
+            case ExpressionOracleOperation::Sin:
+            case ExpressionOracleOperation::Tan:
+                return "cos(z)";
+            case ExpressionOracleOperation::Cos:
+                return "sin(z)";
+            case ExpressionOracleOperation::Sinh:
+            case ExpressionOracleOperation::Tanh:
+                return "cosh(z)";
+            case ExpressionOracleOperation::Cosh:
+                return "sinh(z)";
+            default:
+                return static_cast<const char*>(nullptr);
+            }
+        };
+        ExpressionOracleContext context(512);
+        context.z.set("0.3", "0.2");
+        MpfrComplex output(512);
+        ExpressionOracleTrace trace;
+        std::string error;
+        if (!ExpressionOracle::evaluateTrace(
+                companionProgram, context, output,
+                trace, &error) ||
+            trace.nodes.empty() ||
+            !mpfr_equal_p(
+                trace.nodes.back().output.re, output.re) ||
+            !mpfr_equal_p(
+                trace.nodes.back().output.im, output.im)) {
+            printf("  trace root mismatch: %s\n", error.c_str());
+            ++failures;
+        } else {
+            for (const auto& node : trace.nodes) {
+                const char* source =
+                    companionSource(node.operation);
+                if (!source) continue;
+                ExpressionProgram independent;
+                if (!compile(independent, source)) continue;
+                MpfrComplex expected(512);
+                std::string independentError;
+                ++companionChecks;
+                if (!ExpressionOracle::evaluate(
+                        independent, context, expected,
+                        &independentError) ||
+                    !(node.flags &
+                      formula::OracleTraceHasCompanion) ||
+                    !closeMpfrComplex(
+                        node.auxiliary, expected, 500)) {
+                    printf("  nonlinear companion mismatch [%s]\n",
+                           source);
+                    ++failures;
+                }
+            }
+        }
+
+        ExpressionContext fixed;
+        ExpressionProgram runtime;
+        ExpressionReferenceOrbitResult tapeReference;
+        if (specialize(
+                companionProgram, fixed,
+                FormulaParameter::InitialZ, runtime) &&
+            buildDecimal(
+                companionProgram, runtime,
+                FormulaParameter::InitialZ, fixed,
+                "0.3", "0.2", 1, 512,
+                tapeReference)) {
+            for (const auto& node : tapeReference.tape) {
+                const char* source =
+                    companionSource(node.operation);
+                if (!source) continue;
+                ExpressionProgram independent;
+                if (!compile(independent, source)) continue;
+                MpfrComplex expected(512);
+                MpfrComplex reconstructed(512);
+                std::string independentError;
+                ++companionChecks;
+                if (!ExpressionOracle::evaluate(
+                        independent, context, expected,
+                        &independentError) ||
+                    !formula::reconstructMpfrFromShadows(
+                        reconstructed, node.auxiliary,
+                        node.auxiliaryDefect) ||
+                    !closeMpfrComplex(
+                        reconstructed, expected, 94)) {
+                    printf("  compact companion mismatch [%s]\n",
+                           source);
+                    ++failures;
+                }
+            }
+        }
+    }
+
+    struct AsymptoticCompanionCase {
+        const char* source;
+        const char* real;
+        const char* imaginary;
+        const char* logScale;
+        const char* phase;
+        ExpressionOracleOperation operation;
+    };
+    const AsymptoticCompanionCase asymptoticCases[] = {
+        {
+            "tan(z)", "1", "1e9", "-1e9", "2",
+            ExpressionOracleOperation::Tan
+        },
+        {
+            "tanh(z)", "1e9", "0.25", "-1e9", "0.5",
+            ExpressionOracleOperation::Tanh
+        }
+    };
+    for (const auto& item : asymptoticCases) {
+        ExpressionProgram canonical, runtime;
+        ExpressionContext fixed;
+        if (!compile(canonical, item.source) ||
+            !specialize(
+                canonical, fixed,
+                FormulaParameter::InitialZ, runtime))
+            continue;
+
+        ExpressionOracleContext context(512);
+        context.z.set(item.real, item.imaginary);
+        MpfrComplex output(512);
+        MpfrComplex expectedAuxiliary(512);
+        expectedAuxiliary.set(item.logScale, item.phase);
+        ExpressionOracleTrace trace;
+        std::string error;
+        const ExpressionOracleTraceNode* tracedNode = nullptr;
+        if (ExpressionOracle::evaluateTrace(
+                runtime, context, output, trace, &error)) {
+            for (const auto& node : trace.nodes)
+                if (node.operation == item.operation)
+                    tracedNode = &node;
+        }
+        ++companionChecks;
+        if (!tracedNode ||
+            !mpfr_number_p(output.re) ||
+            !mpfr_number_p(output.im) ||
+            !(tracedNode->flags &
+              formula::OracleTraceHasCompanion) ||
+            !(tracedNode->flags &
+              formula::OracleTraceHasDenominator) ||
+            !(tracedNode->flags &
+              formula::OracleTraceHasAsymptoticLogPhase) ||
+            tracedNode->clearance !=
+                formula::ExpressionOraclePointClearance::
+                    ClearAtPoint ||
+            !mpfr_number_p(tracedNode->auxiliary.re) ||
+            !mpfr_number_p(tracedNode->auxiliary.im) ||
+            !closeMpfrComplex(
+                tracedNode->auxiliary,
+                expectedAuxiliary, 480)) {
+            printf("  asymptotic companion trace failed [%s]\n",
+                   item.source);
+            ++failures;
+            continue;
+        }
+
+        ExpressionReferenceOrbitResult reference;
+        if (!buildDecimal(
+                canonical, runtime,
+                FormulaParameter::InitialZ, fixed,
+                item.real, item.imaginary, 1, 512,
+                reference, 1e100))
+            continue;
+        const ExpressionReferenceTapeNode* compactNode = nullptr;
+        for (const auto& node : reference.tape)
+            if (node.operation == item.operation)
+                compactNode = &node;
+        MpfrComplex reconstructedOutput(512);
+        MpfrComplex reconstructedAuxiliary(512);
+        ++companionChecks;
+        if (!compactNode ||
+            !(compactNode->flags &
+              formula::OracleTraceHasAsymptoticLogPhase) ||
+            !formula::reconstructMpfrFromShadows(
+                reconstructedOutput,
+                compactNode->output,
+                compactNode->outputDefect) ||
+            !formula::reconstructMpfrFromShadows(
+                reconstructedAuxiliary,
+                compactNode->auxiliary,
+                compactNode->auxiliaryDefect) ||
+            !mpfr_number_p(reconstructedOutput.re) ||
+            !mpfr_number_p(reconstructedOutput.im) ||
+            !closeMpfrComplex(
+                reconstructedAuxiliary,
+                expectedAuxiliary, 94)) {
+            printf("  asymptotic compact companion failed [%s]\n",
+                   item.source);
+            ++failures;
+        }
+    }
+
+    auto checkNonFiniteTangentTrace = [&](
+            const char* source,
+            ExpressionOracleOperation operation,
+            bool folded) {
+        ExpressionProgram canonical, runtime;
+        ExpressionContext fixed;
+        if (folded)
+            fixed.parameters[0] = { 0.0, 0.0 };
+        if (!compile(canonical, source))
+            return;
+        const ExpressionProgram* program = &canonical;
+        if (folded) {
+            if (!specialize(
+                    canonical, fixed,
+                    FormulaParameter::InitialZ, runtime))
+                return;
+            program = &runtime;
+        }
+
+        ExpressionOracleContext context(256);
+        context.z.set("0.25", "0.125");
+        if (!folded) {
+            if (operation == ExpressionOracleOperation::Tan)
+                mpfr_set_inf(context.z.im, 1);
+            else
+                mpfr_set_inf(context.z.re, 1);
+        }
+        MpfrComplex output(256);
+        ExpressionOracleTrace trace;
+        std::string error;
+        const bool defined = ExpressionOracle::evaluateTrace(
+            *program, context, output, trace, &error);
+        const ExpressionOracleTraceNode* tangentNode = nullptr;
+        bool sawFoldedNonFinite = !folded;
+        for (const auto& node : trace.nodes) {
+            if (node.operation == operation)
+                tangentNode = &node;
+            if (folded &&
+                node.operation ==
+                    ExpressionOracleOperation::Constant &&
+                (node.flags &
+                 formula::OracleTraceUndefined) &&
+                (!mpfr_number_p(node.output.re) ||
+                 !mpfr_number_p(node.output.im)))
+                sawFoldedNonFinite = true;
+        }
+        if (defined || !tangentNode ||
+            !sawFoldedNonFinite ||
+            !(tangentNode->flags &
+              formula::OracleTraceUndefined) ||
+            (tangentNode->flags &
+             formula::OracleTraceHasAsymptoticLogPhase) ||
+            tangentNode->clearance !=
+                formula::ExpressionOraclePointClearance::
+                    NonFiniteAtPoint) {
+            printf("  nonfinite tangent trace classification failed [%s]\n",
+                   source);
+            ++failures;
+        }
+    };
+    checkNonFiniteTangentTrace(
+        "tan(z)", ExpressionOracleOperation::Tan, false);
+    checkNonFiniteTangentTrace(
+        "tanh(z)", ExpressionOracleOperation::Tanh, false);
+    checkNonFiniteTangentTrace(
+        "tan(z+complex(0,log(p0)))",
+        ExpressionOracleOperation::Tan, true);
+    checkNonFiniteTangentTrace(
+        "tanh(z+log(p0))",
+        ExpressionOracleOperation::Tanh, true);
+
+    ExpressionProgram defectCanonical, defectRuntime;
+    ExpressionContext defectFixed;
+    const char* defectReal =
+        "0.123456789012345678901234567890123456789";
+    if (compile(defectCanonical, "z+c") &&
+        specialize(
+            defectCanonical, defectFixed,
+            FormulaParameter::C, defectRuntime)) {
+        for (mpfr_prec_t bits : { 256L, 1024L, 2048L }) {
+            ExpressionReferenceOrbitResult reference;
+            if (!buildDecimal(
+                    defectCanonical, defectRuntime,
+                    FormulaParameter::C, defectFixed,
+                    defectReal, "1e-500", 1, bits,
+                    reference))
+                continue;
+            ExpressionOracleContext expected(reference.precision);
+            configureOracle(
+                expected, defectFixed, FormulaParameter::C,
+                defectReal, "1e-500");
+            MpfrComplex next(reference.precision);
+            std::string error;
+            expected.iteration = 0;
+            if (!ExpressionOracle::evaluate(
+                    defectRuntime, expected, next, &error) ||
+                reference.samples.size() != 1) {
+                ++failures;
+                continue;
+            }
+            MpfrComplex reconstructed(reference.precision);
+            const auto& sample = reference.samples[0];
+            ++defectChecks;
+            if (reference.precision != bits ||
+                sample.rootDefect.re.isZero() ||
+                sample.next.im.isZero() ||
+                sample.next.im.exponent > -1000 ||
+                !formula::reconstructMpfrFromShadows(
+                    reconstructed, sample.next,
+                    sample.rootDefect) ||
+                !closeMpfrComplex(
+                    reconstructed, next, 94)) {
+                printf("  defect reconstruction failed at %ld bits\n",
+                       (long)bits);
+                ++failures;
+            }
+        }
+    }
+
+    ExpressionProgram foldedDomainCanonical;
+    if (compile(
+            foldedDomainCanonical, "log(p0)+z")) {
+        for (const Complex parameter :
+             { Complex{ 0.0, 0.0 },
+               Complex{ 2.0, 0.0 } }) {
+            ExpressionContext fixed;
+            fixed.parameters[0] = parameter;
+            ExpressionProgram runtime;
+            if (!specialize(
+                    foldedDomainCanonical, fixed,
+                    FormulaParameter::InitialZ, runtime))
+                continue;
+            ExpressionOracleContext context(256);
+            context.z.set("0.5", "0");
+            MpfrComplex output(256);
+            ExpressionOracleTrace trace;
+            std::string error;
+            const bool expectedDefined =
+                parameter.real() != 0.0;
+            const bool defined = ExpressionOracle::evaluate(
+                runtime, context, output, &error);
+            std::string traceError;
+            const bool traced = ExpressionOracle::evaluateTrace(
+                runtime, context, output, trace, &traceError);
+            bool constantUndefined = false;
+            bool finiteConstant = false;
+            for (const auto& node : trace.nodes) {
+                if (node.operation !=
+                    ExpressionOracleOperation::Constant)
+                    continue;
+                constantUndefined =
+                    (node.flags &
+                     formula::OracleTraceUndefined) != 0;
+                finiteConstant =
+                    mpfr_number_p(node.output.re) &&
+                    mpfr_number_p(node.output.im);
+            }
+            if (runtime.instructionCount() != 3 ||
+                defined != expectedDefined ||
+                traced != expectedDefined ||
+                constantUndefined == expectedDefined ||
+                finiteConstant != expectedDefined) {
+                printf("  folded constant domain handling failed\n");
+                ++failures;
+            }
+
+            ExpressionReferenceOrbitResult reference;
+            if (buildDecimal(
+                    foldedDomainCanonical, runtime,
+                    FormulaParameter::InitialZ, fixed,
+                    "0.5", "0", 1, 256, reference, 4.0)) {
+                if (expectedDefined) {
+                    if (reference.undefined ||
+                        reference.escaped)
+                        ++failures;
+                } else if (!reference.undefined ||
+                           reference.escaped ||
+                           reference.undefinedIteration != 1) {
+                    printf("  folded domain reference escaped\n");
+                    ++failures;
+                }
+            }
+        }
+    }
+
+    ExpressionProgram branchCanonical, branchRuntime;
+    ExpressionContext branchFixed;
+    branchFixed.parameters[0] = { 0.5, 0.0 };
+    if (compile(
+            branchCanonical,
+            "log(z)+sqrt(z)+arg(z)+pow(z,p0)+"
+            "1/(z-z)+tan(z)+tanh(z)") &&
+        specialize(
+            branchCanonical, branchFixed,
+            FormulaParameter::InitialZ, branchRuntime)) {
+        ExpressionReferenceOrbitResult branch;
+        if (buildDecimal(
+                branchCanonical, branchRuntime,
+                FormulaParameter::InitialZ, branchFixed,
+                "-1", "-0", 1, 512, branch)) {
+            bool sawLog = false, sawSqrt = false;
+            bool sawArg = false, sawPower = false;
+            bool sawDivide = false, sawTan = false;
+            bool sawTanh = false;
+            for (const auto& node : branch.tape) {
+                auto branchNode = [&] {
+                    ++branchChecks;
+                    return (node.flags &
+                            formula::OracleTraceBranchSensitive) &&
+                           (node.cut ==
+                                formula::ExpressionOracleCutLocation::
+                                    NegativeRealLowerLip ||
+                            node.cut ==
+                                formula::ExpressionOracleCutLocation::
+                                    NegativeRealUpperLip) &&
+                           node.certification ==
+                                formula::ExpressionOracleCertification::
+                                    PointOnlyNotCertified;
+                };
+                switch (node.operation) {
+                case ExpressionOracleOperation::Log:
+                    sawLog = branchNode(); break;
+                case ExpressionOracleOperation::Sqrt:
+                    sawSqrt = branchNode(); break;
+                case ExpressionOracleOperation::Arg:
+                    sawArg = branchNode(); break;
+                case ExpressionOracleOperation::Power:
+                    sawPower = branchNode(); break;
+                case ExpressionOracleOperation::Divide:
+                    ++branchChecks;
+                    sawDivide =
+                        node.clearance ==
+                            formula::ExpressionOraclePointClearance::
+                                ZeroAtPoint &&
+                        (node.flags &
+                         formula::OracleTraceSingularPoint);
+                    break;
+                case ExpressionOracleOperation::Tan:
+                    ++branchChecks;
+                    sawTan =
+                        node.clearance ==
+                            formula::ExpressionOraclePointClearance::
+                                ClearAtPoint &&
+                        (node.flags &
+                         formula::OracleTraceHasDenominator);
+                    break;
+                case ExpressionOracleOperation::Tanh:
+                    ++branchChecks;
+                    sawTanh =
+                        node.clearance ==
+                            formula::ExpressionOraclePointClearance::
+                                ClearAtPoint &&
+                        (node.flags &
+                         formula::OracleTraceHasDenominator);
+                    break;
+                default:
+                    break;
+                }
+            }
+            if (!branch.undefined ||
+                !(sawLog && sawSqrt && sawArg && sawPower &&
+                  sawDivide && sawTan && sawTanh)) {
+                printf("  branch/domain point metadata failed\n");
+                ++failures;
+            }
+        }
+    }
+
+    ExpressionProgram simpleCanonical, simpleRuntimeC;
+    ExpressionProgram simpleRuntimeZ0;
+    ExpressionContext simpleFixed;
+    if (compile(simpleCanonical, "z+1") &&
+        specialize(
+            simpleCanonical, simpleFixed,
+            FormulaParameter::C, simpleRuntimeC) &&
+        specialize(
+            simpleCanonical, simpleFixed,
+            FormulaParameter::InitialZ, simpleRuntimeZ0)) {
+        ExpressionReferenceOrbitResult initialEscape;
+        if (buildDecimal(
+                simpleCanonical, simpleRuntimeZ0,
+                FormulaParameter::InitialZ, simpleFixed,
+                "5", "0", 10, 256, initialEscape, 4.0) &&
+            (!initialEscape.escaped ||
+             initialEscape.escapeIteration != 0 ||
+             initialEscape.sampleCount != 0))
+            ++failures;
+
+        ExpressionReferenceBuildRequest cancellation;
+        cancellation.canonicalProgram = &simpleCanonical;
+        cancellation.runtimeProgram = &simpleRuntimeC;
+        cancellation.pixelParameter = FormulaParameter::C;
+        cancellation.center.realDecimal = "0";
+        cancellation.maxIterations = 100;
+        cancellation.bailout = 1e100;
+        cancellation.precision.requestedBits = 256;
+        cancellation.precision.minimumBits = 53;
+        cancellation.precision.guardBits = 0;
+        int cancellationChecks = 0;
+        cancellation.shouldCancel = [&] {
+            return ++cancellationChecks > 4;
+        };
+        ExpressionReferenceOrbitResult cancelled;
+        if (!formula::buildExpressionReferenceOrbit(
+                cancellation, cancelled) ||
+            !cancelled.cancelled ||
+            cancelled.sampleCount != 3 ||
+            cancelled.escaped || cancelled.undefined)
+            ++failures;
+
+        cancellation.maxIterations = 1000000;
+        cancellation.memoryLimitBytes = 1;
+        cancellation.shouldCancel = [] { return true; };
+        ExpressionReferenceOrbitResult immediate;
+        if (!formula::buildExpressionReferenceOrbit(
+                cancellation, immediate) ||
+            !immediate.cancelled ||
+            immediate.sampleCount != 0 ||
+            immediate.samples.capacity() != 0 ||
+            immediate.tape.capacity() != 0)
+            ++failures;
+
+        cancellation.center.realDecimal = "malformed";
+        cancellation.memoryLimitBytes = 0;
+        cancellation.shouldCancel = {};
+        ExpressionReferenceOrbitResult malformed;
+        if (formula::buildExpressionReferenceOrbit(
+                cancellation, malformed) ||
+            malformed.status !=
+                ExpressionReferenceBuildStatus::InputParseError ||
+            malformed.samples.capacity() != 0 ||
+            malformed.tape.capacity() != 0)
+            ++failures;
+
+        cancellation.center.realDecimal = "0";
+        cancellation.maxIterations = 0;
+        cancellation.shouldCancel = {};
+        ExpressionReferenceOrbitResult zeroIterations;
+        if (!formula::buildExpressionReferenceOrbit(
+                cancellation, zeroIterations) ||
+            zeroIterations.sampleCount != 0 ||
+            zeroIterations.escaped ||
+            zeroIterations.cancelled)
+            ++failures;
+    }
+
+    ExpressionProgram mismatchCanonical, mismatchRuntime;
+    ExpressionContext mismatchFixed;
+    if (compile(mismatchCanonical, "z+c") &&
+        compile(mismatchRuntime, "z-c")) {
+        ExpressionProgram specializedMismatch;
+        specialize(
+            mismatchRuntime, mismatchFixed,
+            FormulaParameter::C, specializedMismatch);
+        ExpressionReferenceBuildRequest mismatch;
+        mismatch.canonicalProgram = &mismatchCanonical;
+        mismatch.runtimeProgram = &specializedMismatch;
+        mismatch.center.realDecimal = "0";
+        mismatch.maxIterations = 1;
+        ExpressionReferenceOrbitResult mismatchResult;
+        if (formula::buildExpressionReferenceOrbit(
+                mismatch, mismatchResult) ||
+            mismatchResult.status !=
+                ExpressionReferenceBuildStatus::ProgramMismatch)
+            ++failures;
+    }
+    ExpressionReferenceBuildRequest invalid;
+    invalid.center.realDecimal = "0";
+    ExpressionReferenceOrbitResult invalidResult;
+    if (formula::buildExpressionReferenceOrbit(
+            invalid, invalidResult) ||
+        invalidResult.status !=
+            ExpressionReferenceBuildStatus::InvalidRequest)
+        ++failures;
+    if (simpleRuntimeC.valid()) {
+        mpf_t mixedReal, mixedImaginary;
+        mpf_init_set_ui(mixedReal, 0);
+        mpf_init_set_ui(mixedImaginary, 0);
+        ExpressionReferenceBuildRequest mixed;
+        mixed.runtimeProgram = &simpleRuntimeC;
+        mixed.center.realMpf = mixedReal;
+        mixed.center.imaginaryMpf = mixedImaginary;
+        mixed.center.imaginaryDecimal = "0";
+        mixed.maxIterations = 0;
+        ExpressionReferenceOrbitResult mixedResult;
+        if (formula::buildExpressionReferenceOrbit(
+                mixed, mixedResult) ||
+            mixedResult.status !=
+                ExpressionReferenceBuildStatus::InvalidRequest) {
+            printf("  mixed MPF/imaginary-decimal input accepted\n");
+            ++failures;
+        }
+        mixed.center.realMpf = nullptr;
+        mixed.center.imaginaryMpf = nullptr;
+        if (formula::buildExpressionReferenceOrbit(
+                mixed, mixedResult) ||
+            mixedResult.status !=
+                ExpressionReferenceBuildStatus::InvalidRequest) {
+            printf("  imaginary-only decimal input accepted\n");
+            ++failures;
+        }
+        mpf_clears(
+            mixedReal, mixedImaginary, (mpf_ptr)0);
+
+        invalid.runtimeProgram = &simpleRuntimeC;
+        invalid.pixelParameter = FormulaParameter::Power;
+        if (formula::buildExpressionReferenceOrbit(
+                invalid, invalidResult))
+            ++failures;
+        invalid.pixelParameter = FormulaParameter::C;
+        invalid.precision.maximumBits = 32;
+        if (formula::buildExpressionReferenceOrbit(
+                invalid, invalidResult) ||
+            invalidResult.status !=
+                ExpressionReferenceBuildStatus::PrecisionOutOfRange)
+            ++failures;
+        invalid.precision = {};
+        invalid.memoryLimitBytes = 1;
+        invalid.maxIterations = 10;
+        invalid.precision.requestedBits =
+            ExpressionReferencePrecisionPolicy::
+                ApplicationMaximumBits + 1;
+        if (formula::buildExpressionReferenceOrbit(
+                invalid, invalidResult) ||
+            invalidResult.status !=
+                ExpressionReferenceBuildStatus::ResourceLimit ||
+            invalidResult.samples.capacity() != 0 ||
+            invalidResult.tape.capacity() != 0)
+            ++failures;
+
+        invalid.precision.requestedBits = 32768;
+        invalid.memoryLimitBytes = 4096;
+        if (formula::buildExpressionReferenceOrbit(
+                invalid, invalidResult) ||
+            invalidResult.status !=
+                ExpressionReferenceBuildStatus::ResourceLimit ||
+            invalidResult.samples.capacity() != 0 ||
+            invalidResult.tape.capacity() != 0)
+            ++failures;
+    }
+
+    ExpressionProgram plannedProgram;
+    ExpressionOrbitPlan plan;
+    if (compile(
+            plannedProgram,
+            "z*(sin(c)+exp(z0))+abs(p0)") &&
+        plan.build(plannedProgram) && plan.profitable()) {
+        ExpressionReferenceBuildRequest unsupported;
+        unsupported.runtimeProgram = &plan.bodyProgram();
+        unsupported.center.realDecimal = "0";
+        unsupported.maxIterations = 1;
+        ExpressionReferenceOrbitResult unsupportedResult;
+        if (formula::buildExpressionReferenceOrbit(
+                unsupported, unsupportedResult) ||
+            unsupportedResult.status !=
+                ExpressionReferenceBuildStatus::UnsupportedProgram)
+            ++failures;
+    } else {
+        ++failures;
+    }
+
+    if (coordinateCanonical.valid() &&
+        coordinateRuntimeC.valid()) {
+        ExpressionReferenceOrbitResult low, high;
+        if (buildDecimal(
+                coordinateCanonical, coordinateRuntimeC,
+                FormulaParameter::C, coordinateFixed,
+                deepCoordinate, "1e-500", 3, 1800, low) &&
+            buildDecimal(
+                coordinateCanonical, coordinateRuntimeC,
+                FormulaParameter::C, coordinateFixed,
+                deepCoordinate, "1e-500", 3, 2400, high)) {
+            if (low.precision != 1800 ||
+                high.precision != 2400 ||
+                low.samples.size() != high.samples.size()) {
+                ++failures;
+            } else {
+                for (size_t i = 0; i < low.samples.size(); ++i) {
+                    MpfrComplex lowValue(2400), highValue(2400);
+                    if (!formula::reconstructMpfrFromShadows(
+                            lowValue, low.samples[i].next,
+                            low.samples[i].rootDefect) ||
+                        !formula::reconstructMpfrFromShadows(
+                            highValue, high.samples[i].next,
+                            high.samples[i].rootDefect) ||
+                        !closeMpfrComplex(
+                            lowValue, highValue, 90)) {
+                        printf("  e500 precision convergence failed\n");
+                        ++failures;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (coordinateCanonical.valid() &&
+        coordinateRuntimeC.valid()) {
+        ExpressionReferenceOrbitResult positiveE500;
+        if (!buildDecimal(
+                coordinateCanonical, coordinateRuntimeC,
+                FormulaParameter::C, coordinateFixed,
+                "1e500", "0", 1, 512,
+                positiveE500) ||
+            !positiveE500.pixel.re.isFinite() ||
+            positiveE500.pixel.re.exponent < 1600) {
+            printf("  positive e500 reference input failed\n");
+            ++failures;
+        }
+
+        for (const char* outOfRange :
+             { "1e-400000000", "1e400000000" }) {
+            ExpressionReferenceBuildRequest request;
+            request.canonicalProgram = &coordinateCanonical;
+            request.runtimeProgram = &coordinateRuntimeC;
+            request.center.realDecimal = outOfRange;
+            request.maxIterations = 1000000;
+            request.precision.requestedBits = 256;
+            request.precision.minimumBits = 53;
+            request.precision.guardBits = 0;
+            request.memoryLimitBytes = 0;
+            ExpressionReferenceOrbitResult rejected;
+            if (formula::buildExpressionReferenceOrbit(
+                    request, rejected) ||
+                rejected.status !=
+                    ExpressionReferenceBuildStatus::InputParseError ||
+                !rejected.samples.empty() ||
+                rejected.samples.capacity() != 0 ||
+                !rejected.tape.empty() ||
+                rejected.tape.capacity() != 0) {
+                printf("  decimal range rejection failed [%s]\n",
+                       outOfRange);
+                ++failures;
+            }
+        }
+    }
+
+    {
+        const mpfr_exp_t runtimeExponents[] = {
+            mpfr_get_emin(), mpfr_get_emax()
+        };
+        for (mpfr_exp_t exponent : runtimeExponents) {
+            MpfrComplex boundary(128);
+            MpfrComplex reconstructed(128);
+            boundary.set(0.75, 0.0);
+            if (mpfr_set_exp(boundary.re, exponent) != 0) {
+                ++failures;
+                continue;
+            }
+            ScaledRealShadow shadow;
+            if (!formula::makeScaledRealShadow(
+                    boundary.re, shadow) ||
+                shadow.exponent !=
+                    static_cast<int64_t>(exponent) ||
+                !formula::setMpfrFromScaledShadow(
+                    reconstructed.re, shadow) ||
+                !mpfr_equal_p(
+                    reconstructed.re, boundary.re)) {
+                printf("  runtime exponent boundary roundtrip failed\n");
+                ++failures;
+            }
+        }
+
+        MpfrComplex roundedMaximum(128);
+        roundedMaximum.set(1.0, 0.0);
+        mpfr_nextbelow(roundedMaximum.re);
+        if (mpfr_set_exp(
+                roundedMaximum.re,
+                mpfr_get_emax()) != 0) {
+            ++failures;
+        } else {
+            ScaledRealShadow shadow;
+            MpfrComplex reconstructed(128);
+            if (!formula::makeScaledRealShadow(
+                    roundedMaximum.re, shadow) ||
+                shadow.exponent !=
+                    static_cast<int64_t>(
+                        mpfr_get_emax()) ||
+                !formula::setMpfrFromScaledShadow(
+                    reconstructed.re, shadow) ||
+                mpfr_cmp(
+                    reconstructed.re,
+                    roundedMaximum.re) > 0) {
+                printf("  inward emax shadow extraction failed\n");
+                ++failures;
+            }
+        }
+
+        MpfrComplex rejected(128);
+        ScaledRealShadow outside;
+        outside.mantissa = 0.75;
+        if (mpfr_get_emin() >
+                std::numeric_limits<int64_t>::min()) {
+            outside.exponent =
+                static_cast<int64_t>(mpfr_get_emin()) - 1;
+            if (formula::setMpfrFromScaledShadow(
+                    rejected.re, outside))
+                ++failures;
+        }
+        if (mpfr_get_emax() <
+                std::numeric_limits<int64_t>::max()) {
+            outside.exponent =
+                static_cast<int64_t>(mpfr_get_emax()) + 1;
+            if (formula::setMpfrFromScaledShadow(
+                    rejected.re, outside))
+                ++failures;
+        }
+
+        if (coordinateCanonical.valid() &&
+            coordinateRuntimeC.valid()) {
+            ExpressionProgram auxiliaryCanonical;
+            ExpressionProgram auxiliaryRuntime;
+            if (compile(auxiliaryCanonical, "z/c") &&
+                specialize(
+                    auxiliaryCanonical, coordinateFixed,
+                    FormulaParameter::C,
+                    auxiliaryRuntime)) {
+                mpf_t real, imaginary;
+                mpf_init2(real, 128);
+                mpf_init2(imaginary, 128);
+                mpf_set_ui(imaginary, 0);
+
+                mpfr_get_f(
+                    real, roundedMaximum.re, MPFR_RNDN);
+                ExpressionReferenceBuildRequest request;
+                request.canonicalProgram =
+                    &auxiliaryCanonical;
+                request.runtimeProgram =
+                    &auxiliaryRuntime;
+                request.pixelParameter =
+                    FormulaParameter::C;
+                request.center.realMpf = real;
+                request.center.imaginaryMpf = imaginary;
+                request.maxIterations = 1;
+                request.bailout =
+                    std::numeric_limits<double>::max();
+                request.precision.minimumBits = 53;
+                request.precision.guardBits = 0;
+                request.precision.maximumBits = 4096;
+                ExpressionReferenceOrbitResult maximum;
+                const ExpressionReferenceTapeNode*
+                    denominator = nullptr;
+                if (formula::buildExpressionReferenceOrbit(
+                        request, maximum)) {
+                    for (const auto& node : maximum.tape)
+                        if (node.operation ==
+                            ExpressionOracleOperation::Divide)
+                            denominator = &node;
+                }
+                MpfrComplex reconstructed(128);
+                if (!maximum.valid || !denominator ||
+                    !formula::reconstructMpfrFromShadows(
+                        reconstructed,
+                        denominator->auxiliary,
+                        denominator->auxiliaryDefect) ||
+                    !closeMpfr(
+                        reconstructed.re,
+                        roundedMaximum.re, 94)) {
+                    printf("  near-emax input/tape auxiliary compaction failed\n");
+                    ++failures;
+                }
+
+                MpfrComplex roundedMinimum(128);
+                roundedMinimum.set(1.0, 0.0);
+                if (mpfr_set_exp(
+                        roundedMinimum.re,
+                        mpfr_get_emin()) != 0) {
+                    ++failures;
+                } else {
+                    mpfr_nextabove(roundedMinimum.re);
+                    mpfr_get_f(
+                        real, roundedMinimum.re,
+                        MPFR_RNDN);
+                    request.canonicalProgram =
+                        &coordinateCanonical;
+                    request.runtimeProgram =
+                        &coordinateRuntimeC;
+                    request.maxIterations = 0;
+                    ExpressionReferenceOrbitResult minimum;
+                    if (formula::buildExpressionReferenceOrbit(
+                            request, minimum) ||
+                        minimum.valid ||
+                        minimum.status !=
+                            ExpressionReferenceBuildStatus::
+                                CompactionOutOfRange ||
+                        minimum.cDefect.re.isNan() ||
+                        minimum.cDefect.im.isNan()) {
+                        printf("  near-emin compaction failure was not explicit\n");
+                        ++failures;
+                    }
+                }
+                mpf_clears(
+                    real, imaginary, (mpf_ptr)0);
+            }
+        }
+    }
+
+    auto benchmarkReference = [&](
+            const char* source, FormulaParameter pixel,
+            const ExpressionContext& fixed,
+            const char* real, const char* imaginary,
+            double& seconds, double& bytesPerSample) {
+        ExpressionProgram canonical, runtime;
+        if (!compile(canonical, source) ||
+            !specialize(canonical, fixed, pixel, runtime))
+            return false;
+        ExpressionReferenceBuildRequest request;
+        request.canonicalProgram = &canonical;
+        request.runtimeProgram = &runtime;
+        request.pixelParameter = pixel;
+        request.fixed = fixed;
+        request.center.realDecimal = real;
+        request.center.imaginaryDecimal = imaginary;
+        request.maxIterations = 10000;
+        request.bailout = 1e100;
+        request.precision.requestedBits = 256;
+        request.precision.minimumBits = 53;
+        request.precision.guardBits = 0;
+        auto start = Clock::now();
+        ExpressionReferenceOrbitResult result;
+        bool okay = formula::buildExpressionReferenceOrbit(
+            request, result);
+        seconds = since(start);
+        bytesPerSample =
+            result.sampleCount
+                ? (double)result.memoryBytes /
+                      result.sampleCount
+                : 0.0;
+        return okay && result.sampleCount == 10000 &&
+               !result.escaped && !result.undefined;
+    };
+    ExpressionContext arithmeticFixed;
+    ExpressionContext transcendentalFixed;
+    double arithmeticSeconds = 0.0;
+    double arithmeticBytes = 0.0;
+    double transcendentalSeconds = 0.0;
+    double transcendentalBytes = 0.0;
+    if (!benchmarkReference(
+            "z*0.9999", FormulaParameter::C,
+            arithmeticFixed, "0", "0",
+            arithmeticSeconds, arithmeticBytes) ||
+        !benchmarkReference(
+            "sin(z)", FormulaParameter::InitialZ,
+            transcendentalFixed, "0.1", "0.05",
+            transcendentalSeconds, transcendentalBytes))
+        ++failures;
+
+    printf("=== MPFR expression reference orbit/tape\n");
+    printf("  root samples=%d companions=%d branches=%d defects=%d\n",
+           orbitSamples, companionChecks,
+           branchChecks, defectChecks);
+    printf("  10k arithmetic: %.3f s %.1f bytes/sample; "
+           "transcendental: %.3f s %.1f bytes/sample\n",
+           arithmeticSeconds, arithmeticBytes,
+           transcendentalSeconds, transcendentalBytes);
+    printf("  branch clearance is point-only/not-certified; "
+           "GUI dispatch remains disabled\n");
+    printf("  => %s\n\n",
+           failures == 0
+               ? "PASS"
+               : "CHECK (expression reference failure)");
+    return failures == 0 ? 0 : 1;
+}
+
 static int runExpressionOracleCase() {
     using formula::Complex;
     using formula::ExpressionContext;
@@ -3955,21 +5335,25 @@ static int runGenericFormulaProfile() {
            orbitInvariantExact, orbitInvariantImproved,
            orbitControlExact, orbitControlNoRegression);
     {
-        formula::ExpressionProgram identity;
-        formula::ExpressionError error;
-        formula::ExpressionJit4 jit;
-        formula::ExpressionContext contexts[4]{};
-        float results[4]{};
-        volatile bool halt = true;
-        bool cancelled =
-            identity.compile("z", &error) &&
-            jit.compile(identity) &&
-            !jit.evaluateOrbit(
-                contexts, 3, 10000000, 4.0,
-                results, &halt);
-        if (!cancelled) ++failures;
-        printf("  orbit cancellation=%s\n",
-               cancelled ? "PASS" : "FAIL");
+        if (VERIFY_JIT) {
+            formula::ExpressionProgram identity;
+            formula::ExpressionError error;
+            formula::ExpressionJit4 jit;
+            formula::ExpressionContext contexts[4]{};
+            float results[4]{};
+            volatile bool halt = true;
+            bool cancelled =
+                identity.compile("z", &error) &&
+                jit.compile(identity) &&
+                !jit.evaluateOrbit(
+                    contexts, 3, 10000000, 4.0,
+                    results, &halt);
+            if (!cancelled) ++failures;
+            printf("  orbit cancellation=%s\n",
+                   cancelled ? "PASS" : "FAIL");
+        } else {
+            printf("  orbit cancellation=SKIP (non-JIT verifier)\n");
+        }
     }
     printf("  => %s\n\n",
            failures == 0 ? "PASS" : "CHECK (generic profile mismatch)");
@@ -6939,7 +8323,7 @@ static int runBackendCase() {
         mpf_set_ui(scale, 1);
     }
 
-    // Running cancellation through the hoisted JIT lane-refill path.
+    // Running cancellation through the hoisted lane-refill path.
     constexpr int CW = 8, CH = 8, CMXIT = 10000000;
     std::vector<float> cancelOutput((size_t)CW * CH, EMPTYPIXEL);
     Mandel cancelMandel(CW, CH, CMXIT, 1, cancelOutput.data());
@@ -6956,7 +8340,7 @@ static int runBackendCase() {
             cancelRuntime, &compileError) &&
         cancelPlan.build(cancelRuntime, &compileError) &&
         cancelPlan.profitable() &&
-        cancelJit.compile(cancelPlan);
+        (!VERIFY_JIT || cancelJit.compile(cancelPlan));
     ComputeRequest cancelRequest;
     cancelRequest.mode = ComputeMode::Expression;
     cancelRequest.cpuEngine = &cancelMandel;
@@ -6968,7 +8352,8 @@ static int runBackendCase() {
     cancelRequest.expression = &cancelRuntime;
     cancelRequest.expressionFixed = &cancelFixed;
     cancelRequest.expressionPlan = &cancelPlan;
-    cancelRequest.expressionJit = &cancelJit;
+    cancelRequest.expressionJit =
+        VERIFY_JIT ? &cancelJit : nullptr;
     cancelRequest.expressionPixel = FormulaParameter::C;
     cancelRequest.expressionColoring =
         formula::ExpressionColoring::OrbitTrap;
@@ -7243,10 +8628,13 @@ int main(int argc, char** argv) {
         rc |= runExpressionColoringCase();
     }
     if (which == "expression-centered")        rc |= runExpressionCenteredCase();
+    if (which == "expression-reference")       rc |= runExpressionReferenceCase();
     if (which == "expression-coloring")        rc |= runExpressionColoringCase();
     if (which == "expression-orbit")           rc |= runExpressionOrbitCase();
-    if (which == "expression-oracle")          rc |= runExpressionOracleCase();
-    if (which == "expression-suite")           rc |= runFormulaRegressionSuite();
+    if (which == "expression-oracle" || which == "oracle")
+        rc |= runExpressionOracleCase();
+    if (which == "expression-suite" || which == "suite")
+        rc |= runFormulaRegressionSuite();
     if (which == "custom-deep")                rc |= runCustomDeepZoomCase();
     if (which == "expression-residual")        rc |= runExpressionResidualSuite();
     if (which == "formula-bench")              rc |= runGenericFormulaProfile();

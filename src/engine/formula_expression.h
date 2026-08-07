@@ -77,6 +77,9 @@ public:
     const std::string& source() const { return _source; }
     size_t instructionCount() const { return _code.size(); }
     size_t stackDepth() const { return _stackDepth; }
+    uint64_t semanticHash() const;
+    bool semanticallyEquivalent(const ExpressionProgram& other) const;
+    bool containsOrbitInvariant() const;
     FastPath fastPath() const { return _fastPath; }
     int fastIntegerPower() const { return _fastIntegerPower; }
     bool isCanonicalQuadraticPlusC() const;
@@ -182,6 +185,7 @@ public:
     size_t bodyInstructionCount() const {
         return _body.instructionCount();
     }
+    const ExpressionProgram& bodyProgram() const { return _body; }
     size_t bodyOperationCount() const { return _bodyOperationCount; }
     size_t bodyStackDepth() const { return _body.stackDepth(); }
     bool avx2Compatible() const {

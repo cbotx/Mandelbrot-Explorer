@@ -528,6 +528,74 @@ bool ExpressionProgram::isCanonicalQuadraticPlusC() const {
             is(2, Op::C) && is(3, Op::Add));
 }
 
+uint64_t ExpressionProgram::semanticHash() const {
+    if (!_valid) return 0;
+    constexpr uint64_t offset = 1469598103934665603ULL;
+    constexpr uint64_t prime = 1099511628211ULL;
+    uint64_t hash = offset;
+    auto append = [&](const void* bytes, size_t count) {
+        const unsigned char* data =
+            static_cast<const unsigned char*>(bytes);
+        for (size_t i = 0; i < count; ++i) {
+            hash ^= data[i];
+            hash *= prime;
+        }
+    };
+    const uint64_t count = static_cast<uint64_t>(_code.size());
+    append(&count, sizeof(count));
+    for (const Instruction& instruction : _code) {
+        const uint8_t op = static_cast<uint8_t>(instruction.op);
+        append(&op, sizeof(op));
+        const uint8_t argument =
+            instruction.op == Op::Constant ? 0 : instruction.argument;
+        append(&argument, sizeof(argument));
+        uint64_t realBits = 0, imaginaryBits = 0;
+        double value = instruction.value.real();
+        std::memcpy(&realBits, &value, sizeof(realBits));
+        value = instruction.value.imag();
+        std::memcpy(&imaginaryBits, &value, sizeof(imaginaryBits));
+        append(&realBits, sizeof(realBits));
+        append(&imaginaryBits, sizeof(imaginaryBits));
+    }
+    return hash;
+}
+
+bool ExpressionProgram::semanticallyEquivalent(
+        const ExpressionProgram& other) const {
+    if (!_valid || !other._valid || _code.size() != other._code.size())
+        return false;
+    for (size_t i = 0; i < _code.size(); ++i) {
+        const Instruction& left = _code[i];
+        const Instruction& right = other._code[i];
+        if (left.op != right.op)
+            return false;
+        if (left.op != Op::Constant &&
+            left.argument != right.argument)
+            return false;
+        uint64_t leftReal = 0, leftImaginary = 0;
+        uint64_t rightReal = 0, rightImaginary = 0;
+        double value = left.value.real();
+        std::memcpy(&leftReal, &value, sizeof(leftReal));
+        value = left.value.imag();
+        std::memcpy(&leftImaginary, &value, sizeof(leftImaginary));
+        value = right.value.real();
+        std::memcpy(&rightReal, &value, sizeof(rightReal));
+        value = right.value.imag();
+        std::memcpy(&rightImaginary, &value, sizeof(rightImaginary));
+        if (leftReal != rightReal || leftImaginary != rightImaginary)
+            return false;
+    }
+    return true;
+}
+
+bool ExpressionProgram::containsOrbitInvariant() const {
+    return std::any_of(
+        _code.begin(), _code.end(),
+        [](const Instruction& instruction) {
+            return instruction.op == Op::OrbitInvariant;
+        });
+}
+
 bool ExpressionProgram::compile(const std::string& source, ExpressionError* error) {
     _valid = false;
     _source.clear();

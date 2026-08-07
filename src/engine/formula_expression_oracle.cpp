@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <vector>
 
 namespace formula {
@@ -25,6 +26,34 @@ struct Scratch {
 void setNan(MpfrComplex& value) {
     mpfr_set_nan(value.re);
     mpfr_set_nan(value.im);
+}
+
+bool decimalSignificandIsNonzero(const std::string& text) {
+    size_t end = text.find_first_of("eE");
+    if (end == std::string::npos) end = text.size();
+    for (size_t i = 0; i < end; ++i)
+        if (text[i] >= '1' && text[i] <= '9')
+            return true;
+    return false;
+}
+
+bool parseFiniteDecimal(mpfr_ptr output, const std::string& text) {
+    const mpfr_flags_t saved = mpfr_flags_save();
+    mpfr_flags_clear(MPFR_FLAGS_ALL);
+    const int parseStatus =
+        mpfr_set_str(output, text.c_str(), 10, RND);
+    const mpfr_flags_t rangeFlags = mpfr_flags_test(
+        MPFR_FLAGS_UNDERFLOW |
+        MPFR_FLAGS_OVERFLOW |
+        MPFR_FLAGS_ERANGE);
+    const bool valid =
+        parseStatus == 0 &&
+        rangeFlags == 0 &&
+        mpfr_number_p(output) &&
+        !(mpfr_zero_p(output) &&
+          decimalSignificandIsNonzero(text));
+    mpfr_flags_restore(saved, MPFR_FLAGS_ALL);
+    return valid;
 }
 
 void add(MpfrComplex& out, const MpfrComplex& a, const MpfrComplex& b) {
@@ -243,6 +272,10 @@ bool squareRoot(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
 }
 
 bool tangent(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
+    if (!mpfr_number_p(a.re) || !mpfr_number_p(a.im)) {
+        setNan(out);
+        return false;
+    }
     if (mpfr_cmpabs_ui(a.im, 16) < 0) {
         MpfrComplex sn(out.precision()), cs(out.precision());
         sine(sn, a, s);
@@ -277,6 +310,10 @@ bool tangent(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
 }
 
 bool hyperbolicTangent(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
+    if (!mpfr_number_p(a.re) || !mpfr_number_p(a.im)) {
+        setNan(out);
+        return false;
+    }
     if (mpfr_cmpabs_ui(a.re, 16) < 0) {
         MpfrComplex sh(out.precision()), ch(out.precision());
         hyperbolicSine(sh, a, s);
@@ -306,6 +343,25 @@ bool hyperbolicTangent(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
     mpfr_mul_2ui(s.values[7], s.values[7], 1, RND);
     mpfr_div(out.im, s.values[7], s.values[8], RND);
     return mpfr_number_p(out.re) && mpfr_number_p(out.im);
+}
+
+void asymptoticLogPhaseCompanion(
+        MpfrComplex& out, const MpfrComplex& input,
+        bool tangentOperation, Scratch& s) {
+    mpfr_srcptr dominant =
+        tangentOperation ? input.im : input.re;
+    mpfr_srcptr phase =
+        tangentOperation ? input.re : input.im;
+    mpfr_abs(out.re, dominant, RND);
+    mpfr_neg(out.re, out.re, RND);
+
+    mpfr_sin_cos(s.values[0], s.values[1], phase, RND);
+    mpfr_mul(s.values[2], s.values[0], s.values[1], RND);
+    mpfr_mul_2ui(s.values[2], s.values[2], 1, RND);
+    mpfr_sqr(s.values[3], s.values[1], RND);
+    mpfr_sqr(s.values[4], s.values[0], RND);
+    mpfr_sub(s.values[3], s.values[3], s.values[4], RND);
+    mpfr_atan2(out.im, s.values[2], s.values[3], RND);
 }
 
 bool power(MpfrComplex& out, const MpfrComplex& a, const MpfrComplex& b, Scratch& s) {
@@ -361,8 +417,8 @@ void MpfrComplex::set(double real, double imaginary) {
 
 bool MpfrComplex::set(const std::string& real, const std::string& imaginary) {
     MpfrComplex parsed(precision());
-    if (mpfr_set_str(parsed.re, real.c_str(), 10, RND) != 0 ||
-        mpfr_set_str(parsed.im, imaginary.c_str(), 10, RND) != 0)
+    if (!parseFiniteDecimal(parsed.re, real) ||
+        !parseFiniteDecimal(parsed.im, imaginary))
         return false;
     set(parsed);
     return true;
@@ -388,21 +444,64 @@ ExpressionOracleContext::ExpressionOracleContext(mpfr_prec_t precision)
                   MpfrComplex(precision), MpfrComplex(precision),
                   MpfrComplex(precision), MpfrComplex(precision) } {}
 
+ExpressionOracleTraceNode::ExpressionOracleTraceNode(
+        mpfr_prec_t precision)
+    : output(precision), auxiliary(precision) {}
+
 bool ExpressionOracle::evaluate(const ExpressionProgram& program,
                                 const ExpressionOracleContext& context,
                                 MpfrComplex& output,
                                 std::string* error) {
+    return evaluateInternal(
+        program, context, output, nullptr, error);
+}
+
+bool ExpressionOracle::evaluateTrace(
+        const ExpressionProgram& program,
+        const ExpressionOracleContext& context,
+        MpfrComplex& output, ExpressionOracleTrace& trace,
+        std::string* error) {
+    return evaluateInternal(
+        program, context, output, &trace, error);
+}
+
+bool ExpressionOracle::evaluateInternal(
+        const ExpressionProgram& program,
+        const ExpressionOracleContext& context,
+        MpfrComplex& output, ExpressionOracleTrace* trace,
+        std::string* error) {
     if (error) error->clear();
+    if (trace) {
+        trace->precision = output.precision();
+        trace->exactDomain = false;
+        trace->nodes.clear();
+    }
     if (!program.valid()) {
         if (error) *error = "program is not compiled";
         setNan(output);
         return false;
+    }
+    for (const ExpressionProgram::Instruction& instruction :
+         program._code) {
+        if (instruction.op ==
+            ExpressionProgram::Op::OrbitInvariant) {
+            if (error)
+                *error =
+                    "orbit-plan bytecode is unsupported by the MPFR oracle";
+            setNan(output);
+            return false;
+        }
     }
     const mpfr_prec_t precision = output.precision();
     std::vector<MpfrComplex> stack;
     stack.reserve(program.stackDepth());
     for (size_t i = 0; i < program.stackDepth(); ++i)
         stack.emplace_back(precision);
+    std::vector<uint16_t> nodeStack;
+    if (trace) {
+        trace->nodes.reserve(program.instructionCount());
+        nodeStack.resize(program.stackDepth(), UINT16_MAX);
+    }
     Scratch scratch(precision);
     size_t top = 0;
     bool exactDomain = true;
@@ -416,10 +515,114 @@ bool ExpressionOracle::evaluate(const ExpressionProgram& program,
         function(stack[top - 1], stack[top - 1], right, scratch);
     };
 
-    for (const ExpressionProgram::Instruction& instruction : program._code) {
+    auto operationOf = [](ExpressionProgram::Op op) {
+        using Op = ExpressionProgram::Op;
+        switch (op) {
+        case Op::Constant: return ExpressionOracleOperation::Constant;
+        case Op::Z: return ExpressionOracleOperation::Z;
+        case Op::C: return ExpressionOracleOperation::C;
+        case Op::Z0: return ExpressionOracleOperation::Z0;
+        case Op::Iteration: return ExpressionOracleOperation::Iteration;
+        case Op::Parameter: return ExpressionOracleOperation::Parameter;
+        case Op::OrbitInvariant:
+            return ExpressionOracleOperation::OrbitInvariant;
+        case Op::Negate: return ExpressionOracleOperation::Negate;
+        case Op::Add: return ExpressionOracleOperation::Add;
+        case Op::Subtract: return ExpressionOracleOperation::Subtract;
+        case Op::Multiply: return ExpressionOracleOperation::Multiply;
+        case Op::Divide: return ExpressionOracleOperation::Divide;
+        case Op::Power: return ExpressionOracleOperation::Power;
+        case Op::Square: return ExpressionOracleOperation::Square;
+        case Op::Sin: return ExpressionOracleOperation::Sin;
+        case Op::Cos: return ExpressionOracleOperation::Cos;
+        case Op::Tan: return ExpressionOracleOperation::Tan;
+        case Op::Sinh: return ExpressionOracleOperation::Sinh;
+        case Op::Cosh: return ExpressionOracleOperation::Cosh;
+        case Op::Tanh: return ExpressionOracleOperation::Tanh;
+        case Op::Exp: return ExpressionOracleOperation::Exp;
+        case Op::Log: return ExpressionOracleOperation::Log;
+        case Op::Log10: return ExpressionOracleOperation::Log10;
+        case Op::Sqrt: return ExpressionOracleOperation::Sqrt;
+        case Op::Abs: return ExpressionOracleOperation::Abs;
+        case Op::Norm: return ExpressionOracleOperation::Norm;
+        case Op::Arg: return ExpressionOracleOperation::Arg;
+        case Op::Conjugate:
+            return ExpressionOracleOperation::Conjugate;
+        case Op::Real: return ExpressionOracleOperation::Real;
+        case Op::Imaginary:
+            return ExpressionOracleOperation::Imaginary;
+        case Op::MakeComplex:
+            return ExpressionOracleOperation::MakeComplex;
+        case Op::Polar: return ExpressionOracleOperation::Polar;
+        }
+        return ExpressionOracleOperation::OrbitInvariant;
+    };
+    auto cutLocation = [](const MpfrComplex& value) {
+        if (!mpfr_number_p(value.re) ||
+            !mpfr_number_p(value.im))
+            return ExpressionOracleCutLocation::NotApplicable;
+        if (mpfr_zero_p(value.re) &&
+            mpfr_zero_p(value.im))
+            return ExpressionOracleCutLocation::Origin;
+        int imaginarySign = mpfr_sgn(value.im);
+        if (imaginarySign > 0)
+            return ExpressionOracleCutLocation::UpperHalfPlane;
+        if (imaginarySign < 0)
+            return ExpressionOracleCutLocation::LowerHalfPlane;
+        if (mpfr_sgn(value.re) < 0) {
+            return mpfr_signbit(value.im)
+                ? ExpressionOracleCutLocation::NegativeRealLowerLip
+                : ExpressionOracleCutLocation::NegativeRealUpperLip;
+        }
+        return ExpressionOracleCutLocation::PositiveRealAxis;
+    };
+    auto pointClearance = [](const MpfrComplex& value) {
+        if (!mpfr_number_p(value.re) ||
+            !mpfr_number_p(value.im))
+            return ExpressionOraclePointClearance::NonFiniteAtPoint;
+        return mpfr_zero_p(value.re) &&
+               mpfr_zero_p(value.im)
+            ? ExpressionOraclePointClearance::ZeroAtPoint
+            : ExpressionOraclePointClearance::ClearAtPoint;
+    };
+
+    for (size_t instructionIndex = 0;
+         instructionIndex < program._code.size();
+         ++instructionIndex) {
+        const ExpressionProgram::Instruction& instruction =
+            program._code[instructionIndex];
+        const int operands =
+            ExpressionProgram::operandCount(instruction.op);
+        uint16_t leftNode = UINT16_MAX;
+        uint16_t rightNode = UINT16_MAX;
+        std::optional<MpfrComplex> leftInput;
+        std::optional<MpfrComplex> rightInput;
+        if (trace && operands >= 1) {
+            leftNode = nodeStack[top - (size_t)operands];
+            leftInput.emplace(precision);
+            leftInput->set(stack[top - (size_t)operands]);
+        }
+        if (trace && operands == 2) {
+            rightNode = nodeStack[top - 1];
+            rightInput.emplace(precision);
+            rightInput->set(stack[top - 1]);
+        }
+        bool nodeDomain = true;
+        auto domainResult = [&](bool valid) {
+            nodeDomain = valid && nodeDomain;
+            exactDomain = valid && exactDomain;
+        };
+
         switch (instruction.op) {
         case ExpressionProgram::Op::Constant:
-            stack[top++].set(instruction.value.real(), instruction.value.imag()); break;
+            stack[top].set(
+                instruction.value.real(),
+                instruction.value.imag());
+            domainResult(
+                mpfr_number_p(stack[top].re) &&
+                mpfr_number_p(stack[top].im));
+            ++top;
+            break;
         case ExpressionProgram::Op::Z: stack[top++].set(context.z); break;
         case ExpressionProgram::Op::C: stack[top++].set(context.c); break;
         case ExpressionProgram::Op::Z0: stack[top++].set(context.z0); break;
@@ -439,11 +642,11 @@ bool ExpressionOracle::evaluate(const ExpressionProgram& program,
             binary([](MpfrComplex& o, const MpfrComplex& a, const MpfrComplex& b, Scratch& s) { mul(o, a, b, s); }); break;
         case ExpressionProgram::Op::Divide:
             binary([&](MpfrComplex& o, const MpfrComplex& a, const MpfrComplex& b, Scratch& s) {
-                exactDomain = divide(o, a, b, s) && exactDomain;
+                domainResult(divide(o, a, b, s));
             }); break;
         case ExpressionProgram::Op::Power:
             binary([&](MpfrComplex& o, const MpfrComplex& a, const MpfrComplex& b, Scratch& s) {
-                exactDomain = power(o, a, b, s) && exactDomain;
+                domainResult(power(o, a, b, s));
             }); break;
         case ExpressionProgram::Op::Square:
             unary([](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
@@ -456,7 +659,7 @@ bool ExpressionOracle::evaluate(const ExpressionProgram& program,
         case ExpressionProgram::Op::Tan:
             unary([&](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
                 MpfrComplex copy(a);
-                exactDomain = tangent(o, copy, s) && exactDomain;
+                domainResult(tangent(o, copy, s));
             }); break;
         case ExpressionProgram::Op::Sinh:
             unary([](MpfrComplex& o, const MpfrComplex& a, Scratch& s) { MpfrComplex copy(a); hyperbolicSine(o, copy, s); }); break;
@@ -465,19 +668,20 @@ bool ExpressionOracle::evaluate(const ExpressionProgram& program,
         case ExpressionProgram::Op::Tanh:
             unary([&](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
                 MpfrComplex copy(a);
-                exactDomain = hyperbolicTangent(o, copy, s) && exactDomain;
+                domainResult(hyperbolicTangent(o, copy, s));
             }); break;
         case ExpressionProgram::Op::Exp:
             unary([](MpfrComplex& o, const MpfrComplex& a, Scratch& s) { MpfrComplex copy(a); exponential(o, copy, s); }); break;
         case ExpressionProgram::Op::Log:
             unary([&](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
-                MpfrComplex copy(a); exactDomain = logarithm(o, copy, s) && exactDomain;
+                MpfrComplex copy(a);
+                domainResult(logarithm(o, copy, s));
             }); break;
         case ExpressionProgram::Op::Log10:
             unary([&](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
                 MpfrComplex copy(a);
                 bool valid = logarithm(o, copy, s);
-                exactDomain = valid && exactDomain;
+                domainResult(valid);
                 if (valid) {
                     mpfr_const_log2(s.values[0], RND);
                     mpfr_log_ui(s.values[1], 5, RND);
@@ -488,7 +692,8 @@ bool ExpressionOracle::evaluate(const ExpressionProgram& program,
             }); break;
         case ExpressionProgram::Op::Sqrt:
             unary([&](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
-                MpfrComplex copy(a); exactDomain = squareRoot(o, copy, s) && exactDomain;
+                MpfrComplex copy(a);
+                domainResult(squareRoot(o, copy, s));
             }); break;
         case ExpressionProgram::Op::Abs:
             unary([](MpfrComplex& o, const MpfrComplex& a, Scratch&) { MpfrComplex copy(a); absolute(o, copy); }); break;
@@ -515,7 +720,8 @@ bool ExpressionOracle::evaluate(const ExpressionProgram& program,
                 mpfr_nan_p(radius.re) || mpfr_inf_p(radius.re) ||
                 mpfr_sgn(radius.re) < 0 || mpfr_nan_p(angle.re) ||
                 mpfr_inf_p(angle.re)) {
-                setNan(radius); exactDomain = false;
+                setNan(radius);
+                domainResult(false);
             } else {
                 mpfr_cos(scratch.values[0], angle.re, RND);
                 mpfr_sin(scratch.values[1], angle.re, RND);
@@ -524,9 +730,164 @@ bool ExpressionOracle::evaluate(const ExpressionProgram& program,
             }
             break;
         }
+        case ExpressionProgram::Op::OrbitInvariant:
+            if (error)
+                *error =
+                    "orbit-plan bytecode is unsupported by the MPFR oracle";
+            setNan(output);
+            return false;
+        }
+
+        if (trace) {
+            trace->nodes.emplace_back(precision);
+            ExpressionOracleTraceNode& node = trace->nodes.back();
+            node.instructionIndex = instructionIndex;
+            node.operation = operationOf(instruction.op);
+            node.leftNode = leftNode;
+            node.rightNode = rightNode;
+            node.output.set(stack[top - 1]);
+            if (!nodeDomain)
+                node.flags |= OracleTraceUndefined;
+
+            using Op = ExpressionProgram::Op;
+            switch (instruction.op) {
+            case Op::Multiply:
+            case Op::Divide:
+            case Op::Power:
+            case Op::Square:
+            case Op::Sin:
+            case Op::Cos:
+            case Op::Tan:
+            case Op::Sinh:
+            case Op::Cosh:
+            case Op::Tanh:
+            case Op::Exp:
+            case Op::Log:
+            case Op::Log10:
+            case Op::Sqrt:
+            case Op::Abs:
+            case Op::Norm:
+            case Op::Arg:
+            case Op::Polar:
+                node.flags |= OracleTraceNonlinear;
+                break;
+            default:
+                break;
+            }
+            switch (instruction.op) {
+            case Op::Log:
+            case Op::Log10:
+            case Op::Sqrt:
+            case Op::Arg:
+            case Op::Power:
+                node.flags |= OracleTraceBranchSensitive;
+                node.cut = cutLocation(*leftInput);
+                if (mpfr_zero_p(leftInput->re) &&
+                    mpfr_zero_p(leftInput->im))
+                    node.flags |= OracleTraceSingularPoint;
+                break;
+            default:
+                break;
+            }
+
+            switch (instruction.op) {
+            case Op::Sin:
+                cosine(node.auxiliary, *leftInput, scratch);
+                node.flags |= OracleTraceHasCompanion;
+                break;
+            case Op::Cos:
+                sine(node.auxiliary, *leftInput, scratch);
+                node.flags |= OracleTraceHasCompanion;
+                break;
+            case Op::Sinh:
+                hyperbolicCosine(
+                    node.auxiliary, *leftInput, scratch);
+                node.flags |= OracleTraceHasCompanion;
+                break;
+            case Op::Cosh:
+                hyperbolicSine(
+                    node.auxiliary, *leftInput, scratch);
+                node.flags |= OracleTraceHasCompanion;
+                break;
+            case Op::Divide:
+                node.auxiliary.set(*rightInput);
+                node.flags |= OracleTraceHasDenominator;
+                node.clearance =
+                    pointClearance(node.auxiliary);
+                if (node.clearance ==
+                    ExpressionOraclePointClearance::ZeroAtPoint)
+                    node.flags |= OracleTraceSingularPoint;
+                break;
+            case Op::Tan:
+                node.flags |= OracleTraceHasCompanion |
+                              OracleTraceHasDenominator;
+                node.clearance =
+                    pointClearance(*leftInput);
+                if (node.clearance ==
+                    ExpressionOraclePointClearance::
+                        NonFiniteAtPoint) {
+                    node.flags |= OracleTraceUndefined;
+                    setNan(node.auxiliary);
+                } else if (
+                    mpfr_cmpabs_ui(leftInput->im, 16) >= 0) {
+                    asymptoticLogPhaseCompanion(
+                        node.auxiliary, *leftInput, true, scratch);
+                    node.flags |=
+                        OracleTraceHasAsymptoticLogPhase;
+                    node.clearance =
+                        ExpressionOraclePointClearance::ClearAtPoint;
+                } else {
+                    cosine(node.auxiliary, *leftInput, scratch);
+                    node.clearance =
+                        pointClearance(node.auxiliary);
+                    if (node.clearance ==
+                        ExpressionOraclePointClearance::ZeroAtPoint)
+                        node.flags |= OracleTraceSingularPoint;
+                }
+                break;
+            case Op::Tanh:
+                node.flags |= OracleTraceHasCompanion |
+                              OracleTraceHasDenominator;
+                node.clearance =
+                    pointClearance(*leftInput);
+                if (node.clearance ==
+                    ExpressionOraclePointClearance::
+                        NonFiniteAtPoint) {
+                    node.flags |= OracleTraceUndefined;
+                    setNan(node.auxiliary);
+                } else if (
+                    mpfr_cmpabs_ui(leftInput->re, 16) >= 0) {
+                    asymptoticLogPhaseCompanion(
+                        node.auxiliary, *leftInput, false, scratch);
+                    node.flags |=
+                        OracleTraceHasAsymptoticLogPhase;
+                    node.clearance =
+                        ExpressionOraclePointClearance::ClearAtPoint;
+                } else {
+                    hyperbolicCosine(
+                        node.auxiliary, *leftInput, scratch);
+                    node.clearance =
+                        pointClearance(node.auxiliary);
+                    if (node.clearance ==
+                        ExpressionOraclePointClearance::ZeroAtPoint)
+                        node.flags |= OracleTraceSingularPoint;
+                }
+                break;
+            case Op::Power:
+                if (!logarithm(
+                        node.auxiliary, *leftInput, scratch))
+                    setNan(node.auxiliary);
+                node.flags |= OracleTraceHasLogarithmBase;
+                break;
+            default:
+                break;
+            }
+            nodeStack[top - 1] = static_cast<uint16_t>(
+                trace->nodes.size() - 1);
         }
     }
     output.set(stack[0]);
+    if (trace) trace->exactDomain = exactDomain;
     if (!exactDomain && error) *error = "expression evaluated outside a function domain";
     return exactDomain;
 }
