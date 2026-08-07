@@ -11,7 +11,7 @@
 //          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
 //          expression | expression-coloring | expression-orbit |
-//          expression-oracle | custom-deep | expression-suite |
+//          expression-centered | expression-oracle | custom-deep | expression-suite |
 //          expression-residual | formula-bench | multibrot | backend | gpu | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
@@ -40,6 +40,7 @@
 #include "compute_backend.h"
 #include "mandel_perturbation.h"
 #include "formula_expression.h"
+#include "formula_expression_centered.h"
 #include "formula_expression_orbit.h"
 #include "formula_expression_jit.h"
 #include "formula_expression_oracle.h"
@@ -1905,6 +1906,693 @@ static int runExpressionCoreCase() {
                (unsigned long)memory.Protect);
     }
     printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (expression core failure)");
+    return failures == 0 ? 0 : 1;
+}
+
+static int runExpressionCenteredCase() {
+    using formula::Complex;
+    using formula::ExpressionCenteredEvaluator;
+    using formula::ExpressionCenteredResult;
+    using formula::ExpressionCenteredStatus;
+    using formula::ExpressionContext;
+    using formula::ExpressionDeltaContext;
+    using formula::ExpressionError;
+    using formula::ExpressionOracle;
+    using formula::ExpressionOracleContext;
+    using formula::ExpressionProgram;
+    using formula::MpfrComplex;
+
+    int failures = 0;
+    int opcodeChecks = 0;
+    int oracleChecks = 0;
+    int tinyChecks = 0;
+    int recurrenceChecks = 0;
+    int fallbackChecks = 0;
+    int signedZeroChecks = 0;
+    constexpr double centeredPi =
+        3.141592653589793238462643383279502884;
+
+    auto sameDoubleBits = [](double left, double right) {
+        uint64_t leftBits = 0, rightBits = 0;
+        std::memcpy(&leftBits, &left, sizeof(leftBits));
+        std::memcpy(&rightBits, &right, sizeof(rightBits));
+        return leftBits == rightBits;
+    };
+    auto sameComplexBits = [&](Complex left, Complex right) {
+        return sameDoubleBits(left.real(), right.real()) &&
+               sameDoubleBits(left.imag(), right.imag());
+    };
+    auto magnitude = [](Complex value) {
+        return std::hypot(value.real(), value.imag());
+    };
+    auto isZero = [](Complex value) {
+        return value.real() == 0.0 && value.imag() == 0.0;
+    };
+    auto residualClose = [&](Complex actual, Complex expected,
+                             double relative = 5e-8) {
+        double scale = magnitude(expected);
+        double error = magnitude(actual - expected);
+        return error <= relative * scale +
+                        16.0 * std::numeric_limits<double>::denorm_min();
+    };
+    auto compile = [&](ExpressionProgram& program, const char* source) {
+        ExpressionError error;
+        if (!program.compile(source, &error)) {
+            printf("  centered compile failed @ %zu: %s [%s]\n",
+                   error.position, error.message.c_str(), source);
+            ++failures;
+            return false;
+        }
+        return true;
+    };
+    auto perturbedContext = [](ExpressionContext base,
+                               const ExpressionDeltaContext& delta) {
+        base.z += delta.z;
+        base.c += delta.c;
+        base.z0 += delta.z0;
+        for (size_t i = 0; i < base.parameters.size(); ++i)
+            base.parameters[i] += delta.parameters[i];
+        return base;
+    };
+    auto setOracleContext = [](ExpressionOracleContext& output,
+                               const ExpressionContext& input) {
+        output.z.set(input.z.real(), input.z.imag());
+        output.c.set(input.c.real(), input.c.imag());
+        output.z0.set(input.z0.real(), input.z0.imag());
+        for (size_t i = 0; i < input.parameters.size(); ++i)
+            output.parameters[i].set(
+                input.parameters[i].real(),
+                input.parameters[i].imag());
+        output.iteration = input.iteration;
+    };
+    auto addOracleDelta = [](ExpressionOracleContext& output,
+                             const ExpressionDeltaContext& delta) {
+        auto add = [](MpfrComplex& value, Complex residual) {
+            mpfr_add_d(value.re, value.re, residual.real(), MPFR_RNDN);
+            mpfr_add_d(value.im, value.im, residual.imag(), MPFR_RNDN);
+        };
+        add(output.z, delta.z);
+        add(output.c, delta.c);
+        add(output.z0, delta.z0);
+        for (size_t i = 0; i < delta.parameters.size(); ++i)
+            add(output.parameters[i], delta.parameters[i]);
+    };
+    auto oracleResidual = [&](const ExpressionProgram& program,
+                              const ExpressionContext& base,
+                              const ExpressionDeltaContext& delta,
+                              Complex& residual,
+                              mpfr_prec_t precision = 1536) {
+        ExpressionOracleContext reference(precision);
+        ExpressionOracleContext perturbed(precision);
+        setOracleContext(reference, base);
+        setOracleContext(perturbed, base);
+        addOracleDelta(perturbed, delta);
+        MpfrComplex referenceOutput(precision);
+        MpfrComplex perturbedOutput(precision);
+        std::string referenceError, perturbedError;
+        if (!ExpressionOracle::evaluate(
+                program, reference, referenceOutput, &referenceError) ||
+            !ExpressionOracle::evaluate(
+                program, perturbed, perturbedOutput, &perturbedError)) {
+            printf("  centered oracle failed: %s / %s [%s]\n",
+                   referenceError.c_str(), perturbedError.c_str(),
+                   program.source().c_str());
+            return false;
+        }
+        MpfrComplex difference(precision);
+        mpfr_sub(
+            difference.re, perturbedOutput.re,
+            referenceOutput.re, MPFR_RNDN);
+        mpfr_sub(
+            difference.im, perturbedOutput.im,
+            referenceOutput.im, MPFR_RNDN);
+        residual = difference.toDouble();
+        return true;
+    };
+    auto expectStatus = [&](const char* source,
+                            ExpressionContext context,
+                            ExpressionDeltaContext delta,
+                            ExpressionCenteredStatus expected) {
+        ExpressionProgram program;
+        if (!compile(program, source)) return;
+        ExpressionCenteredResult result =
+            ExpressionCenteredEvaluator::evaluate(
+                program, context, delta);
+        ++fallbackChecks;
+        if (result.status != expected) {
+            printf("  centered status [%s]: got %s expected %s\n",
+                   source,
+                   formula::expressionCenteredStatusName(result.status),
+                   formula::expressionCenteredStatusName(expected));
+            ++failures;
+        }
+        if (!sameComplexBits(result.base, program.evaluate(context))) {
+            printf("  centered fallback base mismatch [%s]\n", source);
+            ++failures;
+        }
+    };
+    auto expectComposedBranch = [&](
+            const char* source, ExpressionContext context,
+            ExpressionDeltaContext delta) {
+        ++signedZeroChecks;
+        expectStatus(
+            source, context, delta,
+            ExpressionCenteredStatus::BranchUncertain);
+    };
+    auto expectSuccessParity = [&](
+            const char* source, ExpressionContext context,
+            ExpressionDeltaContext delta) {
+        ExpressionProgram program;
+        if (!compile(program, source)) return;
+        ExpressionCenteredResult result =
+            ExpressionCenteredEvaluator::evaluate(
+                program, context, delta);
+        ++signedZeroChecks;
+        if (!result.success()) {
+            printf("  centered benign signed-zero status [%s]: %s\n",
+                   source,
+                   formula::expressionCenteredStatusName(
+                       result.status));
+            ++failures;
+        }
+        if (!sameComplexBits(
+                result.base, program.evaluate(context))) {
+            printf("  centered benign signed-zero base mismatch [%s]\n",
+                   source);
+            ++failures;
+        }
+    };
+
+    ExpressionContext nominal;
+    nominal.z = { 0.7, 0.2 };
+    nominal.c = { 1.2, 0.3 };
+    nominal.z0 = { 0.9, -0.4 };
+    nominal.parameters[0] = { 0.6, 0.1 };
+    nominal.parameters[1] = { 1.3, 0.0 };
+    nominal.parameters[2] = { 0.4, 0.0 };
+    for (int i = 3; i < 8; ++i)
+        nominal.parameters[i] = {
+            0.2 + 0.07 * i, -0.15 + 0.03 * i
+        };
+    nominal.iteration = 7;
+
+    const char* opcodeSources[] = {
+        "2.0",
+        "z+c+z0+p0+p1+p2+p3+p4+p5+p6+p7+n",
+        "-z", "z+c", "z-c", "z*c", "z/c", "pow(z,p0)",
+        "sqr(z)", "sin(z)", "cos(z)", "tan(z)",
+        "sinh(z)", "cosh(z)", "tanh(z)", "exp(z)",
+        "log(z)", "log10(z)", "sqrt(z)", "abs(z)",
+        "norm(z)", "arg(z)", "conj(z)", "real(z)", "imag(z)",
+        "complex(real(z),imag(c))", "polar(p1,p2)"
+    };
+    uint64_t randomState = 0x9e3779b97f4a7c15ULL;
+    auto randomSigned = [&]() {
+        randomState = randomState * 6364136223846793005ULL + 1;
+        double unit =
+            (double)((randomState >> 11) & ((1ULL << 53) - 1)) /
+            (double)(1ULL << 53);
+        return 2.0 * unit - 1.0;
+    };
+    for (int sample = 0; sample < 24; ++sample) {
+        ExpressionContext context = nominal;
+        context.z += Complex{
+            0.08 * randomSigned(), 0.08 * randomSigned()
+        };
+        context.c += Complex{
+            0.08 * randomSigned(), 0.08 * randomSigned()
+        };
+        context.z0 += Complex{
+            0.08 * randomSigned(), 0.08 * randomSigned()
+        };
+        ExpressionDeltaContext delta;
+        delta.z = {
+            1e-7 * randomSigned(), 1e-7 * randomSigned()
+        };
+        delta.c = {
+            1e-7 * randomSigned(), 1e-7 * randomSigned()
+        };
+        delta.z0 = {
+            1e-7 * randomSigned(), 1e-7 * randomSigned()
+        };
+        for (int i = 0; i < 8; ++i) {
+            delta.parameters[i] = {
+                1e-7 * randomSigned(), 1e-7 * randomSigned()
+            };
+        }
+        delta.parameters[1] = { 1e-7 * randomSigned(), 0.0 };
+        delta.parameters[2] = { 1e-7 * randomSigned(), 0.0 };
+
+        for (const char* source : opcodeSources) {
+            ExpressionProgram program;
+            if (!compile(program, source)) continue;
+            ExpressionCenteredResult result =
+                ExpressionCenteredEvaluator::evaluate(
+                    program, context, delta);
+            ++opcodeChecks;
+            if (!result.success()) {
+                printf("  centered random status %s [%s]\n",
+                       formula::expressionCenteredStatusName(result.status),
+                       source);
+                ++failures;
+                continue;
+            }
+            Complex directBase = program.evaluate(context);
+            if (!sameComplexBits(result.base, directBase)) {
+                printf("  centered base bit mismatch [%s]\n", source);
+                ++failures;
+            }
+            Complex directPerturbed =
+                program.evaluate(perturbedContext(context, delta));
+            double reconstructionError =
+                magnitude(result.base + result.delta - directPerturbed);
+            if (reconstructionError >
+                2e-12 * std::max(1.0, magnitude(directPerturbed))) {
+                printf("  centered reconstruction %.3g [%s]\n",
+                       reconstructionError, source);
+                ++failures;
+            }
+            Complex expectedResidual;
+            if (!oracleResidual(
+                    program, context, delta, expectedResidual, 512)) {
+                ++failures;
+            } else {
+                ++oracleChecks;
+                if (!residualClose(
+                        result.delta, expectedResidual, 2e-7)) {
+                    printf("  centered oracle residual actual=(%.17g,%.17g)"
+                           " expected=(%.17g,%.17g) [%s]\n",
+                           result.delta.real(), result.delta.imag(),
+                           expectedResidual.real(), expectedResidual.imag(),
+                           source);
+                    ++failures;
+                }
+            }
+        }
+    }
+
+    struct TinyCase {
+        const char* source;
+        Complex base;
+    };
+    const TinyCase tinyCases[] = {
+        { "exp(z)", { 1.0, 0.2 } },
+        { "sin(z)", { 0.7, 0.2 } },
+        { "log(z)", { 1.2, 0.3 } },
+        { "sqrt(z)", { 1.2, 0.3 } },
+        { "sin(z)+c", { 0.4, -0.15 } }
+    };
+    const int tinyExponents[] = { 2, 8, 16, 40, 100, 200, 300 };
+    int directZeroDemonstrations = 0;
+    for (const TinyCase& test : tinyCases) {
+        ExpressionProgram program;
+        if (!compile(program, test.source)) continue;
+        for (int exponent : tinyExponents) {
+            double amount = std::pow(10.0, -exponent);
+            ExpressionContext context = nominal;
+            context.z = test.base;
+            context.c = { -0.2, 0.05 };
+            ExpressionDeltaContext delta;
+            delta.z = { amount, 0.0 };
+            ExpressionCenteredResult result =
+                ExpressionCenteredEvaluator::evaluate(
+                    program, context, delta);
+            Complex expectedResidual;
+            ++tinyChecks;
+            if (!result.success() ||
+                !oracleResidual(
+                    program, context, delta,
+                    expectedResidual, 2048) ||
+                !residualClose(
+                    result.delta, expectedResidual, 5e-12)) {
+                printf("  centered tiny mismatch 1e-%d [%s] status=%s\n",
+                       exponent, test.source,
+                       formula::expressionCenteredStatusName(result.status));
+                ++failures;
+            }
+            Complex directDifference =
+                program.evaluate(perturbedContext(context, delta)) -
+                program.evaluate(context);
+            if (exponent == 300 &&
+                isZero(directDifference) && !isZero(result.delta))
+                ++directZeroDemonstrations;
+        }
+    }
+    if (directZeroDemonstrations != (int)std::size(tinyCases)) {
+        printf("  centered tiny direct-zero demonstrations=%d/%zu\n",
+               directZeroDemonstrations, std::size(tinyCases));
+        ++failures;
+    }
+
+    struct RecurrenceCase {
+        const char* source;
+        Complex z;
+        Complex c;
+        Complex p0;
+        ExpressionDeltaContext delta;
+        int iterations;
+    };
+    ExpressionDeltaContext sineDelta;
+    sineDelta.z = { 1e-200, -2e-200 };
+    sineDelta.c = { 3e-210, 1e-210 };
+    ExpressionDeltaContext expDelta;
+    expDelta.z = { -2e-180, 1e-180 };
+    expDelta.c = { 1e-200, -2e-200 };
+    ExpressionDeltaContext rationalDelta;
+    rationalDelta.z = { 2e-220, 1e-220 };
+    rationalDelta.c = { -1e-210, 1e-210 };
+    ExpressionDeltaContext powerDelta;
+    powerDelta.z = { 1e-160, -2e-160 };
+    powerDelta.c = { 1e-190, 1e-190 };
+    powerDelta.parameters[0] = { 2e-180, -1e-180 };
+    const RecurrenceCase recurrences[] = {
+        { "sin(z)+c", { 0.2, 0.1 }, { -0.05, 0.02 }, {},
+          sineDelta, 12 },
+        { "exp(z)+c", { -1.0, 0.1 }, { -1.0, -0.02 }, {},
+          expDelta, 12 },
+        { "z/(2+z)+c", { 0.3, 0.1 }, { 0.02, -0.01 }, {},
+          rationalDelta, 12 },
+        { "pow(z,p0)+c", { 0.8, 0.2 }, { 0.01, -0.02 },
+          { 1.3, 0.1 }, powerDelta, 7 }
+    };
+    for (const RecurrenceCase& test : recurrences) {
+        ExpressionProgram program;
+        if (!compile(program, test.source)) continue;
+        ExpressionContext context = nominal;
+        context.z = context.z0 = test.z;
+        context.c = test.c;
+        context.parameters[0] = test.p0;
+        ExpressionDeltaContext delta = test.delta;
+        for (int iteration = 0; iteration < test.iterations; ++iteration) {
+            context.iteration = iteration;
+            Complex expectedResidual;
+            ExpressionCenteredResult result =
+                ExpressionCenteredEvaluator::evaluate(
+                    program, context, delta);
+            ++recurrenceChecks;
+            if (!result.success() ||
+                !oracleResidual(
+                    program, context, delta,
+                    expectedResidual, 2048) ||
+                !residualClose(
+                    result.delta, expectedResidual, 2e-10)) {
+                printf("  centered recurrence n=%d [%s] status=%s\n",
+                       iteration, test.source,
+                       formula::expressionCenteredStatusName(result.status));
+                ++failures;
+                break;
+            }
+            context.z = result.base;
+            delta.z = result.delta;
+        }
+    }
+
+    {
+        ExpressionContext context;
+        context.z = { -0.0, 0.0 };
+        context.c = { 0.0, -0.0 };
+        context.z0 = { -0.0, -0.0 };
+        ExpressionDeltaContext delta;
+        delta.z = { -0.0, 0.0 };
+        delta.c = { 0.0, -0.0 };
+        delta.z0 = { -0.0, -0.0 };
+        ExpressionProgram linear, exponential;
+        if (compile(linear,
+                    "complex(real(z),imag(c))+conj(z0)") &&
+            compile(exponential, "exp(complex(real(z),imag(c)))")) {
+            ExpressionCenteredResult linearResult =
+                ExpressionCenteredEvaluator::evaluate(
+                    linear, context, delta);
+            ExpressionCenteredResult exponentialResult =
+                ExpressionCenteredEvaluator::evaluate(
+                    exponential, context, delta);
+            if (!linearResult.success() ||
+                !exponentialResult.success() ||
+                !sameComplexBits(
+                    linearResult.base, linear.evaluate(context)) ||
+                !sameComplexBits(
+                    exponentialResult.base,
+                    exponential.evaluate(context)))
+                ++failures;
+        }
+    }
+
+    {
+        ExpressionContext context;
+        ExpressionDeltaContext delta;
+        context.z = { 1e308, 0.0 };
+        delta.z = { 1.0, 0.0 };
+        ExpressionProgram absolute;
+        if (compile(absolute, "abs(z)")) {
+            ExpressionCenteredResult result =
+                ExpressionCenteredEvaluator::evaluate(
+                    absolute, context, delta);
+            if (!result.success() ||
+                !(result.delta.real() > 0.5 &&
+                  result.delta.real() < 1.5))
+                ++failures;
+        }
+
+        context.z = { 0.25, 300.0 };
+        delta.z = { 1e-12, 0.0 };
+        ExpressionProgram tangent;
+        if (compile(tangent, "tan(z)")) {
+            ExpressionCenteredResult result =
+                ExpressionCenteredEvaluator::evaluate(
+                    tangent, context, delta);
+            if (!result.success() || isZero(result.delta))
+                ++failures;
+        }
+        context.z = { 300.0, 0.25 };
+        ExpressionProgram hyperbolicTangent;
+        if (compile(hyperbolicTangent, "tanh(z)")) {
+            ExpressionCenteredResult result =
+                ExpressionCenteredEvaluator::evaluate(
+                    hyperbolicTangent, context, delta);
+            if (!result.success() || isZero(result.delta))
+                ++failures;
+        }
+        context.z = { -700.0, 0.0 };
+        delta.z = { 1e-10, 0.0 };
+        ExpressionProgram exponential;
+        if (compile(exponential, "exp(z)")) {
+            ExpressionCenteredResult result =
+                ExpressionCenteredEvaluator::evaluate(
+                    exponential, context, delta);
+            if (!result.success() || isZero(result.delta))
+                ++failures;
+        }
+        context.z = { 1e-300, 1e-300 };
+        context.c = { 2e-300, -2e-300 };
+        delta.z = { 1e-310, -1e-310 };
+        delta.c = { 2e-310, 1e-310 };
+        ExpressionProgram division;
+        if (compile(division, "z/c")) {
+            ExpressionCenteredResult result =
+                ExpressionCenteredEvaluator::evaluate(
+                    division, context, delta);
+            if (!result.success()) ++failures;
+        }
+    }
+
+    {
+        ExpressionContext context;
+        ExpressionDeltaContext delta;
+        context.z = { -1.0, 1.0 };
+        delta.z = { 0.0, -2.0 };
+        expectStatus(
+            "log(z)", context, delta,
+            ExpressionCenteredStatus::BranchUncertain);
+        expectStatus(
+            "sqrt(z)", context, delta,
+            ExpressionCenteredStatus::BranchUncertain);
+        expectStatus(
+            "arg(z)", context, delta,
+            ExpressionCenteredStatus::BranchUncertain);
+        context.parameters[0] = { 0.7, 0.2 };
+        expectStatus(
+            "pow(z,p0)", context, delta,
+            ExpressionCenteredStatus::BranchUncertain);
+
+        context.z = { 1.0, 1.0 };
+        context.c = {
+            -0.9999999999999999, 1.0
+        };
+        delta = {};
+        delta.z = {
+            -8.881784197001252e-16,
+            5.967448757360216e-16
+        };
+        delta.c = {
+            1.4988010832439613e-15,
+            -9.71445146547012e-17
+        };
+        expectStatus(
+            "log(z*c)", context, delta,
+            ExpressionCenteredStatus::BranchUncertain);
+
+        context.z = { -1.0, -0.0 };
+        delta = {};
+        expectStatus(
+            "log(z)", context, delta,
+            ExpressionCenteredStatus::BranchUncertain);
+        expectStatus(
+            "sqrt(z)", context, delta,
+            ExpressionCenteredStatus::BranchUncertain);
+        expectStatus(
+            "arg(z)", context, delta,
+            ExpressionCenteredStatus::BranchUncertain);
+        expectStatus(
+            "pow(z,p0)", context, delta,
+            ExpressionCenteredStatus::BranchUncertain);
+
+        for (const char* source : {
+                 "log(conj(z))",
+                 "sqrt(conj(z))",
+                 "arg(conj(z))",
+                 "pow(conj(z),p0)",
+                 "log(complex(real(z),imag(z)))",
+                 "sqrt(complex(real(z),imag(z)))",
+                 "arg(complex(real(z),imag(z)))",
+                 "pow(complex(real(z),imag(z)),p0)"
+             }) {
+            expectComposedBranch(source, context, delta);
+        }
+        context.z = { 1.0, -0.0 };
+        expectComposedBranch(
+            "log(-(complex(real(z),imag(z))+complex(0,-0)))",
+            context, delta);
+
+        context.z = { -1.0, -0.0 };
+        for (const char* source : {
+                 "exp(conj(z))",
+                 "log(complex(1,imag(z)))",
+                 "sqrt(complex(1,imag(z)))",
+                 "pow(complex(1,imag(z)),p0)"
+             }) {
+            expectSuccessParity(source, context, delta);
+        }
+
+        context.z = { 1.0, 0.0 };
+        delta.z = { -2.0, 0.0 };
+        expectStatus(
+            "log(z)", context, delta,
+            ExpressionCenteredStatus::Singular);
+        context.c = { 1.0, 0.0 };
+        delta = {};
+        delta.c = { -2.0, 0.0 };
+        expectStatus(
+            "z/c", context, delta,
+            ExpressionCenteredStatus::Singular);
+
+        context.z = { centeredPi * 0.5 - 0.1, 0.0 };
+        delta = {};
+        delta.z = { 0.2, 0.0 };
+        expectStatus(
+            "tan(z)", context, delta,
+            ExpressionCenteredStatus::Singular);
+        context.z = { 0.0, centeredPi * 0.5 - 0.1 };
+        delta.z = { 0.0, 0.2 };
+        expectStatus(
+            "tanh(z)", context, delta,
+            ExpressionCenteredStatus::Singular);
+
+        context = nominal;
+        context.parameters[1] = { 0.1, 0.0 };
+        context.parameters[2] = { 0.3, 0.0 };
+        delta = {};
+        delta.parameters[1] = { -0.2, 0.0 };
+        expectStatus(
+            "polar(p1,p2)", context, delta,
+            ExpressionCenteredStatus::Undefined);
+        delta = {};
+        delta.parameters[1] = { 0.0, 1e-10 };
+        expectStatus(
+            "polar(p1,p2)", context, delta,
+            ExpressionCenteredStatus::Undefined);
+
+        context = {};
+        delta = {};
+        expectStatus(
+            "log(z)", context, delta,
+            ExpressionCenteredStatus::Singular);
+        expectStatus(
+            "sqrt(z)", context, delta,
+            ExpressionCenteredStatus::Singular);
+        expectStatus(
+            "pow(z,2)", context, delta,
+            ExpressionCenteredStatus::Singular);
+        context.z = { 710.0, 0.0 };
+        expectStatus(
+            "exp(z)", context, delta,
+            ExpressionCenteredStatus::NonFinite);
+        context.z = {
+            std::numeric_limits<double>::quiet_NaN(), 0.0
+        };
+        expectStatus(
+            "z+1", context, delta,
+            ExpressionCenteredStatus::NonFinite);
+
+        context.z = { -1.0, 0.0 };
+        ExpressionProgram exactCut;
+        if (compile(exactCut, "log(z)")) {
+            ExpressionCenteredResult result =
+                ExpressionCenteredEvaluator::evaluate(
+                    exactCut, context, {});
+            if (!result.success() || !isZero(result.delta) ||
+                !sameComplexBits(
+                    result.base, exactCut.evaluate(context)))
+                ++failures;
+        }
+    }
+
+    ExpressionProgram benchmarkProgram;
+    double scalarMs = 0.0, centeredMs = 0.0;
+    if (compile(
+            benchmarkProgram,
+            "sin(z*z+c)+exp(p0*z)/(2+z)")) {
+        ExpressionContext context = nominal;
+        ExpressionDeltaContext delta;
+        delta.z = { 1e-12, -2e-12 };
+        delta.c = { -1e-13, 2e-13 };
+        delta.parameters[0] = { 1e-13, -1e-13 };
+        constexpr int repetitions = 100000;
+        Complex scalarSink{}, centeredSink{};
+        auto begin = Clock::now();
+        for (int i = 0; i < repetitions; ++i) {
+            context.iteration = i;
+            scalarSink += benchmarkProgram.evaluate(context);
+        }
+        scalarMs = since(begin) * 1000.0;
+        begin = Clock::now();
+        for (int i = 0; i < repetitions; ++i) {
+            context.iteration = i;
+            ExpressionCenteredResult result =
+                ExpressionCenteredEvaluator::evaluate(
+                    benchmarkProgram, context, delta);
+            centeredSink += result.base + result.delta;
+        }
+        centeredMs = since(begin) * 1000.0;
+        if (!std::isfinite(scalarSink.real()) ||
+            !std::isfinite(centeredSink.real()))
+            ++failures;
+    }
+
+    printf("=== expression centered residual bytecode v1\n");
+    printf("  opcode/base/reconstruction=%d oracle=%d tiny=%d"
+           " recurrence=%d fallback=%d signed-zero=%d\n",
+           opcodeChecks, oracleChecks, tinyChecks,
+           recurrenceChecks, fallbackChecks, signedZeroChecks);
+    printf("  direct subtraction zero while centered nonzero=%d/%zu\n",
+           directZeroDemonstrations, std::size(tinyCases));
+    printf("  scalar/centered %.3f/%.3f ms overhead %.2fx"
+           " (informational)\n",
+           scalarMs, centeredMs,
+           scalarMs > 0.0 ? centeredMs / scalarMs : 0.0);
+    printf("  => %s\n\n",
+           failures == 0
+               ? "PASS"
+               : "CHECK (centered expression failure)");
     return failures == 0 ? 0 : 1;
 }
 
@@ -6551,8 +7239,10 @@ int main(int argc, char** argv) {
     if (which == "julia-critical")             rc |= runJuliaCase(false, true, true);
     if (which == "expression") {
         rc |= runExpressionCoreCase();
+        rc |= runExpressionCenteredCase();
         rc |= runExpressionColoringCase();
     }
+    if (which == "expression-centered")        rc |= runExpressionCenteredCase();
     if (which == "expression-coloring")        rc |= runExpressionColoringCase();
     if (which == "expression-orbit")           rc |= runExpressionOrbitCase();
     if (which == "expression-oracle")          rc |= runExpressionOracleCase();

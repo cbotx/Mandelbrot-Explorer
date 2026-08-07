@@ -16,6 +16,7 @@ using Complex = std::complex<double>;
 class ExpressionOracle;
 class ExpressionJit4;
 class ExpressionOrbitPlan;
+class ExpressionCenteredEvaluator;
 
 struct ExpressionError {
     size_t position = 0;
@@ -135,6 +136,7 @@ private:
     friend class ExpressionOracle;
     friend class ExpressionJit4;
     friend class ExpressionOrbitPlan;
+    friend class ExpressionCenteredEvaluator;
 };
 
 class ExpressionOrbitPlan {
