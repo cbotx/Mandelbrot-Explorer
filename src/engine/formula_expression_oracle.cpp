@@ -742,6 +742,7 @@ bool ExpressionOracle::evaluateInternal(
             trace->nodes.emplace_back(precision);
             ExpressionOracleTraceNode& node = trace->nodes.back();
             node.instructionIndex = instructionIndex;
+            node.argument = instruction.argument;
             node.operation = operationOf(instruction.op);
             node.leftNode = leftNode;
             node.rightNode = rightNode;

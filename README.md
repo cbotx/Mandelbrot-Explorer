@@ -31,7 +31,8 @@ root itself, so they can be run from anywhere).
 - `scripts\build_gui.bat` — interactive native Win32 explorer -> `build\mandel_gui.exe`
   (single exe; `vcomp140.dll`, the OpenMP runtime, is copied alongside so the
   `build\` folder is copy-and-run portable).
-- `scripts\build_verify.bat` — headless correctness/benchmark harness -> `build\verify.exe`
+- `scripts\build_verify.bat` — correctness/benchmark harness with production W^X JIT -> `build\verify.exe`
+- `scripts\build_verify_nojit.bat` — Defender-safe verifier without executable-memory allocation -> `build\verify_nojit.exe`
 - `scripts\build_render.bat` — headless BMP renderer -> `build\render.exe`
 - `scripts\build_pbench.bat` — clean-room perturbation/BLA bench -> `build\pbench.exe`
 - `scripts\build_bench.bat` — BigFixed vs GMP micro-bench -> `build\bench_bigfixed.exe`
@@ -65,6 +66,10 @@ Controls:
 ### Verify / benchmark
 
     build\verify.exe [shallow|deep|ticktock|flake|exterior1000|parity1000|all] [W] [H]
+    build\verify.exe expression-scaled
+
+`expression-scaled` runs the non-GUI MPFR-tape/scaled-residual e500 prototype,
+including exact escape comparisons and the scaled-versus-per-pixel-MPFR timing.
 
 ### Compute backend
 

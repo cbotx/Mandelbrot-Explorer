@@ -96,6 +96,7 @@ struct ExpressionOracleTraceNode {
     explicit ExpressionOracleTraceNode(mpfr_prec_t precision);
 
     size_t instructionIndex = 0;
+    uint8_t argument = 0;
     ExpressionOracleOperation operation =
         ExpressionOracleOperation::Constant;
     uint16_t flags = OracleTraceNone;

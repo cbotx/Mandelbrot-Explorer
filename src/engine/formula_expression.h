@@ -17,6 +17,7 @@ class ExpressionOracle;
 class ExpressionJit4;
 class ExpressionOrbitPlan;
 class ExpressionCenteredEvaluator;
+class ExpressionScaledResidualEvaluator;
 
 struct ExpressionError {
     size_t position = 0;
@@ -140,6 +141,7 @@ private:
     friend class ExpressionJit4;
     friend class ExpressionOrbitPlan;
     friend class ExpressionCenteredEvaluator;
+    friend class ExpressionScaledResidualEvaluator;
 };
 
 class ExpressionOrbitPlan {

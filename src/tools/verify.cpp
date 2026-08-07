@@ -11,7 +11,8 @@
 //          deep876 | subpixel | minibrot875 | extref875 | slowpoint | point31 |
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
 //          expression | expression-coloring | expression-orbit |
-//          expression-centered | expression-reference | expression-oracle |
+//          expression-centered | expression-reference | expression-scaled |
+//          expression-oracle |
 //          oracle | custom-deep | expression-suite | suite |
 //          expression-residual | formula-bench | multibrot | backend | gpu | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
@@ -35,7 +36,9 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <set>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "compute_backend.h"
@@ -44,6 +47,7 @@
 #include "formula_expression_centered.h"
 #include "formula_expression_orbit.h"
 #include "formula_reference_orbit.h"
+#include "formula_scaled_residual.h"
 #include "formula_expression_jit.h"
 #include "formula_expression_oracle.h"
 #include "custom_deep_zoom.h"
@@ -4649,6 +4653,1443 @@ static int runExpressionReferenceCase() {
     return failures == 0 ? 0 : 1;
 }
 
+static int runExpressionScaledCase() {
+    using formula::Complex;
+    using formula::ExpressionContext;
+    using formula::ExpressionError;
+    using formula::ExpressionOracle;
+    using formula::ExpressionOracleContext;
+    using formula::ExpressionOracleOperation;
+    using formula::ExpressionProgram;
+    using formula::ExpressionReferenceBuildRequest;
+    using formula::ExpressionReferenceOrbitResult;
+    using formula::ExpressionScaledResidualEvaluator;
+    using formula::ExpressionScaledResidualInput;
+    using formula::ExpressionScaledResidualResult;
+    using formula::ExpressionScaledResidualStatus;
+    using formula::MpfrComplex;
+    using formula::ScaledArithmeticStatus;
+    using formula::ScaledComplexValue;
+    using formula::ScaledRealValue;
+
+    int failures = 0;
+    size_t framePixels = 0;
+    size_t fallbackPixels = 0;
+    size_t seriesOperations = 0;
+    double maximumResidualRelativeError = 0.0;
+    std::array<bool,
+        static_cast<size_t>(ExpressionOracleOperation::Polar) + 1>
+        opcodeCoverage{};
+
+    auto elapsed = [](Clock::time_point start) {
+        return std::chrono::duration<double>(
+            Clock::now() - start).count();
+    };
+    auto compile = [&](ExpressionProgram& program,
+                       const char* source) {
+        ExpressionError error;
+        if (!program.compile(source, &error)) {
+            printf("  scaled compile failed @ %zu: %s [%s]\n",
+                   error.position, error.message.c_str(), source);
+            ++failures;
+            return false;
+        }
+        return true;
+    };
+    auto markCoverage = [&](const ExpressionReferenceOrbitResult& reference) {
+        if (reference.samples.empty()) return;
+        const auto& sample = reference.samples.front();
+        for (size_t node = 0; node < sample.tapeCount; ++node) {
+            const auto operation = reference.tape[
+                static_cast<size_t>(sample.tapeOffset) +
+                node].operation;
+            opcodeCoverage[static_cast<size_t>(operation)] = true;
+        }
+    };
+    auto sameScaled = [](const ScaledRealValue& left,
+                         const ScaledRealValue& right) {
+        uint64_t leftBits = 0, rightBits = 0;
+        std::memcpy(&leftBits, &left.mantissa, sizeof(leftBits));
+        std::memcpy(&rightBits, &right.mantissa, sizeof(rightBits));
+        return leftBits == rightBits &&
+               left.exponent == right.exponent;
+    };
+    auto sameScaledComplex = [&](const ScaledComplexValue& left,
+                                 const ScaledComplexValue& right) {
+        return sameScaled(left.re, right.re) &&
+               sameScaled(left.im, right.im);
+    };
+    auto configureOracle = [](
+            ExpressionOracleContext& context,
+            const ExpressionContext& fixed,
+            FormulaParameter pixel,
+            const std::string& centerReal,
+            const std::string& centerImaginary) {
+        context.c.set(fixed.c.real(), fixed.c.imag());
+        context.z0.set(fixed.z0.real(), fixed.z0.imag());
+        for (size_t parameter = 0;
+             parameter < fixed.parameters.size();
+             ++parameter) {
+            context.parameters[parameter].set(
+                fixed.parameters[parameter].real(),
+                fixed.parameters[parameter].imag());
+        }
+        MpfrComplex center(context.z.precision());
+        if (!center.set(centerReal, centerImaginary))
+            return false;
+        if (pixel == FormulaParameter::C)
+            context.c.set(center);
+        else
+            context.z0.set(center);
+        context.z.set(context.z0);
+        return true;
+    };
+    auto outsideScaled = [](
+            const ScaledComplexValue& value,
+            double bailout, bool& outside) {
+        ScaledRealValue norm, threshold;
+        ScaledArithmeticStatus status =
+            formula::scaledNormSquared(value, norm);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        status = formula::makeScaledRealValue(
+            bailout * bailout, threshold);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        outside =
+            formula::compareScaledNonnegative(
+                norm, threshold) > 0;
+        return ScaledArithmeticStatus::Success;
+    };
+
+    // Arithmetic value contract, including signed zero, MPFR round-trip,
+    // unrepresentable binary64 values, and explicit exponent overflow.
+    {
+        ScaledRealValue negativeZero, positiveZero;
+        ScaledRealValue tiny, product, overflow;
+        ScaledRealValue boundary, boundaryResult;
+        MpfrComplex mpfrValue(2048), reconstructed(2048);
+        mpfrValue.set("1e-500", "-1e500");
+        ScaledComplexValue compact;
+        double converted = 0.0;
+        if (formula::makeScaledRealValue(
+                -0.0, negativeZero) !=
+                    ScaledArithmeticStatus::Success ||
+            formula::scaledNegate(
+                negativeZero, positiveZero) !=
+                    ScaledArithmeticStatus::Success ||
+            !std::signbit(negativeZero.mantissa) ||
+            std::signbit(positiveZero.mantissa) ||
+            formula::makeScaledComplexValue(
+                mpfrValue, compact) !=
+                    ScaledArithmeticStatus::Success ||
+            !formula::setMpfrFromScaledValue(
+                reconstructed, compact) ||
+            mpfr_cmp(reconstructed.re, mpfrValue.re) == 0 ||
+            formula::scaledValueToDouble(
+                compact.im, converted) ||
+            formula::scaledValueToDouble(
+                compact.re, converted)) {
+            printf("  scaled value conversion contract failed\n");
+            ++failures;
+        }
+        tiny.mantissa = 0.5;
+        tiny.exponent =
+            std::numeric_limits<int64_t>::max();
+        if (formula::makeScaledRealValue(
+                2.0, product) !=
+                    ScaledArithmeticStatus::Success ||
+            formula::scaledMultiply(
+                tiny, product, overflow) !=
+                    ScaledArithmeticStatus::ExponentRange) {
+            printf("  scaled exponent overflow was not explicit\n");
+            ++failures;
+        }
+        boundary.mantissa = 0.5;
+        boundary.exponent =
+            std::numeric_limits<int64_t>::max();
+        if (formula::makeScaledRealValue(
+                1.0, product) !=
+                    ScaledArithmeticStatus::Success ||
+            formula::scaledMultiply(
+                boundary, product, boundaryResult) !=
+                    ScaledArithmeticStatus::Success ||
+            boundaryResult.mantissa != 0.5 ||
+            boundaryResult.exponent != boundary.exponent) {
+            printf("  scaled maximum exponent renormalization failed\n");
+            ++failures;
+        }
+        boundary.exponent =
+            std::numeric_limits<int64_t>::min();
+        if (formula::scaledDivideByDouble(
+                boundary, 1.0, boundaryResult) !=
+                    ScaledArithmeticStatus::Success ||
+            boundaryResult.mantissa != 0.5 ||
+            boundaryResult.exponent != boundary.exponent) {
+            printf("  scaled minimum exponent renormalization failed\n");
+            ++failures;
+        }
+        if (formula::makeScaledRealValue(
+                2.0, product) !=
+                    ScaledArithmeticStatus::Success ||
+            formula::scaledMultiply(
+                boundary, product, boundaryResult) !=
+                    ScaledArithmeticStatus::Success ||
+            boundaryResult.exponent !=
+                std::numeric_limits<int64_t>::min() + 1 ||
+            formula::scaledMultiply(
+                product, boundary, boundaryResult) !=
+                    ScaledArithmeticStatus::Success ||
+            boundaryResult.exponent !=
+                std::numeric_limits<int64_t>::min() + 1) {
+            printf("  scaled minimum exponent product ordering failed\n");
+            ++failures;
+        }
+        boundary.exponent =
+            std::numeric_limits<int64_t>::max();
+        if (formula::scaledDivideByDouble(
+                boundary, 1.0, boundaryResult) !=
+                    ScaledArithmeticStatus::Success ||
+            boundaryResult.mantissa != 0.5 ||
+            boundaryResult.exponent != boundary.exponent) {
+            printf("  scaled maximum exponent division failed\n");
+            ++failures;
+        }
+        ScaledRealValue subnormal;
+        subnormal.mantissa = 0.75;
+        subnormal.exponent = -1074;
+        if (!formula::scaledValueToDouble(
+                subnormal, converted) ||
+            converted !=
+                std::numeric_limits<double>::denorm_min()) {
+            printf("  scaled subnormal conversion failed\n");
+            ++failures;
+        }
+    }
+
+    // Moderate local deltas force adaptive nonlinear terms rather than the
+    // e500 linear limit. Compare the returned residual with an independent
+    // higher-precision MPFR subtraction.
+    struct LocalFormula {
+        const char* source;
+        bool series;
+    };
+    const LocalFormula localFormulas[] = {
+        { "sin(z)", true },
+        { "cos(z)", true },
+        { "sinh(z)", true },
+        { "cosh(z)", true },
+        { "exp(z)", true },
+        {
+            "complex(real(conj(z)),imag(z))"
+            "+complex(norm(z),0)-(-z)",
+            false
+        }
+    };
+    for (const LocalFormula& formulaCase : localFormulas) {
+        const char* source = formulaCase.source;
+        ExpressionProgram canonical, runtime;
+        ExpressionContext fixed;
+        if (!compile(canonical, source))
+            continue;
+        fixed.c = { 0.0, 0.0 };
+        ExpressionError error;
+        if (!canonical.specialize(
+                fixed, FormulaParameter::InitialZ,
+                runtime, &error)) {
+            ++failures;
+            continue;
+        }
+        ExpressionReferenceBuildRequest request;
+        request.canonicalProgram = &canonical;
+        request.runtimeProgram = &runtime;
+        request.pixelParameter = FormulaParameter::InitialZ;
+        request.fixed = fixed;
+        request.center.realDecimal = "0.2";
+        request.center.imaginaryDecimal = "0.1";
+        request.bailout = 100.0;
+        request.maxIterations = 1;
+        request.precision.requestedBits = 384;
+        request.precision.minimumBits = 53;
+        request.precision.guardBits = 0;
+        ExpressionReferenceOrbitResult reference;
+        ExpressionScaledResidualEvaluator evaluator;
+        MpfrComplex delta(512);
+        delta.set("0.03125", "-0.015625");
+        ScaledComplexValue scaledDelta;
+        if (!formula::buildExpressionReferenceOrbit(
+                request, reference) ||
+            !evaluator.prepare(runtime, reference) ||
+            formula::makeScaledComplexValue(
+                delta, scaledDelta) !=
+                    ScaledArithmeticStatus::Success) {
+            printf("  nonlinear scaled setup failed [%s]\n", source);
+            ++failures;
+            continue;
+        }
+        markCoverage(reference);
+        ExpressionScaledResidualInput input;
+        input.z = scaledDelta;
+        input.z0 = scaledDelta;
+        input.iteration = 0;
+        ExpressionScaledResidualResult evaluated =
+            evaluator.evaluate(0, input);
+
+        ExpressionOracleContext base(512), actual(512);
+        configureOracle(
+            base, fixed, FormulaParameter::InitialZ,
+            "0.2", "0.1");
+        configureOracle(
+            actual, fixed, FormulaParameter::InitialZ,
+            "0.2", "0.1");
+        mpfr_add(
+            actual.z.re, actual.z.re, delta.re, MPFR_RNDN);
+        mpfr_add(
+            actual.z.im, actual.z.im, delta.im, MPFR_RNDN);
+        actual.z0.set(actual.z);
+        MpfrComplex baseOutput(512), actualOutput(512);
+        std::string baseError, actualError;
+        MpfrComplex expected(512), reconstructed(512);
+        mpfr_t magnitude, difference, ratio;
+        mpfr_inits2(512, magnitude, difference, ratio, (mpfr_ptr)0);
+        bool okay =
+            ExpressionOracle::evaluate(
+                runtime, base, baseOutput, &baseError) &&
+            ExpressionOracle::evaluate(
+                runtime, actual, actualOutput, &actualError);
+        if (okay) {
+            mpfr_sub(
+                expected.re, actualOutput.re,
+                baseOutput.re, MPFR_RNDN);
+            mpfr_sub(
+                expected.im, actualOutput.im,
+                baseOutput.im, MPFR_RNDN);
+            okay =
+                evaluated.status ==
+                    ExpressionScaledResidualStatus::Success &&
+                evaluated.uncertified == formulaCase.series &&
+                (formulaCase.series
+                    ? !evaluated.remainderEstimate.isZero()
+                    : evaluated.remainderEstimate.isZero()) &&
+                formula::setMpfrFromScaledValue(
+                    reconstructed, evaluated.residual);
+        }
+        if (okay) {
+            mpfr_sub(
+                reconstructed.re, reconstructed.re,
+                expected.re, MPFR_RNDN);
+            mpfr_sub(
+                reconstructed.im, reconstructed.im,
+                expected.im, MPFR_RNDN);
+            mpfr_hypot(
+                difference, reconstructed.re,
+                reconstructed.im, MPFR_RNDN);
+            mpfr_hypot(
+                magnitude, expected.re,
+                expected.im, MPFR_RNDN);
+            if (mpfr_zero_p(magnitude))
+                okay = mpfr_zero_p(difference);
+            else {
+                mpfr_div(
+                    ratio, difference, magnitude, MPFR_RNDU);
+                okay = mpfr_cmp_d(ratio, 3e-14) <= 0;
+            }
+        }
+        mpfr_clears(
+            magnitude, difference, ratio, (mpfr_ptr)0);
+        if (!okay) {
+            printf("  nonlinear residual mismatch [%s] status=%s\n",
+                   source,
+                   formula::expressionScaledResidualStatusName(
+                       evaluated.status));
+            ++failures;
+        }
+    }
+
+    // Parameter arguments must survive the trace so p0 and p1 leaves cannot
+    // alias. This also covers cancellation and exact primary/defect rebasing.
+    {
+        ExpressionProgram program;
+        ExpressionContext fixed;
+        fixed.parameters[0] = { 0.25, -0.125 };
+        fixed.parameters[1] = { -0.5, 0.375 };
+        if (compile(program, "(z+p0)-p0+p1-p1")) {
+            ExpressionReferenceBuildRequest request;
+            request.runtimeProgram = &program;
+            request.pixelParameter = FormulaParameter::C;
+            request.fixed = fixed;
+            request.center.realDecimal =
+                "0.123456789012345678901234567890123456789";
+            request.center.imaginaryDecimal = "1e-500";
+            request.bailout = 100.0;
+            request.maxIterations = 2;
+            request.precision.requestedBits = 1800;
+            request.precision.minimumBits = 53;
+            request.precision.guardBits = 0;
+            ExpressionReferenceOrbitResult reference;
+            ExpressionScaledResidualEvaluator evaluator;
+            MpfrComplex delta(1800);
+            delta.set("1e-500", "-2e-500");
+            ScaledComplexValue scaledDelta;
+            bool sawP0 = false, sawP1 = false;
+            if (formula::buildExpressionReferenceOrbit(
+                    request, reference)) {
+                markCoverage(reference);
+                for (const auto& node : reference.tape) {
+                    if (node.operation !=
+                            ExpressionOracleOperation::Parameter)
+                        continue;
+                    sawP0 = sawP0 || node.argument == 0;
+                    sawP1 = sawP1 || node.argument == 1;
+                }
+            }
+            if (!reference.valid ||
+                !evaluator.prepare(program, reference) ||
+                formula::makeScaledComplexValue(
+                    delta, scaledDelta) !=
+                        ScaledArithmeticStatus::Success ||
+                !(sawP0 && sawP1)) {
+                printf("  parameter trace argument setup failed\n");
+                ++failures;
+            } else {
+                ExpressionScaledResidualInput input;
+                input.z = scaledDelta;
+                input.iteration = 0;
+                ExpressionScaledResidualResult evaluated =
+                    evaluator.evaluate(0, input);
+                formula::ExpressionScaledPrimaryRelativeState
+                    primaryRelative;
+                ScaledComplexValue nextExact;
+                bool rebaseOkay =
+                    evaluated.status ==
+                        ExpressionScaledResidualStatus::Success &&
+                    sameScaledComplex(
+                        evaluated.residual, scaledDelta) &&
+                    formula::makeExpressionResidualNextPrimaryState(
+                        reference.samples[0],
+                        evaluated.residual,
+                        primaryRelative) ==
+                            ScaledArithmeticStatus::Success &&
+                    formula::resetExpressionResidualToExactSample(
+                        reference.samples[1],
+                        primaryRelative,
+                        nextExact) ==
+                            ScaledArithmeticStatus::Success &&
+                    sameScaledComplex(nextExact, scaledDelta);
+                if (!rebaseOkay) {
+                    printf("  exact/primary delta convention failed\n");
+                    ++failures;
+                }
+
+                ExpressionReferenceOrbitResult malformed = reference;
+                for (auto& node : malformed.tape) {
+                    if (node.operation ==
+                            ExpressionOracleOperation::Parameter) {
+                        node.argument = 7;
+                        break;
+                    }
+                }
+                ExpressionScaledResidualEvaluator rejected;
+                if (rejected.prepare(program, malformed)) {
+                    printf("  malformed parameter argument accepted\n");
+                    ++failures;
+                }
+                malformed = reference;
+                malformed.tape[malformed.samples[0].tapeOffset +
+                               malformed.samples[0].rootNode].leftNode =
+                    UINT16_MAX;
+                if (rejected.prepare(program, malformed)) {
+                    printf("  malformed child layout accepted\n");
+                    ++failures;
+                }
+                malformed = reference;
+                ++malformed.programSemanticHash;
+                if (rejected.prepare(program, malformed)) {
+                    printf("  semantic mismatch accepted\n");
+                    ++failures;
+                }
+                if (evaluator.evaluate(
+                        reference.samples.size(), input).status !=
+                            ExpressionScaledResidualStatus::InvalidTape ||
+                    ([&] {
+                        input.iteration = 1;
+                        return evaluator.evaluate(0, input).status;
+                    })() !=
+                        ExpressionScaledResidualStatus::InvalidInput) {
+                    printf("  sample range/iteration status failed\n");
+                    ++failures;
+                }
+            }
+        }
+    }
+
+    {
+        ExpressionProgram canonical, runtime;
+        ExpressionContext fixed;
+        fixed.z0 = { 0.125, -0.0625 };
+        if (compile(canonical, "z+c")) {
+            ExpressionError error;
+            canonical.specialize(
+                fixed, FormulaParameter::C,
+                runtime, &error);
+            ExpressionReferenceBuildRequest request;
+            request.canonicalProgram = &canonical;
+            request.runtimeProgram = &runtime;
+            request.pixelParameter = FormulaParameter::C;
+            request.fixed = fixed;
+            request.center.realDecimal =
+                "0.123456789012345678901234567890123456789";
+            request.center.imaginaryDecimal = "1e-500";
+            request.bailout = 100.0;
+            request.maxIterations = 2;
+            request.precision.requestedBits = 1800;
+            request.precision.minimumBits = 53;
+            request.precision.guardBits = 0;
+            ExpressionReferenceOrbitResult reference;
+            ExpressionScaledResidualEvaluator evaluator;
+            MpfrComplex delta(1800);
+            delta.set("-3e-500", "2e-500");
+            ScaledComplexValue scaledDelta;
+            if (!formula::buildExpressionReferenceOrbit(
+                    request, reference) ||
+                !evaluator.prepare(runtime, reference) ||
+                formula::makeScaledComplexValue(
+                    delta, scaledDelta) !=
+                        ScaledArithmeticStatus::Success ||
+                (reference.samples[0].rootDefect.re.isZero() &&
+                 reference.samples[0].rootDefect.im.isZero())) {
+                printf("  reference-defect scaled setup failed\n");
+                ++failures;
+            } else {
+                ExpressionScaledResidualInput input;
+                input.c = scaledDelta;
+                input.iteration = 0;
+                const ExpressionScaledResidualResult evaluated =
+                    evaluator.evaluate(0, input);
+                formula::ExpressionScaledPrimaryRelativeState
+                    primaryRelative;
+                ScaledComplexValue nextExact;
+                if (evaluated.status !=
+                        ExpressionScaledResidualStatus::Success ||
+                    !sameScaledComplex(
+                        evaluated.residual, scaledDelta) ||
+                    formula::makeExpressionResidualNextPrimaryState(
+                        reference.samples[0],
+                        evaluated.residual,
+                        primaryRelative) !=
+                            ScaledArithmeticStatus::Success ||
+                    formula::resetExpressionResidualToExactSample(
+                        reference.samples[1],
+                        primaryRelative,
+                        nextExact) !=
+                            ScaledArithmeticStatus::Success ||
+                    !sameScaledComplex(nextExact, scaledDelta)) {
+                    printf("  reference-defect propagation failed\n");
+                    ++failures;
+                }
+            }
+        }
+    }
+
+    auto checkExplicitStatus = [&](
+            const char* source,
+            FormulaParameter pixel,
+            const char* centerReal,
+            const char* centerImaginary,
+            const ExpressionContext& fixed,
+            ExpressionScaledResidualStatus expected,
+            const ScaledComplexValue& delta,
+            bool corruptCompanion = false,
+            bool removeCompanion = false) {
+        ExpressionProgram canonical, runtime;
+        if (!compile(canonical, source))
+            return;
+        ExpressionError error;
+        if (!canonical.specialize(
+                fixed, pixel, runtime, &error)) {
+            ++failures;
+            return;
+        }
+        ExpressionReferenceBuildRequest request;
+        request.canonicalProgram = &canonical;
+        request.runtimeProgram = &runtime;
+        request.pixelParameter = pixel;
+        request.fixed = fixed;
+        request.center.realDecimal = centerReal;
+        request.center.imaginaryDecimal = centerImaginary;
+        request.bailout = 1e100;
+        request.maxIterations = 1;
+        request.precision.requestedBits = 512;
+        request.precision.minimumBits = 53;
+        request.precision.guardBits = 0;
+        ExpressionReferenceOrbitResult reference;
+        if (!formula::buildExpressionReferenceOrbit(
+                request, reference)) {
+            ++failures;
+            return;
+        }
+        if (corruptCompanion || removeCompanion) {
+            for (auto& node : reference.tape) {
+                if (node.operation !=
+                        ExpressionOracleOperation::Sin)
+                    continue;
+                if (removeCompanion)
+                    node.flags &=
+                        static_cast<uint16_t>(
+                            ~formula::OracleTraceHasCompanion);
+                if (corruptCompanion)
+                    node.auxiliary.re.mantissa =
+                        std::numeric_limits<double>::quiet_NaN();
+                break;
+            }
+        }
+        ExpressionScaledResidualEvaluator evaluator;
+        const bool prepared =
+            evaluator.prepare(runtime, reference);
+        if (corruptCompanion || removeCompanion) {
+            if (prepared ||
+                evaluator.preparationStatus() !=
+                    ExpressionScaledResidualStatus::InvalidTape) {
+                printf("  malformed companion accepted [%s]\n", source);
+                ++failures;
+            }
+            return;
+        }
+        ExpressionScaledResidualInput input;
+        input.iteration = 0;
+        if (pixel == FormulaParameter::InitialZ) {
+            input.z = delta;
+            input.z0 = delta;
+        } else {
+            input.c = delta;
+        }
+        ExpressionScaledResidualResult evaluated =
+            prepared
+                ? evaluator.evaluate(0, input)
+                : ExpressionScaledResidualResult{};
+        if (!prepared || evaluated.status != expected) {
+            printf("  explicit status [%s]: got %s expected %s\n",
+                   source,
+                   formula::expressionScaledResidualStatusName(
+                       evaluated.status),
+                   formula::expressionScaledResidualStatusName(
+                       expected));
+            ++failures;
+        }
+    };
+    {
+        ScaledComplexValue tinyDelta;
+        formula::makeScaledComplexValue(
+            Complex{ 1e-20, -2e-20 }, tinyDelta);
+        ExpressionContext fixed;
+        fixed.c = { 1.0, 0.0 };
+        checkExplicitStatus(
+            "z/c", FormulaParameter::InitialZ,
+            "0.25", "0", fixed,
+            ExpressionScaledResidualStatus::Unsupported,
+            tinyDelta);
+        checkExplicitStatus(
+            "log(z)", FormulaParameter::InitialZ,
+            "0.25", "0", fixed,
+            ExpressionScaledResidualStatus::BranchUncertain,
+            tinyDelta);
+        fixed.c = { 0.0, 0.0 };
+        checkExplicitStatus(
+            "z/(c-c)", FormulaParameter::InitialZ,
+            "0.25", "0", fixed,
+            ExpressionScaledResidualStatus::Singular,
+            tinyDelta);
+        checkExplicitStatus(
+            "sin(z)", FormulaParameter::InitialZ,
+            "0.25", "0", fixed,
+            ExpressionScaledResidualStatus::Success,
+            tinyDelta, true, false);
+        checkExplicitStatus(
+            "sin(z)", FormulaParameter::InitialZ,
+            "0.25", "0", fixed,
+            ExpressionScaledResidualStatus::Success,
+            tinyDelta, false, true);
+
+        ScaledComplexValue outsideSeries;
+        formula::makeScaledComplexValue(
+            Complex{ 0.125, 0.0 }, outsideSeries);
+        checkExplicitStatus(
+            "sin(z)", FormulaParameter::InitialZ,
+            "0.25", "0", fixed,
+            ExpressionScaledResidualStatus::Unsupported,
+            outsideSeries);
+    }
+
+    // A nonfinite stored output is a runtime status, while a finite but
+    // impossible arithmetic exponent reports exponent-range.
+    {
+        ExpressionProgram canonical, runtime;
+        ExpressionContext fixed;
+        if (compile(canonical, "z*z")) {
+            ExpressionError error;
+            canonical.specialize(
+                fixed, FormulaParameter::InitialZ,
+                runtime, &error);
+            ExpressionReferenceBuildRequest request;
+            request.canonicalProgram = &canonical;
+            request.runtimeProgram = &runtime;
+            request.pixelParameter =
+                FormulaParameter::InitialZ;
+            request.center.realDecimal = "0.5";
+            request.center.imaginaryDecimal = "0";
+            request.bailout = 1e100;
+            request.maxIterations = 1;
+            request.precision.requestedBits = 256;
+            request.precision.minimumBits = 53;
+            request.precision.guardBits = 0;
+            ExpressionReferenceOrbitResult reference;
+            if (formula::buildExpressionReferenceOrbit(
+                    request, reference)) {
+                ExpressionReferenceOrbitResult nonfinite =
+                    reference;
+                nonfinite.tape[0].output.re.mantissa =
+                    std::numeric_limits<double>::infinity();
+                ExpressionScaledResidualEvaluator evaluator;
+                ExpressionScaledResidualInput input;
+                input.iteration = 0;
+                if (!evaluator.prepare(runtime, nonfinite) ||
+                    evaluator.evaluate(0, input).status !=
+                        ExpressionScaledResidualStatus::Nonfinite) {
+                    printf("  nonfinite tape status failed\n");
+                    ++failures;
+                }
+                if (!evaluator.prepare(runtime, reference)) {
+                    ++failures;
+                } else {
+                    input.z.re.mantissa = 0.5;
+                    input.z.re.exponent =
+                        std::numeric_limits<int64_t>::max();
+                    input.z0 = input.z;
+                    if (evaluator.evaluate(0, input).status !=
+                            ExpressionScaledResidualStatus::ExponentRange) {
+                        printf("  evaluator exponent-range status failed\n");
+                        ++failures;
+                    }
+                }
+            } else {
+                ++failures;
+            }
+        }
+    }
+
+    struct FrameSpec {
+        const char* name;
+        const char* source;
+        FormulaParameter pixel;
+        const char* centerReal;
+        const char* centerImaginary;
+        ExpressionContext fixed;
+        double bailout;
+        int maxIterations;
+        int width;
+        int height;
+        bool preserveParameters = false;
+        bool benchmark = false;
+    };
+    std::vector<FrameSpec> frames;
+    FrameSpec arithmetic{
+        "arithmetic-c", "z*z+c", FormulaParameter::C,
+        "-2", "0", {}, 4.0, 850, 64, 44, false, true
+    };
+    frames.push_back(arithmetic);
+    FrameSpec sine{
+        "sine-c", "sin(z)+c", FormulaParameter::C,
+        "0", "0", {}, 4.0, 40, 13, 9
+    };
+    frames.push_back(sine);
+    FrameSpec exponential{
+        "exponential-c", "exp(0.1*z)+c",
+        FormulaParameter::C,
+        "-1", "0", {}, 4.0, 50, 13, 9
+    };
+    frames.push_back(exponential);
+    FrameSpec parameter{
+        "parameter-invariant-c",
+        "z*z+c+sin(p0)+exp(p1)-1+0*n",
+        FormulaParameter::C,
+        "-2", "0", {}, 4.0, 850, 9, 7, true
+    };
+    parameter.fixed.parameters[0] = {};
+    parameter.fixed.parameters[1] = {};
+    frames.push_back(parameter);
+    FrameSpec initialZ{
+        "arithmetic-z0", "2*z",
+        FormulaParameter::InitialZ,
+        "0", "0", {}, 4.0, 1670, 9, 7
+    };
+    initialZ.fixed.c = {};
+    frames.push_back(initialZ);
+
+    double benchmarkReferenceSeconds = 0.0;
+    double benchmarkScaledSeconds = 0.0;
+    double benchmarkMpfrSeconds = 0.0;
+    double benchmarkMinimumSpeedup = 0.0;
+    size_t benchmarkMemory = 0;
+    size_t benchmarkBytesPerSample = 0;
+
+    for (const FrameSpec& frame : frames) {
+        ExpressionProgram canonical, runtime;
+        if (!compile(canonical, frame.source))
+            continue;
+        if (frame.preserveParameters) {
+            runtime = canonical;
+        } else {
+            ExpressionError error;
+            if (!canonical.specialize(
+                    frame.fixed, frame.pixel,
+                    runtime, &error)) {
+                printf("  scaled specialize failed: %s [%s]\n",
+                       error.message.c_str(), frame.source);
+                ++failures;
+                continue;
+            }
+        }
+
+        ExpressionReferenceBuildRequest request;
+        request.canonicalProgram =
+            frame.preserveParameters ? nullptr : &canonical;
+        request.runtimeProgram = &runtime;
+        request.pixelParameter = frame.pixel;
+        request.fixed = frame.fixed;
+        request.center.realDecimal = frame.centerReal;
+        request.center.imaginaryDecimal = frame.centerImaginary;
+        request.bailout = frame.bailout;
+        request.maxIterations = frame.maxIterations;
+        request.precision.viewBits = 1750;
+        request.precision.minimumBits = 53;
+        request.precision.guardBits = 64;
+        request.precision.maximumBits = 4096;
+        const Clock::time_point referenceStart = Clock::now();
+        ExpressionReferenceOrbitResult reference;
+        const bool built =
+            formula::buildExpressionReferenceOrbit(
+                request, reference);
+        const double referenceSeconds =
+            elapsed(referenceStart);
+        ExpressionScaledResidualEvaluator evaluator;
+        if (!built ||
+            reference.samples.size() !=
+                static_cast<size_t>(frame.maxIterations) ||
+            reference.escaped || reference.undefined ||
+            !evaluator.prepare(runtime, reference)) {
+            printf("  frame reference failed [%s]: %s / %s\n",
+                   frame.name, reference.error.c_str(),
+                   evaluator.error().c_str());
+            ++failures;
+            continue;
+        }
+        markCoverage(reference);
+
+        const size_t pixelCount =
+            static_cast<size_t>(frame.width) * frame.height;
+        std::vector<ScaledComplexValue> offsets(pixelCount);
+        std::set<std::tuple<
+            int64_t, uint64_t, int64_t, uint64_t>> scaledCoordinates;
+        std::set<std::pair<double, double>> doubleCoordinates;
+        MpfrComplex center(reference.precision);
+        MpfrComplex offset(reference.precision);
+        MpfrComplex coordinate(reference.precision);
+        mpfr_t zoom;
+        mpfr_init2(zoom, reference.precision);
+        bool coordinateOkay =
+            center.set(frame.centerReal, frame.centerImaginary) &&
+            mpfr_set_str(zoom, "1e500", 10, MPFR_RNDN) == 0;
+        for (int y = 0; coordinateOkay && y < frame.height; ++y) {
+            for (int x = 0; x < frame.width; ++x) {
+                const size_t index =
+                    static_cast<size_t>(y) * frame.width + x;
+                mpfr_set_si(
+                    offset.re,
+                    x - frame.width / 2, MPFR_RNDN);
+                mpfr_div(
+                    offset.re, offset.re, zoom, MPFR_RNDN);
+                mpfr_set_si(
+                    offset.im,
+                    y - frame.height / 2, MPFR_RNDN);
+                mpfr_div(
+                    offset.im, offset.im, zoom, MPFR_RNDN);
+                if (formula::makeScaledComplexValue(
+                        offset, offsets[index]) !=
+                            ScaledArithmeticStatus::Success) {
+                    coordinateOkay = false;
+                    break;
+                }
+                mpfr_add(
+                    coordinate.re, center.re,
+                    offset.re, MPFR_RNDN);
+                mpfr_add(
+                    coordinate.im, center.im,
+                    offset.im, MPFR_RNDN);
+                const double directReal =
+                    mpfr_get_d(coordinate.re, MPFR_RNDN);
+                const double directImaginary =
+                    mpfr_get_d(coordinate.im, MPFR_RNDN);
+                uint64_t scaledRealBits = 0;
+                uint64_t scaledImaginaryBits = 0;
+                std::memcpy(
+                    &scaledRealBits,
+                    &offsets[index].re.mantissa,
+                    sizeof(scaledRealBits));
+                std::memcpy(
+                    &scaledImaginaryBits,
+                    &offsets[index].im.mantissa,
+                    sizeof(scaledImaginaryBits));
+                doubleCoordinates.emplace(
+                    directReal, directImaginary);
+                scaledCoordinates.emplace(
+                    offsets[index].re.exponent,
+                    scaledRealBits,
+                    offsets[index].im.exponent,
+                    scaledImaginaryBits);
+            }
+        }
+        mpfr_clear(zoom);
+        if (!coordinateOkay ||
+            doubleCoordinates.size() != 1 ||
+            scaledCoordinates.size() != pixelCount) {
+            printf("  e500 coordinate distinction failed [%s] double/scaled=%zu/%zu\n",
+                   frame.name, doubleCoordinates.size(),
+                   scaledCoordinates.size());
+            ++failures;
+            continue;
+        }
+
+        struct PixelState {
+            int escapeIteration = 0;
+            int stateIteration = 0;
+            ExpressionScaledResidualStatus status =
+                ExpressionScaledResidualStatus::Success;
+            ScaledComplexValue residual;
+        };
+        auto renderScaled = [&](
+                std::vector<PixelState>& states,
+                size_t& localSeriesOperations) {
+            states.assign(pixelCount, {});
+            localSeriesOperations = 0;
+            for (size_t index = 0;
+                 index < pixelCount; ++index) {
+                PixelState& pixel = states[index];
+                pixel.escapeIteration =
+                    frame.maxIterations;
+                ScaledComplexValue stateDelta;
+                ExpressionScaledResidualInput input;
+                if (frame.pixel == FormulaParameter::C) {
+                    input.c = offsets[index];
+                } else {
+                    input.z0 = offsets[index];
+                    stateDelta = offsets[index];
+                }
+                ScaledComplexValue initialBase, initialValue;
+                ScaledArithmeticStatus arithmeticStatus =
+                    formula::makeScaledComplexValue(
+                        reference.initialZ,
+                        reference.initialZDefect,
+                        initialBase);
+                if (arithmeticStatus ==
+                        ScaledArithmeticStatus::Success)
+                    arithmeticStatus = formula::scaledAdd(
+                        initialBase, stateDelta,
+                        initialValue);
+                bool escaped = false;
+                if (arithmeticStatus ==
+                        ScaledArithmeticStatus::Success)
+                    arithmeticStatus = outsideScaled(
+                        initialValue, frame.bailout,
+                        escaped);
+                if (arithmeticStatus !=
+                        ScaledArithmeticStatus::Success) {
+                    pixel.status =
+                        arithmeticStatus ==
+                            ScaledArithmeticStatus::ExponentRange
+                        ? ExpressionScaledResidualStatus::ExponentRange
+                        : ExpressionScaledResidualStatus::Nonfinite;
+                    continue;
+                }
+                if (escaped) {
+                    pixel.escapeIteration = 0;
+                    pixel.stateIteration = 0;
+                    pixel.residual = stateDelta;
+                    continue;
+                }
+                for (int iteration = 0;
+                     iteration < frame.maxIterations;
+                     ++iteration) {
+                    input.z = stateDelta;
+                    input.iteration = iteration;
+                    ExpressionScaledResidualResult evaluated =
+                        evaluator.evaluate(
+                            static_cast<size_t>(iteration),
+                            input);
+                    localSeriesOperations +=
+                        evaluated.seriesOperationCount;
+                    if (evaluated.status !=
+                            ExpressionScaledResidualStatus::Success) {
+                        pixel.status = evaluated.status;
+                        break;
+                    }
+                    ScaledComplexValue outputBase, actualOutput;
+                    arithmeticStatus =
+                        formula::makeScaledComplexValue(
+                            reference.samples[iteration].next,
+                            reference.samples[iteration].rootDefect,
+                            outputBase);
+                    if (arithmeticStatus ==
+                            ScaledArithmeticStatus::Success)
+                        arithmeticStatus = formula::scaledAdd(
+                            outputBase, evaluated.residual,
+                            actualOutput);
+                    if (arithmeticStatus ==
+                            ScaledArithmeticStatus::Success)
+                        arithmeticStatus = outsideScaled(
+                            actualOutput, frame.bailout,
+                            escaped);
+                    if (arithmeticStatus !=
+                            ScaledArithmeticStatus::Success) {
+                        pixel.status =
+                            arithmeticStatus ==
+                                ScaledArithmeticStatus::ExponentRange
+                            ? ExpressionScaledResidualStatus::ExponentRange
+                            : ExpressionScaledResidualStatus::Nonfinite;
+                        break;
+                    }
+                    pixel.residual = evaluated.residual;
+                    pixel.stateIteration = iteration + 1;
+                    if (escaped) {
+                        pixel.escapeIteration = iteration + 1;
+                        break;
+                    }
+                    if (iteration + 1 <
+                            frame.maxIterations) {
+                        formula::ExpressionScaledPrimaryRelativeState
+                            primaryRelative;
+                        arithmeticStatus =
+                            formula::makeExpressionResidualNextPrimaryState(
+                                reference.samples[iteration],
+                                evaluated.residual,
+                                primaryRelative);
+                        if (arithmeticStatus ==
+                                ScaledArithmeticStatus::Success)
+                            arithmeticStatus =
+                                formula::resetExpressionResidualToExactSample(
+                                    reference.samples[iteration + 1],
+                                    primaryRelative,
+                                    stateDelta);
+                        if (arithmeticStatus !=
+                                ScaledArithmeticStatus::Success) {
+                            pixel.status =
+                                ExpressionScaledResidualStatus::ExponentRange;
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+
+        std::vector<PixelState> scaledStates;
+        size_t localSeriesOperations = 0;
+        const Clock::time_point scaledStart = Clock::now();
+        renderScaled(scaledStates, localSeriesOperations);
+        const double scaledSeconds = elapsed(scaledStart);
+        size_t secondSeriesOperations = 0;
+        std::vector<PixelState> repeatedStates;
+        double repeatedScaledSeconds = scaledSeconds;
+        if (frame.benchmark) {
+            const Clock::time_point repeatStart = Clock::now();
+            renderScaled(
+                repeatedStates, secondSeriesOperations);
+            repeatedScaledSeconds = elapsed(repeatStart);
+        }
+        seriesOperations += localSeriesOperations;
+        uint32_t scaledChecksum = 0;
+        uint32_t repeatedChecksum = 0;
+        bool sawInterior = false;
+        bool sawExterior = false;
+        for (size_t index = 0; index < pixelCount; ++index) {
+            scaledChecksum =
+                scaledChecksum * 16777619u ^
+                static_cast<uint32_t>(
+                    scaledStates[index].escapeIteration);
+            if (frame.benchmark)
+                repeatedChecksum =
+                    repeatedChecksum * 16777619u ^
+                    static_cast<uint32_t>(
+                        repeatedStates[index].escapeIteration);
+            if (scaledStates[index].status !=
+                    ExpressionScaledResidualStatus::Success)
+                ++fallbackPixels;
+            sawInterior = sawInterior ||
+                scaledStates[index].escapeIteration ==
+                    frame.maxIterations;
+            sawExterior = sawExterior ||
+                scaledStates[index].escapeIteration <
+                    frame.maxIterations;
+        }
+        framePixels += pixelCount;
+        if (frame.benchmark &&
+            (scaledChecksum != repeatedChecksum ||
+             localSeriesOperations != secondSeriesOperations)) {
+            printf("  scaled benchmark repeat mismatch\n");
+            ++failures;
+        }
+        if ((frame.benchmark ||
+             frame.pixel == FormulaParameter::InitialZ) &&
+            !(sawInterior && sawExterior)) {
+            printf("  frame lacks interior/exterior coverage [%s]\n",
+                   frame.name);
+            ++failures;
+        }
+
+        const mpfr_prec_t oraclePrecision =
+            reference.precision + 256;
+        ExpressionOracleContext highReferenceContext(
+            oraclePrecision);
+        std::vector<MpfrComplex> highReference;
+        highReference.reserve(
+            static_cast<size_t>(frame.maxIterations) + 1);
+        if (!configureOracle(
+                highReferenceContext, frame.fixed,
+                frame.pixel, frame.centerReal,
+                frame.centerImaginary)) {
+            ++failures;
+            continue;
+        }
+        highReference.emplace_back(oraclePrecision);
+        highReference.back().set(highReferenceContext.z);
+        MpfrComplex highNext(oraclePrecision);
+        bool highReferenceOkay = true;
+        for (int iteration = 0;
+             iteration < frame.maxIterations;
+             ++iteration) {
+            highReferenceContext.iteration = iteration;
+            std::string oracleError;
+            if (!ExpressionOracle::evaluate(
+                    runtime, highReferenceContext,
+                    highNext, &oracleError)) {
+                highReferenceOkay = false;
+                break;
+            }
+            highReferenceContext.z.set(highNext);
+            highReference.emplace_back(oraclePrecision);
+            highReference.back().set(highNext);
+        }
+        if (!highReferenceOkay) {
+            printf("  high reference failed [%s]\n", frame.name);
+            ++failures;
+            continue;
+        }
+
+        auto renderOracle = [&](
+                bool compareResiduals,
+                std::vector<int>& escapes,
+                uint32_t& checksum) {
+            escapes.assign(
+                pixelCount, frame.maxIterations);
+            checksum = 0;
+            mpfr_t highZoom, magnitude, residualMagnitude;
+            mpfr_t differenceMagnitude, ratio;
+            mpfr_inits2(
+                oraclePrecision, highZoom, magnitude,
+                residualMagnitude, differenceMagnitude,
+                ratio, (mpfr_ptr)0);
+            mpfr_set_str(
+                highZoom, "1e500", 10, MPFR_RNDN);
+            bool okay = true;
+            for (int y = 0; okay && y < frame.height; ++y) {
+                for (int x = 0; x < frame.width; ++x) {
+                    const size_t index =
+                        static_cast<size_t>(y) *
+                            frame.width + x;
+                    ExpressionOracleContext context(
+                        oraclePrecision);
+                    if (!configureOracle(
+                            context, frame.fixed,
+                            frame.pixel, frame.centerReal,
+                            frame.centerImaginary)) {
+                        okay = false;
+                        break;
+                    }
+                    MpfrComplex exactOffset(oraclePrecision);
+                    mpfr_set_si(
+                        exactOffset.re,
+                        x - frame.width / 2,
+                        MPFR_RNDN);
+                    mpfr_div(
+                        exactOffset.re, exactOffset.re,
+                        highZoom, MPFR_RNDN);
+                    mpfr_set_si(
+                        exactOffset.im,
+                        y - frame.height / 2,
+                        MPFR_RNDN);
+                    mpfr_div(
+                        exactOffset.im, exactOffset.im,
+                        highZoom, MPFR_RNDN);
+                    if (frame.pixel == FormulaParameter::C) {
+                        mpfr_add(
+                            context.c.re, context.c.re,
+                            exactOffset.re, MPFR_RNDN);
+                        mpfr_add(
+                            context.c.im, context.c.im,
+                            exactOffset.im, MPFR_RNDN);
+                    } else {
+                        mpfr_add(
+                            context.z0.re, context.z0.re,
+                            exactOffset.re, MPFR_RNDN);
+                        mpfr_add(
+                            context.z0.im, context.z0.im,
+                            exactOffset.im, MPFR_RNDN);
+                        context.z.set(context.z0);
+                    }
+                    int escapeIteration =
+                        frame.maxIterations;
+                    mpfr_hypot(
+                        magnitude, context.z.re,
+                        context.z.im, MPFR_RNDN);
+                    if (mpfr_cmp_d(
+                            magnitude, frame.bailout) > 0) {
+                        escapeIteration = 0;
+                    } else {
+                        MpfrComplex next(oraclePrecision);
+                        for (int iteration = 0;
+                             iteration < frame.maxIterations;
+                             ++iteration) {
+                            context.iteration = iteration;
+                            std::string oracleError;
+                            if (!ExpressionOracle::evaluate(
+                                    runtime, context, next,
+                                    &oracleError)) {
+                                okay = false;
+                                break;
+                            }
+                            context.z.set(next);
+                            mpfr_hypot(
+                                magnitude, context.z.re,
+                                context.z.im, MPFR_RNDN);
+                            if (mpfr_cmp_d(
+                                    magnitude,
+                                    frame.bailout) > 0) {
+                                escapeIteration = iteration + 1;
+                                break;
+                            }
+                        }
+                    }
+                    if (!okay) break;
+                    escapes[index] = escapeIteration;
+                    checksum =
+                        checksum * 16777619u ^
+                        static_cast<uint32_t>(escapeIteration);
+                    if (escapeIteration !=
+                            scaledStates[index].escapeIteration ||
+                        scaledStates[index].status !=
+                            ExpressionScaledResidualStatus::Success) {
+                        okay = false;
+                        break;
+                    }
+                    if (!compareResiduals) continue;
+
+                    const int stateIteration =
+                        scaledStates[index].stateIteration;
+                    MpfrComplex expectedResidual(
+                        oraclePrecision);
+                    mpfr_sub(
+                        expectedResidual.re, context.z.re,
+                        highReference[stateIteration].re,
+                        MPFR_RNDN);
+                    mpfr_sub(
+                        expectedResidual.im, context.z.im,
+                        highReference[stateIteration].im,
+                        MPFR_RNDN);
+                    MpfrComplex actualResidual(
+                        oraclePrecision);
+                    if (!formula::setMpfrFromScaledValue(
+                            actualResidual,
+                            scaledStates[index].residual)) {
+                        okay = false;
+                        break;
+                    }
+                    mpfr_sub(
+                        actualResidual.re,
+                        actualResidual.re,
+                        expectedResidual.re, MPFR_RNDN);
+                    mpfr_sub(
+                        actualResidual.im,
+                        actualResidual.im,
+                        expectedResidual.im, MPFR_RNDN);
+                    mpfr_hypot(
+                        differenceMagnitude,
+                        actualResidual.re,
+                        actualResidual.im, MPFR_RNDN);
+                    mpfr_hypot(
+                        residualMagnitude,
+                        expectedResidual.re,
+                        expectedResidual.im, MPFR_RNDN);
+                    double relativeError = 0.0;
+                    if (mpfr_zero_p(residualMagnitude)) {
+                        if (!mpfr_zero_p(differenceMagnitude)) {
+                            okay = false;
+                            break;
+                        }
+                    } else {
+                        mpfr_div(
+                            ratio, differenceMagnitude,
+                            residualMagnitude, MPFR_RNDU);
+                        relativeError =
+                            mpfr_get_d(ratio, MPFR_RNDU);
+                        maximumResidualRelativeError =
+                            std::max(
+                                maximumResidualRelativeError,
+                                relativeError);
+                        if (!(relativeError <= 1e-8)) {
+                            okay = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            mpfr_clears(
+                highZoom, magnitude, residualMagnitude,
+                differenceMagnitude, ratio, (mpfr_ptr)0);
+            return okay;
+        };
+
+        std::vector<int> oracleEscapes;
+        uint32_t oracleChecksum = 0;
+        const Clock::time_point oracleStart = Clock::now();
+        const bool oracleOkay =
+            renderOracle(
+                true, oracleEscapes, oracleChecksum);
+        const double oracleSeconds = elapsed(oracleStart);
+        if (!oracleOkay ||
+            oracleChecksum != scaledChecksum) {
+            printf("  e500 frame mismatch [%s] checksums=%08x/%08x\n",
+                   frame.name, scaledChecksum, oracleChecksum);
+            ++failures;
+        }
+
+        double repeatedOracleSeconds = oracleSeconds;
+        if (frame.benchmark) {
+            std::vector<int> repeatedOracle;
+            uint32_t repeatedOracleChecksum = 0;
+            const Clock::time_point repeatStart = Clock::now();
+            const bool repeatOkay =
+                renderOracle(
+                    false, repeatedOracle,
+                    repeatedOracleChecksum);
+            repeatedOracleSeconds = elapsed(repeatStart);
+            if (!repeatOkay ||
+                repeatedOracleChecksum != oracleChecksum) {
+                printf("  MPFR benchmark repeat mismatch\n");
+                ++failures;
+            }
+            benchmarkReferenceSeconds = referenceSeconds;
+            benchmarkScaledSeconds =
+                std::max(
+                    scaledSeconds,
+                    repeatedScaledSeconds);
+            benchmarkMpfrSeconds =
+                std::min(
+                    oracleSeconds,
+                    repeatedOracleSeconds);
+            benchmarkMinimumSpeedup =
+                benchmarkScaledSeconds > 0.0
+                ? benchmarkMpfrSeconds /
+                    benchmarkScaledSeconds
+                : 0.0;
+            benchmarkMemory = reference.memoryBytes;
+            benchmarkBytesPerSample =
+                reference.sampleCount
+                ? reference.memoryBytes /
+                    reference.sampleCount
+                : 0;
+            if (!(benchmarkMinimumSpeedup > 1.0) ||
+                reference.memoryBytes >
+                    size_t{ 8 } * 1024 * 1024) {
+                printf("  scaled benchmark gate failed speedup=%.2fx memory=%zu\n",
+                       benchmarkMinimumSpeedup,
+                       reference.memoryBytes);
+                ++failures;
+            }
+        }
+        printf("  %-22s ref/scaled/MPFR %.3f/%.3f/%.3f s pixels=%zu\n",
+               frame.name, referenceSeconds,
+               scaledSeconds, oracleSeconds, pixelCount);
+    }
+
+    // Initial escape produces no sample, and is deliberately not dispatched
+    // into the evaluator.
+    {
+        ExpressionProgram canonical, runtime;
+        ExpressionContext fixed;
+        fixed.c = {};
+        if (compile(canonical, "z+1")) {
+            ExpressionError error;
+            canonical.specialize(
+                fixed, FormulaParameter::InitialZ,
+                runtime, &error);
+            ExpressionReferenceBuildRequest request;
+            request.canonicalProgram = &canonical;
+            request.runtimeProgram = &runtime;
+            request.pixelParameter =
+                FormulaParameter::InitialZ;
+            request.center.realDecimal = "5";
+            request.center.imaginaryDecimal = "0";
+            request.bailout = 4.0;
+            request.maxIterations = 10;
+            request.precision.requestedBits = 256;
+            request.precision.minimumBits = 53;
+            request.precision.guardBits = 0;
+            ExpressionReferenceOrbitResult reference;
+            ExpressionScaledResidualEvaluator evaluator;
+            if (!formula::buildExpressionReferenceOrbit(
+                    request, reference) ||
+                !reference.escaped ||
+                reference.escapeIteration != 0 ||
+                !reference.samples.empty() ||
+                !evaluator.prepare(runtime, reference) ||
+                evaluator.evaluate(
+                    0, ExpressionScaledResidualInput{}).status !=
+                        ExpressionScaledResidualStatus::InvalidTape) {
+                printf("  initial escape/sample-range handling failed\n");
+                ++failures;
+            }
+        }
+    }
+
+    const size_t coveredOpcodes =
+        static_cast<size_t>(std::count(
+            opcodeCoverage.begin(),
+            opcodeCoverage.end(), true));
+    const double fallbackRate =
+        framePixels
+        ? 100.0 * static_cast<double>(fallbackPixels) /
+            static_cast<double>(framePixels)
+        : 100.0;
+    printf("=== expression scaled residual e500 prototype\n");
+    printf("  direct binary64 coordinates collapse; scaled coordinates distinct in every frame\n");
+    printf("  opcode coverage=%zu fallback=%zu/%zu (%.3f%%) series-ops=%zu\n",
+           coveredOpcodes, fallbackPixels,
+           framePixels, fallbackRate, seriesOperations);
+    printf("  max reconstructed residual relative error=%.3g\n",
+           maximumResidualRelativeError);
+    printf("  64x44 arithmetic reference/scaled/MPFR %.3f/%.3f/%.3f s min speedup %.2fx\n",
+           benchmarkReferenceSeconds,
+           benchmarkScaledSeconds,
+           benchmarkMpfrSeconds,
+           benchmarkMinimumSpeedup);
+    printf("  reference memory=%zu bytes (%zu/sample); nonlinear result is explicitly uncertified\n",
+           benchmarkMemory, benchmarkBytesPerSample);
+    printf("  branch/pole neighborhood certification and GUI dispatch remain disabled\n");
+    printf("  => %s\n\n",
+           failures == 0
+               ? "PASS"
+               : "CHECK (scaled expression failure)");
+    return failures == 0 ? 0 : 1;
+}
+
 static int runExpressionOracleCase() {
     using formula::Complex;
     using formula::ExpressionContext;
@@ -8723,6 +10164,7 @@ int main(int argc, char** argv) {
     }
     if (which == "expression-centered")        rc |= runExpressionCenteredCase();
     if (which == "expression-reference")       rc |= runExpressionReferenceCase();
+    if (which == "expression-scaled")          rc |= runExpressionScaledCase();
     if (which == "expression-coloring")        rc |= runExpressionColoringCase();
     if (which == "expression-orbit")           rc |= runExpressionOrbitCase();
     if (which == "expression-oracle" || which == "oracle")

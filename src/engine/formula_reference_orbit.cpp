@@ -655,6 +655,7 @@ static bool buildExpressionReferenceOrbitImpl(
                 node.leftNode = traced.leftNode;
                 node.rightNode = traced.rightNode;
                 node.flags = traced.flags;
+                node.argument = traced.argument;
                 node.operation = traced.operation;
                 node.cut = traced.cut;
                 node.clearance = traced.clearance;

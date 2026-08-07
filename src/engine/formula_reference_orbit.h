@@ -127,6 +127,7 @@ struct ExpressionReferenceTapeNode {
     uint16_t leftNode = UINT16_MAX;
     uint16_t rightNode = UINT16_MAX;
     uint16_t flags = OracleTraceNone;
+    uint8_t argument = 0;
     ExpressionOracleOperation operation =
         ExpressionOracleOperation::Constant;
     ExpressionOracleCutLocation cut =
