@@ -90,7 +90,8 @@ Custom frames stay on the direct expression AVX2 path through zoom $10^{12}$.
 Above that boundary they use this quadratic perturbation/SA/BLA engine only when
 the compiled source and specialized runtime are the exact recognized `z*z+c`
 recurrence in the c-plane, fixed `z0` is positive zero in both components, and the
-Custom bailout is finite, at least 1, and has a finite squared value. A scoped
+Custom bailout is finite, at least 2, and is inside the engine's overflow-safe
+range. A scoped
 per-frame override makes the reference orbit, SA/BLA, perturbation loops, and
 direct fallbacks use that bailout without changing ordinary Mandelbrot frames.
 The whole frame must also have $z_1=c$ inside the bailout disk because the
@@ -99,10 +100,16 @@ optimized engine starts testing at $z_2$.
 The two renderers historically expose slightly different numeric conventions.
 The deep Custom writer therefore adds the constant
 $-\log(\log 2)/\log 2$ for Smooth and halves Distance (the production engine uses
-$\log |z|^2$ where Custom uses $\log |z|$). Feather and OrbitTrap are not routed
-in stage 1 because Custom includes $z_1=c$ in their accumulators while the
-production quadratic accumulators begin at $z_2$; Raw also remains direct. Those
-modes and every incompatible formula retain the $10^{12}$ cap.
+$\log |z|^2$ where Custom uses $\log |z|$). Feather and OrbitTrap use scoped
+orbit-history adapters: every pixel and reference accumulator is seeded once
+with $z_1=c$, then the production loops continue from $z_2$. Series
+approximation and BLA are disabled for these two Custom modes because either
+mechanism can omit actual pixel-orbit values; perturbation, rebasing, and the
+floatexp path remain enabled. Feather delegates its escape interpolation to the
+same shared integer-power `powerValue` convention as the direct renderer.
+OrbitTrap uses the direct integer-power smooth count
+$n-\log(\log|z_n|)/\log 2$ exactly once rather than the production palette-phase
+variant. Raw and every incompatible formula retain the $10^{12}$ cap.
 
 ---
 

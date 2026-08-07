@@ -4611,6 +4611,13 @@ static int runCustomDeepZoomCase() {
                 ExpressionColoring::Smooth, above)
                .usesQuadraticPerturbation(),
            "canonical square opcode accepted");
+    expect(plan(canonicalSquare, FormulaParameter::C, bailout,
+                ExpressionColoring::Feather, above)
+               .usesQuadraticPerturbation() &&
+           plan(canonicalSquare, FormulaParameter::C, bailout,
+                ExpressionColoring::OrbitTrap, above)
+               .usesQuadraticPerturbation(),
+           "canonical square colored adapters accepted");
     expect(plan(quadratic, FormulaParameter::C, bailout,
                 ExpressionColoring::Distance, above)
                .usesQuadraticPerturbation(),
@@ -4619,14 +4626,20 @@ static int runCustomDeepZoomCase() {
                  ExpressionColoring::Raw, above)
                 .canZoomBeyondDirectLimit(),
            "raw rejected");
-    expect(!plan(quadratic, FormulaParameter::C, bailout,
-                 ExpressionColoring::Feather, above)
-                .canZoomBeyondDirectLimit(),
-           "feather rejected until z1 adapter exists");
-    expect(!plan(quadratic, FormulaParameter::C, bailout,
-                 ExpressionColoring::OrbitTrap, above)
-                .canZoomBeyondDirectLimit(),
-           "orbit trap rejected until z1 adapter exists");
+    auto featherPlan =
+        plan(quadratic, FormulaParameter::C, bailout,
+             ExpressionColoring::Feather, above);
+    auto trapPlan =
+        plan(quadratic, FormulaParameter::C, bailout,
+             ExpressionColoring::OrbitTrap, above);
+    expect(featherPlan.usesQuadraticPerturbation() &&
+           featherPlan.outputAdapter ==
+               CustomDeepZoomOutputAdapter::FeatherExpression,
+           "feather dispatch accepted with z1 adapter");
+    expect(trapPlan.usesQuadraticPerturbation() &&
+           trapPlan.outputAdapter ==
+               CustomDeepZoomOutputAdapter::OrbitTrapExpression,
+           "orbit trap dispatch accepted with z1 adapter");
     expect(!plan(quadratic, FormulaParameter::InitialZ, bailout,
                  ExpressionColoring::Smooth, above)
                 .canZoomBeyondDirectLimit(),
@@ -4791,22 +4804,26 @@ static int runCustomDeepZoomCase() {
         expect(mpf_cmp(scale, expectedScale) == 0 &&
                nav.GetViewPrecision() > 120,
                "compatible SetLocation preserves pasted scale");
-        mpf_clear(expectedScale);
         nav.SetCMethod(ColoringMethod::STRIPE_AVERAGE);
         nav.GetView(re, im, scale);
-        expect(mpf_cmp_d(
-                   scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0,
-               "unsupported coloring switch clamps");
+        expect(mpf_cmp(scale, expectedScale) == 0 &&
+               nav.GetCustomDeepZoomPlan().usesQuadraticPerturbation(),
+               "Feather switch preserves deep view");
         expect(nav.GetExpressionAccelerationText().find(
-                   "direct integer-power AVX2") != std::string::npos,
-               "direct status text");
+                   "deep quadratic perturbation") != std::string::npos,
+               "Feather deep status text");
+        nav.SetCMethod(ColoringMethod::ORBIT_TRAP);
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp(scale, expectedScale) == 0 &&
+               nav.GetCustomDeepZoomPlan().usesQuadraticPerturbation(),
+               "OrbitTrap switch preserves deep view");
 
         expect(nav.SetLocation("-0.75", "0", "1000000000000001"),
-               "incompatible paste accepted with clamp");
+               "compatible coloring paste accepted");
         nav.GetView(re, im, scale);
-        expect(mpf_cmp_d(
-                   scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0,
-               "incompatible SetLocation clamps");
+        expect(mpf_cmp_d(scale, 1000000000000001.0) == 0,
+               "OrbitTrap SetLocation preserves deep scale");
+        mpf_clear(expectedScale);
         mpf_clears(re, im, scale, (mpf_ptr)0);
     }
     {
@@ -4847,10 +4864,33 @@ static int runCustomDeepZoomCase() {
     struct OverlapResult {
         int classMismatch = 0;
         int floorMismatch = 0;
+        int byteMismatch = 0;
         double maxDelta = 0.0;
         double maxRelative = 0.0;
     };
-    auto compareOverlap = [&](ExpressionColoring coloring) {
+    auto adapterFor = [](ExpressionColoring coloring) {
+        return coloring == ExpressionColoring::Smooth
+            ? CustomDeepZoomOutputAdapter::SmoothExpression
+            : coloring == ExpressionColoring::Distance
+                ? CustomDeepZoomOutputAdapter::DistanceExpression
+                : coloring == ExpressionColoring::Feather
+                    ? CustomDeepZoomOutputAdapter::FeatherExpression
+                    : coloring == ExpressionColoring::OrbitTrap
+                        ? CustomDeepZoomOutputAdapter::
+                              OrbitTrapExpression
+                        : CustomDeepZoomOutputAdapter::None;
+    };
+    auto methodFor = [](ExpressionColoring coloring) {
+        return coloring == ExpressionColoring::Distance
+            ? ColoringMethod::EXTERIOR_DIST_EST
+            : coloring == ExpressionColoring::Feather
+                ? ColoringMethod::STRIPE_AVERAGE
+                : coloring == ExpressionColoring::OrbitTrap
+                    ? ColoringMethod::ORBIT_TRAP : 0;
+    };
+    auto compareOverlap = [&](ExpressionColoring coloring,
+                              const char* scaleText =
+                                  "1000000000000") {
         constexpr int W = 48, H = 32, MXIT = 4000;
         std::vector<float> direct((size_t)W * H, EMPTYPIXEL);
         std::vector<float> deep((size_t)W * H, EMPTYPIXEL);
@@ -4860,22 +4900,13 @@ static int runCustomDeepZoomCase() {
         mpf_init2(re, 256); mpf_init2(im, 256); mpf_init2(scale, 256);
         mpf_set_str(re, "-0.75", 10);
         mpf_set_str(im, "0.1", 10);
-        mpf_set_str(scale, "1000000000000", 10);
-        int method = coloring == ExpressionColoring::Distance
-            ? ColoringMethod::EXTERIOR_DIST_EST
-            : coloring == ExpressionColoring::Feather
-                ? ColoringMethod::STRIPE_AVERAGE
-                : coloring == ExpressionColoring::OrbitTrap
-                    ? ColoringMethod::ORBIT_TRAP : 0;
+        mpf_set_str(scale, scaleText, 10);
+        int method = methodFor(coloring);
         bool okay = directEngine.ComputeExpression(
             re, im, scale, quadratic.runtime, quadratic.fixed,
             FormulaParameter::C, MXIT, bailout, coloring);
         CustomDeepZoomOutputAdapter adapter =
-            coloring == ExpressionColoring::Smooth
-                ? CustomDeepZoomOutputAdapter::SmoothExpression
-                : coloring == ExpressionColoring::Distance
-                    ? CustomDeepZoomOutputAdapter::DistanceExpression
-                    : CustomDeepZoomOutputAdapter::None;
+            adapterFor(coloring);
         {
             Mandel::ScopedCustomCompute customCompute(
                 deepEngine, bailout, adapter);
@@ -4887,6 +4918,9 @@ static int runCustomDeepZoomCase() {
 
         OverlapResult result;
         for (size_t i = 0; i < direct.size(); ++i) {
+            if (std::memcmp(
+                    &direct[i], &deep[i], sizeof(float)) != 0)
+                ++result.byteMismatch;
             if (coloring != ExpressionColoring::OrbitTrap &&
                 isInterior(direct[i]) != isInterior(deep[i])) {
                 ++result.classMismatch;
@@ -4912,17 +4946,34 @@ static int runCustomDeepZoomCase() {
     OverlapResult distance = compareOverlap(ExpressionColoring::Distance);
     OverlapResult feather = compareOverlap(ExpressionColoring::Feather);
     OverlapResult trap = compareOverlap(ExpressionColoring::OrbitTrap);
+    OverlapResult featherBelow = compareOverlap(
+        ExpressionColoring::Feather, "999999999999");
+    OverlapResult featherAbove = compareOverlap(
+        ExpressionColoring::Feather, "1000000000001");
+    OverlapResult featherShallow = compareOverlap(
+        ExpressionColoring::Feather, "100");
+    OverlapResult trapBelow = compareOverlap(
+        ExpressionColoring::OrbitTrap, "999999999999");
+    OverlapResult trapAbove = compareOverlap(
+        ExpressionColoring::OrbitTrap, "1000000000001");
+    OverlapResult trapShallow = compareOverlap(
+        ExpressionColoring::OrbitTrap, "100");
     expect(smooth.classMismatch == 0 && smooth.floorMismatch == 0 &&
            smooth.maxDelta <= 0.05,
            "smooth overlap class/floor/value");
     expect(distance.classMismatch == 0 &&
            distance.maxDelta <= 0.01,
            "distance overlap class/value");
-    expect(feather.classMismatch == 0 &&
-           std::isfinite(feather.maxDelta) && feather.maxDelta <= 2.0,
-           "feather overlap remains bounded while unrouted");
-    expect(std::isfinite(trap.maxDelta) && trap.maxDelta <= 100.0,
-           "orbit-trap overlap remains bounded while unrouted");
+    expect(feather.byteMismatch == 0 &&
+           featherBelow.byteMismatch == 0 &&
+           featherAbove.byteMismatch == 0 &&
+           featherShallow.byteMismatch == 0,
+           "feather shallow/crossover is byte-identical");
+    expect(trap.byteMismatch == 0 &&
+           trapBelow.byteMismatch == 0 &&
+           trapAbove.byteMismatch == 0 &&
+           trapShallow.byteMismatch == 0,
+           "orbit-trap shallow/crossover is byte-identical");
 
     {
         constexpr int W = 4, H = 4, MXIT = 16;
@@ -4995,6 +5046,539 @@ static int runCustomDeepZoomCase() {
                "upper bailout Distance matches high-precision fallback");
         printf("  upper bailout smooth/distance relative=%.9g/%.9g\n",
                upperSmooth, upperDistance);
+        mpf_clears(re, im, scale, (mpf_ptr)0);
+    }
+
+    struct ColoredDeepResult {
+        bool okay = false;
+        bool usedDeep = false;
+        bool restored = false;
+        int classMismatch = 0;
+        int byteMismatch = 0;
+        double maxDelta = 0.0;
+        float centerValue = EMPTYPIXEL;
+        float centerOracle = EMPTYPIXEL;
+    };
+    auto compareColoredDeepOracle =
+        [&](ExpressionColoring coloring,
+            const char* centerRe, const char* centerIm,
+            const char* scaleText, int width, int height,
+            int mxit, int step) {
+            mp_bitcnt_t precision =
+                std::max<mp_bitcnt_t>(
+                    256, strlen(scaleText) * 4 + 96);
+            mpf_t re, im, scale;
+            mpf_init2(re, precision);
+            mpf_init2(im, precision);
+            mpf_init2(scale, precision);
+            mpf_set_str(re, centerRe, 10);
+            mpf_set_str(im, centerIm, 10);
+            mpf_set_str(scale, scaleText, 10);
+            std::vector<float> deep(
+                (size_t)width * height, EMPTYPIXEL);
+            std::vector<float> oracle(
+                (size_t)width * height, EMPTYPIXEL);
+            Mandel engine(
+                width, height, mxit, 1, deep.data());
+            engine.setPrecision((int)precision);
+            std::unique_ptr<IComputeBackend> backend =
+                createComputeBackend("cpu");
+            ComputeRequest request;
+            request.mode = ComputeMode::Expression;
+            request.cpuEngine = &engine;
+            request.centerRe = re;
+            request.centerIm = im;
+            request.scale = scale;
+            request.width = width;
+            request.height = height;
+            request.sub = 1;
+            request.maxIterations = mxit;
+            request.coloringMethod = methodFor(coloring);
+            request.iterations = deep.data();
+            request.expressionSource = &quadratic.source;
+            request.expression = &quadratic.runtime;
+            request.expressionFixed = &quadratic.fixed;
+            request.expressionPixel = FormulaParameter::C;
+            request.expressionBailout = bailout;
+            request.expressionColoring = coloring;
+            backend->resetCancellation();
+            ColoredDeepResult result;
+            result.okay = backend->compute(request);
+            result.usedDeep =
+                backend->lastComputeUsedCustomDeepPath();
+            {
+                Mandel::ScopedCustomCompute scope(
+                    engine, bailout, adapterFor(coloring));
+                result.okay = result.okay && scope.active();
+                if (scope.active())
+                    engine.ComputeDirect(
+                        mxit, oracle.data(), step,
+                        methodFor(coloring));
+            }
+            result.restored =
+                engine.escapeRadius() == productionRadius;
+            for (int y = 0; y < height; y += step) {
+                for (int x = 0; x < width; x += step) {
+                    size_t index = (size_t)y * width + x;
+                    if (coloring != ExpressionColoring::OrbitTrap &&
+                        isInterior(deep[index]) !=
+                            isInterior(oracle[index])) {
+                        ++result.classMismatch;
+                        continue;
+                    }
+                    if (std::memcmp(
+                            &deep[index], &oracle[index],
+                            sizeof(float)) != 0)
+                        ++result.byteMismatch;
+                    result.maxDelta = std::max(
+                        result.maxDelta,
+                        std::fabs(
+                            (double)deep[index] -
+                            oracle[index]));
+                }
+            }
+            const size_t center =
+                (size_t)(height / 2) * width + width / 2;
+            result.centerValue = deep[center];
+            result.centerOracle = oracle[center];
+            mpf_clears(re, im, scale, (mpf_ptr)0);
+            return result;
+        };
+
+    ColoredDeepResult featherExterior =
+        compareColoredDeepOracle(
+            ExpressionColoring::Feather,
+            "-0.75", "0.1", "10000000000000",
+            17, 13, 4000, 1);
+    ColoredDeepResult trapExterior =
+        compareColoredDeepOracle(
+            ExpressionColoring::OrbitTrap,
+            "-0.75", "0.1", "10000000000000",
+            17, 13, 4000, 1);
+    ColoredDeepResult trapInterior =
+        compareColoredDeepOracle(
+            ExpressionColoring::OrbitTrap,
+            "0", "0", "10000000000000",
+            9, 7, 96, 1);
+    expect(featherExterior.okay && featherExterior.usedDeep &&
+           featherExterior.restored &&
+           featherExterior.classMismatch == 0 &&
+           featherExterior.byteMismatch == 0,
+           "deep Feather exterior matches GMP oracle");
+    expect(trapExterior.okay && trapExterior.usedDeep &&
+           trapExterior.restored &&
+           trapExterior.byteMismatch == 0,
+           "deep OrbitTrap exterior matches GMP oracle");
+    expect(trapInterior.okay && trapInterior.usedDeep &&
+           trapInterior.restored &&
+           trapInterior.byteMismatch == 0 &&
+           trapInterior.centerValue ==
+               trapInterior.centerOracle,
+           "deep OrbitTrap interior and reference pixel match GMP");
+    if (!(trapInterior.okay && trapInterior.usedDeep &&
+          trapInterior.restored &&
+          trapInterior.byteMismatch == 0 &&
+          trapInterior.centerValue ==
+              trapInterior.centerOracle)) {
+        printf("  trap interior mismatch bytes/max/center="
+               "%d/%.9g/%.9g/%.9g\n",
+               trapInterior.byteMismatch,
+               trapInterior.maxDelta,
+               trapInterior.centerValue,
+               trapInterior.centerOracle);
+    }
+
+    struct HistoryRegressionResult {
+        bool okay = false;
+        bool usedDeep = false;
+        bool directExact = false;
+        bool gmpExact = false;
+        bool centerExact = false;
+        bool seriesWasBuilt = false;
+        bool blaWasRequested = false;
+        bool skipsDisabled = false;
+        long long gmpFallbackPixels = -1;
+        int interiorPixels = 0;
+        int gmpByteMismatch = 0;
+        double gmpMaxDelta = 0.0;
+    };
+    auto runHistoryRegression =
+        [&](ExpressionColoring coloring) {
+            constexpr int W = 5, H = 5, MXIT = 512;
+            mpf_t re, im, scale;
+            mpf_init2(re, 256);
+            mpf_init2(im, 256);
+            mpf_init2(scale, 256);
+            mpf_set_str(re, "-0.5", 10);
+            mpf_set_str(im, "0.5", 10);
+            mpf_set_str(scale, "1000000000001", 10);
+            std::vector<float> direct(
+                (size_t)W * H, EMPTYPIXEL);
+            std::vector<float> deep(
+                (size_t)W * H, EMPTYPIXEL);
+            std::vector<float> gmp(
+                (size_t)W * H, EMPTYPIXEL);
+            std::vector<float> classification(
+                (size_t)W * H, EMPTYPIXEL);
+            Mandel directEngine(W, H, MXIT, 1, direct.data());
+            Mandel deepEngine(W, H, MXIT, 1, deep.data());
+            directEngine.setPrecision(256);
+            deepEngine.setPrecision(256);
+            HistoryRegressionResult result;
+            result.okay = directEngine.ComputeExpression(
+                re, im, scale, quadratic.runtime,
+                quadratic.fixed, FormulaParameter::C,
+                MXIT, bailout, coloring);
+
+            std::unique_ptr<IComputeBackend> backend =
+                createComputeBackend("cpu");
+            ComputeRequest request;
+            request.mode = ComputeMode::Expression;
+            request.cpuEngine = &deepEngine;
+            request.centerRe = re;
+            request.centerIm = im;
+            request.scale = scale;
+            request.width = W;
+            request.height = H;
+            request.sub = 1;
+            request.maxIterations = MXIT;
+            request.coloringMethod = methodFor(coloring);
+            request.iterations = deep.data();
+            request.expressionSource = &quadratic.source;
+            request.expression = &quadratic.runtime;
+            request.expressionFixed = &quadratic.fixed;
+            request.expressionPixel = FormulaParameter::C;
+            request.expressionBailout = bailout;
+            request.expressionColoring = coloring;
+            backend->resetCancellation();
+            result.okay = result.okay && backend->compute(request);
+            result.usedDeep =
+                backend->lastComputeUsedCustomDeepPath();
+            result.seriesWasBuilt =
+                deepEngine.lastCustomHistorySeriesWasBuilt();
+            result.blaWasRequested =
+                deepEngine.lastCustomHistoryBlaWasRequested();
+            result.skipsDisabled =
+                deepEngine.lastCustomHistorySkipsDisabled();
+            result.gmpFallbackPixels =
+                deepEngine.lastDeepGmpFallbackPixels();
+
+            {
+                Mandel::ScopedCustomCompute scope(
+                    deepEngine, bailout, adapterFor(coloring));
+                result.okay = result.okay && scope.active();
+                if (scope.active()) {
+                    deepEngine.ComputeDirect(
+                        MXIT, gmp.data(), 1,
+                        methodFor(coloring));
+                }
+            }
+            {
+                Mandel::ScopedCustomCompute scope(
+                    deepEngine, bailout,
+                    CustomDeepZoomOutputAdapter::None);
+                result.okay = result.okay && scope.active();
+                if (scope.active())
+                    deepEngine.ComputeDirect(
+                        MXIT, classification.data(), 1, 0);
+            }
+            result.directExact =
+                std::memcmp(
+                    deep.data(), direct.data(),
+                    deep.size() * sizeof(float)) == 0;
+            result.gmpExact =
+                std::memcmp(
+                    deep.data(), gmp.data(),
+                    deep.size() * sizeof(float)) == 0;
+            for (size_t index = 0; index < deep.size(); ++index) {
+                if (std::memcmp(
+                        &deep[index], &gmp[index],
+                        sizeof(float)) != 0)
+                    ++result.gmpByteMismatch;
+                result.gmpMaxDelta = std::max(
+                    result.gmpMaxDelta,
+                    std::fabs(
+                        (double)deep[index] - gmp[index]));
+            }
+            const size_t center =
+                (size_t)(H / 2) * W + W / 2;
+            result.centerExact =
+                std::memcmp(
+                    &deep[center], &direct[center],
+                    sizeof(float)) == 0 &&
+                std::memcmp(
+                    &deep[center], &gmp[center],
+                    sizeof(float)) == 0;
+            result.interiorPixels = (int)std::count(
+                classification.begin(), classification.end(),
+                -2.0f);
+            mpf_clears(re, im, scale, (mpf_ptr)0);
+            return result;
+        };
+
+    _putenv_s("MANDEL_BLA", "1");
+    _putenv_s("MANDEL_FE", "0");
+    HistoryRegressionResult featherHistory =
+        runHistoryRegression(ExpressionColoring::Feather);
+    HistoryRegressionResult trapHistory =
+        runHistoryRegression(ExpressionColoring::OrbitTrap);
+    _putenv_s("MANDEL_FE", "1");
+    HistoryRegressionResult trapFloatExpBounded =
+        runHistoryRegression(ExpressionColoring::OrbitTrap);
+    _putenv_s("MANDEL_BLA", "");
+    _putenv_s("MANDEL_FE", "");
+
+    auto historyOkay =
+        [](const HistoryRegressionResult& result) {
+            return result.okay && result.usedDeep &&
+                   result.gmpMaxDelta <= 1e-4 &&
+                   result.centerExact &&
+                   result.seriesWasBuilt &&
+                   result.blaWasRequested &&
+                   result.skipsDisabled &&
+                   result.interiorPixels > 0;
+        };
+    expect(historyOkay(featherHistory) &&
+           historyOkay(trapHistory),
+           "Custom Feather/Trap observe every orbit value with SA/BLA disabled");
+    expect(historyOkay(trapFloatExpBounded) &&
+           trapFloatExpBounded.gmpFallbackPixels == 0,
+           "bounded Custom OrbitTrap avoids cutoff-driven full-frame GMP");
+    if (!(historyOkay(featherHistory) &&
+          historyOkay(trapHistory) &&
+          historyOkay(trapFloatExpBounded) &&
+          trapFloatExpBounded.gmpFallbackPixels == 0)) {
+        printf("  history feather direct/gmp/SA/BLA/off/int="
+               "%d/%d/%d/%d/%d/%d"
+               " trap=%d/%d/%d/%d/%d/%d mismatch/max=%d/%.9g"
+               " FEtrap=%d/%d/%d/%d/%d/%d mismatch/max=%d/%.9g"
+               " fallback=%lld\n",
+               featherHistory.directExact,
+               featherHistory.gmpExact,
+               featherHistory.seriesWasBuilt,
+               featherHistory.blaWasRequested,
+               featherHistory.skipsDisabled,
+               featherHistory.interiorPixels,
+               trapHistory.directExact,
+               trapHistory.gmpExact,
+               trapHistory.seriesWasBuilt,
+               trapHistory.blaWasRequested,
+               trapHistory.skipsDisabled,
+               trapHistory.interiorPixels,
+               trapHistory.gmpByteMismatch,
+               trapHistory.gmpMaxDelta,
+               trapFloatExpBounded.directExact,
+               trapFloatExpBounded.gmpExact,
+               trapFloatExpBounded.seriesWasBuilt,
+               trapFloatExpBounded.blaWasRequested,
+               trapFloatExpBounded.skipsDisabled,
+               trapFloatExpBounded.interiorPixels,
+               trapFloatExpBounded.gmpByteMismatch,
+               trapFloatExpBounded.gmpMaxDelta,
+               trapFloatExpBounded.gmpFallbackPixels);
+    }
+
+    const std::string floatExpScale =
+        "1" + std::string(1000, '0');
+    ColoredDeepResult featherFloatExp =
+        compareColoredDeepOracle(
+            ExpressionColoring::Feather,
+            "-0.5", "0.5", floatExpScale.c_str(),
+            5, 5, 10000, 4);
+    ColoredDeepResult trapFloatExp =
+        compareColoredDeepOracle(
+            ExpressionColoring::OrbitTrap,
+            "-0.5", "0.5", floatExpScale.c_str(),
+            5, 5, 10000, 4);
+    expect(featherFloatExp.okay && featherFloatExp.usedDeep &&
+           featherFloatExp.restored &&
+           featherFloatExp.classMismatch == 0 &&
+           featherFloatExp.maxDelta <= 1e-4,
+           "floatexp Feather matches sampled GMP oracle");
+    expect(trapFloatExp.okay && trapFloatExp.usedDeep &&
+           trapFloatExp.restored &&
+           trapFloatExp.maxDelta <= 1e-4,
+           "floatexp OrbitTrap matches sampled GMP oracle");
+    if (!(featherFloatExp.okay && featherFloatExp.usedDeep &&
+          featherFloatExp.restored &&
+          featherFloatExp.classMismatch == 0 &&
+          featherFloatExp.maxDelta <= 1e-4) ||
+        !(trapFloatExp.okay && trapFloatExp.usedDeep &&
+          trapFloatExp.restored &&
+          trapFloatExp.maxDelta <= 1e-4)) {
+        printf("  floatexp feather class/bytes/max=%d/%d/%.9g"
+               " trap bytes/max=%d/%.9g\n",
+               featherFloatExp.classMismatch,
+               featherFloatExp.byteMismatch,
+               featherFloatExp.maxDelta,
+               trapFloatExp.byteMismatch,
+               trapFloatExp.maxDelta);
+    }
+
+    auto renderColoredDeep =
+        [&](ExpressionColoring coloring,
+            const char* centerRe, const char* centerIm,
+            const char* scaleText, int width, int height,
+            int mxit, std::vector<float>& output) {
+            mp_bitcnt_t precision =
+                std::max<mp_bitcnt_t>(
+                    256, strlen(scaleText) * 4 + 96);
+            mpf_t re, im, scale;
+            mpf_init2(re, precision);
+            mpf_init2(im, precision);
+            mpf_init2(scale, precision);
+            mpf_set_str(re, centerRe, 10);
+            mpf_set_str(im, centerIm, 10);
+            mpf_set_str(scale, scaleText, 10);
+            output.assign(
+                (size_t)width * height, EMPTYPIXEL);
+            Mandel engine(
+                width, height, mxit, 1, output.data());
+            engine.setPrecision((int)precision);
+            std::unique_ptr<IComputeBackend> backend =
+                createComputeBackend("cpu");
+            ComputeRequest request;
+            request.mode = ComputeMode::Expression;
+            request.cpuEngine = &engine;
+            request.centerRe = re;
+            request.centerIm = im;
+            request.scale = scale;
+            request.width = width;
+            request.height = height;
+            request.sub = 1;
+            request.maxIterations = mxit;
+            request.coloringMethod = methodFor(coloring);
+            request.iterations = output.data();
+            request.expressionSource = &quadratic.source;
+            request.expression = &quadratic.runtime;
+            request.expressionFixed = &quadratic.fixed;
+            request.expressionPixel = FormulaParameter::C;
+            request.expressionBailout = bailout;
+            request.expressionColoring = coloring;
+            backend->resetCancellation();
+            bool okay = backend->compute(request) &&
+                backend->lastComputeUsedCustomDeepPath() &&
+                engine.escapeRadius() == productionRadius;
+            mpf_clears(re, im, scale, (mpf_ptr)0);
+            return okay;
+        };
+    std::vector<float> featherBlaOn, featherBlaOff;
+    _putenv_s("MANDEL_BLA", "1");
+    bool featherBlaOnOkay = renderColoredDeep(
+        ExpressionColoring::Feather,
+        "-0.749139567333446841955467474699747367338762518832278501811",
+        "0.040823298514634751035521346975478853963578400940553676068",
+        "73541770000000000000000000000000",
+        8, 6, 50000, featherBlaOn);
+    _putenv_s("MANDEL_BLA", "0");
+    bool featherBlaOffOkay = renderColoredDeep(
+        ExpressionColoring::Feather,
+        "-0.749139567333446841955467474699747367338762518832278501811",
+        "0.040823298514634751035521346975478853963578400940553676068",
+        "73541770000000000000000000000000",
+        8, 6, 50000, featherBlaOff);
+    _putenv_s("MANDEL_BLA", "");
+    expect(featherBlaOnOkay && featherBlaOffOkay &&
+           featherBlaOn.size() == featherBlaOff.size() &&
+           std::memcmp(
+               featherBlaOn.data(), featherBlaOff.data(),
+               featherBlaOn.size() * sizeof(float)) == 0,
+           "deep Feather BLA preserves exact accumulator semantics");
+
+    {
+        constexpr int W = 9, H = 7, MXIT = 1000;
+        mpf_t re, im, scale;
+        mpf_init2(re, 256);
+        mpf_init2(im, 256);
+        mpf_init2(scale, 256);
+        mpf_set_d(re, -0.75);
+        mpf_set_d(im, 0.1);
+        mpf_set_str(scale, "10000000000000", 10);
+        std::vector<float> reused((size_t)W * H, EMPTYPIXEL);
+        std::vector<float> fresh((size_t)W * H, EMPTYPIXEL);
+        Mandel reusedEngine(W, H, MXIT, 1, reused.data());
+        Mandel freshEngine(W, H, MXIT, 1, fresh.data());
+        std::unique_ptr<IComputeBackend> backend =
+            createComputeBackend("cpu");
+        ComputeRequest request;
+        request.mode = ComputeMode::Expression;
+        request.cpuEngine = &reusedEngine;
+        request.centerRe = re;
+        request.centerIm = im;
+        request.scale = scale;
+        request.width = W;
+        request.height = H;
+        request.sub = 1;
+        request.maxIterations = MXIT;
+        request.coloringMethod = ColoringMethod::STRIPE_AVERAGE;
+        request.iterations = reused.data();
+        request.expressionSource = &quadratic.source;
+        request.expression = &quadratic.runtime;
+        request.expressionFixed = &quadratic.fixed;
+        request.expressionPixel = FormulaParameter::C;
+        request.expressionBailout = bailout;
+        request.expressionColoring = ExpressionColoring::Feather;
+        backend->resetCancellation();
+        bool success = backend->compute(request) &&
+            backend->lastComputeUsedCustomDeepPath();
+        std::vector<float> expectedDeep = reused;
+        std::fill(reused.begin(), reused.end(), EMPTYPIXEL);
+        request.coloringMethod =
+            ColoringMethod::STRIPE_AVERAGE |
+            ColoringMethod::SUPER_SAMPLING;
+        backend->resetCancellation();
+        bool orthogonalFlagOkay =
+            backend->compute(request) &&
+            backend->lastComputeUsedCustomDeepPath() &&
+            std::memcmp(
+                expectedDeep.data(), reused.data(),
+                reused.size() * sizeof(float)) == 0;
+
+        request.coloringMethod = ColoringMethod::ORBIT_TRAP;
+        backend->resetCancellation();
+        bool rejectedMismatch = !backend->compute(request) &&
+            !backend->lastComputeUsedCustomDeepPath();
+
+        bool ordinaryDeepSame = true;
+        request.mode = ComputeMode::Mandelbrot;
+        request.maxIterations = MXIT;
+        for (int method :
+             { ColoringMethod::STRIPE_AVERAGE,
+               ColoringMethod::ORBIT_TRAP }) {
+            std::fill(reused.begin(), reused.end(), EMPTYPIXEL);
+            std::fill(fresh.begin(), fresh.end(), EMPTYPIXEL);
+            freshEngine.Compute(
+                re, im, scale, MXIT, method);
+            request.coloringMethod = method;
+            backend->resetCancellation();
+            ordinaryDeepSame =
+                ordinaryDeepSame && backend->compute(request) &&
+                !backend->lastComputeUsedCustomDeepPath() &&
+                std::memcmp(
+                    fresh.data(), reused.data(),
+                    fresh.size() * sizeof(float)) == 0;
+        }
+
+        std::fill(reused.begin(), reused.end(), EMPTYPIXEL);
+        mpf_set_d(re, -0.5);
+        mpf_set_ui(im, 0);
+        mpf_set_ui(scale, 1);
+        freshEngine.Compute(
+            re, im, scale, 300,
+            ColoringMethod::STRIPE_AVERAGE);
+        request.maxIterations = 300;
+        request.coloringMethod = ColoringMethod::STRIPE_AVERAGE;
+        backend->resetCancellation();
+        bool ordinaryOkay = backend->compute(request);
+        bool ordinarySame =
+            std::memcmp(
+                fresh.data(), reused.data(),
+                fresh.size() * sizeof(float)) == 0;
+        expect(success && orthogonalFlagOkay &&
+               rejectedMismatch && ordinaryDeepSame &&
+               ordinaryOkay && ordinarySame &&
+               reusedEngine.escapeRadius() == productionRadius,
+               "backend validates adapter and restores success/failure state");
         mpf_clears(re, im, scale, (mpf_ptr)0);
     }
 
@@ -5198,14 +5782,14 @@ static int runCustomDeepZoomCase() {
         request.scale = scale;
         request.width = W; request.height = H; request.sub = 1;
         request.maxIterations = MXIT;
-        request.coloringMethod = 0;
+        request.coloringMethod = ColoringMethod::ORBIT_TRAP;
         request.iterations = output.data();
         request.expressionSource = &quadratic.source;
         request.expression = &quadratic.runtime;
         request.expressionFixed = &quadratic.fixed;
         request.expressionPixel = FormulaParameter::C;
         request.expressionBailout = bailout;
-        request.expressionColoring = ExpressionColoring::Smooth;
+        request.expressionColoring = ExpressionColoring::OrbitTrap;
         backend->resetCancellation();
         auto future = std::async(std::launch::async, [&] {
             return backend->compute(request);
@@ -5228,7 +5812,7 @@ static int runCustomDeepZoomCase() {
         expect(completed && cancelSeconds < 3.0 &&
                !result && empty > 0 &&
                usedCustom && radiusRestored,
-               "GMP fallback cancellation is bounded and restores state");
+               "OrbitTrap GMP fallback cancellation restores state");
         printf("  GMP cancellation completed/result/empty/time/restored="
                "%d/%d/%d/%.3f/%d\n",
                completed ? 1 : 0, result ? 1 : 0, empty,
@@ -5241,9 +5825,12 @@ static int runCustomDeepZoomCase() {
         mpf_set_d(re, -0.5);
         mpf_set_ui(im, 0);
         mpf_set_ui(scale, 1);
-        ordinaryEngine.Compute(re, im, scale, 200, 0);
+        ordinaryEngine.Compute(
+            re, im, scale, 200,
+            ColoringMethod::ORBIT_TRAP);
         request.mode = ComputeMode::Mandelbrot;
         request.maxIterations = 200;
+        request.coloringMethod = ColoringMethod::ORBIT_TRAP;
         bool ordinaryOkay = backend->compute(request);
         bool ordinarySame =
             std::memcmp(
@@ -5252,7 +5839,21 @@ static int runCustomDeepZoomCase() {
         expect(ordinaryOkay && ordinarySame &&
                engine.escapeRadius() == productionRadius &&
                !backend->lastComputeUsedCustomDeepPath(),
-               "cancelled Custom frame leaves no ordinary-frame state");
+               "cancelled Custom trap leaves ordinary trap byte-identical");
+        ordinaryEngine.setPrecision(256);
+        mpf_set_ui(re, 0);
+        mpf_set_ui(im, 0);
+        mpf_set_str(scale, "10000000000000", 10);
+        ordinaryEngine.Compute(
+            re, im, scale, 200,
+            ColoringMethod::ORBIT_TRAP);
+        float ordinaryTrapCenter =
+            ordinary[(H / 2) * W + W / 2];
+        expect(ordinaryTrapCenter >= 0.0f,
+               "ordinary deep trap reference keeps its interior color");
+        if (ordinaryTrapCenter < 0.0f)
+            printf("  ordinary deep trap center=%.9g\n",
+                   ordinaryTrapCenter);
         mpf_clears(re, im, scale, (mpf_ptr)0);
     }
 
@@ -5270,30 +5871,40 @@ static int runCustomDeepZoomCase() {
         FormulaContext customFormula = expressionFormula();
         customFormula.slice.pixel = FormulaParameter::C;
         OrbitWorker worker;
-        OrbitResult orbit;
-        worker.request(
-            re, im, scale, 3, 3, 7, 7, 16, customFormula,
-            std::make_shared<const formula::ExpressionOrbitSnapshot>(
-                snapshot),
-            plan(quadratic, FormulaParameter::C, bailout,
-                 ExpressionColoring::Smooth, scale, re, im));
-        auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::seconds(3);
-        while (!worker.takeLatest(orbit) &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        for (ExpressionColoring coloring :
+             { ExpressionColoring::Smooth,
+               ExpressionColoring::Feather,
+               ExpressionColoring::OrbitTrap }) {
+            OrbitResult orbit;
+            worker.request(
+                re, im, scale, 3, 3, 7, 7, 16,
+                customFormula,
+                std::make_shared<
+                    const formula::ExpressionOrbitSnapshot>(
+                        snapshot),
+                plan(quadratic, FormulaParameter::C, bailout,
+                     coloring, scale, re, im));
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(3);
+            while (!worker.takeLatest(orbit) &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(1));
+            }
+            expect(orbit.generation != 0 &&
+                   orbit.usedGmpQuadratic &&
+                   orbit.pixelParameter == FormulaParameter::C &&
+                   orbit.points.size() ==
+                       (size_t)orbit.iterations + 1 &&
+                   orbit.escaped && orbit.iterations == 3 &&
+                   orbit.points.back().re == 5.0f &&
+                   orbit.points.back().im == 0.0f,
+                   "Custom deep GMP orbit uses shared coloring plan");
         }
-        expect(orbit.generation != 0 && orbit.usedGmpQuadratic &&
-               orbit.pixelParameter == FormulaParameter::C &&
-               orbit.points.size() == (size_t)orbit.iterations + 1 &&
-               orbit.escaped && orbit.iterations == 3 &&
-               orbit.points.back().re == 5.0f &&
-               orbit.points.back().im == 0.0f,
-               "Custom deep GMP orbit uses bailout squared");
         mpf_clears(re, im, scale, (mpf_ptr)0);
     }
 
-    printf("=== Custom deep-zoom stage 1\n");
+    printf("=== Custom deep-zoom stage 2\n");
     printf("  Custom bailout=%.9g production bailout=%.9g"
            " direct limit=%.0e\n",
            bailout, productionRadius,
@@ -5303,7 +5914,7 @@ static int runCustomDeepZoomCase() {
            smooth.classMismatch, smooth.floorMismatch, smooth.maxDelta,
            distance.classMismatch, distance.maxDelta,
            distance.maxRelative);
-    printf("  unrouted feather/trap max delta=%.6g/%.6g\n",
+    printf("  feather/trap crossover max delta=%.6g/%.6g\n",
            feather.maxDelta, trap.maxDelta);
     printf("  => %s\n\n",
            failures == 0 ? "PASS"

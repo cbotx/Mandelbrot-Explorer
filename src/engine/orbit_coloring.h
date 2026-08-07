@@ -132,6 +132,34 @@ struct TrapAccum {
     }
 };
 
+inline double formulaPowerSmoothMu(
+        int iteration, double magnitude, int power) {
+    double mu = (double)iteration;
+    if (power > 1 && magnitude > 1.0 &&
+        std::isfinite(magnitude)) {
+        double smooth = iteration -
+            std::log(std::log(magnitude)) /
+            std::log((double)power);
+        if (std::isfinite(smooth)) mu = smooth;
+    }
+    return mu;
+}
+
+inline float formulaPowerFeatherValue(
+        const SacAccum& stripe, double magnitude,
+        double bailout, int power) {
+    return power > 1
+        ? stripe.powerValue(magnitude, bailout, power)
+        : stripe.exactValue();
+}
+
+inline float formulaPowerTrapValue(
+        const TrapAccum& trap, int iteration,
+        double magnitude, int power) {
+    return trap.value(
+        formulaPowerSmoothMu(iteration, magnitude, power));
+}
+
 enum class FormulaColorMode {
     Feather,
     OrbitTrap
@@ -160,19 +188,11 @@ struct FormulaColorAccum {
                          int power, double bailout) const {
         double result;
         if (mode == FormulaColorMode::Feather) {
-            result = power > 1
-                ? stripe.powerValue(magnitude, bailout, power)
-                : stripe.exactValue();
+            result = formulaPowerFeatherValue(
+                stripe, magnitude, bailout, power);
         } else {
-            double mu = (double)iteration;
-            if (power > 1 && magnitude > 1.0 &&
-                std::isfinite(magnitude)) {
-                double smooth = iteration -
-                    std::log(std::log(magnitude)) /
-                    std::log((double)power);
-                if (std::isfinite(smooth)) mu = smooth;
-            }
-            result = trap.value(mu);
+            result = formulaPowerTrapValue(
+                trap, iteration, magnitude, power);
         }
         return std::isfinite(result) && result >= 0.0
             ? (float)result : 0.0f;

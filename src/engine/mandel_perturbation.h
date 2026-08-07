@@ -191,6 +191,18 @@ public:
     // Optional second output buffer for NORMAL_MAP: per-pixel surface-normal angle
     // (same layout as the iter buffer). nullptr => no normal output.
     void setNormalBuffer(float* n) { _normal = n; }
+    // Verification telemetry for the most recent deep frame.
+    bool lastCustomHistorySeriesWasBuilt() const {
+        return _lastCustomHistorySeriesBuilt;
+    }
+    bool lastCustomHistoryBlaWasRequested() const {
+        return _lastCustomHistoryBlaRequested;
+    }
+    bool lastCustomHistorySkipsDisabled() const {
+        return _lastCustomHistoryMode && !_use_bla && !_SA_flag &&
+               _SA_it == 0 && _SA_order == 0;
+    }
+    long long lastDeepGmpFallbackPixels() const;
 
 private:
     inline bool escape(Comp& z) const;
@@ -267,6 +279,7 @@ private:
                  double* outAB = nullptr) const;
     int createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random,
                   int c_method = 0, bool view_center = false);
+    void disableCustomHistorySeriesApproximation();
     // Periodic-reference experiment (opt-in via MANDEL_PERIODIC, floatexp non-EDE
     // path). Detect a minibrot nucleus near the view centre; returns its period
     // (0 if none in view) and fills the nucleus coordinate.
@@ -288,7 +301,10 @@ private:
     // O(1) double while the floatexp scale S carries the deep exponent, so the
     // inner loop is native-double yet correct far past double's ~1e320 underflow.
     // Used when _use_floatexp; returns the pixel escape value (interior -> -2).
-    float pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit, int c_method, float* normalOut = nullptr) const;
+    float pixelRescaled(FloatExp dcr, FloatExp dci,
+                        double customSeedRe, double customSeedIm,
+                        int mx_ref_it, int mxit, int c_method,
+                        float* normalOut = nullptr) const;
     // AVX2 4-wide version of pixelRescaled: iterates up to 4 deep-zoom pixels in
     // lockstep, vectorising the rescaled double step while keeping BLA / rescale /
     // rebase as cheap per-lane scalar events. Writes smooth-iteration values into
@@ -316,6 +332,7 @@ private:
     volatile bool _flag_halt = false;
     std::atomic<float>* _progress = nullptr;
     std::atomic<int> _progress_done{0};
+    std::atomic<long long> _deepGmpFallbackPixels{0};
     int _progress_total = 0, _progress_report_step = 1;
     double _progress_offset = 0.0, _progress_scale = 1.0;
     double _progress_begin = 0.0, _progress_span = 1.0;
@@ -360,9 +377,12 @@ private:
     Comp _Adf_old[_SA_N], _Adf_new[_SA_N];
     Comp _Bdf_old[_SA_N], _Bdf_new[_SA_N];
     Comp _SA_delta;
-    bool _SA_flag;
-    int _SA_order;
-    int _SA_it;
+    bool _SA_flag = false;
+    int _SA_order = 0;
+    int _SA_it = 0;
+    bool _lastCustomHistoryMode = false;
+    bool _lastCustomHistorySeriesBuilt = false;
+    bool _lastCustomHistoryBlaRequested = false;
 
     Float* _zfr, * _zfi;
     // floatexp reference orbit (filled only when _use_floatexp): accurate where

@@ -22,7 +22,9 @@ enum class CustomDeepZoomPath : uint8_t {
 enum class CustomDeepZoomOutputAdapter : uint8_t {
     None,
     SmoothExpression,
-    DistanceExpression
+    DistanceExpression,
+    FeatherExpression,
+    OrbitTrapExpression
 };
 
 struct CustomDeepZoomPlan {
@@ -128,10 +130,15 @@ inline CustomDeepZoomPlan makeCustomDeepZoomPlan(
         // log(|z|), so its pixel-normalised distance is exactly one half.
         plan.coloringCompatible = true;
         plan.outputAdapter = CustomDeepZoomOutputAdapter::DistanceExpression;
+    } else if (coloring == ExpressionColoring::Feather) {
+        plan.coloringCompatible = true;
+        plan.outputAdapter = CustomDeepZoomOutputAdapter::FeatherExpression;
+    } else if (coloring == ExpressionColoring::OrbitTrap) {
+        plan.coloringCompatible = true;
+        plan.outputAdapter =
+            CustomDeepZoomOutputAdapter::OrbitTrapExpression;
     }
-    // Feather and OrbitTrap include z1=c in Custom mode but the production
-    // quadratic accumulators begin at z2. Raw also has a different convention.
-    // Keep those modes direct/capped until their orbit histories are adapted.
+    // Raw has a different iteration convention and remains direct/capped.
     if (plan.canZoomBeyondDirectLimit() && scale &&
         mpf_cmp_d(scale, CUSTOM_DIRECT_ZOOM_LIMIT) > 0) {
         plan.path = CustomDeepZoomPath::QuadraticPerturbation;

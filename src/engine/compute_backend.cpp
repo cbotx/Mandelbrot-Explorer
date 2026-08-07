@@ -78,16 +78,29 @@ public:
                     request.width, request.height);
             }
             if (deepZoom.usesQuadraticPerturbation()) {
+                const int method =
+                    request.coloringMethod &
+                    ~ColoringMethod::SUPER_SAMPLING;
                 const bool methodMatches =
                     (deepZoom.outputAdapter ==
                          formula::CustomDeepZoomOutputAdapter::
                              SmoothExpression &&
-                     request.coloringMethod == 0) ||
+                     method == 0) ||
                     (deepZoom.outputAdapter ==
                          formula::CustomDeepZoomOutputAdapter::
                              DistanceExpression &&
-                     request.coloringMethod ==
-                         ColoringMethod::EXTERIOR_DIST_EST);
+                     method ==
+                         ColoringMethod::EXTERIOR_DIST_EST) ||
+                    (deepZoom.outputAdapter ==
+                         formula::CustomDeepZoomOutputAdapter::
+                             FeatherExpression &&
+                     method ==
+                         ColoringMethod::STRIPE_AVERAGE) ||
+                    (deepZoom.outputAdapter ==
+                         formula::CustomDeepZoomOutputAdapter::
+                             OrbitTrapExpression &&
+                     method ==
+                         ColoringMethod::ORBIT_TRAP);
                 if (!methodMatches) {
                     result = false;
                     break;

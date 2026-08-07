@@ -27,7 +27,6 @@
 // [tid][0]=iterations skipped, [1]=BLA applies, [2]=normal steps.
 static long long g_bla_stat[64][8];
 static int g_bla_noescape = -1;   // env MANDEL_BLA_NOESCAPE: force-skip the escape check (timing only)
-static long long g_fe_fallback = 0;
 static long long g_fe_stat[64][3];   // [tid] 0=BLA skip-iters 1=BLA applies 2=normal steps (MANDEL_PROFILE)
 static long long g_blafe_safe[64] = { 0 };   // [tid] tryBLAfe overflow-safe floatexp fallbacks
 static int g_int_rep = -2;       // env MANDEL_INT_REP: exact state-repetition interior detection (default on; -2=unread)
@@ -42,6 +41,36 @@ static inline double nowSec() {
 using orbitcolor::SacAccum;
 using orbitcolor::TrapAccum;
 static inline int sacWindow() { return orbitcolor::stripeWindow(); }
+
+static inline bool customFeatherAdapter(
+        formula::CustomDeepZoomOutputAdapter adapter) {
+    return adapter ==
+        formula::CustomDeepZoomOutputAdapter::FeatherExpression;
+}
+
+static inline bool customTrapAdapter(
+        formula::CustomDeepZoomOutputAdapter adapter) {
+    return adapter ==
+        formula::CustomDeepZoomOutputAdapter::OrbitTrapExpression;
+}
+
+static inline float customFeatherEscapeValue(
+        const SacAccum& accumulator, double zr, double zi,
+        double radius) {
+    return orbitcolor::formulaPowerFeatherValue(
+        accumulator, std::hypot(zr, zi), radius, 2);
+}
+
+static inline float customTrapEscapeValue(
+        const TrapAccum& accumulator, int iteration,
+        double zr, double zi) {
+    return orbitcolor::formulaPowerTrapValue(
+        accumulator, iteration, std::hypot(zr, zi), 2);
+}
+
+long long Mandel::lastDeepGmpFallbackPixels() const {
+    return _deepGmpFallbackPixels.load(std::memory_order_relaxed);
+}
 
 // GMP mpf -> floatexp (m * 2^e, 0.5 <= |m| < 1), no underflow.
 static inline FloatExp mpf_to_fe(mpf_srcptr x) {
@@ -250,12 +279,18 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method,
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
     const bool normal = (c_method & ColoringMethod::NORMAL_MAP) != 0;
     const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
+    const bool customFeather =
+        sac && customFeatherAdapter(_customOutputAdapter);
+    const bool customTrap =
+        trap && customTrapAdapter(_customOutputAdapter);
     const bool de_ovl = (c_method & ColoringMethod::DE_OVERLAY) != 0;
     // The total derivative dz/dc is iterated for EDE (distance), the normal map
     // (its argument) and the DE overlay (distance); track it for any of them.
     const bool deriv = (c_method & ColoringMethod::EXTERIOR_DIST_EST) || normal || de_ovl;
     SacAccum sacc; if (sac) sacc.init(sacWindow());
     TrapAccum trapc;
+    if (customFeather) sacc.push((double)c_re, (double)c_im);
+    if (customTrap) trapc.push((double)c_re, (double)c_im);
     int i = 1;
     while (i < mxit) {
         tmp = 2.0 * (d_re * z_re - d_im * z_im);
@@ -288,16 +323,30 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method,
                 if (normalOut) *normalOut = sqrt(tmp) * log(tmp) / sqrt(dc_re * dc_re + dc_im * dc_im);
                 return (i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
             } else if (trap) {
-                return trapc.value(i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
+                if (customTrap) {
+                    return customTrapEscapeValue(
+                        trapc, i + 1,
+                        (double)z_re, (double)z_im);
+                }
+                return trapc.value(
+                    i + 1 -
+                    log(log(tmp) / 2 / log(2)) / log(2));
             } else if (sac) {
-                return sacc.value((double)tmp, escapeRadius());
+                if (customFeather) {
+                    return customFeatherEscapeValue(
+                        sacc, (double)z_re, (double)z_im,
+                        escapeRadius());
+                }
+                return sacc.value(
+                    (double)tmp, escapeRadius());
             } else {
                 return (i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
             }
         }
 
         tmp = d_re * d_re + d_im * d_im;
-        if (tmp < 0.000000001) return trap ? trapc.value(0.0) : -2;   // interior: trap-colour or sentinel
+        if (!customTrap && tmp < 0.000000001)
+            return trap ? trapc.value(0.0) : -2;   // interior: trap-colour or sentinel
         ++i;
     }
     return trap ? trapc.value(0.0) : -2;   // interior (hit mxit)
@@ -584,14 +633,22 @@ float Mandel::accuratePointCompute(
     const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
     const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
+    const bool customFeather =
+        sac && customFeatherAdapter(_customOutputAdapter);
+    const bool customTrap =
+        trap && customTrapAdapter(_customOutputAdapter);
     // The `d` derivative only powers the |d|<1e-9 interior early-out. On exterior
     // pixels it is ~6 wasted GMP muls/iter, so MANDEL_ORACLE_NODERIV=1 skips it for
     // exterior-dominated frames: interior pixels then run to mxit (same -2 verdict),
     // exterior pixels are ~2.2x cheaper -- identical output, far faster oracle images.
     static const bool g_noderiv = []{ const char* e = getenv("MANDEL_ORACLE_NODERIV"); return e && atoi(e) != 0; }();
-    const bool track_d = !g_noderiv;
+    const bool track_d = !g_noderiv && !customTrap;
     SacAccum sacc; if (sac) sacc.init(sacWindow());
     TrapAccum trapc;
+    const double seedRe = mpf_get_d(c_re);
+    const double seedIm = mpf_get_d(c_im);
+    if (customFeather) sacc.push(seedRe, seedIm);
+    if (customTrap) trapc.push(seedRe, seedIm);
     mpf_t dc_re, dc_im, e1, e2;
     mpf_init2(dc_re, wp); mpf_set_ui(dc_re, 1);
     mpf_init2(dc_im, wp); mpf_init2(e1, wp); mpf_init2(e2, wp);
@@ -664,9 +721,24 @@ float Mandel::accuratePointCompute(
                 if (mpf_sgn(e1) != 0) { mpf_div(e1, e2, e1); res = (float)mpf_get_d(e1); }
                 else res = 0.f;
             } else if (sac) {
-                res = sacc.value(rad, escapeRadius());
+                if (customFeather) {
+                    res = customFeatherEscapeValue(
+                        sacc, mpf_get_d(z_re),
+                        mpf_get_d(z_im), escapeRadius());
+                } else {
+                    res = sacc.value(rad, escapeRadius());
+                }
             } else if (trap) {
-                res = trapc.value((double)i + 1 - log(log(rad) / 2 / log(2)) / log(2));
+                if (customTrap) {
+                    res = customTrapEscapeValue(
+                        trapc, i + 1,
+                        mpf_get_d(z_re), mpf_get_d(z_im));
+                } else {
+                    res = trapc.value(
+                        (double)i + 1 -
+                        log(log(rad) / 2 / log(2)) /
+                            log(2));
+                }
             } else {
                 res = (i + 1 - log(log(rad) / 2 / log(2)) / log(2));
             }
@@ -685,6 +757,8 @@ float Mandel::accuratePointCompute(
         
         ++i;
     }
+    if (trap && res == -2.0f)
+        res = trapc.value(0.0);
     mpf_clear(d_re);
     mpf_clear(d_im);
     mpf_clear(dc_re);
@@ -936,6 +1010,15 @@ int Mandel::createPeriodicRef(int period, int mxit, int c_method) {
     return period;
 }
 
+void Mandel::disableCustomHistorySeriesApproximation() {
+    _SA_flag = false;
+    _SA_it = 0;
+    _SA_order = 0;
+    for (int i = 0; i < _SA_N; ++i)
+        _Adf_old[i] = _Bdf_old[i] = Comp{ 0 };
+    _Adf_old[0] = _SA_delta;
+}
+
 // Minibrot linear size estimate for the period-_ref_period nucleus whose critical
 // orbit was just built into the floatexp shadow (_zfr_fe/_zfi_fe). Standard deep-
 // zoomer formula (Claude Heiland-Allen; Kalles Fraktaler): for a nucleus with
@@ -998,16 +1081,12 @@ int Mandel::buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, in
     if (periodic_env < 0) { const char* e = getenv("MANDEL_PERIODIC"); periodic_env = e ? atoi(e) : -1; }
     bool periodic_want = (periodic_env == 1) ||
                          (periodic_env != 0 && mpf_cmp_d(scale, 1e280) > 0);
-    // EDE / normal-map / DE-overlay track their derivative J inside the delta loop
-    // (not from the reference), tail-window Feather (Stripe-Average) accumulates its
-    // stripe from the reconstructed pixel orbit, and Orbit-Trap accumulates from it
-    // too; the scalar pixelRescaled / stepParallel paths implement the mod-p index
-    // and BLA skip cap, so a bounded nucleus reference is valid for them. Only
-    // full-average Feather (its BLA-skip restore reads a NON-periodic reference prefix
-    // sum) still needs the full escaping-centre reference. This is the fix for the
-    // exterior-reference glitch: with the centre escaping but a sub-pixel nucleus in
-    // frame, the escaping reference is never re-referenced and returns garbage
-    // smooth/EDE/stripe/trap values (the "half image"); the bounded nucleus does not.
+    // EDE / normal-map / DE-overlay track their derivative J inside the delta loop.
+    // Ordinary tail-window Feather and Orbit-Trap also support the mod-p reference
+    // index. Scoped Custom history coloring disables BLA before this selection
+    // because it must observe every pixel-orbit value, so it always uses a full
+    // reference. Full-average Feather still needs the full reference because its
+    // BLA restore reads a non-periodic prefix sum.
     const bool sac_fullavg = (c_method & ColoringMethod::STRIPE_AVERAGE) && sacWindow() <= 0;
     if (periodic_want && _use_bla && !sac_fullavg) {
         tk = nowSec();
@@ -1177,6 +1256,15 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
     // Deep zoom: method = 1, Perturbation + Series Approximation + Rebase
     if (mpf_cmp_d(scale, 1e6) > 0) method = 1;
     if (getenv("MANDEL_FORCE_PERT")) method = 1;   // exercise perturbation at any scale
+    const bool customHistory =
+        method == 1 &&
+        (((c_method & ColoringMethod::STRIPE_AVERAGE) &&
+          customFeatherAdapter(_customOutputAdapter)) ||
+         ((c_method & ColoringMethod::ORBIT_TRAP) &&
+          customTrapAdapter(_customOutputAdapter)));
+    _lastCustomHistoryMode = customHistory;
+    _lastCustomHistorySeriesBuilt = false;
+    _lastCustomHistoryBlaRequested = false;
     
     if (_flag_halt) return;
     int ref_it = 0, pr_it = 0;
@@ -1259,7 +1347,12 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         // misclassifications; equal escape-time floor) because rebasing avoids the
         // naive-perturbation double-precision drift. Hence ON by default; set
         // MANDEL_BLA=0 to force it off.
-        { const char* e = getenv("MANDEL_BLA"); _use_bla = e ? (atoi(e) != 0) : true; }
+        { const char* e = getenv("MANDEL_BLA");
+          _use_bla = e ? (atoi(e) != 0) : true;
+          if (customHistory) {
+              _lastCustomHistoryBlaRequested = _use_bla;
+              _use_bla = false;
+          } }
         { const char* e = getenv("MANDEL_BLA_EPS"); _bla_eps = e ? atof(e) : 0.0; }
         { const char* e = getenv("MANDEL_BLA_MINSKIP"); int ms = e ? atoi(e) : 8;
           _bla_minlevel = 0; while ((1 << (_bla_minlevel + 1)) <= ms) ++_bla_minlevel; }
@@ -1276,7 +1369,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         // reference is built (see the escalation below).
         { const char* e = getenv("MANDEL_FE");
           _use_floatexp = e ? atoi(e) != 0 : (mpf_cmp_d(scale, 1e280) > 0); }
-        g_fe_fallback = 0;
+        _deepGmpFallbackPixels.store(0, std::memory_order_relaxed);
         memset(g_blafe_safe, 0, sizeof(g_blafe_safe));
         _fe_cutoff_sensitive = false;
         if (g_int_rep == -2) { const char* e = getenv("MANDEL_INT_REP"); g_int_rep = e ? atoi(e) : 1; }   // default ON
@@ -1290,6 +1383,11 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         Float c0_im_f = mpf_get_ld(_c0_im);
         floatPointCompute(c0_re_f, c0_im_f, mxit, c_method);
         ref_it = buildReferenceOrbit(s, scale, mxit, c_method, profile, pf_ref);
+        if (customHistory) {
+            _lastCustomHistorySeriesBuilt =
+                _SA_flag || _SA_it > 0;
+            disableCustomHistorySeriesApproximation();
+        }
         if (_customEscapeRadiusActive &&
             _ref_escaped && _ref_escape_iteration < mxit) {
             const int customDirectThreshold =
@@ -1321,21 +1419,32 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         // also cannot use the double-shadow BLA safely; its rescaled AVX2 path is exact.
         if (_ref_subpixel || _ref_deep_zero) _use_bla = false;
         if (_use_bla) { tk = now(); buildBLA(ref_it, (c_method & (ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::NORMAL_MAP | ColoringMethod::DE_OVERLAY)) != 0); pf_bla += now() - tk; }
-        // Reference-orbit stripe prefix sum, so a BLA skip can restore its omitted
-        // stripe-average contributions (z ~ X during a valid skip) instead of
-        // dropping them -- otherwise the dropped fraction grows with distance from
-        // the reference, giving Feather a pan-dependent radial halo.
-        if (_use_bla && _use_floatexp && (c_method & ColoringMethod::STRIPE_AVERAGE) && sacWindow() <= 0) {
+        // Ordinary Feather can restore omitted reference-orbit stripe terms during
+        // BLA skips. Scoped Custom Feather never reaches this path with BLA enabled.
+        const bool customFeather =
+            (c_method & ColoringMethod::STRIPE_AVERAGE) &&
+            customFeatherAdapter(_customOutputAdapter);
+        auto rebuildSacReferencePrefix = [&](int length) {
+            if (!_use_bla) {
+                _sacRefPre.clear();
+                return;
+            }
+            if (!(_use_bla &&
+                  (c_method & ColoringMethod::STRIPE_AVERAGE) &&
+                  sacWindow() <= 0 &&
+                  (_use_floatexp || customFeather))) {
+                _sacRefPre.clear();
+                return;
+            }
             const double* zfp = reinterpret_cast<const double*>(_zf);
-            int N = ref_it + 1;
+            int N = length + 1;
             _sacRefPre.assign((size_t)N + 1, 0.0);
             for (int m = 1; m <= N; ++m) {
                 double xr = zfp[2 * (m - 1)], xi = zfp[2 * (m - 1) + 1];
                 _sacRefPre[m] = _sacRefPre[m - 1] + (0.5 + 0.5 * sin(7.0 * atan2(xi, xr)));
             }
-        } else {
-            _sacRefPre.clear();
-        }
+        };
+        rebuildSacReferencePrefix(ref_it);
         // Coarse strided grid computed once and reused for two purposes:
         //   (a) interior auto-gate: if no probed pixel is interior, disable the
         //       (costly) periodicity detection so exterior-only frames pay ~zero.
@@ -1422,6 +1531,12 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             if (_flag_halt) return;
             if (s.empty()) break;
             tk = now(); ref_it = createRef(s, mxit, mxit, false, c_method); pf_ref += now() - tk;
+            if (customHistory) {
+                _lastCustomHistorySeriesBuilt =
+                    _lastCustomHistorySeriesBuilt ||
+                    _SA_flag || _SA_it > 0;
+                disableCustomHistorySeriesApproximation();
+            }
             _ref_bounded = !_ref_escaped;
             // createRef removes the chosen reference pixel from s. If it was the
             // final unresolved base pixel AND no adaptive-SS pass follows, there is
@@ -1434,6 +1549,8 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                 tk = now(); buildBLA(ref_it, (c_method & (ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::NORMAL_MAP | ColoringMethod::DE_OVERLAY)) != 0);
                 pf_bla += now() - tk;
             }
+            if (customFeather)
+                rebuildSacReferencePrefix(ref_it);
         }
         if (profile) {
             long long sk = 0, ap = 0, no = 0;
@@ -1449,7 +1566,8 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                 fprintf(stderr, "  [profile] FE-BLA: applies=%lld skip-iters=%lld normal-steps=%lld  avg-skip=%.1f  skip-frac=%.1f%%\n",
                         fap, fsk, fst, fap ? (double)fsk / fap : 0.0, (fsk + fst) ? 100.0 * fsk / (fsk + fst) : 0.0);
                 fprintf(stderr, "  [profile] FE: cutoff-sensitive=%d GMP-fallback-pixels=%lld\n",
-                        _fe_cutoff_sensitive ? 1 : 0, g_fe_fallback);
+                        _fe_cutoff_sensitive ? 1 : 0,
+                        _deepGmpFallbackPixels.load(std::memory_order_relaxed));
                 long long safe = 0; for (int t = 0; t < 64; ++t) safe += g_blafe_safe[t];
                 fprintf(stderr, "  [profile] FE-BLA overflow-safe fallbacks=%lld\n", safe);
             }
@@ -1625,7 +1743,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         // (coefficients belong to the base reference) and rebuilding it per
         // re-reference costs more than the skips save. So keep BLA for the first
         // pass and disable it for the (few) refinement passes -- correct by
-        // construction. BLA stays on for the base pass regardless.
+        // construction. When enabled for the frame, BLA stays on for the base pass.
         bool saved_bla = _use_bla;
         if (contiguous_fe && !ss_contiguous.empty()) {
             double ss_step_t0 = nowSec();
@@ -1641,6 +1759,12 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             if (_flag_halt) { _use_bla = saved_bla; return; }
             if (s.empty()) break;
             ref_it = createRef(s, mxit, mxit, false, c_method);
+            if (customHistory) {
+                _lastCustomHistorySeriesBuilt =
+                    _lastCustomHistorySeriesBuilt ||
+                    _SA_flag || _SA_it > 0;
+                disableCustomHistorySeriesApproximation();
+            }
             _use_bla = false;   // base BLA table is now stale for the new reference
         }
         _use_bla = saved_bla;
@@ -1757,6 +1881,19 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
     // Orbit traps need every orbit point, so BLA (which skips runs) is disabled.
     const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
+    const bool customFeather =
+        sac && customFeatherAdapter(_customOutputAdapter);
+    const bool customTrap =
+        trap && customTrapAdapter(_customOutputAdapter);
+    const bool customOrbitSeed = customFeather || customTrap;
+    const double customC0Re =
+        customOrbitSeed ? mpf_get_ld(_c0_re) : 0.0;
+    const double customC0Im =
+        customOrbitSeed ? mpf_get_ld(_c0_im) : 0.0;
+    const double customDx =
+        customOrbitSeed ? mpf_get_ld(_dx) : 0.0;
+    const double customDy =
+        customOrbitSeed ? mpf_get_ld(_dy) : 0.0;
     const bool use_bla_loop = _use_bla && !trap;
     static int simd_env = -1;
     if (simd_env < 0) { const char* e = getenv("MANDEL_SIMD"); simd_env = e ? atoi(e) : 1; }
@@ -1776,6 +1913,10 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         const bool feSimdOn = fesimd && !_use_bla && !sac && !deriv && !trap;
 
         std::vector<FloatExp> Dcr(n), Dci(n);
+        std::vector<double> customSeedRe(
+            customOrbitSeed ? n : 0);
+        std::vector<double> customSeedIm(
+            customOrbitSeed ? n : 0);
         std::vector<float> val(n);
         std::vector<float> nrm((normal || de_ovl) ? n : 0);
 #pragma omp parallel for schedule(dynamic, 1)
@@ -1787,6 +1928,14 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
             double py = arr[0] + (double)arr[2] / _sub;
             Dcr[i] = fe_mul_d(_dxfe, px - _ref_x);
             Dci[i] = fe_mul_d(_dyfe, py - _ref_y);
+            if (customOrbitSeed) {
+                customSeedRe[i] =
+                    customC0Re + customDx * arr[1] +
+                    customDx * arr[3] / _sub;
+                customSeedIm[i] =
+                    customC0Im + customDy * arr[0] +
+                    customDy * arr[2] / _sub;
+            }
         }
         double step_setup = step_profile ? nowSec() - step_t0 - step_copy : 0.0;
         // Write each finished pixel to _iter as soon as it is computed (not in a
@@ -1797,11 +1946,12 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
             float value = val[i];
             if (value == EMPTYPIXEL ||
                 (_fe_cutoff_sensitive &&
-                 (value < 0 || value > mxit - 16))) {
+                 (customOrbitSeed ||
+                  value < 0 || value > mxit - 16))) {
                 value = accuratePixelCompute(
                     arr, mxit, c_method);
-#pragma omp atomic
-                ++g_fe_fallback;
+                _deepGmpFallbackPixels.fetch_add(
+                    1, std::memory_order_relaxed);
             }
             setPixel(arr, value);
             if ((normal || de_ovl) && _normal) _normal[getIndex(arr)] = nrm[i];
@@ -1820,7 +1970,12 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
 #pragma omp parallel for schedule(dynamic, 64)
             for (int i = 0; i < (int)v.size(); ++i) {
                 if (_flag_halt) continue;
-                val[i] = pixelRescaled(Dcr[i], Dci[i], mx_ref_it, mxit, c_method, (normal || de_ovl) ? &nrm[i] : nullptr);
+                val[i] = pixelRescaled(
+                    Dcr[i], Dci[i],
+                    customOrbitSeed ? customSeedRe[i] : 0.0,
+                    customOrbitSeed ? customSeedIm[i] : 0.0,
+                    mx_ref_it, mxit, c_method,
+                    (normal || de_ovl) ? &nrm[i] : nullptr);
                 finalize(i);
             }
         }
@@ -1973,6 +2128,32 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         // BLA skip breaks the tail, so it resets the window.
         SacAccum sacc; if (sac) sacc.init(sacWindow());
         TrapAccum trapc;
+        if (customFeather) {
+            if (arr == _ref) {
+                sacc.push(
+                    mpf_get_ld(_ref_z_re),
+                    mpf_get_ld(_ref_z_im));
+            } else {
+                sacc.push(
+                    customC0Re + customDx * arr[1] +
+                        customDx * arr[3] / _sub,
+                    customC0Im + customDy * arr[0] +
+                        customDy * arr[2] / _sub);
+            }
+        }
+        if (customTrap) {
+            if (arr == _ref) {
+                trapc.push(
+                    mpf_get_ld(_ref_z_re),
+                    mpf_get_ld(_ref_z_im));
+            } else {
+                trapc.push(
+                    customC0Re + customDx * arr[1] +
+                        customDx * arr[3] / _sub,
+                    customC0Im + customDy * arr[0] +
+                        customDy * arr[2] / _sub);
+            }
+        }
         // Exact state-repetition interior detector (MANDEL_INT_REP, default on). The
         // full pixel state is (dzr, dzi, k); it is deterministic, so if it EXACTLY
         // repeats, the orbit loops forever -> provably interior (an escaping orbit
@@ -1981,7 +2162,9 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         // geometric intervals. Gated on _use_interior (auto-off for exterior-only
         // views -> no overhead) and !trap (trap's interior value depends on the orbit
         // accumulator).
-        const bool int_rep = g_int_rep > 0 && _use_interior && !trap;
+        const bool detect_interior = _use_interior && !customTrap;
+        const bool int_rep =
+            g_int_rep > 0 && detect_interior && !trap;
         double sdzr = 1e300, sdzi = 1e300; int sk = -1; int save_j2 = j, twin2 = 1;
         while (j < mxit) {
             if (_flag_halt) break;
@@ -2003,7 +2186,18 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                     g_bla_stat[tid][0] += skip; ++g_bla_stat[tid][1];
                     k += skip; j += skip;
                     rk += skip; if (per && rk >= per) rk -= per; rkm1 = (per && rk == 0) ? per - 1 : rk - 1;
-                    if (sac) sacc.reset_window();   // the jump breaks the tail window
+                    if (sac) {
+                        if (customFeather && sacc.W <= 0 &&
+                            !_sacRefPre.empty() &&
+                            k < (int)_sacRefPre.size()) {
+                            sacc.add_full(
+                                _sacRefPre[k] -
+                                    _sacRefPre[k - skip],
+                                skip);
+                        } else {
+                            sacc.reset_window();
+                        }
+                    }
                     // A BLA skip jumps j forward, making the tortoise/hare periodicity
                     // detector stale, so restart it. (The exact-state interior detector
                     // below is unaffected -- it compares the full (dz,k) state, which is
@@ -2048,7 +2242,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
 
             ++k;
             rkm1 = rk; if (per) { if (++rk == per) rk = 0; } else rk = k;
-            if (_customEscapeRadiusActive && !per &&
+            if (_customEscapeRadiusActive && _ref_escaped && !per &&
                 k >= _ref_escape_iteration) {
                 setPixel(
                     arr,
@@ -2069,17 +2263,33 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                     setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
                     if (_normal) _normal[getIndex(arr)] = (float)(sqrt(zrad) / dxf * log(zrad) / sqrt(dr * dr + di * di));
                 } else if (trap) {
-                    setPixel(arr, trapc.value(j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2)));
+                    setPixel(
+                        arr,
+                        customTrap
+                            ? customTrapEscapeValue(
+                                  trapc, j + 1,
+                                  (double)zr, (double)zi)
+                            : trapc.value(
+                                  j + 1 -
+                                  log(log((double)zrad) / 2 /
+                                      log(2)) / log(2)));
                 } else if (sac) {
-                    setPixel(arr, sacc.value(
-                        (double)zrad, escapeRadius()));
+                    setPixel(
+                        arr,
+                        customFeather
+                            ? customFeatherEscapeValue(
+                                  sacc, (double)zr,
+                                  (double)zi, escapeRadius())
+                            : sacc.value(
+                                  (double)zrad,
+                                  escapeRadius()));
                 } else {
                     setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
                 }
                 markDone(i);
                 break;
             }
-            if (_use_interior) {
+            if (detect_interior) {
                 if (conf_P > 0) {
                     // Confirm a candidate cycle over several periods. Each period must
                     // (a) return close to the (updated) anchor -- a real cycle returns
@@ -2646,7 +2856,7 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
             if (!act[l] || (blaSkipped & (1 << l))) continue;   // not a stepping lane
             int bit = 1 << l;
             ++k_[l];
-            if (_customEscapeRadiusActive &&
+            if (_customEscapeRadiusActive && _ref_escaped &&
                 k_[l] >= _ref_escape_iteration)
                 need |= bit;
             if (em & bit) need |= bit;
@@ -2676,7 +2886,7 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
         bool changed = false;
         for (int l = 0; l < lanes; ++l) {
             if (!act[l] || (blaSkipped & (1 << l))) continue;
-            if (_customEscapeRadiusActive &&
+            if (_customEscapeRadiusActive && _ref_escaped &&
                 k_[l] >= _ref_escape_iteration) {
                 setPixel(
                     v[g + l],
@@ -2738,7 +2948,11 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
 // Deep-zoom rescaled (z = S w) perturbation for one pixel. See header comment:
 // w stays an O(1) double, the floatexp scale S carries the deep exponent, so the
 // inner loop is native-double yet correct far past double's ~1e320 underflow.
-float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit, int c_method, float* normalOut) const {
+float Mandel::pixelRescaled(
+        FloatExp dcr, FloatExp dci,
+        double customSeedRe, double customSeedIm,
+        int mx_ref_it, int mxit, int c_method,
+        float* normalOut) const {
     const double ESC2 = escapeRadiusSquared();
     const double LG2 = log(2.0);
     struct FeStat { long long* s; long long sk = 0, skl = 0, st = 0;
@@ -2781,6 +2995,12 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
     SacAccum sacc; if (sac) sacc.init(sacWindow());
     const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;   // BLA disabled below
     TrapAccum trapc;
+    const bool customFeather =
+        sac && customFeatherAdapter(_customOutputAdapter);
+    const bool customTrap =
+        trap && customTrapAdapter(_customOutputAdapter);
+    if (customFeather) sacc.push(customSeedRe, customSeedIm);
+    if (customTrap) trapc.push(customSeedRe, customSeedIm);
 
     // Exterior distance estimation. The double path tracks the derivative in
     // double, but at deep zoom the true derivative |dz/dc| ~ 1/dx overflows it,
@@ -2799,7 +3019,9 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
     // Exact state-repetition interior detector (see stepParallel). The floatexp
     // pixel state is (wr, wi, S, m); it is deterministic, so a bit-exact repeat
     // proves the orbit loops -> interior. Zero false positives by construction.
-    const bool int_rep = g_int_rep > 0 && _use_interior && !trap;
+    const bool detect_interior = _use_interior && !customTrap;
+    const bool int_rep =
+        g_int_rep > 0 && detect_interior && !trap;
     double swr = 1e300, swi = 1e300; FloatExp sS{ 1e300, 0 }; int sm = -1, save_iter2 = 1, twin2r = 1;
 
     while (iter < mxit) {
@@ -2872,7 +3094,7 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
         }
         ++m; ++iter; g.st++;
         rm++; if (per && rm == per) rm = 0;             // advance the (mod-per) ref index
-        if (_customEscapeRadiusActive && !per &&
+        if (_customEscapeRadiusActive && _ref_escaped && !per &&
             m >= _ref_escape_iteration)
             return EMPTYPIXEL;
         if (deriv) {
@@ -2919,17 +3141,26 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, int mx_ref_it, int mxit,
                 return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
             }
             if (trap) {
-                return trapc.value((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
+                if (customTrap) {
+                    return customTrapEscapeValue(
+                        trapc, iter, zr, zi);
+                }
+                return trapc.value(
+                    (double)iter -
+                    log(log(zrad) / 2.0 / LG2) / LG2);
             }
             if (!sac)
                 return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
-            return sacc.value(zrad, escapeRadius());
+            return customFeather
+                ? customFeatherEscapeValue(
+                      sacc, zr, zi, escapeRadius())
+                : sacc.value(zrad, escapeRadius());
         }
         if (_customEscapeRadiusActive && !per &&
             m >= reflen)
             return EMPTYPIXEL;
 
-        if (_use_interior) {
+        if (detect_interior) {
             if (conf_P > 0) {
                 conf_D2 *= 4.0 * zrad; if (conf_D2 > 1e18) conf_D2 = 1e18;
                 if (iter >= conf_next) {
@@ -3101,7 +3332,7 @@ void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g,
                 wr[l] = nwr_[l]; wi[l] = nwi_[l];
             }
             ++m[l]; ++iter[l];
-            if (_customEscapeRadiusActive &&
+            if (_customEscapeRadiusActive && _ref_escaped &&
                 m[l] >= _ref_escape_iteration) {
                 out[g + l] = EMPTYPIXEL;
                 act[l] = false;
@@ -3294,11 +3525,23 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
     if (_ref_virtual && _use_floatexp) {
         // A reference that only escapes just beyond maxit makes classification
         // exquisitely sensitive to accumulated double perturbation rounding.
+        // Custom colored values are not escape verdicts (bounded traps are
+        // nonnegative), so probe Custom frames with the uncolored oracle.
         _fe_cutoff_sensitive =
-            accuratePointCompute(_ref_z_re, _ref_z_im, mxit + 64, c_method) >= 0;
+            accuratePointCompute(
+                _ref_z_re, _ref_z_im, mxit + 64,
+                _customEscapeRadiusActive ? 0 : c_method) >= 0;
     }
-    if (!_flag_halt && !_ref_virtual)
-        setPixel(_ref, -2.f);   // bounded pixel reference was removed from the delta pass
+    if (!_flag_halt && !_ref_virtual) {
+        if (c_method & ColoringMethod::ORBIT_TRAP) {
+            setPixel(
+                _ref,
+                accuratePointCompute(
+                    _ref_z_re, _ref_z_im, mxit, c_method));
+        } else {
+            setPixel(_ref, -2.f);
+        }
+    }
     return mxit;
 }
 
