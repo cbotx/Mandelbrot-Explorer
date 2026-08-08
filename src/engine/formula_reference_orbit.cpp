@@ -1,4 +1,5 @@
 #include "formula_reference_orbit.h"
+#include "formula_scaled_residual.h"
 
 #include <algorithm>
 #include <cmath>
@@ -161,6 +162,91 @@ bool quantizationDefect(
         !mpfr_number_p(difference.im))
         return false;
     return makeScaledComplexShadow(difference, defect);
+}
+
+bool makeUpwardScaledRadius(
+        mpfr_srcptr value, ScaledRealValue& output) {
+    output = {};
+    if (!mpfr_number_p(value) || mpfr_sgn(value) < 0)
+        return false;
+    if (mpfr_zero_p(value))
+        return true;
+    long exponent = 0;
+    double mantissa =
+        mpfr_get_d_2exp(&exponent, value, MPFR_RNDU);
+    if (!std::isfinite(mantissa) || mantissa <= 0.0)
+        return false;
+    int adjustment = 0;
+    mantissa = std::frexp(mantissa, &adjustment);
+    if ((adjustment > 0 &&
+         exponent >
+             std::numeric_limits<int64_t>::max() -
+                 adjustment) ||
+        (adjustment < 0 &&
+         exponent <
+             std::numeric_limits<int64_t>::min() -
+                 adjustment))
+        return false;
+    output.mantissa = mantissa;
+    output.exponent =
+        static_cast<int64_t>(exponent) + adjustment;
+    return output.isNormalized();
+}
+
+bool compactError(
+        const MpfrComplex& exact,
+        const ScaledComplexShadow& primary,
+        const ScaledComplexShadow& defect,
+        MpfrComplex& reconstructedValue,
+        MpfrComplex& differenceLower,
+        MpfrComplex& differenceUpper,
+        mpfr_ptr componentMaximum,
+        mpfr_ptr maximum,
+        ScaledRealValue& output) {
+    ScaledComplexValue reconstructed;
+    if (makeScaledComplexValue(
+            primary, defect, reconstructed) !=
+            ScaledArithmeticStatus::Success ||
+        !setMpfrFromScaledValue(
+            reconstructedValue, reconstructed))
+        return false;
+    auto componentError = [&](
+            mpfr_srcptr exactComponent,
+            mpfr_srcptr reconstructedComponent,
+            mpfr_ptr componentOutput) {
+        mpfr_sub(
+            differenceLower.re,
+            exactComponent, reconstructedComponent,
+            MPFR_RNDD);
+        mpfr_sub(
+            differenceUpper.re,
+            exactComponent, reconstructedComponent,
+            MPFR_RNDU);
+        mpfr_abs(
+            differenceLower.re,
+            differenceLower.re, MPFR_RNDU);
+        mpfr_abs(
+            differenceUpper.re,
+            differenceUpper.re, MPFR_RNDU);
+        if (mpfr_cmp(
+                differenceLower.re,
+                differenceUpper.re) >= 0)
+            mpfr_set(
+                componentOutput,
+                differenceLower.re, MPFR_RNDU);
+        else
+            mpfr_set(
+                componentOutput,
+                differenceUpper.re, MPFR_RNDU);
+    };
+    componentError(
+        exact.re, reconstructedValue.re, maximum);
+    componentError(
+        exact.im, reconstructedValue.im,
+        componentMaximum);
+    if (mpfr_cmp(componentMaximum, maximum) > 0)
+        mpfr_set(maximum, componentMaximum, MPFR_RNDU);
+    return makeUpwardScaledRadius(maximum, output);
 }
 
 bool outsideBailout(
@@ -537,6 +623,37 @@ static bool buildExpressionReferenceOrbitImpl(
             ExpressionReferenceBuildStatus::ResourceLimit,
             "reference orbit exceeds peak memory limit");
     }
+    if (request.certificationPrecision != 0) {
+        if (request.certificationPrecision <= precision ||
+            request.certificationPrecision >
+                request.precision.maximumBits ||
+            request.certificationPrecision >
+                ExpressionReferencePrecisionPolicy::
+                    ApplicationMaximumBits) {
+            return fail(
+                ExpressionReferenceBuildStatus::
+                    PrecisionOutOfRange,
+                "higher reference certification precision is invalid");
+        }
+        uint64_t certificationPeak = 0;
+        if (!estimatePeakBytes(
+                *runtime, iterations, tapeNodes,
+                request.certificationPrecision,
+                certificationPeak) ||
+            estimatedPeak >
+                std::numeric_limits<uint64_t>::max() -
+                    certificationPeak ||
+            (request.memoryLimitBytes != 0 &&
+             estimatedPeak + certificationPeak >
+                static_cast<uint64_t>(
+                    request.memoryLimitBytes))) {
+            return fail(
+                ExpressionReferenceBuildStatus::ResourceLimit,
+                "certified reference exceeds peak memory limit");
+        }
+        result.certificationPrecision =
+            request.certificationPrecision;
+    }
 
     ExpressionOracleContext context(precision);
     setDoubleContext(request.fixed, context);
@@ -552,21 +669,75 @@ static bool buildExpressionReferenceOrbitImpl(
         context.z0.set(center);
     context.z.set(context.z0);
 
+    const bool certify =
+        request.certificationPrecision != 0;
+    const mpfr_prec_t certificationPrecision = certify
+        ? request.certificationPrecision : precision;
+    ExpressionOracleContext certificationContext(
+        certificationPrecision);
+    setDoubleContext(
+        request.fixed, certificationContext);
+    MpfrComplex certificationCenter(
+        certificationPrecision);
+    if (!setExactInput(
+            request.center, certificationCenter)) {
+        return fail(
+            ExpressionReferenceBuildStatus::InputParseError,
+            "failed to parse higher-precision reference center");
+    }
+    if (request.pixelParameter == FormulaParameter::C)
+        certificationContext.c.set(certificationCenter);
+    else
+        certificationContext.z0.set(certificationCenter);
+    certificationContext.z.set(
+        certificationContext.z0);
+
     MpfrComplex reconstructed(precision);
     MpfrComplex difference(precision);
+    MpfrComplex radiusReconstructed(
+        certificationPrecision);
+    MpfrComplex radiusDifferenceLower(
+        certificationPrecision);
+    MpfrComplex radiusDifferenceUpper(
+        certificationPrecision);
+    MpfrComplex radiusMaximumStorage(
+        certificationPrecision);
+    mpfr_ptr radiusComponentMaximum =
+        radiusMaximumStorage.re;
+    mpfr_ptr radiusMaximum =
+        radiusMaximumStorage.im;
     auto compact = [&](const MpfrComplex& value,
+                       const MpfrComplex& exact,
                        ScaledComplexShadow& shadow,
-                       ScaledComplexShadow& defect) {
+                       ScaledComplexShadow& defect,
+                       ScaledRealValue& error) {
         shadow = {};
         defect = {};
-        return makeScaledComplexShadow(value, shadow) &&
-               quantizationDefect(
-                   value, shadow, reconstructed,
-                   difference, defect);
+        error = {};
+        if (!makeScaledComplexShadow(value, shadow) ||
+            !quantizationDefect(
+                value, shadow, reconstructed,
+                difference, defect))
+            return false;
+        return !certify ||
+               compactError(
+                   exact, shadow, defect,
+                   radiusReconstructed,
+                   radiusDifferenceLower,
+                   radiusDifferenceUpper,
+                   radiusComponentMaximum,
+                   radiusMaximum, error);
     };
-    if (!compact(context.c, result.c, result.cDefect) ||
-        !compact(context.z0, result.z0, result.z0Defect) ||
-        !compact(center, result.pixel, result.pixelDefect)) {
+    if (!compact(
+            context.c, certificationContext.c,
+            result.c, result.cDefect, result.cError) ||
+        !compact(
+            context.z0, certificationContext.z0,
+            result.z0, result.z0Defect, result.z0Error) ||
+        !compact(
+            center, certificationCenter,
+            result.pixel, result.pixelDefect,
+            result.pixelError)) {
         return fail(
             ExpressionReferenceBuildStatus::
                 CompactionOutOfRange,
@@ -574,6 +745,7 @@ static bool buildExpressionReferenceOrbitImpl(
     }
     result.initialZ = result.z0;
     result.initialZDefect = result.z0Defect;
+    result.initialZError = result.z0Error;
 
     result.samples.reserve(
         static_cast<size_t>(iterations));
@@ -588,6 +760,8 @@ static bool buildExpressionReferenceOrbitImpl(
         result.escapeIteration = 0;
     } else {
         MpfrComplex next(precision);
+        MpfrComplex certificationNext(
+            certificationPrecision);
         for (int iteration = 0;
              iteration < request.maxIterations; ++iteration) {
             if (request.shouldCancel &&
@@ -601,6 +775,20 @@ static bool buildExpressionReferenceOrbitImpl(
             std::string oracleError;
             bool defined = ExpressionOracle::evaluateTrace(
                 *runtime, context, next, trace, &oracleError);
+            ExpressionOracleTrace certificationTrace;
+            std::string certificationError;
+            bool certificationDefined = true;
+            if (certify) {
+                certificationContext.iteration = iteration;
+                certificationDefined =
+                    ExpressionOracle::evaluateTrace(
+                        *runtime, certificationContext,
+                        certificationNext,
+                        certificationTrace,
+                        &certificationError);
+            } else {
+                certificationNext.set(next);
+            }
             if (trace.nodes.empty() ||
                 trace.nodes.size() >
                     std::numeric_limits<uint16_t>::max()) {
@@ -608,15 +796,26 @@ static bool buildExpressionReferenceOrbitImpl(
                     ExpressionReferenceBuildStatus::UnsupportedProgram,
                     "oracle trace did not produce a compact program tape");
             }
+            if (certify &&
+                (certificationTrace.nodes.size() !=
+                     trace.nodes.size() ||
+                 certificationDefined != defined)) {
+                return fail(
+                    ExpressionReferenceBuildStatus::
+                        CompactionOutOfRange,
+                    "higher-precision reference did not converge to the same finite trace");
+            }
 
             ExpressionReferenceSample sample;
             sample.iteration = iteration;
             if (!compact(
-                    context.z, sample.z,
-                    sample.zDefect) ||
+                    context.z, certificationContext.z,
+                    sample.z, sample.zDefect,
+                    sample.zError) ||
                 !compact(
-                    next, sample.next,
-                    sample.rootDefect)) {
+                    next, certificationNext,
+                    sample.next, sample.rootDefect,
+                    sample.nextError)) {
                 return fail(
                     ExpressionReferenceBuildStatus::
                         CompactionOutOfRange,
@@ -627,12 +826,30 @@ static bool buildExpressionReferenceOrbitImpl(
                 static_cast<uint16_t>(trace.nodes.size());
             sample.rootNode =
                 static_cast<uint16_t>(trace.nodes.size() - 1);
-            for (const ExpressionOracleTraceNode& traced :
-                 trace.nodes) {
+            for (size_t traceIndex = 0;
+                 traceIndex < trace.nodes.size();
+                 ++traceIndex) {
+                const ExpressionOracleTraceNode& traced =
+                    trace.nodes[traceIndex];
+                const ExpressionOracleTraceNode& exact =
+                    certify
+                    ? certificationTrace.nodes[traceIndex]
+                    : traced;
+                if (certify &&
+                    (traced.operation != exact.operation ||
+                     traced.argument != exact.argument ||
+                     traced.leftNode != exact.leftNode ||
+                     traced.rightNode != exact.rightNode)) {
+                    return fail(
+                        ExpressionReferenceBuildStatus::
+                            CompactionOutOfRange,
+                        "higher-precision reference tape layout mismatch");
+                }
                 ExpressionReferenceTapeNode node;
                 if (!compact(
-                        traced.output, node.output,
-                        node.outputDefect)) {
+                        traced.output, exact.output,
+                        node.output, node.outputDefect,
+                        node.outputError)) {
                     return fail(
                         ExpressionReferenceBuildStatus::
                             CompactionOutOfRange,
@@ -643,9 +860,10 @@ static bool buildExpressionReferenceOrbitImpl(
                      OracleTraceHasDenominator |
                      OracleTraceHasLogarithmBase)) {
                     if (!compact(
-                            traced.auxiliary,
+                            traced.auxiliary, exact.auxiliary,
                             node.auxiliary,
-                            node.auxiliaryDefect)) {
+                            node.auxiliaryDefect,
+                            node.auxiliaryError)) {
                         return fail(
                             ExpressionReferenceBuildStatus::
                                 CompactionOutOfRange,
@@ -662,6 +880,10 @@ static bool buildExpressionReferenceOrbitImpl(
                 node.certification = traced.certification;
                 result.tape.push_back(node);
             }
+            sample.rootError =
+                result.tape[
+                    static_cast<size_t>(sample.tapeOffset) +
+                    sample.rootNode].outputError;
             result.samples.push_back(sample);
 
             if (!defined) {
@@ -671,6 +893,9 @@ static bool buildExpressionReferenceOrbitImpl(
                 break;
             }
             context.z.set(next);
+            if (certify)
+                certificationContext.z.set(
+                    certificationNext);
             if (outsideBailout(
                     context.z, request.bailout, magnitude)) {
                 result.escaped = true;
@@ -679,6 +904,7 @@ static bool buildExpressionReferenceOrbitImpl(
             }
         }
     }
+    result.certifiedAgainstHigherPrecision = certify;
     return succeed();
 }
 

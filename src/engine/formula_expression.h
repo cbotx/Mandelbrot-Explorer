@@ -47,6 +47,13 @@ enum class ExpressionColoring : uint8_t {
     OrbitTrap
 };
 
+enum class ExpressionScaledResidualCapability : uint8_t {
+    ExactCenteredArithmetic,
+    UncertifiedSeries,
+    BranchSensitive,
+    Unsupported
+};
+
 class ExpressionProgram {
 public:
     static constexpr size_t MAX_SOURCE = 4096;
@@ -87,6 +94,7 @@ public:
     bool avx2Compatible() const { return _avx2Compatible; }
     bool batchCompatible() const { return _batchCompatible; }
     bool derivativeCompatible() const { return _derivativeCompatible; }
+    ExpressionScaledResidualCapability scaledResidualCapability() const;
 
 private:
     enum class Op : uint8_t {

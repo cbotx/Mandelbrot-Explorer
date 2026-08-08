@@ -84,6 +84,218 @@ ScaledRealValue absoluteValue(ScaledRealValue value) {
     return value;
 }
 
+bool validRadius(const ScaledRealValue& value) {
+    return value.isNormalized() &&
+           value.mantissa >= 0.0;
+}
+
+bool mpfrCertificationExponentBounds(
+        int64_t& safeMinimum, int64_t& safeMaximum) {
+    constexpr int64_t margin = 4096;
+    const int64_t emin =
+        static_cast<int64_t>(mpfr_get_emin());
+    const int64_t emax =
+        static_cast<int64_t>(mpfr_get_emax());
+    if (emin > std::numeric_limits<int64_t>::max() - margin ||
+        emax < std::numeric_limits<int64_t>::min() + margin)
+        return false;
+    safeMinimum = emin + margin;
+    safeMaximum = emax - margin;
+    return safeMinimum < safeMaximum;
+}
+
+ScaledArithmeticStatus certifyMpfrExponentRange(
+        const ScaledRealValue& value,
+        int64_t safeMinimum, int64_t safeMaximum) {
+    ScaledArithmeticStatus status = validate(value);
+    if (status != ScaledArithmeticStatus::Success ||
+        value.isZero())
+        return status;
+    return value.exponent <= safeMinimum ||
+           value.exponent >= safeMaximum
+        ? ScaledArithmeticStatus::ExponentRange
+        : ScaledArithmeticStatus::Success;
+}
+
+ScaledArithmeticStatus certifyMpfrExponentRange(
+        const ScaledComplexValue& value,
+        int64_t safeMinimum, int64_t safeMaximum) {
+    ScaledArithmeticStatus status =
+        certifyMpfrExponentRange(
+            value.re, safeMinimum, safeMaximum);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    return certifyMpfrExponentRange(
+        value.im, safeMinimum, safeMaximum);
+}
+
+ScaledArithmeticStatus certifyMpfrExponentRange(
+        const ScaledComplexBall& value,
+        int64_t safeMinimum, int64_t safeMaximum) {
+    ScaledArithmeticStatus status =
+        certifyMpfrExponentRange(
+            value.value, safeMinimum, safeMaximum);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    if (!validRadius(value.radius))
+        return ScaledArithmeticStatus::ExponentRange;
+    return certifyMpfrExponentRange(
+        value.radius, safeMinimum, safeMaximum);
+}
+
+ScaledArithmeticStatus roundScaledUp(
+        const ScaledRealValue& value,
+        ScaledRealValue& output) {
+    ScaledArithmeticStatus status = validate(value);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    if (value.mantissa < 0.0)
+        return ScaledArithmeticStatus::ExponentRange;
+    if (value.isZero()) {
+        output = {};
+        return ScaledArithmeticStatus::Success;
+    }
+    const double upward = std::nextafter(
+        value.mantissa,
+        std::numeric_limits<double>::infinity());
+    return normalize(upward, value.exponent, output);
+}
+
+ScaledArithmeticStatus addErrors(
+        const ScaledRealValue& first,
+        const ScaledRealValue& second,
+        const ScaledRealValue& third,
+        ScaledRealValue& output) {
+    ScaledRealValue partial;
+    ScaledArithmeticStatus status =
+        scaledAddUp(first, second, partial);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    return scaledAddUp(partial, third, output);
+}
+
+ScaledArithmeticStatus addRoundoff(
+        const ScaledRealValue& left,
+        const ScaledRealValue& right,
+        ScaledRealValue& output) {
+    ScaledRealValue magnitude;
+    ScaledArithmeticStatus status = scaledAddUp(
+        absoluteValue(left), absoluteValue(right),
+        magnitude);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    ScaledRealValue unitRoundoff;
+    status = makeScaledRealValue(
+        std::ldexp(1.0, -52), unitRoundoff);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    return scaledMultiplyUp(
+        magnitude, unitRoundoff, output);
+}
+
+ScaledArithmeticStatus multiplyRoundoff(
+        const ScaledRealValue& left,
+        const ScaledRealValue& right,
+        ScaledRealValue& output) {
+    ScaledRealValue magnitude;
+    ScaledArithmeticStatus status = scaledMultiplyUp(
+        absoluteValue(left), absoluteValue(right),
+        magnitude);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    ScaledRealValue unitRoundoff;
+    status = makeScaledRealValue(
+        std::ldexp(1.0, -52), unitRoundoff);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    return scaledMultiplyUp(
+        magnitude, unitRoundoff, output);
+}
+
+struct ScaledRealBall {
+    ScaledRealValue value;
+    ScaledRealValue radius;
+};
+
+ScaledArithmeticStatus certifiedRealAdd(
+        const ScaledRealBall& left,
+        const ScaledRealBall& right,
+        ScaledRealBall& output) {
+    if (!validRadius(left.radius) ||
+        !validRadius(right.radius))
+        return ScaledArithmeticStatus::ExponentRange;
+    ScaledRealBall result;
+    ScaledArithmeticStatus status = scaledAdd(
+        left.value, right.value, result.value);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    ScaledRealValue roundoff;
+    status = addRoundoff(
+        left.value, right.value, roundoff);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    status = addErrors(
+        left.radius, right.radius, roundoff,
+        result.radius);
+    if (status == ScaledArithmeticStatus::Success)
+        output = result;
+    return status;
+}
+
+ScaledArithmeticStatus certifiedRealSubtract(
+        const ScaledRealBall& left,
+        const ScaledRealBall& right,
+        ScaledRealBall& output) {
+    ScaledRealBall negative = right;
+    ScaledArithmeticStatus status =
+        scaledNegate(right.value, negative.value);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    return certifiedRealAdd(left, negative, output);
+}
+
+ScaledArithmeticStatus certifiedRealMultiply(
+        const ScaledRealBall& left,
+        const ScaledRealBall& right,
+        ScaledRealBall& output) {
+    if (!validRadius(left.radius) ||
+        !validRadius(right.radius))
+        return ScaledArithmeticStatus::ExponentRange;
+    ScaledRealBall result;
+    ScaledArithmeticStatus status = scaledMultiply(
+        left.value, right.value, result.value);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    ScaledRealValue first, second, cross, roundoff;
+    status = scaledMultiplyUp(
+        absoluteValue(left.value),
+        right.radius, first);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    status = scaledMultiplyUp(
+        absoluteValue(right.value),
+        left.radius, second);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    status = scaledMultiplyUp(
+        left.radius, right.radius, cross);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    status = multiplyRoundoff(
+        left.value, right.value, roundoff);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    ScaledRealValue partial;
+    status = addErrors(first, second, cross, partial);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    status = scaledAddUp(
+        partial, roundoff, result.radius);
+    if (status == ScaledArithmeticStatus::Success)
+        output = result;
+    return status;
+}
+
 ScaledArithmeticStatus maxComponentMagnitude(
         const ScaledComplexValue& value,
         ScaledRealValue& output) {
@@ -446,6 +658,23 @@ ScaledArithmeticStatus makeScaledRealValue(
     if (!makeScaledRealShadow(value, shadow))
         return ScaledArithmeticStatus::ExponentRange;
     return makeScaledRealValue(shadow, output);
+}
+
+ScaledArithmeticStatus makeScaledNonnegativeUpward(
+        mpfr_srcptr value, ScaledRealValue& output) {
+    if (!mpfr_number_p(value) || mpfr_sgn(value) < 0)
+        return ScaledArithmeticStatus::Nonfinite;
+    if (mpfr_zero_p(value)) {
+        output = {};
+        return ScaledArithmeticStatus::Success;
+    }
+    long exponent = 0;
+    const double mantissa =
+        mpfr_get_d_2exp(
+            &exponent, value, MPFR_RNDU);
+    return normalize(
+        mantissa, static_cast<int64_t>(exponent),
+        output);
 }
 
 ScaledArithmeticStatus makeScaledComplexValue(
@@ -819,6 +1048,183 @@ ScaledArithmeticStatus scaledNormSquared(
         realSquared, imaginarySquared, output);
 }
 
+ScaledArithmeticStatus scaledAddUp(
+        const ScaledRealValue& left,
+        const ScaledRealValue& right,
+        ScaledRealValue& output) {
+    if (!validRadius(left) || !validRadius(right))
+        return ScaledArithmeticStatus::ExponentRange;
+    ScaledRealValue rounded;
+    ScaledArithmeticStatus status =
+        scaledAdd(left, right, rounded);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    return roundScaledUp(rounded, output);
+}
+
+ScaledArithmeticStatus scaledMultiplyUp(
+        const ScaledRealValue& left,
+        const ScaledRealValue& right,
+        ScaledRealValue& output) {
+    if (!validRadius(left) || !validRadius(right))
+        return ScaledArithmeticStatus::ExponentRange;
+    ScaledRealValue rounded;
+    ScaledArithmeticStatus status =
+        scaledMultiply(left, right, rounded);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    return roundScaledUp(rounded, output);
+}
+
+ScaledArithmeticStatus certifiedScaledAdd(
+        const ScaledComplexBall& left,
+        const ScaledComplexBall& right,
+        ScaledComplexBall& output) {
+    ScaledRealBall leftReal{ left.value.re, left.radius };
+    ScaledRealBall rightReal{ right.value.re, right.radius };
+    ScaledRealBall leftImaginary{
+        left.value.im, left.radius };
+    ScaledRealBall rightImaginary{
+        right.value.im, right.radius };
+    ScaledRealBall real, imaginary;
+    ScaledArithmeticStatus status = certifiedRealAdd(
+        leftReal, rightReal, real);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    status = certifiedRealAdd(
+        leftImaginary, rightImaginary, imaginary);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    output.value.re = real.value;
+    output.value.im = imaginary.value;
+    output.radius =
+        compareScaledNonnegative(
+            real.radius, imaginary.radius) >= 0
+        ? real.radius : imaginary.radius;
+    return ScaledArithmeticStatus::Success;
+}
+
+ScaledArithmeticStatus certifiedScaledSubtract(
+        const ScaledComplexBall& left,
+        const ScaledComplexBall& right,
+        ScaledComplexBall& output) {
+    ScaledRealBall leftReal{ left.value.re, left.radius };
+    ScaledRealBall rightReal{ right.value.re, right.radius };
+    ScaledRealBall leftImaginary{
+        left.value.im, left.radius };
+    ScaledRealBall rightImaginary{
+        right.value.im, right.radius };
+    ScaledRealBall real, imaginary;
+    ScaledArithmeticStatus status = certifiedRealSubtract(
+        leftReal, rightReal, real);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    status = certifiedRealSubtract(
+        leftImaginary, rightImaginary, imaginary);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    output.value.re = real.value;
+    output.value.im = imaginary.value;
+    output.radius =
+        compareScaledNonnegative(
+            real.radius, imaginary.radius) >= 0
+        ? real.radius : imaginary.radius;
+    return ScaledArithmeticStatus::Success;
+}
+
+ScaledArithmeticStatus certifiedScaledMultiply(
+        const ScaledComplexBall& left,
+        const ScaledComplexBall& right,
+        ScaledComplexBall& output) {
+    ScaledRealBall ar{ left.value.re, left.radius };
+    ScaledRealBall ai{ left.value.im, left.radius };
+    ScaledRealBall br{ right.value.re, right.radius };
+    ScaledRealBall bi{ right.value.im, right.radius };
+    ScaledRealBall arbr, aibi, arbi, aibr;
+    ScaledRealBall real, imaginary;
+    ScaledArithmeticStatus status =
+        certifiedRealMultiply(ar, br, arbr);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    status = certifiedRealMultiply(ai, bi, aibi);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    status = certifiedRealSubtract(arbr, aibi, real);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    status = certifiedRealMultiply(ar, bi, arbi);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    status = certifiedRealMultiply(ai, br, aibr);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    status = certifiedRealAdd(arbi, aibr, imaginary);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    output.value.re = real.value;
+    output.value.im = imaginary.value;
+    output.radius =
+        compareScaledNonnegative(
+            real.radius, imaginary.radius) >= 0
+        ? real.radius : imaginary.radius;
+    return ScaledArithmeticStatus::Success;
+}
+
+ScaledArithmeticStatus certifiedScaledNormSquared(
+        const ScaledComplexValue& value,
+        const ScaledRealValue& radius,
+        ScaledRealValue& midpoint,
+        ScaledRealValue& error) {
+    ScaledRealBall real{ value.re, radius };
+    ScaledRealBall imaginary{ value.im, radius };
+    ScaledRealBall realSquared, imaginarySquared, sum;
+    ScaledArithmeticStatus status =
+        certifiedRealMultiply(real, real, realSquared);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    status = certifiedRealMultiply(
+        imaginary, imaginary, imaginarySquared);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    status = certifiedRealAdd(
+        realSquared, imaginarySquared, sum);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    midpoint = sum.value;
+    error = sum.radius;
+    return ScaledArithmeticStatus::Success;
+}
+
+ScaledArithmeticStatus certifyScaledMpfrExponentRange(
+        const ScaledRealValue& value) {
+    int64_t safeMinimum = 0, safeMaximum = 0;
+    if (!mpfrCertificationExponentBounds(
+            safeMinimum, safeMaximum))
+        return ScaledArithmeticStatus::ExponentRange;
+    return certifyMpfrExponentRange(
+        value, safeMinimum, safeMaximum);
+}
+
+ScaledArithmeticStatus certifyScaledMpfrExponentRange(
+        const ScaledComplexValue& value) {
+    int64_t safeMinimum = 0, safeMaximum = 0;
+    if (!mpfrCertificationExponentBounds(
+            safeMinimum, safeMaximum))
+        return ScaledArithmeticStatus::ExponentRange;
+    return certifyMpfrExponentRange(
+        value, safeMinimum, safeMaximum);
+}
+
+ScaledArithmeticStatus certifyScaledMpfrExponentRange(
+        const ScaledComplexBall& value) {
+    int64_t safeMinimum = 0, safeMaximum = 0;
+    if (!mpfrCertificationExponentBounds(
+            safeMinimum, safeMaximum))
+        return ScaledArithmeticStatus::ExponentRange;
+    return certifyMpfrExponentRange(
+        value, safeMinimum, safeMaximum);
+}
+
 int compareScaledNonnegative(
         const ScaledRealValue& left,
         const ScaledRealValue& right) {
@@ -861,9 +1267,14 @@ void ExpressionScaledResidualEvaluator::reset() {
     _reference = nullptr;
     _states.clear();
     _layoutStack.clear();
+    _sampleExponentRangeUnsafe.clear();
+    _sampleUndefinedStatus.clear();
+    _nodeExponentRangeUnsafe.clear();
     _preparationStatus =
         ExpressionScaledResidualStatus::InvalidTape;
     _error.clear();
+    _mpfrSafeMinimum = 0;
+    _mpfrSafeMaximum = 0;
     _ready = false;
 }
 
@@ -900,6 +1311,68 @@ bool ExpressionScaledResidualEvaluator::prepare(
          referenceShadows)
         if (!validShadowEncoding(*shadow))
             return fail("malformed compact reference input");
+    const ScaledRealValue* referenceErrors[] = {
+        &reference.cError, &reference.z0Error,
+        &reference.pixelError, &reference.initialZError
+    };
+    for (const ScaledRealValue* radius :
+         referenceErrors)
+        if (!validRadius(*radius))
+            return fail("malformed compact reference error");
+    if (!mpfrCertificationExponentBounds(
+            _mpfrSafeMinimum, _mpfrSafeMaximum)) {
+        _mpfrSafeMinimum = 0;
+        _mpfrSafeMaximum = 0;
+    }
+    _sampleExponentRangeUnsafe.assign(
+        reference.samples.size(), 0);
+    _sampleUndefinedStatus.assign(
+        reference.samples.size(), 0);
+    _nodeExponentRangeUnsafe.assign(
+        reference.tape.size(), 0);
+    auto radiusRangeUnsafe =
+        [&](const ScaledRealValue& radius) {
+            return certifyMpfrExponentRange(
+                       radius, _mpfrSafeMinimum,
+                       _mpfrSafeMaximum) !=
+                   ScaledArithmeticStatus::Success;
+        };
+    auto compactRangeUnsafe =
+        [&](const ScaledComplexShadow& primary,
+            const ScaledComplexShadow& defect,
+            const ScaledRealValue& radius) {
+            if (!finiteShadow(primary) ||
+                !finiteShadow(defect))
+                return false;
+            ScaledComplexValue primaryValue;
+            ScaledComplexValue defectValue;
+            ScaledComplexValue combined;
+            if (makeScaledComplexValue(
+                    primary, primaryValue) !=
+                    ScaledArithmeticStatus::Success ||
+                makeScaledComplexValue(
+                    defect, defectValue) !=
+                    ScaledArithmeticStatus::Success)
+                return true;
+            if (certifyMpfrExponentRange(
+                    primaryValue, _mpfrSafeMinimum,
+                    _mpfrSafeMaximum) !=
+                    ScaledArithmeticStatus::Success ||
+                certifyMpfrExponentRange(
+                    defectValue, _mpfrSafeMinimum,
+                    _mpfrSafeMaximum) !=
+                    ScaledArithmeticStatus::Success ||
+                scaledAdd(
+                    primaryValue, defectValue,
+                    combined) !=
+                    ScaledArithmeticStatus::Success ||
+                certifyMpfrExponentRange(
+                    combined, _mpfrSafeMinimum,
+                    _mpfrSafeMaximum) !=
+                    ScaledArithmeticStatus::Success)
+                return true;
+            return radiusRangeUnsafe(radius);
+        };
 
     auto operationOf = [](ExpressionProgram::Op op) {
         using Op = ExpressionProgram::Op;
@@ -980,6 +1453,18 @@ bool ExpressionScaledResidualEvaluator::prepare(
             !validShadowEncoding(sample.next) ||
             !validShadowEncoding(sample.rootDefect))
             return fail("malformed compact reference sample");
+        if (!validRadius(sample.zError) ||
+            !validRadius(sample.nextError) ||
+            !validRadius(sample.rootError))
+            return fail("malformed compact sample error");
+        _sampleExponentRangeUnsafe[sampleIndex] =
+            compactRangeUnsafe(
+                sample.z, sample.zDefect,
+                sample.zError) ||
+            compactRangeUnsafe(
+                sample.next, sample.rootDefect,
+                sample.nextError) ||
+            radiusRangeUnsafe(sample.rootError);
         _layoutStack.clear();
         for (size_t instructionIndex = 0;
              instructionIndex < program._code.size();
@@ -1016,6 +1501,9 @@ bool ExpressionScaledResidualEvaluator::prepare(
             if (!validShadowEncoding(node.output) ||
                 !validShadowEncoding(node.outputDefect))
                 return fail("malformed reference output");
+            if (!validRadius(node.outputError) ||
+                !validRadius(node.auxiliaryError))
+                return fail("malformed reference error");
             const bool hasAuxiliary =
                 (node.flags &
                  (OracleTraceHasCompanion |
@@ -1034,12 +1522,47 @@ bool ExpressionScaledResidualEvaluator::prepare(
                 (!finiteShadow(node.auxiliary) ||
                  !finiteShadow(node.auxiliaryDefect)))
                 return fail("required companion is nonfinite");
+            if ((node.flags & OracleTraceUndefined) &&
+                _sampleUndefinedStatus[sampleIndex] == 0) {
+                _sampleUndefinedStatus[sampleIndex] =
+                    (node.flags &
+                     OracleTraceSingularPoint)
+                    ? 1
+                    : (node.flags &
+                       OracleTraceBranchSensitive)
+                        ? 2
+                        : 3;
+            }
+            const size_t tapeIndex =
+                static_cast<size_t>(sample.tapeOffset) +
+                instructionIndex;
+            _nodeExponentRangeUnsafe[tapeIndex] =
+                compactRangeUnsafe(
+                    node.output, node.outputDefect,
+                    node.outputError) ||
+                (hasAuxiliary &&
+                 compactRangeUnsafe(
+                     node.auxiliary,
+                     node.auxiliaryDefect,
+                     node.auxiliaryError));
             _layoutStack.push_back(
                 static_cast<uint16_t>(instructionIndex));
         }
         if (_layoutStack.size() != 1 ||
             sample.rootNode != _layoutStack.back())
             return fail("reference tape root mismatch");
+        const ExpressionReferenceTapeNode& root =
+            reference.tape[
+                static_cast<size_t>(sample.tapeOffset) +
+                sample.rootNode];
+        if (std::memcmp(
+                &root.output, &sample.next,
+                sizeof(root.output)) != 0 ||
+            std::memcmp(
+                &root.outputDefect, &sample.rootDefect,
+                sizeof(root.outputDefect)) != 0)
+            return fail(
+                "reference root and next compaction mismatch");
     }
 
     _program = &program;
@@ -1071,23 +1594,43 @@ ExpressionScaledResidualEvaluator::evaluate(
             ExpressionScaledResidualStatus::InvalidInput;
         return result;
     }
-    auto validateInput = [&](const ScaledComplexValue& value) {
+    auto certifyScaledMpfrExponentRange =
+        [&](const auto& value) {
+            if (_mpfrSafeMinimum >= _mpfrSafeMaximum)
+                return ScaledArithmeticStatus::ExponentRange;
+            return certifyMpfrExponentRange(
+                value, _mpfrSafeMinimum,
+                _mpfrSafeMaximum);
+        };
+    auto validateInput = [&](const ScaledComplexValue& value,
+                             const ScaledRealValue& radius) {
         ScaledArithmeticStatus status = validate(value);
         if (status == ScaledArithmeticStatus::Nonfinite)
             result.status =
                 ExpressionScaledResidualStatus::Nonfinite;
-        else if (status != ScaledArithmeticStatus::Success)
+        else if (status != ScaledArithmeticStatus::Success ||
+                 !validRadius(radius))
             result.status =
                 ExpressionScaledResidualStatus::InvalidInput;
-        return status == ScaledArithmeticStatus::Success;
+        else {
+            ScaledComplexBall ball{ value, radius };
+            status = certifyScaledMpfrExponentRange(ball);
+            if (status != ScaledArithmeticStatus::Success)
+                result.status = residualStatus(status);
+        }
+        return status == ScaledArithmeticStatus::Success &&
+               validRadius(radius);
     };
-    if (!validateInput(input.z) ||
-        !validateInput(input.c) ||
-        !validateInput(input.z0))
+    if (!validateInput(input.z, input.zError) ||
+        !validateInput(input.c, input.cError) ||
+        !validateInput(input.z0, input.z0Error))
         return result;
-    for (const ScaledComplexValue& parameter :
-         input.parameters)
-        if (!validateInput(parameter))
+    for (size_t parameter = 0;
+         parameter < input.parameters.size();
+         ++parameter)
+        if (!validateInput(
+                input.parameters[parameter],
+                input.parameterErrors[parameter]))
             return result;
 
     const size_t offset =
@@ -1097,12 +1640,236 @@ ExpressionScaledResidualEvaluator::evaluate(
         result.status = residualStatus(status);
         return result;
     };
+    auto compactValue = [&](
+            const ScaledComplexShadow& primary,
+            const ScaledComplexShadow& defect,
+            ScaledComplexValue& output) {
+        ScaledArithmeticStatus status =
+            makeScaledComplexValue(
+                primary, defect, output);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        return certifyScaledMpfrExponentRange(output);
+    };
     auto nodeBase = [&](uint16_t localNode,
                         ScaledComplexValue& output) {
         const ExpressionReferenceTapeNode& node =
             _reference->tape[offset + localNode];
-        return makeScaledComplexValue(
+        return compactValue(
             node.output, node.outputDefect, output);
+    };
+    auto addOutputError = [&](
+            const ExpressionReferenceTapeNode& node,
+            ScaledRealValue& radius) {
+        ScaledArithmeticStatus status = scaledAddUp(
+            radius, node.outputError, radius);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        return certifyScaledMpfrExponentRange(radius);
+    };
+    if (sampleIndex >=
+            _sampleExponentRangeUnsafe.size() ||
+        sampleIndex >= _sampleUndefinedStatus.size()) {
+        result.status =
+            ExpressionScaledResidualStatus::InvalidTape;
+        return result;
+    }
+    switch (_sampleUndefinedStatus[sampleIndex]) {
+    case 1:
+        result.status =
+            ExpressionScaledResidualStatus::Singular;
+        return result;
+    case 2:
+        result.status =
+            ExpressionScaledResidualStatus::BranchUncertain;
+        return result;
+    case 3:
+        result.status =
+            ExpressionScaledResidualStatus::Nonfinite;
+        return result;
+    default:
+        break;
+    }
+    if (_sampleExponentRangeUnsafe[sampleIndex])
+        return failArithmetic(
+            ScaledArithmeticStatus::ExponentRange);
+
+    auto guardedAdd = [&](
+            const ScaledComplexBall& left,
+            const ScaledComplexBall& right,
+            ScaledComplexBall& output) {
+        ScaledArithmeticStatus status =
+            certifyScaledMpfrExponentRange(left);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        status = certifyScaledMpfrExponentRange(right);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        status = certifiedScaledAdd(left, right, output);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        return certifyScaledMpfrExponentRange(output);
+    };
+    auto guardedSubtract = [&](
+            const ScaledComplexBall& left,
+            const ScaledComplexBall& right,
+            ScaledComplexBall& output) {
+        ScaledArithmeticStatus status =
+            certifyScaledMpfrExponentRange(left);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        status = certifyScaledMpfrExponentRange(right);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        status = certifiedScaledSubtract(
+            left, right, output);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        return certifyScaledMpfrExponentRange(output);
+    };
+    auto guardedMultiply = [&](
+            const ScaledComplexBall& left,
+            const ScaledComplexBall& right,
+            ScaledComplexBall& output) {
+        ScaledArithmeticStatus status =
+            certifyScaledMpfrExponentRange(left);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        status = certifyScaledMpfrExponentRange(right);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        status = certifiedScaledMultiply(
+            left, right, output);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        return certifyScaledMpfrExponentRange(output);
+    };
+    auto guardedValueMultiply = [&](
+            const ScaledComplexValue& left,
+            const ScaledComplexValue& right,
+            ScaledComplexValue& output) {
+        ScaledArithmeticStatus status =
+            certifyScaledMpfrExponentRange(left);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        status = certifyScaledMpfrExponentRange(right);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        status = scaledMultiply(left, right, output);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        return certifyScaledMpfrExponentRange(output);
+    };
+    auto addOracleRoundoff = [&](
+            const ExpressionReferenceTapeNode& node,
+            ScaledRealValue& radius) {
+        if (!_reference->
+                certifiedAgainstHigherPrecision ||
+            _reference->certificationPrecision <= 16)
+            return ScaledArithmeticStatus::Success;
+        ScaledRealValue leftMagnitude, rightMagnitude;
+        ScaledArithmeticStatus status =
+            ScaledArithmeticStatus::Success;
+        auto nodeMagnitude = [&](
+                uint16_t localNode,
+                ScaledRealValue& output) {
+            ScaledComplexValue base;
+            ScaledArithmeticStatus localStatus =
+                nodeBase(localNode, base);
+            if (localStatus !=
+                    ScaledArithmeticStatus::Success)
+                return localStatus;
+            ScaledRealValue baseMagnitude;
+            ScaledRealValue residualMagnitude;
+            localStatus = maxComponentMagnitude(
+                base, baseMagnitude);
+            if (localStatus !=
+                    ScaledArithmeticStatus::Success)
+                return localStatus;
+            localStatus = maxComponentMagnitude(
+                _states[localNode].residual,
+                residualMagnitude);
+            if (localStatus !=
+                    ScaledArithmeticStatus::Success)
+                return localStatus;
+            ScaledRealValue midpointMagnitude;
+            localStatus = scaledAddUp(
+                baseMagnitude, residualMagnitude,
+                midpointMagnitude);
+            if (localStatus !=
+                    ScaledArithmeticStatus::Success)
+                return localStatus;
+            localStatus = certifyScaledMpfrExponentRange(
+                midpointMagnitude);
+            if (localStatus !=
+                    ScaledArithmeticStatus::Success)
+                return localStatus;
+            localStatus = scaledAddUp(
+                midpointMagnitude,
+                _states[localNode].radius, output);
+            if (localStatus !=
+                    ScaledArithmeticStatus::Success)
+                return localStatus;
+            return certifyScaledMpfrExponentRange(output);
+        };
+        if (node.leftNode != UINT16_MAX) {
+            status = nodeMagnitude(
+                node.leftNode, leftMagnitude);
+            if (status != ScaledArithmeticStatus::Success)
+                return status;
+        }
+        if (node.rightNode != UINT16_MAX) {
+            status = nodeMagnitude(
+                node.rightNode, rightMagnitude);
+            if (status != ScaledArithmeticStatus::Success)
+                return status;
+        }
+
+        ScaledRealValue scale;
+        scale.mantissa = 0.5;
+        scale.exponent =
+            9 - static_cast<int64_t>(
+                _reference->certificationPrecision);
+        ScaledRealValue operationMagnitude;
+        switch (node.operation) {
+        case ExpressionOracleOperation::Add:
+        case ExpressionOracleOperation::Subtract:
+            status = scaledAddUp(
+                leftMagnitude, rightMagnitude,
+                operationMagnitude);
+            break;
+        case ExpressionOracleOperation::Multiply:
+            status = scaledMultiplyUp(
+                leftMagnitude, rightMagnitude,
+                operationMagnitude);
+            break;
+        case ExpressionOracleOperation::Square:
+        case ExpressionOracleOperation::Norm:
+            status = scaledMultiplyUp(
+                leftMagnitude, leftMagnitude,
+                operationMagnitude);
+            break;
+        default:
+            return ScaledArithmeticStatus::Success;
+        }
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        status = certifyScaledMpfrExponentRange(
+            operationMagnitude);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        ScaledRealValue roundoff;
+        status = scaledMultiplyUp(
+            operationMagnitude, scale, roundoff);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        status = certifyScaledMpfrExponentRange(roundoff);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        status = scaledAddUp(radius, roundoff, radius);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        return certifyScaledMpfrExponentRange(radius);
     };
     auto updateRemainder = [&](
             const ScaledRealValue& estimate) {
@@ -1117,13 +1884,13 @@ ExpressionScaledResidualEvaluator::evaluate(
         ScaledComplexValue base, companion;
         SeriesValue first, second;
         ScaledArithmeticStatus status =
-            makeScaledComplexValue(
+            compactValue(
                 node.output, node.outputDefect, base);
         if (status != ScaledArithmeticStatus::Success)
             return status;
         if (node.operation !=
                 ExpressionOracleOperation::Exp) {
-            status = makeScaledComplexValue(
+            status = compactValue(
                 node.auxiliary,
                 node.auxiliaryDefect,
                 companion);
@@ -1140,7 +1907,7 @@ ExpressionScaledResidualEvaluator::evaluate(
                 return status;
             if (status != ScaledArithmeticStatus::Success)
                 return status;
-            status = scaledMultiply(
+            status = guardedValueMultiply(
                 base, first.value, output);
             if (status != ScaledArithmeticStatus::Success)
                 return status;
@@ -1158,11 +1925,11 @@ ExpressionScaledResidualEvaluator::evaluate(
             status = oddSeries(delta, false, second);
             if (status != ScaledArithmeticStatus::Success)
                 return status;
-            status = scaledMultiply(
+            status = guardedValueMultiply(
                 base, first.value, left);
             if (status != ScaledArithmeticStatus::Success)
                 return status;
-            status = scaledMultiply(
+            status = guardedValueMultiply(
                 companion, second.value, right);
             if (status != ScaledArithmeticStatus::Success)
                 return status;
@@ -1173,6 +1940,9 @@ ExpressionScaledResidualEvaluator::evaluate(
                     return status;
             }
             status = scaledAdd(left, right, output);
+            if (status != ScaledArithmeticStatus::Success)
+                return status;
+            status = certifyScaledMpfrExponentRange(output);
             if (status != ScaledArithmeticStatus::Success)
                 return status;
             status = combineRemainder(
@@ -1199,15 +1969,18 @@ ExpressionScaledResidualEvaluator::evaluate(
             status = oddSeries(delta, true, second);
             if (status != ScaledArithmeticStatus::Success)
                 return status;
-            status = scaledMultiply(
+            status = guardedValueMultiply(
                 base, first.value, left);
             if (status != ScaledArithmeticStatus::Success)
                 return status;
-            status = scaledMultiply(
+            status = guardedValueMultiply(
                 companion, second.value, right);
             if (status != ScaledArithmeticStatus::Success)
                 return status;
             status = scaledAdd(left, right, output);
+            if (status != ScaledArithmeticStatus::Success)
+                return status;
+            status = certifyScaledMpfrExponentRange(output);
             if (status != ScaledArithmeticStatus::Success)
                 return status;
             status = combineRemainder(
@@ -1233,7 +2006,9 @@ ExpressionScaledResidualEvaluator::evaluate(
             result.uncertified = true;
             ++result.seriesOperationCount;
         }
-        return status;
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        return certifyScaledMpfrExponentRange(output);
     };
 
     for (size_t local = 0;
@@ -1260,11 +2035,33 @@ ExpressionScaledResidualEvaluator::evaluate(
                 ExpressionScaledResidualStatus::Nonfinite;
             return result;
         }
-        ScaledComplexValue& output =
-            _states[local].residual;
-        output = {};
         ScaledArithmeticStatus status =
             ScaledArithmeticStatus::Success;
+        const bool hasAuxiliary =
+            (node.flags &
+             (OracleTraceHasCompanion |
+              OracleTraceHasDenominator |
+              OracleTraceHasLogarithmBase)) != 0;
+        if (hasAuxiliary) {
+            if (!finiteShadow(node.auxiliary) ||
+                !finiteShadow(node.auxiliaryDefect)) {
+                result.status =
+                    ExpressionScaledResidualStatus::Nonfinite;
+                return result;
+            }
+        }
+        const size_t tapeIndex = offset + local;
+        if (tapeIndex >=
+                _nodeExponentRangeUnsafe.size() ||
+            _nodeExponentRangeUnsafe[tapeIndex])
+            return failArithmetic(
+                ScaledArithmeticStatus::ExponentRange);
+        ScaledComplexValue& output =
+            _states[local].residual;
+        ScaledRealValue& outputRadius =
+            _states[local].radius;
+        output = {};
+        outputRadius = {};
         const ScaledComplexValue* left =
             node.leftNode == UINT16_MAX
                 ? nullptr
@@ -1273,18 +2070,27 @@ ExpressionScaledResidualEvaluator::evaluate(
             node.rightNode == UINT16_MAX
                 ? nullptr
                 : &_states[node.rightNode].residual;
+        auto stateBall = [&](uint16_t index) {
+            ScaledComplexBall ball;
+            ball.value = _states[index].residual;
+            ball.radius = _states[index].radius;
+            return ball;
+        };
         switch (node.operation) {
         case ExpressionOracleOperation::Constant:
         case ExpressionOracleOperation::Iteration:
             break;
         case ExpressionOracleOperation::Z:
             output = input.z;
+            outputRadius = input.zError;
             break;
         case ExpressionOracleOperation::C:
             output = input.c;
+            outputRadius = input.cError;
             break;
         case ExpressionOracleOperation::Z0:
             output = input.z0;
+            outputRadius = input.z0Error;
             break;
         case ExpressionOracleOperation::Parameter:
             if (node.argument >= input.parameters.size()) {
@@ -1293,20 +2099,45 @@ ExpressionScaledResidualEvaluator::evaluate(
                 return result;
             }
             output = input.parameters[node.argument];
+            outputRadius =
+                input.parameterErrors[node.argument];
             break;
         case ExpressionOracleOperation::Negate:
             status = scaledNegate(*left, output);
+            outputRadius =
+                _states[node.leftNode].radius;
             break;
-        case ExpressionOracleOperation::Add:
-            status = scaledAdd(*left, *right, output);
+        case ExpressionOracleOperation::Add: {
+            ScaledComplexBall sum;
+            status = guardedAdd(
+                stateBall(node.leftNode),
+                stateBall(node.rightNode), sum);
+            if (status == ScaledArithmeticStatus::Success) {
+                output = sum.value;
+                outputRadius = sum.radius;
+            }
             break;
-        case ExpressionOracleOperation::Subtract:
-            status = scaledSubtract(
-                *left, *right, output);
+        }
+        case ExpressionOracleOperation::Subtract: {
+            ScaledComplexBall differenceBall;
+            status = guardedSubtract(
+                stateBall(node.leftNode),
+                stateBall(node.rightNode),
+                differenceBall);
+            if (status == ScaledArithmeticStatus::Success) {
+                output = differenceBall.value;
+                outputRadius = differenceBall.radius;
+            }
             break;
+        }
         case ExpressionOracleOperation::Multiply: {
             ScaledComplexValue leftBase, rightBase;
-            ScaledComplexValue first, second, cross;
+            ScaledComplexBall first, second, cross, sum;
+            ScaledComplexBall leftBaseBall, rightBaseBall;
+            ScaledComplexBall leftBall =
+                stateBall(node.leftNode);
+            ScaledComplexBall rightBall =
+                stateBall(node.rightNode);
             status = nodeBase(
                 node.leftNode, leftBase);
             if (status != ScaledArithmeticStatus::Success)
@@ -1315,43 +2146,62 @@ ExpressionScaledResidualEvaluator::evaluate(
                 node.rightNode, rightBase);
             if (status != ScaledArithmeticStatus::Success)
                 break;
-            status = scaledMultiply(
-                leftBase, *right, first);
+            leftBaseBall.value = leftBase;
+            rightBaseBall.value = rightBase;
+            status = guardedMultiply(
+                leftBaseBall, rightBall, first);
             if (status != ScaledArithmeticStatus::Success)
                 break;
-            status = scaledMultiply(
-                rightBase, *left, second);
+            status = guardedMultiply(
+                rightBaseBall, leftBall, second);
             if (status != ScaledArithmeticStatus::Success)
                 break;
-            status = scaledMultiply(
-                *left, *right, cross);
+            status = guardedMultiply(
+                leftBall, rightBall, cross);
             if (status != ScaledArithmeticStatus::Success)
                 break;
-            status = scaledAdd(first, second, output);
+            status = guardedAdd(
+                first, second, sum);
             if (status != ScaledArithmeticStatus::Success)
                 break;
-            status = scaledAdd(output, cross, output);
+            status = guardedAdd(
+                sum, cross, sum);
+            if (status == ScaledArithmeticStatus::Success) {
+                output = sum.value;
+                outputRadius = sum.radius;
+            }
             break;
         }
         case ExpressionOracleOperation::Square: {
-            ScaledComplexValue base, linear, quadratic;
+            ScaledComplexValue base;
+            ScaledComplexBall baseBall;
+            ScaledComplexBall leftBall =
+                stateBall(node.leftNode);
+            ScaledComplexBall linearBall;
+            ScaledComplexBall quadraticBall;
             status = nodeBase(node.leftNode, base);
             if (status != ScaledArithmeticStatus::Success)
                 break;
-            status = scaledMultiply(
-                base, *left, linear);
+            baseBall.value = base;
+            status = guardedMultiply(
+                baseBall, leftBall, linearBall);
             if (status != ScaledArithmeticStatus::Success)
                 break;
-            status = scaledMultiplyByDouble(
-                linear, 2.0, linear);
+            status = guardedAdd(
+                linearBall, linearBall, linearBall);
             if (status != ScaledArithmeticStatus::Success)
                 break;
-            status = scaledMultiply(
-                *left, *left, quadratic);
+            status = guardedMultiply(
+                leftBall, leftBall, quadraticBall);
             if (status != ScaledArithmeticStatus::Success)
                 break;
-            status = scaledAdd(
-                linear, quadratic, output);
+            status = guardedAdd(
+                linearBall, quadraticBall,
+                linearBall);
+            if (status == ScaledArithmeticStatus::Success) {
+                output = linearBall.value;
+                outputRadius = linearBall.radius;
+            }
             break;
         }
         case ExpressionOracleOperation::Exp:
@@ -1361,6 +2211,8 @@ ExpressionScaledResidualEvaluator::evaluate(
         case ExpressionOracleOperation::Cosh:
             status = nonlinearResult(
                 node, *left, output);
+            outputRadius =
+                _states[node.leftNode].radius;
             if (status == ScaledArithmeticStatus::Singular) {
                 result.status =
                     ExpressionScaledResidualStatus::Unsupported;
@@ -1371,22 +2223,34 @@ ExpressionScaledResidualEvaluator::evaluate(
             output.re = left->re;
             status = scaledNegate(
                 left->im, output.im);
+            outputRadius =
+                _states[node.leftNode].radius;
             break;
         case ExpressionOracleOperation::Real:
             output.re = left->re;
             output.im = {};
+            outputRadius =
+                _states[node.leftNode].radius;
             break;
         case ExpressionOracleOperation::Imaginary:
             output.re = left->im;
             output.im = {};
+            outputRadius =
+                _states[node.leftNode].radius;
             break;
         case ExpressionOracleOperation::MakeComplex:
             output.re = left->re;
             output.im = right->re;
+            outputRadius =
+                compareScaledNonnegative(
+                    _states[node.leftNode].radius,
+                    _states[node.rightNode].radius) >= 0
+                ? _states[node.leftNode].radius
+                : _states[node.rightNode].radius;
             break;
         case ExpressionOracleOperation::Norm: {
-            ScaledComplexValue base, product;
-            ScaledRealValue deltaNorm, linear;
+            ScaledComplexValue base;
+            ScaledRealValue deltaNorm, deltaNormError;
             status = nodeBase(node.leftNode, base);
             if (status != ScaledArithmeticStatus::Success)
                 break;
@@ -1396,22 +2260,52 @@ ExpressionScaledResidualEvaluator::evaluate(
                 conjugateBase.im);
             if (status != ScaledArithmeticStatus::Success)
                 break;
-            status = scaledMultiply(
-                conjugateBase, *left, product);
+            ScaledComplexBall conjugateBaseBall;
+            conjugateBaseBall.value = conjugateBase;
+            ScaledComplexBall product;
+            ScaledComplexBall leftBall =
+                stateBall(node.leftNode);
+            status = guardedMultiply(
+                conjugateBaseBall, leftBall, product);
             if (status != ScaledArithmeticStatus::Success)
                 break;
-            status = scaledMultiplyByDouble(
-                product, 2.0, product);
+            status = guardedAdd(
+                product, product, product);
             if (status != ScaledArithmeticStatus::Success)
                 break;
-            linear = product.re;
-            status = scaledNormSquared(
-                *left, deltaNorm);
+            status = certifiedScaledNormSquared(
+                leftBall.value, leftBall.radius,
+                deltaNorm, deltaNormError);
             if (status != ScaledArithmeticStatus::Success)
                 break;
-            status = scaledAdd(
-                linear, deltaNorm, output.re);
-            output.im = {};
+            status = certifyScaledMpfrExponentRange(
+                deltaNorm);
+            if (status != ScaledArithmeticStatus::Success)
+                break;
+            status = certifyScaledMpfrExponentRange(
+                deltaNormError);
+            if (status != ScaledArithmeticStatus::Success)
+                break;
+            ScaledRealBall linear{
+                product.value.re, product.radius };
+            ScaledRealBall quadratic{
+                deltaNorm, deltaNormError };
+            ScaledRealBall normResult;
+            status = certifiedRealAdd(
+                linear, quadratic, normResult);
+            if (status == ScaledArithmeticStatus::Success) {
+                status = certifyScaledMpfrExponentRange(
+                    normResult.value);
+            }
+            if (status == ScaledArithmeticStatus::Success) {
+                status = certifyScaledMpfrExponentRange(
+                    normResult.radius);
+            }
+            if (status == ScaledArithmeticStatus::Success) {
+                output.re = normResult.value;
+                output.im = {};
+                outputRadius = normResult.radius;
+            }
             break;
         }
         case ExpressionOracleOperation::Divide:
@@ -1446,9 +2340,32 @@ ExpressionScaledResidualEvaluator::evaluate(
         }
         if (status != ScaledArithmeticStatus::Success)
             return failArithmetic(status);
+        ScaledComplexBall residualBall{
+            output, outputRadius
+        };
+        status = certifyScaledMpfrExponentRange(
+            residualBall);
+        if (status != ScaledArithmeticStatus::Success)
+            return failArithmetic(status);
+        status = addOutputError(node, outputRadius);
+        if (status != ScaledArithmeticStatus::Success)
+            return failArithmetic(status);
+        status = addOracleRoundoff(node, outputRadius);
+        if (status != ScaledArithmeticStatus::Success)
+            return failArithmetic(status);
+        residualBall.radius = outputRadius;
+        status = certifyScaledMpfrExponentRange(
+            residualBall);
+        if (status != ScaledArithmeticStatus::Success)
+            return failArithmetic(status);
     }
     result.residual =
         _states[sample.rootNode].residual;
+    result.radius =
+        _states[sample.rootNode].radius;
+    result.certified =
+        _reference->certifiedAgainstHigherPrecision &&
+        !result.uncertified;
     result.status =
         ExpressionScaledResidualStatus::Success;
     return result;

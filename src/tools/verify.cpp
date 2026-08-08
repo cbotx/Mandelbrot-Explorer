@@ -12,6 +12,7 @@
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
 //          expression | expression-coloring | expression-orbit |
 //          expression-centered | expression-reference | expression-scaled |
+//          expression-deep-render |
 //          expression-oracle |
 //          oracle | custom-deep | expression-suite | suite |
 //          expression-residual | formula-bench | multibrot | backend | gpu | all
@@ -32,6 +33,7 @@
 #include <string>
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 #include <future>
 #include <iterator>
 #include <limits>
@@ -48,6 +50,7 @@
 #include "formula_expression_orbit.h"
 #include "formula_reference_orbit.h"
 #include "formula_scaled_residual.h"
+#include "formula_deep_renderer.h"
 #include "formula_expression_jit.h"
 #include "formula_expression_oracle.h"
 #include "custom_deep_zoom.h"
@@ -6090,6 +6093,1266 @@ static int runExpressionScaledCase() {
     return failures == 0 ? 0 : 1;
 }
 
+static int runExpressionDeepRenderCase() {
+    using formula::ExpressionContext;
+    using formula::ExpressionDeepFallbackReason;
+    using formula::ExpressionDeepRenderPhase;
+    using formula::ExpressionDeepRenderRequest;
+    using formula::ExpressionDeepRenderResult;
+    using formula::ExpressionDeepRenderStatus;
+    using formula::ExpressionDeepVerificationFault;
+    using formula::ExpressionError;
+    using formula::ExpressionOracle;
+    using formula::ExpressionOracleContext;
+    using formula::ExpressionProgram;
+    using formula::MpfrComplex;
+
+    struct ProgramPair {
+        ExpressionProgram canonical;
+        ExpressionProgram runtime;
+    };
+    auto compilePair = [](
+            const char* source, FormulaParameter pixel,
+            const ExpressionContext& fixed,
+            ProgramPair& pair) {
+        ExpressionError error;
+        return pair.canonical.compile(source, &error) &&
+               pair.canonical.specialize(
+                   fixed, pixel, pair.runtime, &error);
+    };
+    auto makeRequest = [](
+            const ProgramPair& pair,
+            const ExpressionContext& fixed,
+            FormulaParameter pixel,
+            const char* centerReal,
+            const char* centerImaginary,
+            int width, int height, int iterations,
+            std::vector<float>& output) {
+        output.assign(
+            static_cast<size_t>(width) * height,
+            formula::ExpressionDeepEmptyPixel);
+        ExpressionDeepRenderRequest request;
+        request.canonicalProgram = &pair.canonical;
+        request.runtimeProgram = &pair.runtime;
+        request.center.realDecimal = centerReal;
+        request.center.imaginaryDecimal = centerImaginary;
+        request.scale.decimal = "1e500";
+        request.fixed = fixed;
+        request.pixelParameter = pixel;
+        request.width = width;
+        request.height = height;
+        request.maxIterations = iterations;
+        request.bailout = 4.0;
+        request.output = output.data();
+        request.outputCount = output.size();
+        request.precision.minimumBits = 128;
+        request.precision.guardBits = 64;
+        request.precision.maximumBits = 4096;
+        request.memory.fallbackGuardBits = 128;
+        request.threading.tileWidth = 4;
+        request.threading.tileHeight = 3;
+        return request;
+    };
+    auto renderOracle = [](
+            const ExpressionProgram& program,
+            const ExpressionContext& fixed,
+            FormulaParameter pixelParameter,
+            const char* centerReal,
+            const char* centerImaginary,
+            const char* scaleText,
+            int width, int height, int maxIterations,
+            double bailout, mpfr_prec_t precision,
+            std::vector<float>& output) {
+        output.assign(
+            static_cast<size_t>(width) * height,
+            formula::ExpressionDeepEmptyPixel);
+        std::atomic_bool okay{ true };
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int y = 0; y < height; ++y) {
+            if (!okay.load(std::memory_order_acquire))
+                continue;
+            ExpressionOracleContext context(precision);
+            MpfrComplex center(precision);
+            MpfrComplex coordinate(precision);
+            MpfrComplex next(precision);
+            mpfr_t scale, dxHalf, dyHalf, temporary, magnitude;
+            mpfr_inits2(
+                precision, scale, dxHalf, dyHalf,
+                temporary, magnitude, (mpfr_ptr)0);
+            bool rowOkay =
+                center.set(centerReal, centerImaginary) &&
+                mpfr_set_str(
+                    scale, scaleText, 10, MPFR_RNDN) == 0;
+            if (rowOkay) {
+                mpfr_mul_ui(
+                    temporary, scale,
+                    static_cast<unsigned long>(width - 1),
+                    MPFR_RNDN);
+                mpfr_ui_div(dxHalf, 2, temporary, MPFR_RNDN);
+                mpfr_mul_ui(
+                    temporary, scale,
+                    static_cast<unsigned long>(width),
+                    MPFR_RNDN);
+                mpfr_mul_ui(
+                    temporary, temporary,
+                    static_cast<unsigned long>(height - 1),
+                    MPFR_RNDN);
+                mpfr_ui_div(
+                    dyHalf,
+                    static_cast<unsigned long>(height),
+                    temporary, MPFR_RNDN);
+                mpfr_mul_ui(dyHalf, dyHalf, 2, MPFR_RNDN);
+            }
+            for (int x = 0; rowOkay && x < width; ++x) {
+                context.z.set(
+                    fixed.z.real(), fixed.z.imag());
+                context.c.set(
+                    fixed.c.real(), fixed.c.imag());
+                context.z0.set(
+                    fixed.z0.real(), fixed.z0.imag());
+                for (size_t p = 0;
+                     p < fixed.parameters.size(); ++p) {
+                    context.parameters[p].set(
+                        fixed.parameters[p].real(),
+                        fixed.parameters[p].imag());
+                }
+                mpfr_mul_si(
+                    coordinate.re, dxHalf,
+                    static_cast<long>(
+                        2LL * x - (width - 1LL)),
+                    MPFR_RNDN);
+                mpfr_add(
+                    coordinate.re, coordinate.re,
+                    center.re, MPFR_RNDN);
+                mpfr_mul_si(
+                    coordinate.im, dyHalf,
+                    static_cast<long>(
+                        2LL * y - (height - 1LL)),
+                    MPFR_RNDN);
+                mpfr_add(
+                    coordinate.im, coordinate.im,
+                    center.im, MPFR_RNDN);
+                if (pixelParameter == FormulaParameter::C)
+                    context.c.set(coordinate);
+                else
+                    context.z0.set(coordinate);
+                context.z.set(context.z0);
+
+                float value =
+                    formula::ExpressionDeepInteriorPixel;
+                mpfr_hypot(
+                    magnitude, context.z.re, context.z.im,
+                    MPFR_RNDN);
+                bool escaped =
+                    mpfr_number_p(magnitude) &&
+                    mpfr_cmp_d(magnitude, bailout) > 0;
+                bool defined = mpfr_number_p(magnitude);
+                if (escaped) value = 0.0f;
+                for (int iteration = 0;
+                     defined && !escaped &&
+                     iteration < maxIterations;
+                     ++iteration) {
+                    context.iteration = iteration;
+                    std::string error;
+                    defined = ExpressionOracle::evaluate(
+                        program, context, next, &error) &&
+                        mpfr_number_p(next.re) &&
+                        mpfr_number_p(next.im);
+                    if (!defined) break;
+                    context.z.set(next);
+                    mpfr_hypot(
+                        magnitude,
+                        context.z.re, context.z.im,
+                        MPFR_RNDN);
+                    defined = mpfr_number_p(magnitude);
+                    if (defined &&
+                        mpfr_cmp_d(
+                            magnitude, bailout) > 0) {
+                        value = static_cast<float>(
+                            iteration + 1);
+                        escaped = true;
+                    }
+                }
+                if (!defined) {
+                    rowOkay = false;
+                    break;
+                }
+                output[
+                    static_cast<size_t>(y) * width + x] =
+                        value;
+            }
+            mpfr_clears(
+                scale, dxHalf, dyHalf, temporary,
+                magnitude, (mpfr_ptr)0);
+            if (!rowOkay)
+                okay.store(false, std::memory_order_release);
+        }
+        return okay.load(std::memory_order_acquire);
+    };
+    auto reasonCount = [](
+            const ExpressionDeepRenderResult& result,
+            ExpressionDeepFallbackReason reason) {
+        return result.fallbackReasonCounts[
+            static_cast<size_t>(reason)];
+    };
+
+    int failures = 0;
+    int exactFrames = 0;
+    bool sawInitialEscape = false;
+    bool sawInterior = false;
+    bool sawExterior = false;
+    auto verifyFrame = [&](
+            const char* name, const char* source,
+            FormulaParameter pixel,
+            const ExpressionContext& fixed,
+            const char* centerReal,
+            const char* centerImaginary,
+            int width, int height, int iterations,
+            uint64_t expectedFallback,
+            ExpressionDeepFallbackReason expectedReason) {
+        ProgramPair pair;
+        if (!compilePair(source, pixel, fixed, pair)) {
+            printf("  compile failed [%s]\n", name);
+            ++failures;
+            return;
+        }
+        std::vector<float> actual;
+        ExpressionDeepRenderRequest request = makeRequest(
+            pair, fixed, pixel, centerReal, centerImaginary,
+            width, height, iterations, actual);
+        ExpressionDeepRenderResult result;
+        if (!formula::renderExpressionDeepFrame(
+                request, result)) {
+            printf("  render failed [%s]: %s/%s\n",
+                   name,
+                   formula::expressionDeepRenderStatusName(
+                       result.status),
+                   result.error.c_str());
+            ++failures;
+            return;
+        }
+        std::vector<float> expected;
+        const bool oracleOkay = renderOracle(
+            pair.runtime, fixed, pixel,
+            centerReal, centerImaginary,
+            "1e500",
+            width, height, iterations, request.bailout,
+            result.fallbackPrecision, expected);
+        const uint64_t pixelCount =
+            static_cast<uint64_t>(width) * height;
+        const bool expectsReference =
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    ExactCenteredArithmetic;
+        const bool uncertainReason =
+            expectedReason ==
+                ExpressionDeepFallbackReason::
+                    UncertifiedSeries ||
+            expectedReason ==
+                ExpressionDeepFallbackReason::
+                    BranchSensitive ||
+            expectedReason ==
+                ExpressionDeepFallbackReason::
+                    BailoutUncertain ||
+            expectedReason ==
+                ExpressionDeepFallbackReason::
+                    CertificationFailure;
+        if (!oracleOkay || actual != expected ||
+            result.fallbackPixelCount != expectedFallback ||
+            result.fastPixelCount + result.fallbackPixelCount !=
+                pixelCount ||
+            result.uncertainPixelCount !=
+                (uncertainReason ? expectedFallback : 0) ||
+            result.undefinedPixelCount != 0 ||
+            (expectedFallback != 0 &&
+             reasonCount(result, expectedReason) !=
+                 expectedFallback) ||
+            result.maxFallbackReasonCount !=
+                expectedFallback ||
+            (expectedFallback != 0 &&
+             (result.fallbackTileCount == 0 ||
+              result.maxTileFallbackRate != 1.0)) ||
+            result.selectedPrecision < 1700 ||
+            (expectsReference
+                ? result.referenceBytes == 0 ||
+                  result.certificationPrecision <=
+                      result.selectedPrecision
+                : result.referenceBytes != 0) ||
+            result.rendererBytes == 0) {
+            printf("  exact frame mismatch [%s] fast/fallback=%llu/%llu precision=%lld reasons cert/bailout/exhausted=%llu/%llu/%llu\n",
+                   name,
+                   (unsigned long long)result.fastPixelCount,
+                   (unsigned long long)result.fallbackPixelCount,
+                   (long long)result.selectedPrecision,
+                   (unsigned long long)reasonCount(
+                       result,
+                       ExpressionDeepFallbackReason::
+                           CertificationFailure),
+                   (unsigned long long)reasonCount(
+                       result,
+                       ExpressionDeepFallbackReason::
+                           BailoutUncertain),
+                   (unsigned long long)reasonCount(
+                       result,
+                       ExpressionDeepFallbackReason::
+                           ReferenceExhausted));
+            ++failures;
+            return;
+        }
+        for (float value : actual) {
+            sawInitialEscape =
+                sawInitialEscape || value == 0.0f;
+            sawInterior =
+                sawInterior ||
+                value ==
+                    formula::ExpressionDeepInteriorPixel;
+            sawExterior =
+                sawExterior || value > 0.0f;
+        }
+        ++exactFrames;
+    };
+
+    ExpressionContext mandelbrotFixed;
+    verifyFrame(
+        "arithmetic-c-tail", "z*z+c",
+        FormulaParameter::C, mandelbrotFixed,
+        "-2", "0", 15, 9, 850, 135,
+        ExpressionDeepFallbackReason::BailoutUncertain);
+
+    ExpressionContext z0Fixed;
+    z0Fixed.c = {};
+    verifyFrame(
+        "arithmetic-z0-tail", "2*z",
+        FormulaParameter::InitialZ, z0Fixed,
+        "0", "0", 13, 7, 1670, 0,
+        ExpressionDeepFallbackReason::InvalidTape);
+    verifyFrame(
+        "initial-escape", "z+1",
+        FormulaParameter::InitialZ, z0Fixed,
+        "5", "0", 9, 5, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape);
+    verifyFrame(
+        "finite-interior", "z",
+        FormulaParameter::C, mandelbrotFixed,
+        "3", "0", 7, 5, 12, 0,
+        ExpressionDeepFallbackReason::InvalidTape);
+    verifyFrame(
+        "bailout-gate-fallback", "z",
+        FormulaParameter::InitialZ, z0Fixed,
+        "4", "0", 7, 5, 2, 35,
+        ExpressionDeepFallbackReason::BailoutUncertain);
+
+    ExpressionContext transcendentalFixed;
+    verifyFrame(
+        "sine-fallback", "sin(z)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 7, 5, 20, 35,
+        ExpressionDeepFallbackReason::UncertifiedSeries);
+    verifyFrame(
+        "exp-fallback", "exp(0.1*z)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "-1", "0", 7, 5, 20, 35,
+        ExpressionDeepFallbackReason::UncertifiedSeries);
+    verifyFrame(
+        "rational-fallback", "z/(c+2)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 7, 5, 20, 35,
+        ExpressionDeepFallbackReason::UnsupportedOperation);
+    ExpressionContext branchFixed;
+    branchFixed.z0 = { 1.0, 0.0 };
+    verifyFrame(
+        "branch-fallback", "log(z+2)+c",
+        FormulaParameter::C, branchFixed,
+        "0", "0", 7, 5, 12, 35,
+        ExpressionDeepFallbackReason::BranchSensitive);
+
+    // Independently rebuild the higher-precision point orbit and verify that
+    // every retained compact arithmetic value lies inside its stored radius.
+    {
+        ProgramPair pair;
+        if (!compilePair(
+                "z*z+c", FormulaParameter::C,
+                mandelbrotFixed, pair)) {
+            ++failures;
+        } else {
+            formula::ExpressionReferenceBuildRequest request;
+            request.canonicalProgram = &pair.canonical;
+            request.runtimeProgram = &pair.runtime;
+            request.pixelParameter = FormulaParameter::C;
+            request.center.realDecimal = "-1";
+            request.center.imaginaryDecimal = "0";
+            request.fixed = mandelbrotFixed;
+            request.bailout = 4.0;
+            request.maxIterations = 40;
+            request.precision.viewBits = 1700;
+            request.precision.minimumBits = 128;
+            request.precision.guardBits = 64;
+            request.precision.maximumBits = 4096;
+            request.certificationPrecision = 1892;
+            formula::ExpressionReferenceOrbitResult reference;
+            bool okay = formula::buildExpressionReferenceOrbit(
+                request, reference);
+            auto contains = [&](const formula::MpfrComplex& exact,
+                                const formula::ScaledComplexShadow& primary,
+                                const formula::ScaledComplexShadow& defect,
+                                const formula::ScaledRealValue& radius) {
+                formula::ScaledComplexValue midpoint;
+                formula::MpfrComplex reconstructed(
+                    request.certificationPrecision);
+                mpfr_t bound, difference, otherDifference;
+                mpfr_inits2(
+                    request.certificationPrecision,
+                    bound, difference, otherDifference,
+                    (mpfr_ptr)0);
+                bool contained =
+                    formula::makeScaledComplexValue(
+                        primary, defect, midpoint) ==
+                        formula::ScaledArithmeticStatus::Success &&
+                    formula::setMpfrFromScaledValue(
+                        reconstructed, midpoint) &&
+                    formula::setMpfrFromScaledValue(
+                        bound, radius);
+                if (contained) {
+                    mpfr_sub(
+                        difference, exact.re,
+                        reconstructed.re, MPFR_RNDD);
+                    mpfr_sub(
+                        otherDifference, exact.re,
+                        reconstructed.re, MPFR_RNDU);
+                    mpfr_abs(
+                        difference, difference, MPFR_RNDU);
+                    mpfr_abs(
+                        otherDifference, otherDifference,
+                        MPFR_RNDU);
+                    contained =
+                        mpfr_cmp(difference, bound) <= 0 &&
+                        mpfr_cmp(
+                            otherDifference, bound) <= 0;
+                }
+                if (contained) {
+                    mpfr_sub(
+                        difference, exact.im,
+                        reconstructed.im, MPFR_RNDD);
+                    mpfr_sub(
+                        otherDifference, exact.im,
+                        reconstructed.im, MPFR_RNDU);
+                    mpfr_abs(
+                        difference, difference, MPFR_RNDU);
+                    mpfr_abs(
+                        otherDifference, otherDifference,
+                        MPFR_RNDU);
+                    contained =
+                        mpfr_cmp(difference, bound) <= 0 &&
+                        mpfr_cmp(
+                            otherDifference, bound) <= 0;
+                }
+                mpfr_clears(
+                    bound, difference, otherDifference,
+                    (mpfr_ptr)0);
+                return contained;
+            };
+            if (okay) {
+                ExpressionOracleContext context(
+                    request.certificationPrecision);
+                context.c.set("-1", "0");
+                context.z0.set(0.0, 0.0);
+                context.z.set(context.z0);
+                MpfrComplex next(
+                    request.certificationPrecision);
+                for (size_t sampleIndex = 0;
+                     okay &&
+                     sampleIndex < reference.samples.size();
+                     ++sampleIndex) {
+                    const auto& sample =
+                        reference.samples[sampleIndex];
+                    okay = contains(
+                        context.z, sample.z,
+                        sample.zDefect, sample.zError);
+                    context.iteration =
+                        static_cast<int>(sampleIndex);
+                    formula::ExpressionOracleTrace trace;
+                    std::string error;
+                    okay = okay &&
+                        ExpressionOracle::evaluateTrace(
+                            pair.runtime, context, next,
+                            trace, &error) &&
+                        contains(
+                            next, sample.next,
+                            sample.rootDefect,
+                            sample.nextError) &&
+                        contains(
+                            next, sample.next,
+                            sample.rootDefect,
+                            sample.rootError) &&
+                        trace.nodes.size() ==
+                            sample.tapeCount;
+                    for (size_t nodeIndex = 0;
+                         okay &&
+                         nodeIndex < trace.nodes.size();
+                         ++nodeIndex) {
+                        const auto& exact =
+                            trace.nodes[nodeIndex];
+                        const auto& compact =
+                            reference.tape[
+                                static_cast<size_t>(
+                                    sample.tapeOffset) +
+                                nodeIndex];
+                        okay = contains(
+                            exact.output,
+                            compact.output,
+                            compact.outputDefect,
+                            compact.outputError);
+                        if (okay &&
+                            (compact.flags &
+                             (formula::OracleTraceHasCompanion |
+                              formula::OracleTraceHasDenominator |
+                              formula::OracleTraceHasLogarithmBase)))
+                            okay = contains(
+                                exact.auxiliary,
+                                compact.auxiliary,
+                                compact.auxiliaryDefect,
+                                compact.auxiliaryError);
+                    }
+                    context.z.set(next);
+                }
+            }
+            if (!okay) {
+                printf("  compact certification containment failed\n");
+                ++failures;
+            }
+        }
+    }
+
+    // Deterministic output and byte identity across thread policies.
+    {
+        ProgramPair pair;
+        std::vector<float> single, parallel, repeated;
+        if (!compilePair(
+                "z*z+c", FormulaParameter::C,
+                mandelbrotFixed, pair)) {
+            ++failures;
+        } else {
+            ExpressionDeepRenderRequest one = makeRequest(
+                pair, mandelbrotFixed, FormulaParameter::C,
+                "-2", "0", 17, 11, 850, single);
+            one.threading.threads = 1;
+            ExpressionDeepRenderResult oneResult;
+            bool okay =
+                formula::renderExpressionDeepFrame(
+                    one, oneResult);
+            ExpressionDeepRenderRequest many = makeRequest(
+                pair, mandelbrotFixed, FormulaParameter::C,
+                "-2", "0", 17, 11, 850, parallel);
+            many.threading.threads = 4;
+            ExpressionDeepRenderResult manyResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    many, manyResult);
+            ExpressionDeepRenderRequest again = makeRequest(
+                pair, mandelbrotFixed, FormulaParameter::C,
+                "-2", "0", 17, 11, 850, repeated);
+            again.threading.threads = 4;
+            ExpressionDeepRenderResult againResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    again, againResult);
+            if (!okay || single != parallel ||
+                parallel != repeated ||
+                oneResult.fallbackPixelCount !=
+                    manyResult.fallbackPixelCount ||
+                manyResult.fallbackPixelCount !=
+                    againResult.fallbackPixelCount) {
+                printf("  deterministic thread identity failed\n");
+                ++failures;
+            }
+        }
+    }
+
+    // Moderate-scale chaotic polynomial views exercise rigorous ambiguity
+    // fallback while preserving every first-escape result.
+    {
+        struct ViewCase {
+            const char* name;
+            const char* source;
+            const char* centerReal;
+            const char* centerImaginary;
+            const char* scale;
+            int iterations;
+        };
+        const ViewCase views[] = {
+            { "moderate-mandelbrot", "z*z+c",
+              "-0.743643887037151", "0.13182590420533",
+              "64", 300 },
+            { "moderate-cubic", "z*z*z-0.2*z+c",
+              "-0.1", "0.65", "48", 220 }
+        };
+        for (const ViewCase& view : views) {
+            ProgramPair pair;
+            std::vector<float> actual, expected;
+            if (!compilePair(
+                    view.source, FormulaParameter::C,
+                    mandelbrotFixed, pair)) {
+                ++failures;
+                continue;
+            }
+            ExpressionDeepRenderRequest request = makeRequest(
+                pair, mandelbrotFixed, FormulaParameter::C,
+                view.centerReal, view.centerImaginary,
+                19, 13, view.iterations, actual);
+            request.scale.decimal = view.scale;
+            ExpressionDeepRenderResult result;
+            const bool okay =
+                formula::renderExpressionDeepFrame(
+                    request, result) &&
+                renderOracle(
+                    pair.runtime, mandelbrotFixed,
+                    FormulaParameter::C,
+                    view.centerReal, view.centerImaginary,
+                    view.scale, 19, 13, view.iterations,
+                    4.0, result.fallbackPrecision,
+                    expected);
+            if (!okay || actual != expected ||
+                result.fastPixelCount +
+                    result.fallbackPixelCount !=
+                    actual.size()) {
+                printf("  adversarial view failed [%s]\n",
+                       view.name);
+                ++failures;
+            }
+        }
+    }
+
+    // Artificially enlarged intervals must only increase fallback, never
+    // commit a classification that disagrees with the MPFR oracle.
+    {
+        ProgramPair pair;
+        std::vector<float> baseline, widened, expected;
+        if (!compilePair(
+                "z*z+c", FormulaParameter::C,
+                mandelbrotFixed, pair)) {
+            ++failures;
+        } else {
+            ExpressionDeepRenderRequest baseRequest = makeRequest(
+                pair, mandelbrotFixed, FormulaParameter::C,
+                "-1", "0", 21, 13, 180, baseline);
+            ExpressionDeepRenderResult baseResult;
+            bool okay = formula::renderExpressionDeepFrame(
+                baseRequest, baseResult);
+            ExpressionDeepRenderRequest wideRequest = makeRequest(
+                pair, mandelbrotFixed, FormulaParameter::C,
+                "-1", "0", 21, 13, 180, widened);
+            wideRequest.verificationErrorInflationBits = 2048;
+            ExpressionDeepRenderResult wideResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    wideRequest, wideResult) &&
+                renderOracle(
+                    pair.runtime, mandelbrotFixed,
+                    FormulaParameter::C, "-1", "0",
+                    "1e500", 21, 13, 180, 4.0,
+                    wideResult.fallbackPrecision, expected);
+            if (!okay || baseline != expected ||
+                widened != expected ||
+                wideResult.fallbackPixelCount == 0 ||
+                wideResult.fallbackPixelCount <
+                    baseResult.fallbackPixelCount) {
+                printf("  widened certification fallback failed\n");
+                ++failures;
+            }
+        }
+    }
+
+    // The opt-in series path is informational only and is never the default.
+    {
+        ProgramPair pair;
+        std::vector<float> output, expected;
+        if (compilePair(
+                "sin(z)+c", FormulaParameter::C,
+                transcendentalFixed, pair)) {
+            ExpressionDeepRenderRequest request = makeRequest(
+                pair, transcendentalFixed, FormulaParameter::C,
+                "0", "0", 9, 7, 20, output);
+            request.allowUncertifiedForBenchmark = true;
+            ExpressionDeepRenderResult result;
+            if (!formula::renderExpressionDeepFrame(
+                    request, result)) {
+                ++failures;
+            } else {
+                renderOracle(
+                    pair.runtime, transcendentalFixed,
+                    FormulaParameter::C, "0", "0",
+                    "1e500",
+                    9, 7, 20, 4.0,
+                    result.fallbackPrecision, expected);
+                size_t mismatches = 0;
+                for (size_t i = 0;
+                     i < output.size(); ++i)
+                    mismatches += output[i] != expected[i];
+                printf("  uncertified opt-in informational mismatches=%zu fallback=%llu\n",
+                       mismatches,
+                       (unsigned long long)
+                           result.fallbackPixelCount);
+            }
+        } else {
+            ++failures;
+        }
+    }
+
+    // A defined MPFR infinity is an escape, not an undefined domain result.
+    {
+        ProgramPair pair;
+        std::vector<float> output;
+        if (!compilePair(
+                "exp(1e100)", FormulaParameter::C,
+                mandelbrotFixed, pair)) {
+            ++failures;
+        } else {
+            ExpressionDeepRenderRequest request = makeRequest(
+                pair, mandelbrotFixed, FormulaParameter::C,
+                "0", "0", 5, 3, 2, output);
+            ExpressionDeepRenderResult result;
+            if (!formula::renderExpressionDeepFrame(
+                    request, result) ||
+                result.undefinedPixelCount != 0 ||
+                std::count(
+                    output.begin(), output.end(), 1.0f) !=
+                    static_cast<ptrdiff_t>(output.size())) {
+                printf("  MPFR infinity escape policy failed\n");
+                ++failures;
+            }
+        }
+    }
+
+    // Undefined orbits are not reported as successful pixels.
+    {
+        ProgramPair pair;
+        std::vector<float> output;
+        if (!compilePair(
+                "1/(z-z)", FormulaParameter::InitialZ,
+                z0Fixed, pair)) {
+            ++failures;
+        } else {
+            ExpressionDeepRenderRequest request = makeRequest(
+                pair, z0Fixed, FormulaParameter::InitialZ,
+                "1", "0", 7, 5, 8, output);
+            ExpressionDeepRenderResult result;
+            if (formula::renderExpressionDeepFrame(
+                    request, result) ||
+                result.status !=
+                    ExpressionDeepRenderStatus::UndefinedPixel ||
+                result.undefinedPixelCount != output.size() ||
+                std::count(
+                    output.begin(), output.end(),
+                    formula::ExpressionDeepEmptyPixel) !=
+                        static_cast<ptrdiff_t>(output.size())) {
+                printf("  undefined pixel policy failed\n");
+                ++failures;
+            }
+        }
+    }
+
+    // Scaled exponents extend beyond MPFR's runtime range. Near either bound,
+    // the certified path must defer before a finite reference neighborhood can
+    // overflow, underflow, or turn a later multiplication by zero undefined.
+    {
+        mpf_t centerReal, centerImaginary, scaleValue;
+        mpf_init2(centerReal, 768);
+        mpf_init2(centerImaginary, 768);
+        mpf_init2(scaleValue, 768);
+        mpf_set_ui(centerImaginary, 0);
+        mpfr_t value, scale, temporary;
+        mpfr_inits2(
+            768, value, scale, temporary,
+            (mpfr_ptr)0);
+
+        auto runRangeCase = [&](
+                const char* name, const char* source,
+                ExpressionDeepFallbackReason expectedReason) {
+            ProgramPair pair;
+            if (!compilePair(
+                    source, FormulaParameter::C,
+                    mandelbrotFixed, pair)) {
+                printf("  exponent-range compile failed [%s]\n",
+                       name);
+                ++failures;
+                return;
+            }
+            std::vector<float> actual, expected;
+            ExpressionDeepRenderRequest request = makeRequest(
+                pair, mandelbrotFixed, FormulaParameter::C,
+                "0", "0", 3, 3, 2, actual);
+            request.center.realDecimal.clear();
+            request.center.imaginaryDecimal.clear();
+            request.center.realMpf = centerReal;
+            request.center.imaginaryMpf =
+                centerImaginary;
+            request.scale.decimal.clear();
+            request.scale.mpf = scaleValue;
+            ExpressionDeepRenderResult actualResult;
+            const bool actualOkay =
+                formula::renderExpressionDeepFrame(
+                    request, actualResult);
+
+            ExpressionDeepRenderRequest oracleRequest =
+                request;
+            oracleRequest.output = nullptr;
+            oracleRequest.outputCount = 0;
+            if (actualResult.fallbackPrecision >
+                    request.precision.guardBits) {
+                oracleRequest.precision.requestedBits =
+                    actualResult.fallbackPrecision -
+                    request.precision.guardBits;
+                oracleRequest.precision.maximumBits =
+                    actualResult.fallbackPrecision;
+            }
+            oracleRequest.memory.fallbackGuardBits = 0;
+            expected.assign(
+                actual.size(),
+                formula::ExpressionDeepEmptyPixel);
+            oracleRequest.output = expected.data();
+            oracleRequest.outputCount = expected.size();
+            ExpressionDeepRenderResult expectedResult;
+            const bool expectedOkay =
+                formula::renderExpressionDeepFrame(
+                    oracleRequest, expectedResult);
+            const uint64_t pixelCount =
+                static_cast<uint64_t>(actual.size());
+            if (actualResult.fallbackPrecision == 0 ||
+                actualOkay != expectedOkay ||
+                actualResult.status != expectedResult.status ||
+                actual != expected ||
+                actualResult.undefinedPixelCount !=
+                    expectedResult.undefinedPixelCount ||
+                actualResult.fastPixelCount != 0 ||
+                actualResult.fallbackPixelCount !=
+                    pixelCount ||
+                reasonCount(
+                    actualResult, expectedReason) !=
+                    pixelCount) {
+                printf("  exponent-range fallback mismatch [%s] status=%s/%s fast/fallback=%llu/%llu range=%llu error=%s\n",
+                       name,
+                       formula::expressionDeepRenderStatusName(
+                           actualResult.status),
+                       formula::expressionDeepRenderStatusName(
+                           expectedResult.status),
+                       (unsigned long long)
+                           actualResult.fastPixelCount,
+                       (unsigned long long)
+                           actualResult.fallbackPixelCount,
+                       (unsigned long long)reasonCount(
+                           actualResult,
+                           ExpressionDeepFallbackReason::
+                               ExponentRange),
+                       actualResult.error.c_str());
+                ++failures;
+            }
+        };
+
+        const mpfr_exp_t emax = mpfr_get_emax();
+        const mpfr_exp_t emin = mpfr_get_emin();
+
+        mpfr_set_ui_2exp(
+            value, 1, emax - 2, MPFR_RNDN);
+        mpfr_ui_div(scale, 1, value, MPFR_RNDN);
+        mpfr_get_f(centerReal, value, MPFR_RNDN);
+        mpfr_get_f(scaleValue, scale, MPFR_RNDN);
+        runRangeCase(
+            "two-c-times-zero", "(2*c)*0",
+            ExpressionDeepFallbackReason::ExponentRange);
+
+        const mpfr_exp_t hugePower =
+            (emax - 2) / 2;
+        mpfr_set_ui_2exp(
+            value, 1, hugePower, MPFR_RNDN);
+        mpfr_ui_div(scale, 1, value, MPFR_RNDN);
+        mpfr_get_f(centerReal, value, MPFR_RNDN);
+        mpfr_get_f(scaleValue, scale, MPFR_RNDN);
+        runRangeCase(
+            "huge-multiply", "c*c",
+            ExpressionDeepFallbackReason::ExponentRange);
+
+        const mpfr_exp_t tinyPower = emin / 2;
+        mpfr_set_ui_2exp(
+            value, 1, tinyPower, MPFR_RNDN);
+        mpfr_get_f(centerReal, value, MPFR_RNDN);
+        mpf_set_ui(scaleValue, 1);
+        runRangeCase(
+            "tiny-underflow", "(c*c)*0.125",
+            ExpressionDeepFallbackReason::ExponentRange);
+
+        mpfr_const_log2(value, MPFR_RNDN);
+        mpfr_mul_si(
+            temporary, value,
+            static_cast<long>(emax), MPFR_RNDN);
+        mpfr_sub_ui(
+            temporary, temporary, 1, MPFR_RNDN);
+        mpfr_get_f(centerReal, temporary, MPFR_RNDN);
+        mpf_set_ui(scaleValue, 1);
+        runRangeCase(
+            "exp-overflow-domain", "exp(c)*0",
+            ExpressionDeepFallbackReason::
+                UncertifiedSeries);
+
+        mpfr_clears(
+            value, scale, temporary, (mpfr_ptr)0);
+        mpf_clear(centerReal);
+        mpf_clear(centerImaginary);
+        mpf_clear(scaleValue);
+    }
+
+    // Cancellation leaves all unfinished pixels at EMPTY in both phases.
+    auto cancellationCase = [&](
+            const char* source, bool fallbackPhase) {
+        ProgramPair pair;
+        const FormulaParameter pixel = FormulaParameter::C;
+        if (!compilePair(
+                source, pixel, mandelbrotFixed, pair)) {
+            ++failures;
+            return;
+        }
+        std::vector<float> output;
+        ExpressionDeepRenderRequest request = makeRequest(
+            pair, mandelbrotFixed, pixel,
+            fallbackPhase ? "0" : "-2", "0",
+            48, 28, fallbackPhase ? 30 : 850,
+            output);
+        std::atomic<int> phase{
+            static_cast<int>(
+                ExpressionDeepRenderPhase::Reference) };
+        std::atomic<int> polls{ 0 };
+        request.progress = [&](ExpressionDeepRenderPhase value,
+                               uint64_t, uint64_t) {
+            phase.store(
+                static_cast<int>(value),
+                std::memory_order_release);
+        };
+        request.shouldCancel = [&] {
+            const ExpressionDeepRenderPhase current =
+                static_cast<ExpressionDeepRenderPhase>(
+                    phase.load(std::memory_order_acquire));
+            const bool target = fallbackPhase
+                ? current ==
+                    ExpressionDeepRenderPhase::Fallback
+                : current ==
+                    ExpressionDeepRenderPhase::Fast;
+            return target &&
+                   polls.fetch_add(
+                       1, std::memory_order_relaxed) > 300;
+        };
+        ExpressionDeepRenderResult result;
+        const bool okay =
+            formula::renderExpressionDeepFrame(
+                request, result);
+        const size_t empty = static_cast<size_t>(
+            std::count(
+                output.begin(), output.end(),
+                formula::ExpressionDeepEmptyPixel));
+        if (okay || !result.cancelled ||
+            result.status !=
+                ExpressionDeepRenderStatus::Cancelled ||
+            empty == 0) {
+            printf("  %s cancellation failed empty=%zu\n",
+                   fallbackPhase ? "fallback" : "fast",
+                   empty);
+            ++failures;
+        }
+    };
+    cancellationCase("z*z+c", false);
+    cancellationCase("sin(z)+c", true);
+
+    // Worker and per-iteration allocation failures must not let any thread
+    // bypass an OpenMP worksharing barrier.
+    auto workerFaultCase = [&](
+            const char* source,
+            ExpressionDeepVerificationFault fault,
+            const char* name) {
+        ProgramPair pair;
+        if (!compilePair(
+                source, FormulaParameter::C,
+                mandelbrotFixed, pair)) {
+            ++failures;
+            return;
+        }
+        std::vector<float> output;
+        ExpressionDeepRenderRequest request = makeRequest(
+            pair, mandelbrotFixed, FormulaParameter::C,
+            "-1", "0", 16, 10, 40, output);
+        request.threading.threads = 4;
+        request.verificationFault = fault;
+        ExpressionDeepRenderResult result;
+        const Clock::time_point start = Clock::now();
+        const bool okay =
+            formula::renderExpressionDeepFrame(
+                request, result);
+        const double elapsed =
+            std::chrono::duration<double>(
+                Clock::now() - start).count();
+        if (okay ||
+            result.status !=
+                ExpressionDeepRenderStatus::ResourceLimit ||
+            elapsed > 10.0) {
+            printf("  %s fault handling failed status=%s elapsed=%.3f\n",
+                   name,
+                   formula::expressionDeepRenderStatusName(
+                       result.status),
+                   elapsed);
+            ++failures;
+        }
+    };
+    workerFaultCase(
+        "z*z+c",
+        ExpressionDeepVerificationFault::
+            FastWorkerAllocation,
+        "fast worker allocation");
+    workerFaultCase(
+        "z*z+c",
+        ExpressionDeepVerificationFault::
+            FastIterationAllocation,
+        "fast iteration allocation");
+    workerFaultCase(
+        "sin(z)+c",
+        ExpressionDeepVerificationFault::
+            FallbackWorkerAllocation,
+        "fallback worker allocation");
+    workerFaultCase(
+        "sin(z)+c",
+        ExpressionDeepVerificationFault::
+            FallbackIterationAllocation,
+        "fallback iteration allocation");
+
+    // Request, resource, and semantic validation.
+    {
+        ProgramPair pair;
+        std::vector<float> output;
+        if (!compilePair(
+                "z*z+c", FormulaParameter::C,
+                mandelbrotFixed, pair)) {
+            ++failures;
+        } else {
+            ExpressionDeepRenderRequest request = makeRequest(
+                pair, mandelbrotFixed, FormulaParameter::C,
+                "-1", "0", 7, 5, 20, output);
+            ExpressionDeepRenderResult result;
+            request.outputCount = output.size() - 1;
+            if (formula::renderExpressionDeepFrame(
+                    request, result) ||
+                result.status !=
+                    ExpressionDeepRenderStatus::InvalidRequest)
+                ++failures;
+            request.outputCount = output.size();
+            request.scale.decimal = "-1";
+            if (formula::renderExpressionDeepFrame(
+                    request, result) ||
+                result.status !=
+                    ExpressionDeepRenderStatus::InvalidRequest)
+                ++failures;
+            request.scale.decimal = "1e500";
+            request.memory.memoryLimitBytes = 1;
+            if (formula::renderExpressionDeepFrame(
+                    request, result) ||
+                result.status !=
+                    ExpressionDeepRenderStatus::ResourceLimit)
+                ++failures;
+            request.memory.memoryLimitBytes =
+                size_t{ 1 } << 30;
+            request.precision.maximumBits = 128;
+            if (formula::renderExpressionDeepFrame(
+                    request, result) ||
+                result.status !=
+                    ExpressionDeepRenderStatus::
+                        PrecisionOutOfRange)
+                ++failures;
+
+            ProgramPair mismatch;
+            ExpressionError error;
+            mismatch.canonical.compile("z-c", &error);
+            mismatch.canonical.specialize(
+                mandelbrotFixed, FormulaParameter::C,
+                mismatch.runtime, &error);
+            request.precision.maximumBits = 4096;
+            request.canonicalProgram = &pair.canonical;
+            request.runtimeProgram = &mismatch.runtime;
+            if (formula::renderExpressionDeepFrame(
+                    request, result) ||
+                result.status !=
+                    ExpressionDeepRenderStatus::ProgramMismatch)
+                ++failures;
+
+            const char* allFallbackMismatchSources[] = {
+                "sin(z)+c",
+                "log(z+2)+c",
+                "z/(c+2)+c"
+            };
+            for (const char* source :
+                 allFallbackMismatchSources) {
+                ProgramPair allFallback;
+                std::vector<float> mismatchOutput;
+                if (!compilePair(
+                        source, FormulaParameter::C,
+                        mandelbrotFixed, allFallback)) {
+                    ++failures;
+                    continue;
+                }
+                ExpressionDeepRenderRequest
+                    mismatchRequest = makeRequest(
+                        allFallback, mandelbrotFixed,
+                        FormulaParameter::C,
+                        "0", "0", 7, 5, 8,
+                        mismatchOutput);
+                mismatchRequest.runtimeProgram =
+                    &mismatch.runtime;
+                ExpressionDeepRenderResult mismatchResult;
+                if (formula::renderExpressionDeepFrame(
+                        mismatchRequest,
+                        mismatchResult) ||
+                    mismatchResult.status !=
+                        ExpressionDeepRenderStatus::
+                            ProgramMismatch ||
+                    mismatchResult.fastPixelCount != 0 ||
+                    mismatchResult.fallbackPixelCount != 0) {
+                    printf("  all-fallback mismatch was accepted [%s]\n",
+                           source);
+                    ++failures;
+                }
+            }
+
+            request.canonicalProgram = &pair.canonical;
+            request.runtimeProgram = &pair.runtime;
+            request.precision.maximumBits = 4096;
+            request.memory.fallbackGuardBits = 4096;
+            request.scale.decimal = "1e500";
+            if (!formula::renderExpressionDeepFrame(
+                    request, result) ||
+                result.fallbackPixelCount != 0)
+                ++failures;
+        }
+    }
+
+    // A production-sized-enough timing sample: reference is reported
+    // separately, and the parallel scaled pass must beat all-pixel MPFR.
+    double benchmarkReference = 0.0;
+    double benchmarkScaled = 0.0;
+    double benchmarkMpfr = 0.0;
+    double benchmarkSpeedup = 0.0;
+    double benchmarkFastPixelsPerSecond = 0.0;
+    double benchmarkFallbackRate = 0.0;
+    size_t benchmarkMemory = 0;
+    uint64_t benchmarkFallback = 0;
+    {
+        ProgramPair pair;
+        if (!compilePair(
+                "z*z+c", FormulaParameter::C,
+                mandelbrotFixed, pair)) {
+            ++failures;
+        } else {
+            constexpr int BW = 64;
+            constexpr int BH = 40;
+            constexpr int BI = 350;
+            std::vector<float> first, second;
+            ExpressionDeepRenderRequest firstRequest = makeRequest(
+                pair, mandelbrotFixed, FormulaParameter::C,
+                "-1", "0", BW, BH, BI, first);
+            firstRequest.threading.tileWidth = 16;
+            firstRequest.threading.tileHeight = 8;
+            ExpressionDeepRenderResult firstResult;
+            bool okay =
+                formula::renderExpressionDeepFrame(
+                    firstRequest, firstResult);
+            ExpressionDeepRenderRequest secondRequest = makeRequest(
+                pair, mandelbrotFixed, FormulaParameter::C,
+                "-1", "0", BW, BH, BI, second);
+            secondRequest.threading.tileWidth = 16;
+            secondRequest.threading.tileHeight = 8;
+            ExpressionDeepRenderResult secondResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    secondRequest, secondResult);
+
+            std::vector<float> oracleA, oracleB;
+            const Clock::time_point oracleStartA = Clock::now();
+            okay = okay && renderOracle(
+                pair.runtime, mandelbrotFixed,
+                FormulaParameter::C, "-1", "0",
+                "1e500",
+                BW, BH, BI, 4.0,
+                firstResult.fallbackPrecision, oracleA);
+            const double oracleSecondsA =
+                std::chrono::duration<double>(
+                    Clock::now() - oracleStartA).count();
+            const Clock::time_point oracleStartB = Clock::now();
+            okay = okay && renderOracle(
+                pair.runtime, mandelbrotFixed,
+                FormulaParameter::C, "-1", "0",
+                "1e500",
+                BW, BH, BI, 4.0,
+                firstResult.fallbackPrecision, oracleB);
+            const double oracleSecondsB =
+                std::chrono::duration<double>(
+                    Clock::now() - oracleStartB).count();
+            benchmarkReference = std::max(
+                firstResult.referenceSeconds,
+                secondResult.referenceSeconds);
+            benchmarkScaled = std::max(
+                firstResult.fastSeconds,
+                secondResult.fastSeconds);
+            benchmarkMpfr = std::min(
+                oracleSecondsA, oracleSecondsB);
+            benchmarkSpeedup =
+                benchmarkScaled > 0.0
+                ? benchmarkMpfr / benchmarkScaled
+                : 0.0;
+            benchmarkFastPixelsPerSecond =
+                benchmarkScaled > 0.0
+                ? static_cast<double>(BW * BH) /
+                    benchmarkScaled
+                : 0.0;
+            benchmarkMemory =
+                firstResult.referenceBytes +
+                firstResult.rendererBytes;
+            benchmarkFallback =
+                firstResult.fallbackPixelCount;
+            benchmarkFallbackRate =
+                static_cast<double>(benchmarkFallback) /
+                static_cast<double>(BW * BH);
+            if (!okay || first != second ||
+                first != oracleA || oracleA != oracleB ||
+                firstResult.fallbackPixelCount != 0 ||
+                secondResult.fallbackPixelCount != 0 ||
+                !(benchmarkSpeedup > 1.0)) {
+                printf("  deep renderer benchmark gate failed speedup=%.2fx fallback=%llu\n",
+                       benchmarkSpeedup,
+                       (unsigned long long)
+                           benchmarkFallback);
+                ++failures;
+            }
+        }
+    }
+
+    if (!(sawInitialEscape &&
+          sawInterior && sawExterior)) {
+        printf("  initial/interior/exterior coverage failed\n");
+        ++failures;
+    }
+
+    printf("=== expression deep frame renderer e500\n");
+    printf("  exact frames=%d default MPFR fallback covers series/rational/branch formulas\n",
+           exactFrames);
+    printf("  64x40 reference/scaled/all-MPFR %.3f/%.3f/%.3f s speedup %.2fx\n",
+           benchmarkReference, benchmarkScaled,
+           benchmarkMpfr, benchmarkSpeedup);
+    printf("  certified fast rate=%.0f px/s fallback=%llu (%.3f%%) memory=%zu bytes\n",
+           benchmarkFastPixelsPerSecond,
+           (unsigned long long)benchmarkFallback,
+           benchmarkFallbackRate * 100.0,
+           benchmarkMemory);
+    printf("  undefined pixels remain EMPTY\n");
+    printf("  => %s\n\n",
+           failures == 0
+               ? "PASS"
+               : "CHECK (deep renderer failure)");
+    return failures == 0 ? 0 : 1;
+}
+
 static int runExpressionOracleCase() {
     using formula::Complex;
     using formula::ExpressionContext;
@@ -10165,6 +11428,7 @@ int main(int argc, char** argv) {
     if (which == "expression-centered")        rc |= runExpressionCenteredCase();
     if (which == "expression-reference")       rc |= runExpressionReferenceCase();
     if (which == "expression-scaled")          rc |= runExpressionScaledCase();
+    if (which == "expression-deep-render")     rc |= runExpressionDeepRenderCase();
     if (which == "expression-coloring")        rc |= runExpressionColoringCase();
     if (which == "expression-orbit")           rc |= runExpressionOrbitCase();
     if (which == "expression-oracle" || which == "oracle")

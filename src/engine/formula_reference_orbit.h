@@ -43,6 +43,24 @@ struct ScaledComplexShadow {
     ScaledRealShadow im;
 };
 
+// A finite arithmetic value is mantissa*2^exponent with
+// 0.5 <= abs(mantissa) < 1. Error radii use the same representation and are
+// always finite and nonnegative.
+struct ScaledRealValue {
+    double mantissa = 0.0;
+    int64_t exponent = 0;
+
+    bool isZero() const { return mantissa == 0.0; }
+    bool isFinite() const { return std::isfinite(mantissa); }
+    bool isNormalized() const {
+        return isZero()
+            ? exponent == 0
+            : isFinite() &&
+              std::abs(mantissa) >= 0.5 &&
+              std::abs(mantissa) < 1.0;
+    }
+};
+
 // Conversion is fallible: every finite result is guaranteed to be
 // reconstructible in the linked MPFR runtime exponent range.
 bool makeScaledRealShadow(
@@ -115,15 +133,24 @@ struct ExpressionReferenceBuildRequest {
     double bailout = 4.0;
     int maxIterations = 0;
     ExpressionReferencePrecisionPolicy precision;
+    // When nonzero, compact values are additionally compared against an
+    // independently iterated oracle at this higher precision. The resulting
+    // radii certify the compact data relative to that finite-precision oracle.
+    mpfr_prec_t certificationPrecision = 0;
     size_t memoryLimitBytes = size_t{ 1 } << 30;
     std::function<bool()> shouldCancel;
 };
 
 struct ExpressionReferenceTapeNode {
+    // outputError/auxiliaryError are upward maximum-component radii from the
+    // fast reconstructed value to the independently iterated certification
+    // oracle when certifiedAgainstHigherPrecision is true.
     ScaledComplexShadow output;
     ScaledComplexShadow outputDefect;
+    ScaledRealValue outputError;
     ScaledComplexShadow auxiliary;
     ScaledComplexShadow auxiliaryDefect;
+    ScaledRealValue auxiliaryError;
     uint16_t leftNode = UINT16_MAX;
     uint16_t rightNode = UINT16_MAX;
     uint16_t flags = OracleTraceNone;
@@ -142,12 +169,15 @@ struct ExpressionReferenceSample {
     int iteration = 0;
     ScaledComplexShadow z;
     ScaledComplexShadow zDefect;
+    ScaledRealValue zError;
     ScaledComplexShadow next;
     // rootDefect is only the compact quantization correction from the MPFR
-    // trace root to next. It is not a full formula-recurrence defect. A future
-    // centered evaluator must include it when rebasing onto next rather than
-    // treating the rounded primary shadows as an exact orbit.
+    // trace root to next. It is not a full formula-recurrence defect. The
+    // centered evaluator includes its reconstruction in both the state and
+    // the propagated radius rather than treating primary shadows as exact.
     ScaledComplexShadow rootDefect;
+    ScaledRealValue nextError;
+    ScaledRealValue rootError;
     uint64_t tapeOffset = 0;
     uint16_t tapeCount = 0;
     uint16_t rootNode = UINT16_MAX;
@@ -167,6 +197,8 @@ struct ExpressionReferenceOrbitResult {
     int escapeIteration = -1;
     int undefinedIteration = -1;
     mpfr_prec_t precision = 0;
+    mpfr_prec_t certificationPrecision = 0;
+    bool certifiedAgainstHigherPrecision = false;
     uint64_t programSemanticHash = 0;
     uint64_t canonicalSemanticHash = 0;
     std::string programSource;
@@ -177,24 +209,30 @@ struct ExpressionReferenceOrbitResult {
 
     ScaledComplexShadow c;
     ScaledComplexShadow cDefect;
+    ScaledRealValue cError;
     ScaledComplexShadow z0;
     ScaledComplexShadow z0Defect;
+    ScaledRealValue z0Error;
     ScaledComplexShadow pixel;
     ScaledComplexShadow pixelDefect;
+    ScaledRealValue pixelError;
     ScaledComplexShadow initialZ;
     ScaledComplexShadow initialZDefect;
+    ScaledRealValue initialZError;
     std::vector<ExpressionReferenceSample> samples;
     std::vector<ExpressionReferenceTapeNode> tape;
 };
 
 // This builds reference/tape data only. It is intentionally not connected to
-// production GUI dispatch. Branch and pole metadata classify the MPFR point;
-// interval-certified neighborhood clearance remains future work.
+// production GUI dispatch. Arithmetic references can be certified relative to
+// a requested higher-precision finite MPFR iteration. Branch and pole metadata
+// still classify only the MPFR point; transcendental neighborhoods are not
+// interval-certified.
 //
 // The intended low-precision base is the two-term compact value
 // output+outputDefect stored at every tape node, not a fresh evaluation of the
-// formula from rounded z shadows. A future centered evaluator propagates only
-// the perturbation from that stored reference and reconstructs the root as
+// formula from rounded z shadows. The centered evaluator propagates the
+// perturbation and a conservative maximum-component radius, reconstructing as
 // next+rootDefect+perturbation. Auxiliary companions use the same two-term
 // convention. This avoids assuming that primary shadows form an exact orbit.
 bool buildExpressionReferenceOrbit(

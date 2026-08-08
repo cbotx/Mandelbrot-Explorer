@@ -528,6 +528,66 @@ bool ExpressionProgram::isCanonicalQuadraticPlusC() const {
             is(2, Op::C) && is(3, Op::Add));
 }
 
+ExpressionScaledResidualCapability
+ExpressionProgram::scaledResidualCapability() const {
+    if (!_valid)
+        return ExpressionScaledResidualCapability::Unsupported;
+
+    bool hasSeries = false;
+    bool hasBranch = false;
+    bool hasUnsupported = false;
+    for (const Instruction& instruction : _code) {
+        switch (instruction.op) {
+        case Op::Constant:
+        case Op::Z:
+        case Op::C:
+        case Op::Z0:
+        case Op::Iteration:
+        case Op::Parameter:
+        case Op::Negate:
+        case Op::Add:
+        case Op::Subtract:
+        case Op::Multiply:
+        case Op::Square:
+        case Op::Conjugate:
+        case Op::Real:
+        case Op::Imaginary:
+        case Op::MakeComplex:
+        case Op::Norm:
+            break;
+        case Op::Sin:
+        case Op::Cos:
+        case Op::Sinh:
+        case Op::Cosh:
+        case Op::Exp:
+            hasSeries = true;
+            break;
+        case Op::Power:
+        case Op::Tan:
+        case Op::Tanh:
+        case Op::Log:
+        case Op::Log10:
+        case Op::Sqrt:
+        case Op::Arg:
+            hasBranch = true;
+            break;
+        case Op::Divide:
+        case Op::Abs:
+        case Op::Polar:
+        case Op::OrbitInvariant:
+            hasUnsupported = true;
+            break;
+        }
+    }
+    if (hasBranch)
+        return ExpressionScaledResidualCapability::BranchSensitive;
+    if (hasUnsupported)
+        return ExpressionScaledResidualCapability::Unsupported;
+    if (hasSeries)
+        return ExpressionScaledResidualCapability::UncertifiedSeries;
+    return ExpressionScaledResidualCapability::ExactCenteredArithmetic;
+}
+
 uint64_t ExpressionProgram::semanticHash() const {
     if (!_valid) return 0;
     constexpr uint64_t offset = 1469598103934665603ULL;

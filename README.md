@@ -67,9 +67,17 @@ Controls:
 
     build\verify.exe [shallow|deep|ticktock|flake|exterior1000|parity1000|all] [W] [H]
     build\verify.exe expression-scaled
+    build\verify.exe expression-deep-render
 
 `expression-scaled` runs the non-GUI MPFR-tape/scaled-residual e500 prototype,
 including exact escape comparisons and the scaled-versus-per-pixel-MPFR timing.
+`expression-deep-render` verifies the production-shaped tiled frame API,
+higher-precision-MPFR-relative arithmetic certification, rigorous bailout
+intervals, automatic per-pixel MPFR fallback, cancellation, determinism,
+adversarial views, and e500 timing. Certified arithmetic also falls back
+conservatively near MPFR's runtime exponent limits. Transcendental,
+branch-sensitive, and unsupported programs default to MPFR.
+The API is not dispatched by the GUI backend yet.
 
 ### Compute backend
 
