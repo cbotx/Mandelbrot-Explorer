@@ -529,6 +529,11 @@ struct ScaledOffset {
     ScaledRealValue error;
 };
 
+ScaledRealValue absoluteScaled(ScaledRealValue value) {
+    value.mantissa = std::abs(value.mantissa);
+    return value;
+}
+
 bool componentDiscrepancy(
         mpfr_srcptr exact,
         const ScaledRealValue& base,
@@ -753,6 +758,20 @@ bool renderExpressionDeepFrame(
             return fail(
                 ExpressionDeepRenderStatus::InvalidRequest,
                 "fallback guard precision is invalid");
+        if (request.taylor.minimumLanding < 1 ||
+            request.taylor.minimumOrder < 8 ||
+            request.taylor.maximumOrder > 20 ||
+            request.taylor.minimumOrder >
+                request.taylor.order ||
+            request.taylor.order >
+                request.taylor.maximumOrder ||
+            request.taylor.maximumCandidateIteration < 0 ||
+            !(request.taylor.accuracyBudget > 0.0) ||
+            !std::isfinite(
+                request.taylor.accuracyBudget))
+            return fail(
+                ExpressionDeepRenderStatus::InvalidRequest,
+                "Taylor policy is invalid");
         if (request.verificationErrorInflationBits < 0 ||
             request.verificationErrorInflationBits > 4096)
             return fail(
@@ -878,13 +897,16 @@ bool renderExpressionDeepFrame(
         result.capability =
             request.runtimeProgram->scaledResidualCapability();
         bool runFast =
-            result.capability ==
+            !request.forceMpfrFallbackForVerification &&
+            (result.capability ==
                 ExpressionScaledResidualCapability::
                     ExactCenteredArithmetic ||
             (result.capability ==
                  ExpressionScaledResidualCapability::
                     UncertifiedSeries &&
-             request.allowUncertifiedForBenchmark);
+             request.allowUncertifiedForBenchmark));
+        bool certificationUnavailable =
+            request.forceMpfrFallbackForVerification;
 
         size_t rendererBaseBytes = 0;
         if ((runFast &&
@@ -958,7 +980,6 @@ bool renderExpressionDeepFrame(
                 result.selectedPrecision +
                 request.memory.fallbackGuardBits;
 
-        bool certificationUnavailable = false;
         if (runFast &&
             result.capability ==
                 ExpressionScaledResidualCapability::
@@ -1122,7 +1143,11 @@ bool renderExpressionDeepFrame(
         ScaledComplexBall initialReference;
         bool initialReferenceExponentUnsafe = false;
         BailoutThreshold bailoutThreshold;
-        ExpressionScaledResidualEvaluator validationEvaluator;
+        std::unique_ptr<ExpressionScaledResidualEvaluator>
+            validationEvaluator;
+        ExpressionTaylorJetResult taylorJet;
+        bool useTaylor = false;
+        size_t retainedTaylorBytes = 0;
         if (runFast) {
             ExactGeometry geometry(reference.precision);
             ExactGeometry certificationGeometry(
@@ -1247,8 +1272,11 @@ bool renderExpressionDeepFrame(
                         ExpressionDeepRenderStatus::InternalError,
                         "certified y coordinate construction failed");
             }
+            validationEvaluator =
+                std::make_unique<
+                    ExpressionScaledResidualEvaluator>();
             if (reference.defectPending ||
-                !validationEvaluator.prepare(
+                !validationEvaluator->prepare(
                     *request.runtimeProgram, reference)) {
                 runFast = false;
                 std::fill(
@@ -1262,7 +1290,7 @@ bool renderExpressionDeepFrame(
                 if (!checkedAddSize(
                         validationThreadBytesTotal,
                         static_cast<size_t>(threadCount),
-                        validationEvaluator.workspaceBytes()))
+                        validationEvaluator->workspaceBytes()))
                     return fail(
                         ExpressionDeepRenderStatus::ResourceLimit,
                         "validation workspace multiplication overflow");
@@ -1286,7 +1314,203 @@ bool renderExpressionDeepFrame(
                         ExpressionDeepRenderStatus::ResourceLimit,
                         "validation workspace exceeds memory limit");
             }
+            // Validation is complete; destroy its retained vector capacities
+            // before Taylor construction and the parallel render peak.
             validationEvaluator.reset();
+
+            if (runFast && request.taylor.enableTaylor &&
+                result.capability ==
+                    ExpressionScaledResidualCapability::
+                        ExactCenteredArithmetic &&
+                request.maxIterations >
+                    request.taylor.minimumLanding) {
+                result.taylorAttempted = true;
+                ScaledRealValue maximumRealMagnitude;
+                ScaledRealValue maximumImaginaryMagnitude;
+                ScaledRealValue maximumComponentError;
+                for (const ScaledOffset& offset : xOffsets) {
+                    const ScaledRealValue magnitude =
+                        absoluteScaled(offset.value);
+                    if (compareScaledNonnegative(
+                            magnitude,
+                            maximumRealMagnitude) > 0)
+                        maximumRealMagnitude = magnitude;
+                    if (compareScaledNonnegative(
+                            offset.error,
+                            maximumComponentError) > 0)
+                        maximumComponentError =
+                            offset.error;
+                }
+                for (const ScaledOffset& offset : yOffsets) {
+                    const ScaledRealValue magnitude =
+                        absoluteScaled(offset.value);
+                    if (compareScaledNonnegative(
+                            magnitude,
+                            maximumImaginaryMagnitude) > 0)
+                        maximumImaginaryMagnitude = magnitude;
+                    if (compareScaledNonnegative(
+                            offset.error,
+                            maximumComponentError) > 0)
+                        maximumComponentError =
+                            offset.error;
+                }
+                ScaledComplexValue parameterScale;
+                if (makeExpressionTaylorFrameScale(
+                        maximumRealMagnitude,
+                        maximumImaginaryMagnitude,
+                        maximumComponentError,
+                        parameterScale)) {
+                    ExpressionTaylorJetRequest jetRequest;
+                    jetRequest.program =
+                        request.runtimeProgram;
+                    jetRequest.reference = &reference;
+                    jetRequest.pixelParameter =
+                        request.pixelParameter;
+                    jetRequest.parameterScale =
+                        parameterScale;
+                    jetRequest.minimumOrder =
+                        request.taylor.minimumOrder;
+                    jetRequest.preferredOrder =
+                        request.taylor.order;
+                    jetRequest.maximumOrder =
+                        request.taylor.maximumOrder;
+                    jetRequest.minimumLanding =
+                        request.taylor.minimumLanding;
+                    jetRequest.maximumCandidateIteration =
+                        request.taylor.
+                            maximumCandidateIteration;
+                    jetRequest.bailout = request.bailout;
+                    jetRequest.accuracyBudget =
+                        request.taylor.accuracyBudget;
+                    if (request.memory.memoryLimitBytes != 0 &&
+                        reference.memoryBytes <=
+                            request.memory.memoryLimitBytes &&
+                        rendererBaseBytes <=
+                            request.memory.memoryLimitBytes -
+                                reference.memoryBytes)
+                        jetRequest.memoryLimitBytes =
+                            request.memory.memoryLimitBytes -
+                            reference.memoryBytes -
+                            rendererBaseBytes;
+                    else
+                        jetRequest.memoryLimitBytes =
+                            request.memory.memoryLimitBytes;
+                    jetRequest.shouldCancel =
+                        pollCancellation;
+                    useTaylor =
+                        ExpressionTaylorJetBuilder::build(
+                            jetRequest, taylorJet);
+                } else {
+                    taylorJet.status =
+                        ExpressionTaylorJetStatus::
+                            ExponentRange;
+                    taylorJet.failureReason =
+                        "Taylor frame normalization failed";
+                }
+                result.taylorBuildSeconds =
+                    taylorJet.buildSeconds;
+                result.taylorMemoryBytes =
+                    taylorJet.memoryBytes;
+                result.taylorStatus =
+                    taylorJet.status;
+                result.taylorFailureReason =
+                    taylorJet.failureReason;
+                result.taylorOrder = taylorJet.order;
+                result.taylorCoveredIterations =
+                    taylorJet.landingIteration;
+                if (cancelled.load(
+                        std::memory_order_acquire) ||
+                    taylorJet.status ==
+                        ExpressionTaylorJetStatus::
+                            Cancelled)
+                    return fail(
+                        ExpressionDeepRenderStatus::
+                            Cancelled,
+                        "render cancelled while building Taylor jet");
+                if (useTaylor &&
+                    request.taylor.
+                        requirePredictedBenefit) {
+                    const long double saved =
+                        static_cast<long double>(
+                            pixelCount64) *
+                        taylorJet.landingIteration * 16.0L;
+                    const long double evaluation =
+                        static_cast<long double>(
+                            pixelCount64) *
+                        (2.0L * taylorJet.order + 2.0L);
+                    const long double predictedCost =
+                        static_cast<long double>(
+                            taylorJet.operationCount) +
+                        evaluation;
+                    if (saved <= predictedCost) {
+                        useTaylor = false;
+                        result.taylorFailureReason =
+                            "Taylor cost predicts no frame benefit";
+                    }
+                }
+                if (useTaylor) {
+                    size_t persistentTaylorBytes = 0;
+                    if (!checkedAddSize(
+                            persistentTaylorBytes,
+                            taylorJet.coefficients.capacity(),
+                            sizeof(ScaledComplexValue)) ||
+                        !checkedAddSize(
+                            persistentTaylorBytes,
+                            taylorJet.coefficientRadii.capacity(),
+                            sizeof(ScaledRealValue)) ||
+                        !checkedAddSize(
+                            persistentTaylorBytes,
+                            taylorJet.
+                                intermediateEscapeMargins.
+                                    capacity(),
+                            sizeof(ScaledRealValue))) {
+                        useTaylor = false;
+                        result.taylorFailureReason =
+                            "Taylor coefficient memory calculation overflow";
+                    }
+                    size_t fastWithTaylor = rendererBytes;
+                    size_t buildWithTaylor =
+                        rendererBaseBytes;
+                    if (useTaylor &&
+                        (!checkedAddSize(
+                             fastWithTaylor, 1,
+                             persistentTaylorBytes) ||
+                         !checkedAddSize(
+                             buildWithTaylor, 1,
+                             taylorJet.memoryBytes))) {
+                        useTaylor = false;
+                        result.taylorFailureReason =
+                            "Taylor peak memory calculation overflow";
+                    }
+                    const size_t withTaylor = std::max(
+                        fastWithTaylor, buildWithTaylor);
+                    if (useTaylor &&
+                        (request.memory.memoryLimitBytes != 0 &&
+                         (reference.memoryBytes >
+                              request.memory.memoryLimitBytes ||
+                          withTaylor >
+                              request.memory.memoryLimitBytes -
+                                  reference.memoryBytes))) {
+                        useTaylor = false;
+                        result.taylorFailureReason =
+                            "Taylor coefficients exceed renderer memory policy";
+                    } else if (useTaylor) {
+                        retainedTaylorBytes =
+                            persistentTaylorBytes;
+                        rendererBytes = withTaylor;
+                        result.rendererBytes = rendererBytes;
+                    }
+                }
+                if (!useTaylor) {
+                    std::vector<ScaledComplexValue>().swap(
+                        taylorJet.coefficients);
+                    std::vector<ScaledRealValue>().swap(
+                        taylorJet.coefficientRadii);
+                    std::vector<ScaledRealValue>().swap(
+                        taylorJet.intermediateEscapeMargins);
+                }
+                result.taylorAccepted = useTaylor;
+            }
         }
         if (!runFast &&
             fallbackReason[0] == NoFallbackReason) {
@@ -1306,6 +1530,10 @@ bool renderExpressionDeepFrame(
         const Clock::time_point fastStart = Clock::now();
         std::atomic<uint64_t> fastPixels{ 0 };
         std::atomic<uint64_t> totalIterations{ 0 };
+        std::atomic<uint64_t> taylorAcceptedPixels{ 0 };
+        std::atomic<uint64_t> taylorFallbackPixels{ 0 };
+        std::atomic<uint64_t> taylorEvaluationNanoseconds{ 0 };
+        std::atomic<uint64_t> taylorResidualNanoseconds{ 0 };
         std::atomic<uint64_t> fastCompleted{ 0 };
         std::atomic_bool fastResourceError{ false };
         std::atomic_bool fastInternalError{ false };
@@ -1489,7 +1717,111 @@ bool renderExpressionDeepFrame(
                                         pixel.decided = true;
                                         pixel.output = 0.0f;
                                     } else {
-                                        for (int iteration = 0;
+                                        int firstIteration = 0;
+                                        if (useTaylor) {
+                                            const Clock::time_point
+                                                evaluationStart =
+                                                    Clock::now();
+                                            ScaledComplexBall q;
+                                            ScaledComplexBall
+                                                landingDelta;
+                                            bool landed = false;
+                                            if (makeExpressionTaylorNormalizedQ(
+                                                    offset,
+                                                    taylorJet.
+                                                        parameterScale,
+                                                    q) &&
+                                                expressionTaylorQInsideUnitDisk(
+                                                    q)) {
+                                                ExpressionTaylorJetEvaluation
+                                                    landing;
+                                                if (ExpressionTaylorJetEvaluator::
+                                                        evaluate(
+                                                            taylorJet,
+                                                            q,
+                                                            landing)) {
+                                                    landingDelta =
+                                                        landing.residual;
+                                                    const ExpressionReferenceSample&
+                                                        landingSample =
+                                                            reference.samples[
+                                                                taylorJet.
+                                                                    landingSample];
+                                                    ScaledComplexBall
+                                                        landingBase;
+                                                    ScaledComplexBall
+                                                        landingValue;
+                                                    arithmetic =
+                                                        makeScaledComplexValue(
+                                                            landingSample.z,
+                                                            landingSample.
+                                                                zDefect,
+                                                            landingBase.value);
+                                                    if (arithmetic ==
+                                                            ScaledArithmeticStatus::
+                                                                Success)
+                                                        arithmetic =
+                                                            certifiedScaledAdd(
+                                                                landingBase,
+                                                                landingDelta,
+                                                                landingValue);
+                                                    if (arithmetic ==
+                                                            ScaledArithmeticStatus::
+                                                                Success)
+                                                        arithmetic =
+                                                            certifyScaledMpfrExponentRange(
+                                                                landingValue);
+                                                    if (arithmetic ==
+                                                            ScaledArithmeticStatus::
+                                                                Success) {
+                                                        decision =
+                                                            decideBailout(
+                                                                landingValue.
+                                                                    value,
+                                                                landingValue.
+                                                                    radius,
+                                                                bailoutThreshold,
+                                                                gateStatus);
+                                                        landed =
+                                                            decision ==
+                                                                BailoutDecision::
+                                                                    Inside;
+                                                    }
+                                                }
+                                            }
+                                            taylorEvaluationNanoseconds.
+                                                fetch_add(
+                                                    static_cast<uint64_t>(
+                                                        std::chrono::
+                                                            duration_cast<
+                                                                std::chrono::
+                                                                    nanoseconds>(
+                                                                Clock::now() -
+                                                                evaluationStart).
+                                                            count()),
+                                                    std::memory_order_relaxed);
+                                            if (landed) {
+                                                stateDelta =
+                                                    landingDelta;
+                                                firstIteration =
+                                                    taylorJet.
+                                                        landingIteration;
+                                                taylorAcceptedPixels.
+                                                    fetch_add(
+                                                        1,
+                                                        std::memory_order_relaxed);
+                                            } else {
+                                                taylorFallbackPixels.
+                                                    fetch_add(
+                                                        1,
+                                                        std::memory_order_relaxed);
+                                            }
+                                        }
+                                        const Clock::time_point
+                                            residualStart =
+                                                Clock::now();
+                                        for (int iteration =
+                                                 firstIteration;
                                              iteration <
                                                  request.maxIterations;
                                              ++iteration) {
@@ -1668,6 +2000,18 @@ bool renderExpressionDeepFrame(
                                                 break;
                                             }
                                         }
+                                        if (useTaylor)
+                                            taylorResidualNanoseconds.
+                                                fetch_add(
+                                                    static_cast<uint64_t>(
+                                                        std::chrono::
+                                                            duration_cast<
+                                                                std::chrono::
+                                                                    nanoseconds>(
+                                                                Clock::now() -
+                                                                residualStart).
+                                                            count()),
+                                                    std::memory_order_relaxed);
                                     }
                                 }
                             }
@@ -1728,6 +2072,22 @@ bool renderExpressionDeepFrame(
             fastPixels.load(std::memory_order_relaxed);
         result.totalIterations =
             totalIterations.load(std::memory_order_relaxed);
+        result.taylorAcceptedPixelCount =
+            taylorAcceptedPixels.load(
+                std::memory_order_relaxed);
+        result.taylorFallbackPixelCount =
+            taylorFallbackPixels.load(
+                std::memory_order_relaxed);
+        result.taylorEvaluationSeconds =
+            static_cast<double>(
+                taylorEvaluationNanoseconds.load(
+                    std::memory_order_relaxed)) /
+            1.0e9;
+        result.taylorResidualSeconds =
+            static_cast<double>(
+                taylorResidualNanoseconds.load(
+                    std::memory_order_relaxed)) /
+            1.0e9;
         if (fastResourceError.load(
                 std::memory_order_acquire))
             return fail(
@@ -1874,6 +2234,9 @@ bool renderExpressionDeepFrame(
             size_t fallbackRendererBytes =
                 rendererBaseBytes;
             if (!checkedAddSize(
+                    fallbackRendererBytes, 1,
+                    retainedTaylorBytes) ||
+                !checkedAddSize(
                     fallbackRendererBytes, 1,
                     std::max(
                         fastThreadBytesTotal,

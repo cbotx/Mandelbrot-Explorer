@@ -18,6 +18,7 @@ class ExpressionJit4;
 class ExpressionOrbitPlan;
 class ExpressionCenteredEvaluator;
 class ExpressionScaledResidualEvaluator;
+class ExpressionTaylorJetBuilder;
 
 struct ExpressionError {
     size_t position = 0;
@@ -150,6 +151,7 @@ private:
     friend class ExpressionOrbitPlan;
     friend class ExpressionCenteredEvaluator;
     friend class ExpressionScaledResidualEvaluator;
+    friend class ExpressionTaylorJetBuilder;
 };
 
 class ExpressionOrbitPlan {

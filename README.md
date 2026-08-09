@@ -67,10 +67,14 @@ Controls:
 
     build\verify.exe [shallow|deep|ticktock|flake|exterior1000|parity1000|all] [W] [H]
     build\verify.exe expression-scaled
+    build\verify.exe expression-taylor
     build\verify.exe expression-deep-render
 
 `expression-scaled` runs the non-GUI MPFR-tape/scaled-residual e500 prototype,
 including exact escape comparisons and the scaled-versus-per-pixel-MPFR timing.
+`expression-taylor` verifies the certified adaptive order-8..20 Taylor-jet
+prefix, normalized-frame containment, MPFR landing bounds, renderer parity,
+and the practical acceleration gate.
 `expression-deep-render` verifies the production-shaped tiled frame API,
 higher-precision-MPFR-relative arithmetic certification, rigorous bailout
 intervals, automatic per-pixel MPFR fallback, cancellation, determinism,

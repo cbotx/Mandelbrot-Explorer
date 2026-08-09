@@ -12,7 +12,7 @@
 //          gui875 | julia | julia-ede | julia-dendrite | julia-critical |
 //          expression | expression-coloring | expression-orbit |
 //          expression-centered | expression-reference | expression-scaled |
-//          expression-deep-render |
+//          expression-taylor | expression-deep-render |
 //          expression-oracle |
 //          oracle | custom-deep | expression-suite | suite |
 //          expression-residual | formula-bench | multibrot | backend | gpu | all
@@ -50,6 +50,7 @@
 #include "formula_expression_orbit.h"
 #include "formula_reference_orbit.h"
 #include "formula_scaled_residual.h"
+#include "formula_taylor_jet.h"
 #include "formula_deep_renderer.h"
 #include "formula_expression_jit.h"
 #include "formula_expression_oracle.h"
@@ -6093,6 +6094,714 @@ static int runExpressionScaledCase() {
     return failures == 0 ? 0 : 1;
 }
 
+static int runExpressionTaylorCase() {
+    using formula::Complex;
+    using formula::ExpressionContext;
+    using formula::ExpressionDeepRenderRequest;
+    using formula::ExpressionDeepRenderResult;
+    using formula::ExpressionError;
+    using formula::ExpressionOracle;
+    using formula::ExpressionOracleContext;
+    using formula::ExpressionProgram;
+    using formula::ExpressionReferenceBuildRequest;
+    using formula::ExpressionReferenceOrbitResult;
+    using formula::ExpressionTaylorJetBuilder;
+    using formula::ExpressionTaylorJetEvaluation;
+    using formula::ExpressionTaylorJetEvaluator;
+    using formula::ExpressionTaylorJetRequest;
+    using formula::ExpressionTaylorJetResult;
+    using formula::ExpressionTaylorJetStatus;
+    using formula::MpfrComplex;
+    using formula::ScaledArithmeticStatus;
+    using formula::ScaledComplexBall;
+    using formula::ScaledComplexValue;
+    using formula::ScaledRealValue;
+
+    struct ProgramPair {
+        ExpressionProgram canonical;
+        ExpressionProgram runtime;
+    };
+    auto compilePair = [](
+            const char* source, FormulaParameter pixel,
+            const ExpressionContext& fixed,
+            ProgramPair& pair) {
+        ExpressionError error;
+        return pair.canonical.compile(source, &error) &&
+               pair.canonical.specialize(
+                   fixed, pixel, pair.runtime, &error);
+    };
+    auto makeScale = [](int64_t binaryExponent) {
+        ScaledComplexValue scale;
+        scale.re.mantissa = 0.5;
+        scale.re.exponent = binaryExponent + 1;
+        return scale;
+    };
+    auto buildReference = [](
+            const ProgramPair& pair,
+            const ExpressionContext& fixed,
+            FormulaParameter pixel,
+            const char* centerReal,
+            const char* centerImaginary,
+            int iterations, mpfr_prec_t viewBits,
+            ExpressionReferenceOrbitResult& reference) {
+        ExpressionReferenceBuildRequest request;
+        request.canonicalProgram = &pair.canonical;
+        request.runtimeProgram = &pair.runtime;
+        request.pixelParameter = pixel;
+        request.center.realDecimal = centerReal;
+        request.center.imaginaryDecimal = centerImaginary;
+        request.fixed = fixed;
+        request.bailout = 4.0;
+        request.maxIterations = iterations;
+        request.precision.viewBits = viewBits;
+        request.precision.minimumBits = 128;
+        request.precision.guardBits = 64;
+        request.precision.maximumBits = 8192;
+        request.certificationPrecision =
+            viewBits + 256;
+        request.memoryLimitBytes = size_t{ 1 } << 30;
+        return formula::buildExpressionReferenceOrbit(
+            request, reference);
+    };
+    auto contains = [](
+            const MpfrComplex& exact,
+            const ScaledComplexBall& ball) {
+        MpfrComplex midpoint(exact.precision());
+        mpfr_t radius, difference, otherDifference;
+        mpfr_inits2(
+            exact.precision(), radius, difference,
+            otherDifference,
+            (mpfr_ptr)0);
+        bool okay =
+            formula::setMpfrFromScaledValue(
+                midpoint, ball.value) &&
+            formula::setMpfrFromScaledValue(
+                radius, ball.radius);
+        if (okay) {
+            mpfr_sub(
+                difference, exact.re, midpoint.re,
+                MPFR_RNDD);
+            mpfr_sub(
+                otherDifference, exact.re, midpoint.re,
+                MPFR_RNDU);
+            mpfr_abs(
+                difference, difference, MPFR_RNDU);
+            mpfr_abs(
+                otherDifference, otherDifference,
+                MPFR_RNDU);
+            okay =
+                mpfr_cmp(difference, radius) <= 0 &&
+                mpfr_cmp(otherDifference, radius) <= 0;
+        }
+        if (okay) {
+            mpfr_sub(
+                difference, exact.im, midpoint.im,
+                MPFR_RNDD);
+            mpfr_sub(
+                otherDifference, exact.im, midpoint.im,
+                MPFR_RNDU);
+            mpfr_abs(
+                difference, difference, MPFR_RNDU);
+            mpfr_abs(
+                otherDifference, otherDifference,
+                MPFR_RNDU);
+            okay =
+                mpfr_cmp(difference, radius) <= 0 &&
+                mpfr_cmp(otherDifference, radius) <= 0;
+        }
+        mpfr_clears(
+            radius, difference, otherDifference,
+            (mpfr_ptr)0);
+        return okay;
+    };
+    auto evaluateOracle = [](
+            const ExpressionProgram& program,
+            const ExpressionContext& fixed,
+            FormulaParameter pixel,
+            const char* centerReal,
+            const char* centerImaginary,
+            const ScaledComplexValue& scale,
+            Complex q, int iterations,
+            mpfr_prec_t precision,
+            MpfrComplex& state) {
+        ExpressionOracleContext context(precision);
+        context.c.set(fixed.c.real(), fixed.c.imag());
+        context.z0.set(
+            fixed.z0.real(), fixed.z0.imag());
+        for (size_t parameter = 0;
+             parameter < fixed.parameters.size();
+             ++parameter)
+            context.parameters[parameter].set(
+                fixed.parameters[parameter].real(),
+                fixed.parameters[parameter].imag());
+        MpfrComplex center(precision);
+        MpfrComplex d(precision);
+        MpfrComplex coordinate(precision);
+        MpfrComplex next(precision);
+        if (!center.set(centerReal, centerImaginary) ||
+            !formula::setMpfrFromScaledValue(d, scale))
+            return false;
+        mpfr_mul_d(
+            coordinate.re, d.re, q.real(),
+            MPFR_RNDN);
+        mpfr_add(
+            coordinate.re, coordinate.re,
+            center.re, MPFR_RNDN);
+        mpfr_mul_d(
+            coordinate.im, d.re, q.imag(),
+            MPFR_RNDN);
+        mpfr_add(
+            coordinate.im, coordinate.im,
+            center.im, MPFR_RNDN);
+        if (pixel == FormulaParameter::C)
+            context.c.set(coordinate);
+        else
+            context.z0.set(coordinate);
+        context.z.set(context.z0);
+        for (int iteration = 0;
+             iteration < iterations; ++iteration) {
+            context.iteration = iteration;
+            std::string error;
+            if (!ExpressionOracle::evaluate(
+                    program, context, next, &error))
+                return false;
+            context.z.set(next);
+        }
+        state.set(context.z);
+        return mpfr_number_p(state.re) &&
+               mpfr_number_p(state.im);
+    };
+    auto reconstructLanding = [](
+            const ExpressionReferenceOrbitResult& reference,
+            const ExpressionTaylorJetResult& jet,
+            const ExpressionTaylorJetEvaluation& evaluated,
+            ScaledComplexBall& landing) {
+        if (jet.landingSample >=
+                reference.samples.size())
+            return false;
+        const auto& sample =
+            reference.samples[jet.landingSample];
+        ScaledComplexBall base;
+        if (formula::makeScaledComplexValue(
+                sample.z, sample.zDefect,
+                base.value) !=
+                ScaledArithmeticStatus::Success ||
+            formula::certifiedScaledAdd(
+                base, evaluated.residual,
+                landing) !=
+                ScaledArithmeticStatus::Success)
+            return false;
+        return formula::certifyScaledMpfrExponentRange(
+                   landing) ==
+               ScaledArithmeticStatus::Success;
+    };
+
+    int failures = 0;
+    int containmentChecks = 0;
+    const Complex qValues[] = {
+        { 0.0, 0.0 },
+        { 0.25, -0.5 },
+        { -0.6, 0.2 },
+        { 0.45, 0.45 },
+        { -0.137, -0.419 },
+        { 0.382, -0.071 },
+        { -0.493, 0.311 },
+        { 0.064, 0.527 },
+        { 0.571, -0.233 },
+        { -0.284, -0.506 },
+        { 0.198, 0.613 },
+        { -0.623, 0.109 }
+    };
+    struct FormulaCase {
+        const char* name;
+        const char* source;
+        FormulaParameter pixel;
+        ExpressionContext fixed;
+        const char* centerReal;
+        const char* centerImaginary;
+        int64_t scaleExponent;
+        mpfr_prec_t viewBits;
+    };
+    ExpressionContext quadratic;
+    ExpressionContext parameterized;
+    parameterized.parameters[0] = { 0.125, -0.0625 };
+    ExpressionContext z0Plane;
+    z0Plane.c = { -0.35, 0.2 };
+    const FormulaCase cases[] = {
+        { "quadratic-c", "z*z+c", FormulaParameter::C,
+          quadratic, "-0.25", "0.1", -1800, 1800 },
+        { "parameter-poly", "z*z+c+p0*z",
+          FormulaParameter::C, parameterized,
+          "-0.2", "0.15", -1800, 1800 },
+        { "generic-cubic", "z*z*z+c",
+          FormulaParameter::C, quadratic,
+          "-0.1", "0.2", -1800, 1800 },
+        { "quadratic-z0", "z*z+c",
+          FormulaParameter::InitialZ, z0Plane,
+          "0.1", "-0.2", -1800, 1800 },
+        { "quadratic-c-e1000", "z*z+c",
+          FormulaParameter::C, quadratic,
+          "-0.25", "0.1", -3600, 3600 }
+    };
+
+    for (const FormulaCase& test : cases) {
+        ProgramPair pair;
+        ExpressionReferenceOrbitResult reference;
+        if (!compilePair(
+                test.source, test.pixel,
+                test.fixed, pair) ||
+            !buildReference(
+                pair, test.fixed, test.pixel,
+                test.centerReal, test.centerImaginary,
+                28, test.viewBits, reference)) {
+            printf("  Taylor setup failed [%s]\n",
+                   test.name);
+            ++failures;
+            continue;
+        }
+        const ScaledComplexValue scale =
+            makeScale(test.scaleExponent);
+        ExpressionTaylorJetRequest request;
+        request.program = &pair.runtime;
+        request.reference = &reference;
+        request.pixelParameter = test.pixel;
+        request.parameterScale = scale;
+        request.minimumOrder = 8;
+        request.preferredOrder = 12;
+        request.maximumOrder = 20;
+        request.minimumLanding = 1;
+        request.maximumCandidateIteration = 12;
+        request.bailout = 4.0;
+        request.accuracyBudget = 0x1p-40;
+        ExpressionTaylorJetResult jet;
+        if (!ExpressionTaylorJetBuilder::build(
+                request, jet) ||
+            jet.landingIteration < 1 ||
+            !jet.certified ||
+            jet.coefficients.size() !=
+                static_cast<size_t>(jet.order) + 1) {
+            printf("  Taylor build failed [%s]: %s/%s landing=%d\n",
+                   test.name,
+                   formula::expressionTaylorJetStatusName(
+                       jet.status),
+                   jet.failureReason.c_str(),
+                   jet.landingIteration);
+            ++failures;
+            continue;
+        }
+        const int checkedLanding =
+            std::min(8, jet.landingIteration);
+        for (int landing = 1;
+             landing <= checkedLanding; ++landing) {
+            request.maximumCandidateIteration = landing;
+            ExpressionTaylorJetResult prefix;
+            if (!ExpressionTaylorJetBuilder::build(
+                    request, prefix) ||
+                prefix.landingIteration != landing) {
+                printf("  Taylor prefix build failed [%s/%d]\n",
+                       test.name, landing);
+                ++failures;
+                break;
+            }
+            if (landing == 1 &&
+                test.pixel == FormulaParameter::C &&
+                (prefix.coefficients[1].re.mantissa !=
+                     scale.re.mantissa ||
+                 prefix.coefficients[1].re.exponent !=
+                     scale.re.exponent ||
+                 !prefix.coefficients[1].im.isZero())) {
+                printf("  first Taylor coefficient mismatch [%s]\n",
+                       test.name);
+                ++failures;
+            }
+            for (Complex qValue : qValues) {
+                ScaledComplexBall q;
+                if (formula::makeScaledComplexValue(
+                        qValue, q.value) !=
+                        ScaledArithmeticStatus::Success ||
+                    !formula::expressionTaylorQInsideUnitDisk(
+                        q)) {
+                    ++failures;
+                    continue;
+                }
+                ExpressionTaylorJetEvaluation evaluated;
+                ScaledComplexBall landingBall;
+                MpfrComplex exact(
+                    reference.certificationPrecision);
+                const bool okay =
+                    ExpressionTaylorJetEvaluator::evaluate(
+                        prefix, q, evaluated) &&
+                    reconstructLanding(
+                        reference, prefix, evaluated,
+                        landingBall) &&
+                    evaluateOracle(
+                        pair.runtime, test.fixed,
+                        test.pixel, test.centerReal,
+                        test.centerImaginary, scale,
+                        qValue, landing,
+                        reference.certificationPrecision,
+                        exact) &&
+                    contains(exact, landingBall);
+                ++containmentChecks;
+                if (!okay) {
+                    printf("  Taylor MPFR containment failed [%s/%d q=(%.2f,%.2f)]\n",
+                           test.name, landing,
+                           qValue.real(), qValue.imag());
+                    ++failures;
+                }
+            }
+        }
+    }
+
+    // Odd dimensions and all frame corners must remain in the normalized disk.
+    {
+        ScaledRealValue real, imaginary, error;
+        formula::makeScaledRealValue(3.0, real);
+        formula::makeScaledRealValue(2.0, imaginary);
+        formula::makeScaledRealValue(0x1p-50, error);
+        ScaledComplexValue scale;
+        bool okay = formula::makeExpressionTaylorFrameScale(
+            real, imaginary, error, scale);
+        for (double y : { -2.0, 0.0, 2.0 })
+            for (double x : { -3.0, 0.0, 3.0 }) {
+                ScaledComplexBall offset;
+                okay = okay &&
+                    formula::makeScaledComplexValue(
+                        Complex{ x, y }, offset.value) ==
+                        ScaledArithmeticStatus::Success;
+                offset.radius = error;
+                ScaledComplexBall q;
+                okay = okay &&
+                    formula::makeExpressionTaylorNormalizedQ(
+                        offset, scale, q) &&
+                    formula::expressionTaylorQInsideUnitDisk(
+                        q);
+            }
+        if (!okay) {
+            printf("  Taylor odd-frame normalization failed\n");
+            ++failures;
+        }
+        scale = {};
+        scale.re.mantissa = 0.5;
+        scale.re.exponent =
+            std::numeric_limits<int64_t>::min();
+        ScaledComplexBall boundaryOffset, boundaryQ;
+        boundaryOffset.value.re.mantissa = 0.5;
+        boundaryOffset.value.re.exponent =
+            std::numeric_limits<int64_t>::min();
+        if (formula::makeExpressionTaylorNormalizedQ(
+                boundaryOffset, scale, boundaryQ)) {
+            printf("  Taylor exponent-boundary normalization was not rejected\n");
+            ++failures;
+        }
+    }
+
+    // Unsupported non-holomorphic bytecode, malformed tape, policy limits,
+    // cancellation, and exponent guards must reject without weakening bounds.
+    {
+        ProgramPair pair;
+        ExpressionReferenceOrbitResult reference;
+        ExpressionContext fixed;
+        bool okay = compilePair(
+            "conj(z)+c", FormulaParameter::C,
+            fixed, pair) &&
+            buildReference(
+                pair, fixed, FormulaParameter::C,
+                "0", "0", 12, 512, reference);
+        ExpressionTaylorJetRequest request;
+        request.program = &pair.runtime;
+        request.reference = &reference;
+        request.pixelParameter = FormulaParameter::C;
+        request.parameterScale = makeScale(-600);
+        request.minimumLanding = 1;
+        ExpressionTaylorJetResult jet;
+        okay = okay &&
+            !ExpressionTaylorJetBuilder::build(
+                request, jet) &&
+            jet.status ==
+                ExpressionTaylorJetStatus::
+                    UnsupportedProgram;
+        if (!okay) {
+            printf("  Taylor non-holomorphic rejection failed\n");
+            ++failures;
+        }
+    }
+    {
+        ProgramPair pair;
+        ExpressionReferenceOrbitResult reference;
+        ExpressionContext fixed;
+        bool okay = compilePair(
+            "z*z+c", FormulaParameter::C,
+            fixed, pair) &&
+            buildReference(
+                pair, fixed, FormulaParameter::C,
+                "0", "0", 20, 512, reference);
+        ExpressionTaylorJetRequest request;
+        request.program = &pair.runtime;
+        request.reference = &reference;
+        request.pixelParameter = FormulaParameter::C;
+        request.parameterScale = makeScale(-600);
+        request.minimumLanding = 1;
+        ExpressionTaylorJetResult jet;
+        ExpressionReferenceOrbitResult malformed =
+            reference;
+        malformed.samples[0].rootNode = UINT16_MAX;
+        request.reference = &malformed;
+        okay = okay &&
+            !ExpressionTaylorJetBuilder::build(
+                request, jet) &&
+            jet.status ==
+                ExpressionTaylorJetStatus::InvalidTape;
+        request.reference = &reference;
+        request.minimumOrder = 7;
+        okay = okay &&
+            !ExpressionTaylorJetBuilder::build(
+                request, jet) &&
+            jet.status ==
+                ExpressionTaylorJetStatus::
+                    InvalidRequest;
+        request.minimumOrder = 8;
+        request.memoryLimitBytes = 1;
+        okay = okay &&
+            !ExpressionTaylorJetBuilder::build(
+                request, jet) &&
+            jet.status ==
+                ExpressionTaylorJetStatus::
+                    ResourceLimit;
+        request.memoryLimitBytes = size_t{ 1 } << 30;
+        request.shouldCancel = [] { return true; };
+        okay = okay &&
+            !ExpressionTaylorJetBuilder::build(
+                request, jet) &&
+            jet.status ==
+                ExpressionTaylorJetStatus::Cancelled;
+        request.shouldCancel = {};
+        request.parameterScale.re.exponent =
+            static_cast<int64_t>(mpfr_get_emax());
+        okay = okay &&
+            !ExpressionTaylorJetBuilder::build(
+                request, jet) &&
+            jet.status ==
+                ExpressionTaylorJetStatus::
+                    ExponentRange;
+        if (!okay) {
+            printf("  Taylor rejection policy failed\n");
+            ++failures;
+        }
+    }
+
+    // The certified prefix must stop before a known escape.
+    {
+        ProgramPair pair;
+        ExpressionReferenceOrbitResult reference;
+        ExpressionContext fixed;
+        bool okay = compilePair(
+            "z*z+c", FormulaParameter::C,
+            fixed, pair) &&
+            buildReference(
+                pair, fixed, FormulaParameter::C,
+                "2", "0", 10, 512, reference);
+        ExpressionTaylorJetRequest request;
+        request.program = &pair.runtime;
+        request.reference = &reference;
+        request.pixelParameter = FormulaParameter::C;
+        request.parameterScale = makeScale(-600);
+        request.minimumLanding = 1;
+        request.maximumCandidateIteration = 8;
+        ExpressionTaylorJetResult jet;
+        okay = okay &&
+            ExpressionTaylorJetBuilder::build(
+                request, jet) &&
+            jet.landingIteration == 1;
+        if (!okay) {
+            printf("  Taylor first-escape stop failed landing=%d\n",
+                   jet.landingIteration);
+            ++failures;
+        }
+    }
+
+    // Renderer parity, thread identity, and a practical repeated speed gate.
+    ProgramPair renderPair;
+    ExpressionContext renderFixed;
+    if (!compilePair(
+            "z*z+c", FormulaParameter::C,
+            renderFixed, renderPair)) {
+        ++failures;
+    } else {
+        auto makeRenderRequest = [&](
+                int width, int height, int iterations,
+                std::vector<float>& output) {
+            output.assign(
+                static_cast<size_t>(width) * height,
+                formula::ExpressionDeepEmptyPixel);
+            ExpressionDeepRenderRequest request;
+            request.canonicalProgram =
+                &renderPair.canonical;
+            request.runtimeProgram = &renderPair.runtime;
+            request.center.realDecimal = "0";
+            request.center.imaginaryDecimal = "0";
+            request.scale.decimal = "1e500";
+            request.fixed = renderFixed;
+            request.pixelParameter = FormulaParameter::C;
+            request.width = width;
+            request.height = height;
+            request.maxIterations = iterations;
+            request.bailout = 4.0;
+            request.output = output.data();
+            request.outputCount = output.size();
+            request.precision.minimumBits = 128;
+            request.precision.guardBits = 64;
+            request.precision.maximumBits = 4096;
+            request.threading.tileWidth = 8;
+            request.threading.tileHeight = 5;
+            return request;
+        };
+        std::vector<float> enabled, disabled, single;
+        ExpressionDeepRenderRequest enabledRequest =
+            makeRenderRequest(41, 25, 240, enabled);
+        ExpressionDeepRenderResult enabledResult;
+        bool okay = formula::renderExpressionDeepFrame(
+            enabledRequest, enabledResult);
+        ExpressionDeepRenderRequest disabledRequest =
+            makeRenderRequest(41, 25, 240, disabled);
+        disabledRequest.taylor.enableTaylor = false;
+        ExpressionDeepRenderResult disabledResult;
+        okay = okay &&
+            formula::renderExpressionDeepFrame(
+                disabledRequest, disabledResult);
+        ExpressionDeepRenderRequest singleRequest =
+            makeRenderRequest(41, 25, 240, single);
+        singleRequest.threading.threads = 1;
+        ExpressionDeepRenderResult singleResult;
+        okay = okay &&
+            formula::renderExpressionDeepFrame(
+                singleRequest, singleResult);
+        if (!okay || enabled != disabled ||
+            enabled != single ||
+            !enabledResult.taylorAccepted ||
+            enabledResult.taylorAcceptedPixelCount == 0 ||
+            enabledResult.taylorCoveredIterations <
+                enabledRequest.taylor.minimumLanding) {
+            printf("  Taylor renderer parity failed accepted=%d landing=%d pixels=%llu/%llu\n",
+                   enabledResult.taylorAccepted ? 1 : 0,
+                   enabledResult.taylorCoveredIterations,
+                   (unsigned long long)
+                       enabledResult.taylorAcceptedPixelCount,
+                   (unsigned long long)
+                       enabledResult.taylorFallbackPixelCount);
+            ++failures;
+        }
+
+        double jetSeconds[2]{};
+        double baselineSeconds[2]{};
+        ExpressionDeepRenderResult benchmarkTelemetry;
+        bool speedOkay = true;
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            std::vector<float> jetOutput;
+            ExpressionDeepRenderRequest jetRequest =
+                makeRenderRequest(
+                    160, 100, 360, jetOutput);
+            ExpressionDeepRenderResult jetResult;
+            const Clock::time_point jetStart =
+                Clock::now();
+            speedOkay = speedOkay &&
+                formula::renderExpressionDeepFrame(
+                    jetRequest, jetResult);
+            jetSeconds[repeat] =
+                std::chrono::duration<double>(
+                    Clock::now() - jetStart).count();
+            if (repeat == 0)
+                benchmarkTelemetry = jetResult;
+
+            std::vector<float> baselineOutput;
+            ExpressionDeepRenderRequest baselineRequest =
+                makeRenderRequest(
+                    160, 100, 360, baselineOutput);
+            baselineRequest.taylor.enableTaylor = false;
+            ExpressionDeepRenderResult baselineResult;
+            const Clock::time_point baselineStart =
+                Clock::now();
+            speedOkay = speedOkay &&
+                formula::renderExpressionDeepFrame(
+                    baselineRequest, baselineResult);
+            baselineSeconds[repeat] =
+                std::chrono::duration<double>(
+                    Clock::now() - baselineStart).count();
+            speedOkay = speedOkay &&
+                jetOutput == baselineOutput &&
+                jetResult.taylorAccepted &&
+                jetResult.taylorAcceptedPixelCount > 0 &&
+                jetSeconds[repeat] <
+                    baselineSeconds[repeat];
+        }
+        printf("  Taylor 160x100 total jet/no-jet %.3f/%.3f and %.3f/%.3f s\n",
+               jetSeconds[0], baselineSeconds[0],
+               jetSeconds[1], baselineSeconds[1]);
+
+        std::vector<float> jetSmall, mpfrOutput;
+        ExpressionDeepRenderRequest jetSmallRequest =
+            makeRenderRequest(
+                64, 40, 360, jetSmall);
+        ExpressionDeepRenderResult jetSmallResult;
+        const Clock::time_point jetSmallStart =
+            Clock::now();
+        bool mpfrOkay =
+            formula::renderExpressionDeepFrame(
+                jetSmallRequest, jetSmallResult);
+        const double jetSmallSeconds =
+            std::chrono::duration<double>(
+                Clock::now() - jetSmallStart).count();
+        mpfrOutput.assign(
+            jetSmall.size(),
+            formula::ExpressionDeepEmptyPixel);
+        ExpressionDeepRenderResult mpfrResult;
+        double mpfrSeconds = 0.0;
+        if (mpfrOkay) {
+            ExpressionDeepRenderRequest mpfrRequest =
+                jetSmallRequest;
+            mpfrRequest.forceMpfrFallbackForVerification =
+                true;
+            mpfrRequest.output = mpfrOutput.data();
+            mpfrRequest.outputCount =
+                mpfrOutput.size();
+            const Clock::time_point mpfrStart =
+                Clock::now();
+            mpfrOkay =
+                formula::renderExpressionDeepFrame(
+                    mpfrRequest, mpfrResult);
+            mpfrSeconds =
+                std::chrono::duration<double>(
+                    Clock::now() - mpfrStart).count();
+        } else {
+            mpfrOkay = false;
+        }
+        printf("  Taylor breakdown reference/build/eval/residual %.3f/%.3f/%.3f/%.3f s; 64x40 jet/MPFR %.3f/%.3f s\n",
+               benchmarkTelemetry.referenceSeconds,
+               benchmarkTelemetry.taylorBuildSeconds,
+               benchmarkTelemetry.taylorEvaluationSeconds,
+               benchmarkTelemetry.taylorResidualSeconds,
+               jetSmallSeconds, mpfrSeconds);
+        speedOkay = speedOkay && mpfrOkay &&
+            jetSmall == mpfrOutput &&
+            jetSmallResult.taylorAccepted &&
+            mpfrResult.fastPixelCount == 0 &&
+            mpfrResult.fallbackPixelCount ==
+                mpfrOutput.size() &&
+            jetSmallSeconds < mpfrSeconds;
+        if (!speedOkay) {
+            printf("  Taylor repeated speed gate failed\n");
+            ++failures;
+        }
+    }
+
+    printf("=== certified expression Taylor jet\n");
+    printf("  MPFR containment checks=%d\n",
+           containmentChecks);
+    printf("  => %s\n",
+           failures == 0 ? "PASS" : "FAIL");
+    return failures == 0 ? 0 : 1;
+}
+
 static int runExpressionDeepRenderCase() {
     using formula::ExpressionContext;
     using formula::ExpressionDeepFallbackReason;
@@ -11428,6 +12137,7 @@ int main(int argc, char** argv) {
     if (which == "expression-centered")        rc |= runExpressionCenteredCase();
     if (which == "expression-reference")       rc |= runExpressionReferenceCase();
     if (which == "expression-scaled")          rc |= runExpressionScaledCase();
+    if (which == "expression-taylor")          rc |= runExpressionTaylorCase();
     if (which == "expression-deep-render")     rc |= runExpressionDeepRenderCase();
     if (which == "expression-coloring")        rc |= runExpressionColoringCase();
     if (which == "expression-orbit")           rc |= runExpressionOrbitCase();

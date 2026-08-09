@@ -12,6 +12,7 @@
 
 #include "formula_reference_orbit.h"
 #include "formula_scaled_residual.h"
+#include "formula_taylor_jet.h"
 
 namespace formula {
 
@@ -36,6 +37,19 @@ struct ExpressionDeepThreadPolicy {
 struct ExpressionDeepMemoryPolicy {
     size_t memoryLimitBytes = size_t{ 1 } << 30;
     mpfr_prec_t fallbackGuardBits = 128;
+};
+
+struct ExpressionDeepTaylorPolicy {
+    bool enableTaylor = true;
+    int minimumLanding = 8;
+    int order = 12;
+    int minimumOrder = 8;
+    int maximumOrder = 20;
+    int maximumCandidateIteration = 0;
+    double accuracyBudget = 0x1p-40;
+    // Reject a built jet when its certified work estimate cannot amortize
+    // across the frame.
+    bool requirePredictedBenefit = true;
 };
 
 enum class ExpressionDeepRenderPhase : uint8_t {
@@ -96,9 +110,12 @@ struct ExpressionDeepRenderRequest {
     ExpressionReferencePrecisionPolicy precision;
     ExpressionDeepThreadPolicy threading;
     ExpressionDeepMemoryPolicy memory;
+    ExpressionDeepTaylorPolicy taylor;
     // This is a verification/benchmark switch. Production callers must leave
     // it false because local transcendental series are not interval-certified.
     bool allowUncertifiedForBenchmark = false;
+    // Verification-only all-MPFR baseline for the identical formula.
+    bool forceMpfrFallbackForVerification = false;
     // Verification-only outward inflation of every certification radius.
     int verificationErrorInflationBits = 0;
     // Verification-only deterministic exception injection. Production callers
@@ -137,6 +154,20 @@ struct ExpressionDeepRenderResult {
     mpfr_prec_t certificationPrecision = 0;
     mpfr_prec_t fallbackPrecision = 0;
     uint64_t totalIterations = 0;
+    bool taylorAttempted = false;
+    bool taylorAccepted = false;
+    int taylorOrder = 0;
+    int taylorCoveredIterations = 0;
+    double taylorBuildSeconds = 0.0;
+    // Aggregate worker time; it may exceed fastSeconds under parallelism.
+    double taylorEvaluationSeconds = 0.0;
+    double taylorResidualSeconds = 0.0;
+    uint64_t taylorAcceptedPixelCount = 0;
+    uint64_t taylorFallbackPixelCount = 0;
+    size_t taylorMemoryBytes = 0;
+    ExpressionTaylorJetStatus taylorStatus =
+        ExpressionTaylorJetStatus::NoCoverage;
+    std::string taylorFailureReason;
     ExpressionScaledResidualCapability capability =
         ExpressionScaledResidualCapability::Unsupported;
 };

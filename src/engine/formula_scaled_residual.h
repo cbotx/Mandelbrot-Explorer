@@ -191,6 +191,10 @@ public:
     bool prepare(
         const ExpressionProgram& program,
         const ExpressionReferenceOrbitResult& reference);
+    static bool estimateWorkspaceBytes(
+        const ExpressionProgram& program,
+        const ExpressionReferenceOrbitResult& reference,
+        size_t& bytes);
     void reset();
 
     bool ready() const { return _ready; }

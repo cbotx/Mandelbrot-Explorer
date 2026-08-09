@@ -1278,6 +1278,27 @@ void ExpressionScaledResidualEvaluator::reset() {
     _ready = false;
 }
 
+bool ExpressionScaledResidualEvaluator::estimateWorkspaceBytes(
+        const ExpressionProgram& program,
+        const ExpressionReferenceOrbitResult& reference,
+        size_t& bytes) {
+    bytes = 0;
+    auto add = [&](size_t count, size_t elementSize) {
+        if (elementSize != 0 &&
+            count >
+                (std::numeric_limits<size_t>::max() - bytes) /
+                    elementSize)
+            return false;
+        bytes += count * elementSize;
+        return true;
+    };
+    return add(program.instructionCount(), sizeof(NodeState)) &&
+           add(program.stackDepth(), sizeof(uint16_t)) &&
+           add(reference.samples.size(), sizeof(uint8_t)) &&
+           add(reference.samples.size(), sizeof(uint8_t)) &&
+           add(reference.tape.size(), sizeof(uint8_t));
+}
+
 bool ExpressionScaledResidualEvaluator::prepare(
         const ExpressionProgram& program,
         const ExpressionReferenceOrbitResult& reference) {
