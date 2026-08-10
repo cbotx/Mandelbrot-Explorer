@@ -226,8 +226,9 @@ struct ExpressionReferenceOrbitResult {
 // This builds reference/tape data only. It is intentionally not connected to
 // production GUI dispatch. Arithmetic references can be certified relative to
 // a requested higher-precision finite MPFR iteration. Branch and pole metadata
-// still classify only the MPFR point; transcendental neighborhoods are not
-// interval-certified.
+// still classify only the MPFR point. Certified Taylor construction must
+// independently enclose the full parameter frame; this builder never promotes
+// point cut metadata into a neighborhood certificate.
 //
 // The intended low-precision base is the two-term compact value
 // output+outputDefect stored at every tape node, not a fresh evaluation of the
