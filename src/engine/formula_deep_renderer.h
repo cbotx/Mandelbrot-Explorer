@@ -163,6 +163,12 @@ struct ExpressionDeepRenderResult {
     uint64_t taylorFunctionSeriesCount = 0;
     uint64_t taylorFunctionSeriesOperationCount = 0;
     ScaledRealValue taylorMaximumFunctionSeriesTail;
+    int taylorMaximumReciprocalOrder = 0;
+    uint64_t taylorReciprocalCount = 0;
+    uint64_t taylorReciprocalOperationCount = 0;
+    ScaledRealValue taylorMinimumDenominatorClearance;
+    ScaledRealValue taylorMaximumReciprocalTail;
+    bool taylorPoleRejected = false;
     double taylorBuildSeconds = 0.0;
     // Aggregate worker time; it may exceed fastSeconds under parallelism.
     double taylorEvaluationSeconds = 0.0;
@@ -186,8 +192,10 @@ const char* expressionDeepFallbackReasonName(
 // certified relative to an independently iterated higher-precision MPFR oracle;
 // ambiguous bailout intervals fall back per pixel. Exp/sin/cos/sinh/cosh may
 // use a certified whole-prefix Taylor jet; if that jet cannot cover the full
-// requested horizon profitably, the formula remains all-MPFR. Interior output
-// means only that no escape was observed before maxIterations, not mathematical
+// requested horizon profitably, the formula remains all-MPFR. Divide/tan/tanh
+// use a distinct certified-meromorphic Taylor tier and reject any full-frame
+// denominator neighborhood that is not proven pole-free. Interior output means
+// only that no escape was observed before maxIterations, not mathematical
 // membership.
 bool renderExpressionDeepFrame(
     const ExpressionDeepRenderRequest& request,

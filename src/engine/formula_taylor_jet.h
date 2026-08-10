@@ -22,7 +22,8 @@ enum class ExpressionTaylorJetStatus : uint8_t {
     ExponentRange,
     Nonfinite,
     AccuracyBudget,
-    BailoutUncertain
+    BailoutUncertain,
+    PoleRejected
 };
 
 const char* expressionTaylorJetStatusName(
@@ -66,6 +67,12 @@ struct ExpressionTaylorJetResult {
     uint64_t functionSeriesCount = 0;
     uint64_t functionSeriesOperationCount = 0;
     ScaledRealValue maximumFunctionSeriesTail;
+    int maximumReciprocalOrder = 0;
+    uint64_t reciprocalCount = 0;
+    uint64_t reciprocalOperationCount = 0;
+    ScaledRealValue minimumDenominatorClearance;
+    ScaledRealValue maximumReciprocalTail;
+    bool poleRejected = false;
     // True when landingSample identifies the sample whose next/rootDefect
     // pair is the landing base rather than its z/zDefect pair.
     bool landingUsesSampleOutput = false;

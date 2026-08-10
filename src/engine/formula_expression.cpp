@@ -534,6 +534,7 @@ ExpressionProgram::scaledResidualCapability() const {
         return ExpressionScaledResidualCapability::Unsupported;
 
     bool hasSeries = false;
+    bool hasMeromorphic = false;
     bool hasBranch = false;
     bool hasUnsupported = false;
     for (const Instruction& instruction : _code) {
@@ -562,16 +563,18 @@ ExpressionProgram::scaledResidualCapability() const {
         case Op::Exp:
             hasSeries = true;
             break;
-        case Op::Power:
+        case Op::Divide:
         case Op::Tan:
         case Op::Tanh:
+            hasMeromorphic = true;
+            break;
+        case Op::Power:
         case Op::Log:
         case Op::Log10:
         case Op::Sqrt:
         case Op::Arg:
             hasBranch = true;
             break;
-        case Op::Divide:
         case Op::Abs:
         case Op::Polar:
         case Op::OrbitInvariant:
@@ -583,6 +586,9 @@ ExpressionProgram::scaledResidualCapability() const {
         return ExpressionScaledResidualCapability::BranchSensitive;
     if (hasUnsupported)
         return ExpressionScaledResidualCapability::Unsupported;
+    if (hasMeromorphic)
+        return ExpressionScaledResidualCapability::
+            CertifiedMeromorphicCandidate;
     if (hasSeries)
         return ExpressionScaledResidualCapability::
             CertifiedEntireCandidate;

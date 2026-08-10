@@ -386,6 +386,8 @@ ExpressionDeepFallbackReason reasonForCapability(
     switch (capability) {
     case ExpressionScaledResidualCapability::
             CertifiedEntireCandidate:
+    case ExpressionScaledResidualCapability::
+            CertifiedMeromorphicCandidate:
         return ExpressionDeepFallbackReason::
             CertificationFailure;
     case ExpressionScaledResidualCapability::UncertifiedSeries:
@@ -902,31 +904,38 @@ bool renderExpressionDeepFrame(
 
         result.capability =
             request.runtimeProgram->scaledResidualCapability();
-        const bool entireCandidate =
+        const bool certifiedTaylorCandidate =
             result.capability ==
                 ExpressionScaledResidualCapability::
-                    CertifiedEntireCandidate;
-        const bool entireTaylorEligible =
-            !entireCandidate ||
+                    CertifiedEntireCandidate ||
+            result.capability ==
+                ExpressionScaledResidualCapability::
+                    CertifiedMeromorphicCandidate;
+        const bool certifiedTaylorEligible =
+            !certifiedTaylorCandidate ||
             (request.taylor.enableTaylor &&
              request.maxIterations >
                  request.taylor.minimumLanding);
         bool runFast =
             !request.forceMpfrFallbackForVerification &&
-            entireTaylorEligible &&
+            certifiedTaylorEligible &&
             (result.capability ==
                 ExpressionScaledResidualCapability::
                     ExactCenteredArithmetic ||
             result.capability ==
                 ExpressionScaledResidualCapability::
                     CertifiedEntireCandidate ||
+            result.capability ==
+                ExpressionScaledResidualCapability::
+                    CertifiedMeromorphicCandidate ||
             (result.capability ==
                  ExpressionScaledResidualCapability::
                     UncertifiedSeries &&
              request.allowUncertifiedForBenchmark));
         bool certificationUnavailable =
             request.forceMpfrFallbackForVerification ||
-            (entireCandidate && !entireTaylorEligible);
+            (certifiedTaylorCandidate &&
+             !certifiedTaylorEligible);
 
         size_t rendererBaseBytes = 0;
         if ((runFast &&
@@ -974,7 +983,7 @@ bool renderExpressionDeepFrame(
         if (request.memory.memoryLimitBytes != 0 &&
             rendererBytes >
                 request.memory.memoryLimitBytes) {
-            if (!entireCandidate)
+            if (!certifiedTaylorCandidate)
                 return fail(
                     ExpressionDeepRenderStatus::ResourceLimit,
                     "renderer exceeds memory limit");
@@ -1028,7 +1037,10 @@ bool renderExpressionDeepFrame(
                      ExactCenteredArithmetic ||
              result.capability ==
                  ExpressionScaledResidualCapability::
-                     CertifiedEntireCandidate)) {
+                     CertifiedEntireCandidate ||
+             result.capability ==
+                 ExpressionScaledResidualCapability::
+                     CertifiedMeromorphicCandidate)) {
             const mpfr_prec_t certificationGuard =
                 std::max<mpfr_prec_t>(
                     128, precision.guardBits);
@@ -1104,7 +1116,10 @@ bool renderExpressionDeepFrame(
                          ExactCenteredArithmetic ||
                  result.capability ==
                      ExpressionScaledResidualCapability::
-                         CertifiedEntireCandidate)
+                         CertifiedEntireCandidate ||
+                 result.capability ==
+                     ExpressionScaledResidualCapability::
+                         CertifiedMeromorphicCandidate)
                 ? result.certificationPrecision : 0;
             referenceRequest.memoryLimitBytes =
                 request.memory.memoryLimitBytes;
@@ -1130,7 +1145,10 @@ bool renderExpressionDeepFrame(
                              ExactCenteredArithmetic ||
                      result.capability ==
                          ExpressionScaledResidualCapability::
-                             CertifiedEntireCandidate) &&
+                             CertifiedEntireCandidate ||
+                     result.capability ==
+                         ExpressionScaledResidualCapability::
+                             CertifiedMeromorphicCandidate) &&
                     reference.status !=
                         ExpressionReferenceBuildStatus::
                             ProgramMismatch &&
@@ -1161,7 +1179,10 @@ bool renderExpressionDeepFrame(
                          ExactCenteredArithmetic ||
                  result.capability ==
                      ExpressionScaledResidualCapability::
-                         CertifiedEntireCandidate) &&
+                         CertifiedEntireCandidate ||
+                 result.capability ==
+                     ExpressionScaledResidualCapability::
+                         CertifiedMeromorphicCandidate) &&
                 (!reference.
                      certifiedAgainstHigherPrecision ||
                  reference.certificationPrecision !=
@@ -1185,7 +1206,7 @@ bool renderExpressionDeepFrame(
                  rendererBytes >
                      request.memory.memoryLimitBytes -
                          reference.memoryBytes)) {
-                if (!entireCandidate)
+                if (!certifiedTaylorCandidate)
                     return fail(
                         ExpressionDeepRenderStatus::ResourceLimit,
                         "reference plus renderer exceeds memory limit");
@@ -1383,7 +1404,7 @@ bool renderExpressionDeepFrame(
                      rendererBytes >
                          request.memory.memoryLimitBytes -
                              reference.memoryBytes)) {
-                    if (!entireCandidate)
+                    if (!certifiedTaylorCandidate)
                         return fail(
                             ExpressionDeepRenderStatus::ResourceLimit,
                             "validation workspace exceeds memory limit");
@@ -1419,7 +1440,10 @@ bool renderExpressionDeepFrame(
                          ExactCenteredArithmetic ||
                  result.capability ==
                      ExpressionScaledResidualCapability::
-                         CertifiedEntireCandidate) &&
+                         CertifiedEntireCandidate ||
+                 result.capability ==
+                     ExpressionScaledResidualCapability::
+                         CertifiedMeromorphicCandidate) &&
                 request.maxIterations >
                     request.taylor.minimumLanding) {
                 result.taylorAttempted = true;
@@ -1527,6 +1551,18 @@ bool renderExpressionDeepFrame(
                     taylorJet.functionSeriesOperationCount;
                 result.taylorMaximumFunctionSeriesTail =
                     taylorJet.maximumFunctionSeriesTail;
+                result.taylorMaximumReciprocalOrder =
+                    taylorJet.maximumReciprocalOrder;
+                result.taylorReciprocalCount =
+                    taylorJet.reciprocalCount;
+                result.taylorReciprocalOperationCount =
+                    taylorJet.reciprocalOperationCount;
+                result.taylorMinimumDenominatorClearance =
+                    taylorJet.minimumDenominatorClearance;
+                result.taylorMaximumReciprocalTail =
+                    taylorJet.maximumReciprocalTail;
+                result.taylorPoleRejected =
+                    taylorJet.poleRejected;
                 if (cancelled.load(
                         std::memory_order_acquire) ||
                     taylorJet.status ==
@@ -1537,15 +1573,18 @@ bool renderExpressionDeepFrame(
                             Cancelled,
                         "render cancelled while building Taylor jet");
                 if (useTaylor &&
-                    result.capability ==
-                        ExpressionScaledResidualCapability::
-                            CertifiedEntireCandidate &&
+                    (result.capability ==
+                         ExpressionScaledResidualCapability::
+                             CertifiedEntireCandidate ||
+                     result.capability ==
+                         ExpressionScaledResidualCapability::
+                             CertifiedMeromorphicCandidate) &&
                     !request.allowUncertifiedForBenchmark &&
                     taylorJet.landingIteration <
                         request.maxIterations) {
                     useTaylor = false;
                     result.taylorFailureReason =
-                        "certified entire Taylor jet does not cover the full iteration horizon";
+                        "certified Taylor jet does not cover the full iteration horizon";
                 }
                 if (useTaylor &&
                     request.taylor.
@@ -1632,9 +1671,12 @@ bool renderExpressionDeepFrame(
                 result.taylorAccepted = useTaylor;
             }
             if (runFast &&
-                result.capability ==
-                    ExpressionScaledResidualCapability::
-                        CertifiedEntireCandidate &&
+                (result.capability ==
+                     ExpressionScaledResidualCapability::
+                         CertifiedEntireCandidate ||
+                 result.capability ==
+                     ExpressionScaledResidualCapability::
+                         CertifiedMeromorphicCandidate) &&
                 !request.allowUncertifiedForBenchmark &&
                 !useTaylor) {
                 runFast = false;
@@ -1982,9 +2024,12 @@ bool renderExpressionDeepFrame(
                                                     fetch_add(
                                                         1,
                                                         std::memory_order_relaxed);
-                                                if (result.capability ==
-                                                        ExpressionScaledResidualCapability::
-                                                            CertifiedEntireCandidate &&
+                                                if ((result.capability ==
+                                                         ExpressionScaledResidualCapability::
+                                                             CertifiedEntireCandidate ||
+                                                     result.capability ==
+                                                         ExpressionScaledResidualCapability::
+                                                             CertifiedMeromorphicCandidate) &&
                                                     !request.
                                                         allowUncertifiedForBenchmark) {
                                                     pixel.reason =

@@ -6402,7 +6402,26 @@ static int runExpressionTaylorCase() {
           "0", "0", -1800, 1800, true },
         { "sin-z0-e500", "sin(z)+c",
           FormulaParameter::InitialZ, z0Plane,
-          "0", "0", -1800, 1800, false }
+          "0", "0", -1800, 1800, false },
+        { "divide-polynomial", "z/(c+2)+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -5, 512, false },
+        { "reciprocal-polynomial", "1/(z+2)+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -6, 512, false },
+        { "tangent", "tan(z)+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -8, 512, false },
+        { "hyperbolic-tangent", "tanh(z)+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -5, 512, false },
+        { "nested-entire-division",
+          "(sin(z)+c)/(cos(z)+2)",
+          FormulaParameter::C, quadratic,
+          "0", "0", -7, 512, false },
+        { "reciprocal-z0", "1/(z+2)+c",
+          FormulaParameter::InitialZ, z0Plane,
+          "0", "0", -7, 512, false }
     };
 
     for (const FormulaCase& test : cases) {
@@ -6439,6 +6458,10 @@ static int runExpressionTaylorCase() {
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
                     CertifiedEntireCandidate;
+        const bool meromorphicCandidate =
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    CertifiedMeromorphicCandidate;
         if (!ExpressionTaylorJetBuilder::build(
                 request, jet) ||
             jet.landingIteration < 1 ||
@@ -6452,7 +6475,12 @@ static int runExpressionTaylorCase() {
               formula::compareScaledNonnegative(
                   jet.maximumFunctionSeriesTail,
                   ScaledRealValue{
-                      0.5, -39 }) > 0))) {
+                      0.5, -39 }) > 0)) ||
+            (meromorphicCandidate &&
+             (jet.reciprocalCount == 0 ||
+              jet.reciprocalOperationCount == 0 ||
+              jet.maximumReciprocalOrder < 8 ||
+              jet.minimumDenominatorClearance.isZero()))) {
             printf("  Taylor build failed [%s]: %s/%s landing=%d\n",
                    test.name,
                    formula::expressionTaylorJetStatusName(
@@ -6573,6 +6601,58 @@ static int runExpressionTaylorCase() {
     // Unsupported non-holomorphic bytecode, malformed tape, policy limits,
     // cancellation, and exponent guards must reject without weakening bounds.
     {
+        struct CapabilityCase {
+            const char* source;
+            formula::ExpressionScaledResidualCapability expected;
+        };
+        const CapabilityCase capabilityCases[] = {
+            { "z/(c+2)+c",
+              formula::ExpressionScaledResidualCapability::
+                  CertifiedMeromorphicCandidate },
+            { "tan(z)+c",
+              formula::ExpressionScaledResidualCapability::
+                  CertifiedMeromorphicCandidate },
+            { "tanh(z)+c",
+              formula::ExpressionScaledResidualCapability::
+                  CertifiedMeromorphicCandidate },
+            { "log(z)+c",
+              formula::ExpressionScaledResidualCapability::
+                  BranchSensitive },
+            { "log10(z)+c",
+              formula::ExpressionScaledResidualCapability::
+                  BranchSensitive },
+            { "sqrt(z)+c",
+              formula::ExpressionScaledResidualCapability::
+                  BranchSensitive },
+            { "pow(z,2.5)+c",
+              formula::ExpressionScaledResidualCapability::
+                  BranchSensitive },
+            { "arg(z)+c",
+              formula::ExpressionScaledResidualCapability::
+                  BranchSensitive },
+            { "abs(z)+c",
+              formula::ExpressionScaledResidualCapability::
+                  Unsupported },
+            { "polar(1,z)+c",
+              formula::ExpressionScaledResidualCapability::
+                  Unsupported }
+        };
+        for (const CapabilityCase& test :
+             capabilityCases) {
+            ProgramPair pair;
+            ExpressionContext fixed;
+            if (!compilePair(
+                    test.source, FormulaParameter::C,
+                    fixed, pair) ||
+                pair.runtime.scaledResidualCapability() !=
+                    test.expected) {
+                printf("  Taylor capability tier mismatch [%s]\n",
+                       test.source);
+                ++failures;
+            }
+        }
+    }
+    {
         ProgramPair pair;
         ExpressionReferenceOrbitResult reference;
         ExpressionContext fixed;
@@ -6660,6 +6740,50 @@ static int runExpressionTaylorCase() {
                     ExponentRange;
         if (!okay) {
             printf("  Taylor rejection policy failed\n");
+            ++failures;
+        }
+    }
+
+    // Meromorphic workspace accounting includes reciprocal/convolution
+    // buffers and the retained best rejected-order candidate.
+    {
+        ProgramPair pair;
+        ExpressionReferenceOrbitResult reference;
+        ExpressionContext fixed;
+        bool okay = compilePair(
+            "1/(z+2)+c", FormulaParameter::C,
+            fixed, pair) &&
+            buildReference(
+                pair, fixed, FormulaParameter::C,
+                "0", "0", 24, 512, reference);
+        ExpressionTaylorJetRequest request;
+        request.program = &pair.runtime;
+        request.reference = &reference;
+        request.pixelParameter = FormulaParameter::C;
+        request.parameterScale = makeScale(-8);
+        request.minimumLanding = 1;
+        request.maximumCandidateIteration = 12;
+        ExpressionTaylorJetResult baseline;
+        okay = okay &&
+            ExpressionTaylorJetBuilder::build(
+                request, baseline) &&
+            baseline.memoryBytes > 1 &&
+            baseline.reciprocalCount > 0;
+        if (okay) {
+            request.memoryLimitBytes =
+                baseline.memoryBytes - 1;
+            ExpressionTaylorJetResult constrained;
+            okay =
+                !ExpressionTaylorJetBuilder::build(
+                    request, constrained) &&
+                constrained.status ==
+                    ExpressionTaylorJetStatus::
+                        ResourceLimit &&
+                constrained.coefficients.empty() &&
+                constrained.coefficientRadii.empty();
+        }
+        if (!okay) {
+            printf("  meromorphic Taylor workspace accounting failed\n");
             ++failures;
         }
     }
@@ -7261,7 +7385,20 @@ static int runExpressionDeepRenderCase() {
                     ExactCenteredArithmetic ||
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
-                    CertifiedEntireCandidate;
+                    CertifiedEntireCandidate ||
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    CertifiedMeromorphicCandidate;
+        const bool meromorphicCandidate =
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    CertifiedMeromorphicCandidate;
+        const bool allMpfrTaylorCandidate =
+            (pair.runtime.scaledResidualCapability() ==
+                 formula::ExpressionScaledResidualCapability::
+                     CertifiedEntireCandidate ||
+             meromorphicCandidate) &&
+            expectedFallback == pixelCount;
         const bool uncertainReason =
             expectedReason ==
                 ExpressionDeepFallbackReason::
@@ -7292,17 +7429,25 @@ static int runExpressionDeepRenderCase() {
               result.maxTileFallbackRate != 1.0)) ||
             result.selectedPrecision < 1700 ||
             (expectsReference
-                ? result.referenceBytes == 0 ||
-                  result.certificationPrecision <=
-                      result.selectedPrecision
+                ? (allMpfrTaylorCandidate
+                       ? result.referenceBytes != 0
+                       : result.referenceBytes == 0 ||
+                         result.certificationPrecision <=
+                             result.selectedPrecision)
                 : result.referenceBytes != 0) ||
             (expectTaylorAccepted &&
              (!result.taylorAccepted ||
               result.taylorAcceptedPixelCount == 0 ||
               result.taylorCoveredIterations != iterations ||
-              result.taylorFunctionSeriesCount == 0 ||
-              result.taylorFunctionSeriesOperationCount == 0 ||
-              result.taylorMaximumFunctionSeriesOrder < 1)) ||
+              (meromorphicCandidate
+                   ? result.taylorReciprocalCount == 0 ||
+                     result.taylorReciprocalOperationCount == 0 ||
+                     result.taylorMaximumReciprocalOrder < 8 ||
+                     result.taylorMinimumDenominatorClearance.
+                         isZero()
+                   : result.taylorFunctionSeriesCount == 0 ||
+                     result.taylorFunctionSeriesOperationCount == 0 ||
+                     result.taylorMaximumFunctionSeriesOrder < 1))) ||
             result.rendererBytes == 0) {
             printf("  exact frame mismatch [%s] fast/fallback=%llu/%llu precision=%lld reasons cert/bailout/exhausted=%llu/%llu/%llu Taylor=%s/%s\n",
                    name,
@@ -7400,11 +7545,42 @@ static int runExpressionDeepRenderCase() {
         "0", "0", 7, 5, 20, 0,
         ExpressionDeepFallbackReason::InvalidTape, true);
     verifyFrame(
-        "rational-fallback", "z/(c+2)+c",
+        "rational-cost-fallback", "z/(c+2)+c",
         FormulaParameter::C, transcendentalFixed,
         "0", "0", 7, 5, 20, 35,
-        ExpressionDeepFallbackReason::UnsupportedOperation,
+        ExpressionDeepFallbackReason::CertificationFailure,
         false);
+    verifyFrame(
+        "divide-taylor", "z/(c+2)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "reciprocal-taylor", "1/(z+2)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "tangent-taylor", "tan(z)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "tanh-taylor", "tanh(z)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "nested-meromorphic-taylor",
+        "(sin(z)+c)/(cos(z)+2)",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "reciprocal-z0-taylor", "1/(z+2)+c",
+        FormulaParameter::InitialZ, z0Fixed,
+        "0", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
     ExpressionContext branchFixed;
     branchFixed.z0 = { 1.0, 0.0 };
     verifyFrame(
@@ -7413,6 +7589,94 @@ static int runExpressionDeepRenderCase() {
         "0", "0", 7, 5, 12, 35,
         ExpressionDeepFallbackReason::BranchSensitive,
         false);
+
+    // Pole clearance is a whole-frame proof, not point-only tape metadata.
+    // A frame whose denominator neighborhood crosses zero must release the
+    // Taylor/reference resources and render entirely through MPFR; a nearby
+    // separated frame must be accepted and remain byte-identical.
+    {
+        ProgramPair pair;
+        const char* source = "0.001/(c+2)";
+        if (!compilePair(
+                source, FormulaParameter::C,
+                transcendentalFixed, pair)) {
+            ++failures;
+        } else {
+            auto runPoleFrame = [&](
+                    const char* scale,
+                    bool expectAccepted) {
+                std::vector<float> actual, expected;
+                ExpressionDeepRenderRequest request =
+                    makeRequest(
+                        pair, transcendentalFixed,
+                        FormulaParameter::C,
+                        "-1.9", "0",
+                        64, 40, 20, actual);
+                request.scale.decimal = scale;
+                ExpressionDeepRenderResult result;
+                bool okay =
+                    formula::renderExpressionDeepFrame(
+                        request, result) &&
+                    renderOracle(
+                        pair.runtime,
+                        transcendentalFixed,
+                        FormulaParameter::C,
+                        "-1.9", "0", scale,
+                        64, 40, 20, 4.0,
+                        result.fallbackPrecision,
+                        expected) &&
+                    actual == expected &&
+                    result.taylorAttempted;
+                if (expectAccepted) {
+                    okay = okay &&
+                        result.taylorAccepted &&
+                        result.taylorAcceptedPixelCount > 0 &&
+                        result.fallbackPixelCount == 0 &&
+                        result.taylorReciprocalCount > 0 &&
+                        !result.
+                            taylorMinimumDenominatorClearance.
+                                isZero();
+                } else {
+                    const uint64_t pixels =
+                        static_cast<uint64_t>(
+                            actual.size());
+                    okay = okay &&
+                        !result.taylorAccepted &&
+                        result.taylorPoleRejected &&
+                        result.taylorStatus ==
+                            formula::
+                                ExpressionTaylorJetStatus::
+                                    PoleRejected &&
+                        result.fastPixelCount == 0 &&
+                        result.fallbackPixelCount == pixels &&
+                        result.referenceBytes == 0 &&
+                        reasonCount(
+                            result,
+                            ExpressionDeepFallbackReason::
+                                CertificationFailure) ==
+                            pixels;
+                }
+                if (!okay) {
+                    printf("  pole-clearance frame failed scale=%s accepted=%d status=%s reason=%s clearance=(%.17g,e%lld)\n",
+                           scale,
+                           result.taylorAccepted ? 1 : 0,
+                           formula::
+                               expressionTaylorJetStatusName(
+                                   result.taylorStatus),
+                           result.taylorFailureReason.c_str(),
+                           result.
+                               taylorMinimumDenominatorClearance.
+                                   mantissa,
+                           (long long)result.
+                               taylorMinimumDenominatorClearance.
+                                   exponent);
+                    ++failures;
+                }
+            };
+            runPoleFrame("10", false);
+            runPoleFrame("320", true);
+        }
+    }
 
     // Independently rebuild the higher-precision point orbit and verify that
     // every retained compact arithmetic value lies inside its stored radius.
@@ -7732,6 +7996,21 @@ static int runExpressionDeepRenderCase() {
             { "cosh", "cosh(z)-1+c", FormulaParameter::C,
               &transcendentalFixed, "0" },
             { "sin-z0", "sin(z)+c",
+              FormulaParameter::InitialZ, &z0Fixed, "0" },
+            { "divide", "z/(c+2)+c", FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "reciprocal", "1/(z+2)+c",
+              FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "tan", "tan(z)+c", FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "tanh", "tanh(z)+c", FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "nested",
+              "(sin(z)+c)/(cos(z)+2)",
+              FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "reciprocal-z0", "1/(z+2)+c",
               FormulaParameter::InitialZ, &z0Fixed, "0" }
         };
         for (const EntireFrame& frame : frames) {
@@ -7787,12 +8066,25 @@ static int runExpressionDeepRenderCase() {
                     singleRequest, singleResult);
             const uint64_t pixels =
                 static_cast<uint64_t>(enabled.size());
+            const bool meromorphic =
+                pair.runtime.scaledResidualCapability() ==
+                    formula::
+                        ExpressionScaledResidualCapability::
+                            CertifiedMeromorphicCandidate;
             if (!okay || enabled != disabled ||
                 enabled != mpfr || enabled != single ||
                 !enabledResult.taylorAccepted ||
                 enabledResult.taylorAcceptedPixelCount == 0 ||
                 enabledResult.taylorCoveredIterations != 30 ||
-                enabledResult.taylorFunctionSeriesCount == 0 ||
+                (meromorphic
+                    ? enabledResult.taylorReciprocalCount == 0 ||
+                      enabledResult.
+                          taylorReciprocalOperationCount == 0 ||
+                      enabledResult.
+                          taylorMinimumDenominatorClearance.
+                              isZero()
+                    : enabledResult.
+                          taylorFunctionSeriesCount == 0) ||
                 disabledResult.fastPixelCount != 0 ||
                 disabledResult.fallbackPixelCount != pixels ||
                 mpfrResult.fastPixelCount != 0 ||
@@ -7880,6 +8172,180 @@ static int runExpressionDeepRenderCase() {
                 tinyResult.fallbackPixelCount !=
                     tinyOutput.size()) {
                 printf("  entire Taylor cost auto-disable failed\n");
+                ++failures;
+            }
+        }
+
+        ProgramPair reciprocalBenchmark;
+        if (!compilePair(
+                "1/(z+2)+c", FormulaParameter::C,
+                transcendentalFixed,
+                reciprocalBenchmark)) {
+            ++failures;
+        } else {
+            bool speedOkay = true;
+            double jetSeconds[2]{};
+            double mpfrSeconds[2]{};
+            uint64_t fallback = 0;
+            formula::ScaledRealValue clearance;
+            formula::ScaledRealValue reciprocalTail;
+            for (int repeat = 0;
+                 repeat < 2; ++repeat) {
+                std::vector<float> jetOutput, mpfrOutput;
+                ExpressionDeepRenderRequest jetRequest =
+                    makeRequest(
+                        reciprocalBenchmark,
+                        transcendentalFixed,
+                        FormulaParameter::C,
+                        "0", "0", 80, 50, 120,
+                        jetOutput);
+                ExpressionDeepRenderResult jetResult;
+                const Clock::time_point jetStart =
+                    Clock::now();
+                speedOkay = speedOkay &&
+                    formula::renderExpressionDeepFrame(
+                        jetRequest, jetResult);
+                jetSeconds[repeat] =
+                    std::chrono::duration<double>(
+                        Clock::now() - jetStart).count();
+
+                ExpressionDeepRenderRequest mpfrRequest =
+                    makeRequest(
+                        reciprocalBenchmark,
+                        transcendentalFixed,
+                        FormulaParameter::C,
+                        "0", "0", 80, 50, 120,
+                        mpfrOutput);
+                mpfrRequest.
+                    forceMpfrFallbackForVerification = true;
+                ExpressionDeepRenderResult mpfrResult;
+                const Clock::time_point mpfrStart =
+                    Clock::now();
+                speedOkay = speedOkay &&
+                    formula::renderExpressionDeepFrame(
+                        mpfrRequest, mpfrResult);
+                mpfrSeconds[repeat] =
+                    std::chrono::duration<double>(
+                        Clock::now() - mpfrStart).count();
+                fallback = jetResult.fallbackPixelCount;
+                clearance =
+                    jetResult.
+                        taylorMinimumDenominatorClearance;
+                reciprocalTail =
+                    jetResult.taylorMaximumReciprocalTail;
+                speedOkay = speedOkay &&
+                    jetOutput == mpfrOutput &&
+                    jetResult.taylorAccepted &&
+                    jetResult.taylorReciprocalCount > 0 &&
+                    jetResult.taylorAcceptedPixelCount > 0 &&
+                    jetSeconds[repeat] <
+                        mpfrSeconds[repeat];
+            }
+            printf("  meromorphic Taylor e500 jet/MPFR %.3f/%.3f and %.3f/%.3f s fallback=%llu clearance=(%.6g,e%lld) max-tail=(%.6g,e%lld)\n",
+                   jetSeconds[0], mpfrSeconds[0],
+                   jetSeconds[1], mpfrSeconds[1],
+                   (unsigned long long)fallback,
+                   clearance.mantissa,
+                   (long long)clearance.exponent,
+                   reciprocalTail.mantissa,
+                   (long long)reciprocalTail.exponent);
+            if (!speedOkay) {
+                printf("  meromorphic Taylor repeated speed gate failed\n");
+                ++failures;
+            }
+
+            std::vector<float> baseline, constrained, mpfr;
+            ExpressionDeepRenderRequest baselineRequest =
+                makeRequest(
+                    reciprocalBenchmark,
+                    transcendentalFixed,
+                    FormulaParameter::C,
+                    "0", "0", 80, 50, 300,
+                    baseline);
+            baselineRequest.threading.threads = 1;
+            ExpressionDeepRenderResult baselineResult;
+            bool memoryOkay =
+                formula::renderExpressionDeepFrame(
+                    baselineRequest, baselineResult) &&
+                baselineResult.taylorAccepted &&
+                baselineResult.taylorMemoryBytes > 0;
+            ExpressionDeepRenderRequest mpfrRequest =
+                makeRequest(
+                    reciprocalBenchmark,
+                    transcendentalFixed,
+                    FormulaParameter::C,
+                    "0", "0", 80, 50, 300,
+                    mpfr);
+            mpfrRequest.forceMpfrFallbackForVerification =
+                true;
+            mpfrRequest.threading.threads = 1;
+            ExpressionDeepRenderResult mpfrResult;
+            memoryOkay = memoryOkay &&
+                formula::renderExpressionDeepFrame(
+                    mpfrRequest, mpfrResult);
+            size_t constrainedLimit = 0;
+            if (memoryOkay) {
+                const size_t fullPeak =
+                    baselineResult.referenceBytes +
+                    baselineResult.rendererBytes;
+                const size_t reduction = std::max<size_t>(
+                    1,
+                    baselineResult.taylorMemoryBytes / 2);
+                constrainedLimit =
+                    fullPeak > reduction
+                    ? fullPeak - reduction : 1;
+                constrainedLimit = std::max(
+                    constrainedLimit,
+                    mpfrResult.rendererBytes + 4096);
+                memoryOkay =
+                    constrainedLimit < fullPeak;
+            }
+            ExpressionDeepRenderRequest constrainedRequest =
+                makeRequest(
+                    reciprocalBenchmark,
+                    transcendentalFixed,
+                    FormulaParameter::C,
+                    "0", "0", 80, 50, 300,
+                    constrained);
+            constrainedRequest.memory.memoryLimitBytes =
+                constrainedLimit;
+            constrainedRequest.threading.threads = 1;
+            ExpressionDeepRenderResult constrainedResult;
+            memoryOkay = memoryOkay &&
+                formula::renderExpressionDeepFrame(
+                    constrainedRequest,
+                    constrainedResult);
+            const uint64_t pixels =
+                static_cast<uint64_t>(
+                    constrained.size());
+            if (!memoryOkay ||
+                baseline != mpfr ||
+                constrained != mpfr ||
+                constrainedResult.taylorAccepted ||
+                constrainedResult.fastPixelCount != 0 ||
+                constrainedResult.fallbackPixelCount != pixels ||
+                constrainedResult.referenceBytes != 0 ||
+                constrainedResult.rendererBytes >
+                    constrainedLimit) {
+                printf("  meromorphic Taylor memory fallback failed okay=%d status=%s error=%s limit=%zu peak=%zu Taylor=%zu attempted/accepted=%d/%d fast/fallback=%llu/%llu ref=%zu renderer=%zu parity=%d/%d\n",
+                       memoryOkay ? 1 : 0,
+                       formula::expressionDeepRenderStatusName(
+                           constrainedResult.status),
+                       constrainedResult.error.c_str(),
+                       constrainedLimit,
+                       baselineResult.referenceBytes +
+                           baselineResult.rendererBytes,
+                       baselineResult.taylorMemoryBytes,
+                       constrainedResult.taylorAttempted ? 1 : 0,
+                       constrainedResult.taylorAccepted ? 1 : 0,
+                       (unsigned long long)
+                           constrainedResult.fastPixelCount,
+                       (unsigned long long)
+                           constrainedResult.fallbackPixelCount,
+                       constrainedResult.referenceBytes,
+                       constrainedResult.rendererBytes,
+                       baseline == mpfr ? 1 : 0,
+                       constrained == mpfr ? 1 : 0);
                 ++failures;
             }
         }
@@ -8084,6 +8550,14 @@ static int runExpressionDeepRenderCase() {
         runRangeCase(
             "two-c-times-zero", "(2*c)*0",
             ExpressionDeepFallbackReason::ExponentRange);
+        runRangeCase(
+            "huge-divide-unit", "c/c",
+            ExpressionDeepFallbackReason::
+                CertificationFailure);
+        runRangeCase(
+            "huge-reciprocal", "1/c",
+            ExpressionDeepFallbackReason::
+                CertificationFailure);
 
         const mpfr_exp_t hugePower =
             (emax - 2) / 2;
@@ -8104,6 +8578,14 @@ static int runExpressionDeepRenderCase() {
         runRangeCase(
             "tiny-underflow", "(c*c)*0.125",
             ExpressionDeepFallbackReason::ExponentRange);
+        runRangeCase(
+            "tiny-divide-unit", "c/c",
+            ExpressionDeepFallbackReason::
+                CertificationFailure);
+        runRangeCase(
+            "tiny-reciprocal", "1/c",
+            ExpressionDeepFallbackReason::
+                CertificationFailure);
 
         mpfr_const_log2(value, MPFR_RNDN);
         mpfr_mul_si(
@@ -8139,7 +8621,9 @@ static int runExpressionDeepRenderCase() {
         ExpressionDeepRenderRequest request = makeRequest(
             pair, mandelbrotFixed, pixel,
             fallbackPhase ? "0" : "-2", "0",
-            48, 28, fallbackPhase ? 30 : 850,
+            fallbackPhase ? 96 : 48,
+            fallbackPhase ? 64 : 28,
+            fallbackPhase ? 30 : 850,
             output);
         std::atomic<int> phase{
             static_cast<int>(
@@ -8162,7 +8646,8 @@ static int runExpressionDeepRenderCase() {
                     ExpressionDeepRenderPhase::Fast;
             return target &&
                    polls.fetch_add(
-                       1, std::memory_order_relaxed) > 300;
+                       1, std::memory_order_relaxed) >
+                       (fallbackPhase ? 20 : 300);
         };
         ExpressionDeepRenderResult result;
         const bool okay =
@@ -8184,7 +8669,7 @@ static int runExpressionDeepRenderCase() {
     };
     cancellationCase("z*z+c", false);
     cancellationCase("sin(z)+c", false);
-    cancellationCase("z/(c+2)+c", true);
+    cancellationCase("0.001/(c-c)", true);
 
     // Worker and per-iteration allocation failures must not let any thread
     // bypass an OpenMP worksharing barrier.
@@ -8200,9 +8685,14 @@ static int runExpressionDeepRenderCase() {
             return;
         }
         std::vector<float> output;
+        const bool largeFastFrame =
+            std::string(source) == "1/(z+2)+c";
         ExpressionDeepRenderRequest request = makeRequest(
             pair, mandelbrotFixed, FormulaParameter::C,
-            "-1", "0", 16, 10, 40, output);
+            largeFastFrame ? "0" : "-1", "0",
+            largeFastFrame ? 80 : 16,
+            largeFastFrame ? 50 : 10,
+            largeFastFrame ? 120 : 40, output);
         request.threading.threads = 4;
         request.verificationFault = fault;
         ExpressionDeepRenderResult result;
@@ -8246,12 +8736,22 @@ static int runExpressionDeepRenderCase() {
             FastIterationAllocation,
         "entire fast iteration allocation");
     workerFaultCase(
-        "z/(c+2)+c",
+        "1/(z+2)+c",
+        ExpressionDeepVerificationFault::
+            FastWorkerAllocation,
+        "meromorphic fast worker allocation");
+    workerFaultCase(
+        "1/(z+2)+c",
+        ExpressionDeepVerificationFault::
+            FastIterationAllocation,
+        "meromorphic fast iteration allocation");
+    workerFaultCase(
+        "0.001/(c-c)",
         ExpressionDeepVerificationFault::
             FallbackWorkerAllocation,
         "fallback worker allocation");
     workerFaultCase(
-        "z/(c+2)+c",
+        "0.001/(c-c)",
         ExpressionDeepVerificationFault::
             FallbackIterationAllocation,
         "fallback iteration allocation");
@@ -8471,7 +8971,7 @@ static int runExpressionDeepRenderCase() {
     }
 
     printf("=== expression deep frame renderer e500\n");
-    printf("  exact frames=%d certified entire jets plus MPFR rational/branch fallback\n",
+    printf("  exact frames=%d certified entire/meromorphic jets plus MPFR pole/branch fallback\n",
            exactFrames);
     printf("  64x40 reference/scaled/all-MPFR %.3f/%.3f/%.3f s speedup %.2fx\n",
            benchmarkReference, benchmarkScaled,

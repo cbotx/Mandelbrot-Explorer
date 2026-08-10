@@ -94,6 +94,26 @@ ScaledArithmeticStatus upperMagnitude(
     return scaledAddUp(real, imaginary, output);
 }
 
+ScaledArithmeticStatus upperMaxComponent(
+        const ScaledComplexBall& value,
+        ScaledRealValue& output) {
+    if (!validRadius(value.radius))
+        return ScaledArithmeticStatus::ExponentRange;
+    const ScaledRealValue real =
+        absoluteValue(value.value.re);
+    const ScaledRealValue imaginary =
+        absoluteValue(value.value.im);
+    output =
+        compareScaledNonnegative(real, imaginary) >= 0
+        ? real : imaginary;
+    ScaledRealValue sum;
+    const ScaledArithmeticStatus status =
+        scaledAddUp(output, value.radius, sum);
+    if (status == ScaledArithmeticStatus::Success)
+        output = sum;
+    return status;
+}
+
 ScaledArithmeticStatus addUp(
         ScaledRealValue& target,
         const ScaledRealValue& value) {
@@ -110,6 +130,312 @@ ScaledArithmeticStatus multiplyUp(
         const ScaledRealValue& right,
         ScaledRealValue& output) {
     return scaledMultiplyUp(left, right, output);
+}
+
+ScaledArithmeticStatus makeScaledNonnegativeDownward(
+        mpfr_srcptr value, ScaledRealValue& output) {
+    if (!mpfr_number_p(value) || mpfr_sgn(value) < 0)
+        return ScaledArithmeticStatus::Nonfinite;
+    if (mpfr_zero_p(value)) {
+        output = {};
+        return ScaledArithmeticStatus::Success;
+    }
+    long exponent = 0;
+    double mantissa =
+        mpfr_get_d_2exp(&exponent, value, MPFR_RNDZ);
+    if (!(mantissa > 0.0) || !std::isfinite(mantissa))
+        return ScaledArithmeticStatus::ExponentRange;
+    if (mantissa >= 1.0) {
+        mantissa *= 0.5;
+        if (exponent == LONG_MAX)
+            return ScaledArithmeticStatus::ExponentRange;
+        ++exponent;
+    }
+    output.mantissa = mantissa;
+    output.exponent = static_cast<int64_t>(exponent);
+    return output.isNormalized()
+        ? ScaledArithmeticStatus::Success
+        : ScaledArithmeticStatus::ExponentRange;
+}
+
+ScaledArithmeticStatus lowerMaxComponentAfterVariation(
+        const ScaledComplexValue& center,
+        const ScaledRealValue& variation,
+        ScaledRealValue& output) {
+    if (!validRadius(variation))
+        return ScaledArithmeticStatus::ExponentRange;
+    MpfrComplex value(256);
+    mpfr_t radius, real, imaginary, magnitude, lower;
+    mpfr_inits2(
+        256, radius, real, imaginary, magnitude, lower,
+        (mpfr_ptr)0);
+    const mpfr_flags_t saved = mpfr_flags_save();
+    mpfr_flags_clear(MPFR_FLAGS_ALL);
+    bool reconstructed =
+        setMpfrFromScaledValue(value, center, MPFR_RNDN) &&
+        setMpfrFromScaledValue(
+            radius, variation, MPFR_RNDU);
+    bool positive = false;
+    if (reconstructed) {
+        mpfr_abs(real, value.re, MPFR_RNDD);
+        mpfr_abs(imaginary, value.im, MPFR_RNDD);
+        mpfr_max(
+            magnitude, real, imaginary, MPFR_RNDD);
+        mpfr_sub(lower, magnitude, radius, MPFR_RNDD);
+        reconstructed =
+            mpfr_number_p(lower) &&
+            mpfr_flags_test(
+                MPFR_FLAGS_UNDERFLOW |
+                MPFR_FLAGS_OVERFLOW |
+                MPFR_FLAGS_ERANGE) == 0;
+        positive =
+            reconstructed && mpfr_sgn(lower) > 0;
+    }
+    ScaledArithmeticStatus status =
+        reconstructed
+        ? ScaledArithmeticStatus::Singular
+        : ScaledArithmeticStatus::ExponentRange;
+    if (positive)
+        status = makeScaledNonnegativeDownward(
+            lower, output);
+    mpfr_flags_restore(saved, MPFR_FLAGS_ALL);
+    mpfr_clears(
+        radius, real, imaginary, magnitude, lower,
+        (mpfr_ptr)0);
+    return status;
+}
+
+ScaledArithmeticStatus multiplyNonnegativeDown(
+        const ScaledRealValue& left,
+        const ScaledRealValue& right,
+        ScaledRealValue& output) {
+    if (!validRadius(left) || !validRadius(right))
+        return ScaledArithmeticStatus::ExponentRange;
+    if (left.isZero() || right.isZero()) {
+        output = {};
+        return ScaledArithmeticStatus::Success;
+    }
+    mpfr_t first, second, product;
+    mpfr_inits2(256, first, second, product, (mpfr_ptr)0);
+    const mpfr_flags_t saved = mpfr_flags_save();
+    mpfr_flags_clear(MPFR_FLAGS_ALL);
+    bool okay =
+        setMpfrFromScaledValue(
+            first, left, MPFR_RNDD) &&
+        setMpfrFromScaledValue(
+            second, right, MPFR_RNDD);
+    if (okay) {
+        mpfr_mul(product, first, second, MPFR_RNDD);
+        okay =
+            mpfr_number_p(product) &&
+            mpfr_sgn(product) > 0 &&
+            mpfr_flags_test(
+                MPFR_FLAGS_UNDERFLOW |
+                MPFR_FLAGS_OVERFLOW |
+                MPFR_FLAGS_ERANGE) == 0;
+    }
+    ScaledArithmeticStatus status =
+        ScaledArithmeticStatus::ExponentRange;
+    if (okay)
+        status = makeScaledNonnegativeDownward(
+            product, output);
+    mpfr_flags_restore(saved, MPFR_FLAGS_ALL);
+    mpfr_clears(first, second, product, (mpfr_ptr)0);
+    return status;
+}
+
+ScaledArithmeticStatus divideNonnegativeUp(
+        const ScaledRealValue& numerator,
+        const ScaledRealValue& denominator,
+        ScaledRealValue& output) {
+    if (!validRadius(numerator) ||
+        !validRadius(denominator) ||
+        denominator.isZero())
+        return ScaledArithmeticStatus::Singular;
+    mpfr_t left, right, quotient;
+    mpfr_inits2(256, left, right, quotient, (mpfr_ptr)0);
+    const mpfr_flags_t saved = mpfr_flags_save();
+    mpfr_flags_clear(MPFR_FLAGS_ALL);
+    bool okay =
+        setMpfrFromScaledValue(
+            left, numerator, MPFR_RNDU) &&
+        setMpfrFromScaledValue(
+            right, denominator, MPFR_RNDD);
+    if (okay) {
+        mpfr_div(quotient, left, right, MPFR_RNDU);
+        okay =
+            mpfr_number_p(quotient) &&
+            mpfr_sgn(quotient) >= 0 &&
+            mpfr_flags_test(
+                MPFR_FLAGS_UNDERFLOW |
+                MPFR_FLAGS_OVERFLOW |
+                MPFR_FLAGS_ERANGE) == 0;
+    }
+    ScaledArithmeticStatus status =
+        ScaledArithmeticStatus::ExponentRange;
+    if (okay)
+        status = makeScaledNonnegativeUpward(
+            quotient, output);
+    mpfr_flags_restore(saved, MPFR_FLAGS_ALL);
+    mpfr_clears(left, right, quotient, (mpfr_ptr)0);
+    return status;
+}
+
+ScaledArithmeticStatus reciprocalScaledValue(
+        const ScaledComplexValue& input,
+        ScaledComplexBall& output) {
+    output = {};
+    if (input.isZero())
+        return ScaledArithmeticStatus::Singular;
+    MpfrComplex value(256);
+    if (!setMpfrFromScaledValue(
+            value, input, MPFR_RNDN))
+        return ScaledArithmeticStatus::ExponentRange;
+
+    mpfr_t scaledReal, scaledImaginary;
+    mpfr_t denominatorLow, denominatorHigh;
+    mpfr_t numerator, lower, upper, midpoint;
+    mpfr_t encoded, firstError, secondError, radius;
+    mpfr_inits2(
+        256, scaledReal, scaledImaginary,
+        denominatorLow, denominatorHigh, numerator,
+        lower, upper, midpoint, encoded,
+        firstError, secondError, radius,
+        (mpfr_ptr)0);
+    const mpfr_flags_t saved = mpfr_flags_save();
+    mpfr_flags_clear(MPFR_FLAGS_ALL);
+
+    const mpfr_exp_t realExponent =
+        mpfr_zero_p(value.re)
+        ? mpfr_get_emin()
+        : mpfr_get_exp(value.re);
+    const mpfr_exp_t imaginaryExponent =
+        mpfr_zero_p(value.im)
+        ? mpfr_get_emin()
+        : mpfr_get_exp(value.im);
+    const mpfr_exp_t scaleExponent =
+        std::max(realExponent, imaginaryExponent);
+    bool okay =
+        scaleExponent >= LONG_MIN &&
+        scaleExponent <= LONG_MAX &&
+        scaleExponent != LONG_MIN;
+    if (okay) {
+        mpfr_div_2si(
+            scaledReal, value.re,
+            static_cast<long>(scaleExponent),
+            MPFR_RNDN);
+        mpfr_div_2si(
+            scaledImaginary, value.im,
+            static_cast<long>(scaleExponent),
+            MPFR_RNDN);
+        mpfr_sqr(
+            denominatorLow, scaledReal, MPFR_RNDD);
+        mpfr_sqr(
+            firstError, scaledImaginary, MPFR_RNDD);
+        mpfr_add(
+            denominatorLow, denominatorLow,
+            firstError, MPFR_RNDD);
+        mpfr_sqr(
+            denominatorHigh, scaledReal, MPFR_RNDU);
+        mpfr_sqr(
+            firstError, scaledImaginary, MPFR_RNDU);
+        mpfr_add(
+            denominatorHigh, denominatorHigh,
+            firstError, MPFR_RNDU);
+        okay =
+            mpfr_number_p(denominatorLow) &&
+            mpfr_sgn(denominatorLow) > 0 &&
+            mpfr_number_p(denominatorHigh);
+    }
+
+    ScaledRealValue componentRadius;
+    auto makeComponent = [&](
+            mpfr_srcptr source,
+            ScaledRealValue& component) {
+        mpfr_set(numerator, source, MPFR_RNDN);
+        if (mpfr_sgn(numerator) >= 0) {
+            mpfr_div(
+                lower, numerator,
+                denominatorHigh, MPFR_RNDD);
+            mpfr_div(
+                upper, numerator,
+                denominatorLow, MPFR_RNDU);
+        } else {
+            mpfr_div(
+                lower, numerator,
+                denominatorLow, MPFR_RNDD);
+            mpfr_div(
+                upper, numerator,
+                denominatorHigh, MPFR_RNDU);
+        }
+        mpfr_mul_2si(
+            lower, lower,
+            static_cast<long>(-scaleExponent),
+            MPFR_RNDD);
+        mpfr_mul_2si(
+            upper, upper,
+            static_cast<long>(-scaleExponent),
+            MPFR_RNDU);
+        mpfr_add(midpoint, lower, upper, MPFR_RNDN);
+        mpfr_div_2ui(midpoint, midpoint, 1, MPFR_RNDN);
+        ScaledArithmeticStatus status =
+            makeScaledRealValue(midpoint, component);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        if (!setMpfrFromScaledValue(
+                encoded, component, MPFR_RNDN))
+            return ScaledArithmeticStatus::ExponentRange;
+        mpfr_sub(
+            firstError, encoded, lower, MPFR_RNDU);
+        mpfr_abs(
+            firstError, firstError, MPFR_RNDU);
+        mpfr_sub(
+            secondError, upper, encoded, MPFR_RNDU);
+        mpfr_abs(
+            secondError, secondError, MPFR_RNDU);
+        mpfr_max(radius, firstError, secondError, MPFR_RNDU);
+        ScaledRealValue localRadius;
+        status = makeScaledNonnegativeUpward(
+            radius, localRadius);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        if (compareScaledNonnegative(
+                localRadius, componentRadius) > 0)
+            componentRadius = localRadius;
+        return ScaledArithmeticStatus::Success;
+    };
+
+    ScaledArithmeticStatus status =
+        ScaledArithmeticStatus::ExponentRange;
+    if (okay) {
+        status = makeComponent(
+            scaledReal, output.value.re);
+        if (status == ScaledArithmeticStatus::Success) {
+            mpfr_neg(
+                scaledImaginary,
+                scaledImaginary, MPFR_RNDN);
+            status = makeComponent(
+                scaledImaginary, output.value.im);
+        }
+    }
+    if (status == ScaledArithmeticStatus::Success) {
+        output.radius = componentRadius;
+        if (mpfr_flags_test(
+                MPFR_FLAGS_UNDERFLOW |
+                MPFR_FLAGS_OVERFLOW |
+                MPFR_FLAGS_ERANGE) != 0)
+            status = ScaledArithmeticStatus::ExponentRange;
+    }
+    mpfr_flags_restore(saved, MPFR_FLAGS_ALL);
+    mpfr_clears(
+        scaledReal, scaledImaginary,
+        denominatorLow, denominatorHigh, numerator,
+        lower, upper, midpoint, encoded,
+        firstError, secondError, radius,
+        (mpfr_ptr)0);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    return certifyScaledMpfrExponentRange(output);
 }
 
 ScaledArithmeticStatus finiteSeriesTailBound(
@@ -272,6 +598,13 @@ struct Candidate {
     uint64_t functionSeriesOperations = 0;
     int maximumFunctionSeriesOrder = 0;
     ScaledRealValue maximumFunctionSeriesTail;
+    uint64_t reciprocalCount = 0;
+    uint64_t reciprocalOperations = 0;
+    int maximumReciprocalOrder = 0;
+    ScaledRealValue minimumDenominatorClearance;
+    ScaledRealValue maximumReciprocalTail;
+    bool hasDenominatorClearance = false;
+    bool poleRejected = false;
     bool landingUsesSampleOutput = false;
     size_t memoryBytes = 0;
 };
@@ -303,6 +636,8 @@ const char* expressionTaylorJetStatusName(
         return "accuracy-budget";
     case ExpressionTaylorJetStatus::BailoutUncertain:
         return "bailout-uncertain";
+    case ExpressionTaylorJetStatus::PoleRejected:
+        return "pole-rejected";
     }
     return "invalid-request";
 }
@@ -412,7 +747,10 @@ bool ExpressionTaylorJetBuilder::build(
                  ExactCenteredArithmetic &&
          request.program->scaledResidualCapability() !=
              ExpressionScaledResidualCapability::
-                 CertifiedEntireCandidate) ||
+                 CertifiedEntireCandidate &&
+         request.program->scaledResidualCapability() !=
+             ExpressionScaledResidualCapability::
+                 CertifiedMeromorphicCandidate) ||
         (request.pixelParameter != FormulaParameter::C &&
          request.pixelParameter !=
              FormulaParameter::InitialZ) ||
@@ -467,12 +805,15 @@ bool ExpressionTaylorJetBuilder::build(
         case Op::Add:
         case Op::Subtract:
         case Op::Multiply:
+        case Op::Divide:
         case Op::Square:
         case Op::Exp:
         case Op::Sin:
         case Op::Cos:
+        case Op::Tan:
         case Op::Sinh:
         case Op::Cosh:
+        case Op::Tanh:
             break;
         default:
             return finish(
@@ -555,6 +896,10 @@ bool ExpressionTaylorJetBuilder::build(
 
     Candidate best;
     bool haveBest = false;
+    const bool meromorphicProgram =
+        request.program->scaledResidualCapability() ==
+            ExpressionScaledResidualCapability::
+                CertifiedMeromorphicCandidate;
     uint64_t totalOperations = 0;
     size_t peakMemory = 0;
     ExpressionTaylorJetStatus lastStatus =
@@ -572,6 +917,21 @@ bool ExpressionTaylorJetBuilder::build(
         const size_t nodeCount =
             request.program->instructionCount();
         size_t candidateBytes = validationBytes;
+        if (haveBest &&
+            (!checkedAddSize(
+                 candidateBytes,
+                 best.coefficients.capacity(),
+                 sizeof(ScaledComplexBall)) ||
+             !checkedAddSize(
+                 candidateBytes,
+                 best.margins.capacity(),
+                 sizeof(ScaledRealValue)))) {
+            lastStatus =
+                ExpressionTaylorJetStatus::ResourceLimit;
+            lastReason =
+                "retained Taylor candidate size overflow";
+            break;
+        }
         if (!checkedAddSize(
                 candidateBytes, nodeCount * stride,
                 sizeof(ScaledComplexBall)) ||
@@ -579,7 +939,8 @@ bool ExpressionTaylorJetBuilder::build(
                 candidateBytes, nodeCount,
                 sizeof(ScaledRealValue)) ||
             !checkedAddSize(
-                candidateBytes, stride * 8,
+                candidateBytes,
+                stride * (meromorphicProgram ? 11 : 8),
                 sizeof(ScaledComplexBall)) ||
             !checkedAddSize(
                 candidateBytes,
@@ -614,6 +975,20 @@ bool ExpressionTaylorJetBuilder::build(
             std::vector<ScaledComplexBall> functionScratch(stride);
             std::vector<ScaledComplexBall> functionFirst(stride);
             std::vector<ScaledComplexBall> functionSecond(stride);
+            std::vector<ScaledComplexBall>
+                meromorphicNumerator;
+            std::vector<ScaledComplexBall>
+                meromorphicDenominator;
+            std::vector<ScaledComplexBall>
+                reciprocalCoefficients;
+            std::vector<ScaledComplexBall>
+                quotientCoefficients;
+            if (meromorphicProgram) {
+                meromorphicNumerator.resize(stride);
+                meromorphicDenominator.resize(stride);
+                reciprocalCoefficients.resize(stride);
+                quotientCoefficients.resize(stride);
+            }
             candidate.margins.reserve(
                 static_cast<size_t>(maximumLanding) + 1);
 
@@ -989,7 +1364,7 @@ bool ExpressionTaylorJetBuilder::build(
                         ExpressionOracleOperation::Multiply ||
                     node.operation ==
                         ExpressionOracleOperation::Square;
-                const bool entireOperation =
+                const bool nonlinearOutputOperation =
                     node.operation ==
                         ExpressionOracleOperation::Exp ||
                     node.operation ==
@@ -999,8 +1374,15 @@ bool ExpressionTaylorJetBuilder::build(
                     node.operation ==
                         ExpressionOracleOperation::Sinh ||
                     node.operation ==
-                        ExpressionOracleOperation::Cosh;
-                if (!arithmeticOperation && !entireOperation)
+                        ExpressionOracleOperation::Cosh ||
+                    node.operation ==
+                        ExpressionOracleOperation::Divide ||
+                    node.operation ==
+                        ExpressionOracleOperation::Tan ||
+                    node.operation ==
+                        ExpressionOracleOperation::Tanh;
+                if (!arithmeticOperation &&
+                    !nonlinearOutputOperation)
                     return ScaledArithmeticStatus::Success;
 
                 auto fullBound = [&](
@@ -1044,7 +1426,7 @@ bool ExpressionTaylorJetBuilder::build(
                 ScaledRealValue operationMagnitude;
                 ScaledArithmeticStatus status =
                     ScaledArithmeticStatus::Success;
-                if (entireOperation) {
+                if (nonlinearOutputOperation) {
                     status = fullBound(
                         static_cast<uint16_t>(local),
                         operationMagnitude);
@@ -1054,12 +1436,12 @@ bool ExpressionTaylorJetBuilder::build(
                             ScaledArithmeticStatus::Success)
                         return status;
                 }
-                if (!entireOperation &&
+                if (!nonlinearOutputOperation &&
                     node.operation ==
                         ExpressionOracleOperation::Square) {
                     status = multiplyBound(
                         left, left, operationMagnitude);
-                } else if (!entireOperation) {
+                } else if (!nonlinearOutputOperation) {
                     status = fullBound(
                         node.rightNode, right);
                     if (status !=
@@ -1099,7 +1481,16 @@ bool ExpressionTaylorJetBuilder::build(
             auto composeEntire = [&](
                     size_t local,
                     const ExpressionReferenceTapeNode& node,
-                    ScaledRealValue& outputRemainder) {
+                    ScaledRealValue& outputRemainder,
+                    ScaledComplexBall* destination = nullptr,
+                    ExpressionOracleOperation
+                        operationOverride =
+                            ExpressionOracleOperation::
+                                Constant,
+                    const ScaledComplexBall*
+                        baseOverride = nullptr,
+                    const ScaledComplexBall*
+                        companionOverride = nullptr) {
                 auto failComposition = [&](
                         ExpressionTaylorJetStatus status,
                         const char* reason) {
@@ -1112,16 +1503,20 @@ bool ExpressionTaylorJetBuilder::build(
                         ExpressionTaylorJetStatus::Nonfinite,
                         "entire-function reference node is undefined");
 
+                const ExpressionOracleOperation operation =
+                    operationOverride ==
+                        ExpressionOracleOperation::Constant
+                    ? node.operation : operationOverride;
                 const bool needsCompanion =
-                    node.operation ==
+                    operation ==
                         ExpressionOracleOperation::Sin ||
-                    node.operation ==
+                    operation ==
                         ExpressionOracleOperation::Cos ||
-                    node.operation ==
+                    operation ==
                         ExpressionOracleOperation::Sinh ||
-                    node.operation ==
+                    operation ==
                         ExpressionOracleOperation::Cosh;
-                if (needsCompanion &&
+                if (!companionOverride && needsCompanion &&
                     (node.flags & OracleTraceHasCompanion) == 0)
                     return failComposition(
                         ExpressionTaylorJetStatus::InvalidTape,
@@ -1129,10 +1524,15 @@ bool ExpressionTaylorJetBuilder::build(
 
                 ScaledComplexBall base;
                 ScaledArithmeticStatus arithmetic =
-                    makeScaledComplexValue(
+                    ScaledArithmeticStatus::Success;
+                if (baseOverride) {
+                    base = *baseOverride;
+                } else {
+                    arithmetic = makeScaledComplexValue(
                         node.output, node.outputDefect,
                         base.value);
-                base.radius = node.outputError;
+                    base.radius = node.outputError;
+                }
                 if (arithmetic ==
                         ScaledArithmeticStatus::Success)
                     arithmetic =
@@ -1145,12 +1545,16 @@ bool ExpressionTaylorJetBuilder::build(
 
                 ScaledComplexBall companion;
                 if (needsCompanion) {
-                    arithmetic = makeScaledComplexValue(
-                        node.auxiliary,
-                        node.auxiliaryDefect,
-                        companion.value);
-                    companion.radius =
-                        node.auxiliaryError;
+                    if (companionOverride) {
+                        companion = *companionOverride;
+                    } else {
+                        arithmetic = makeScaledComplexValue(
+                            node.auxiliary,
+                            node.auxiliaryDefect,
+                            companion.value);
+                        companion.radius =
+                            node.auxiliaryError;
+                    }
                     if (arithmetic ==
                             ScaledArithmeticStatus::Success)
                         arithmetic =
@@ -1257,12 +1661,12 @@ bool ExpressionTaylorJetBuilder::build(
                     }
 
                     const bool exponential =
-                        node.operation ==
+                        operation ==
                             ExpressionOracleOperation::Exp;
                     const bool hyperbolic =
-                        node.operation ==
+                        operation ==
                             ExpressionOracleOperation::Sinh ||
-                        node.operation ==
+                        operation ==
                             ExpressionOracleOperation::Cosh;
                     const bool even =
                         (seriesOrder & 1) == 0;
@@ -1366,7 +1770,10 @@ bool ExpressionTaylorJetBuilder::build(
                 if (!needsCompanion) {
                     for (int degree = 0;
                          degree <= order; ++degree)
-                        coefficient(local, degree) =
+                        (destination
+                            ? destination[
+                                  static_cast<size_t>(degree)]
+                            : coefficient(local, degree)) =
                             functionScratch[
                                 static_cast<size_t>(degree)];
                     outputRemainder =
@@ -1385,7 +1792,7 @@ bool ExpressionTaylorJetBuilder::build(
                             statusForArithmetic(arithmetic),
                             "entire-function companion multiplication failed");
                     const bool subtractCompanion =
-                        node.operation ==
+                        operation ==
                             ExpressionOracleOperation::Cos;
                     for (int degree = 0;
                          degree <= order; ++degree) {
@@ -1397,7 +1804,12 @@ bool ExpressionTaylorJetBuilder::build(
                                   functionTerm[
                                       static_cast<size_t>(
                                           degree)],
-                                  coefficient(local, degree))
+                                  destination
+                                      ? destination[
+                                            static_cast<size_t>(
+                                                degree)]
+                                      : coefficient(
+                                            local, degree))
                             : functionAddBall(
                                   functionScratch[
                                       static_cast<size_t>(
@@ -1405,7 +1817,12 @@ bool ExpressionTaylorJetBuilder::build(
                                   functionTerm[
                                       static_cast<size_t>(
                                           degree)],
-                                  coefficient(local, degree));
+                                  destination
+                                      ? destination[
+                                            static_cast<size_t>(
+                                                degree)]
+                                      : coefficient(
+                                            local, degree));
                         if (arithmetic !=
                                 ScaledArithmeticStatus::
                                     Success)
@@ -1443,6 +1860,481 @@ bool ExpressionTaylorJetBuilder::build(
                     0)
                     candidate.maximumFunctionSeriesTail =
                         certifiedTail;
+                return true;
+            };
+            auto inflateReferenceValue = [&](
+                    ScaledComplexBall& value) {
+                if (request.reference->
+                        certificationPrecision <= 16)
+                    return ScaledArithmeticStatus::Success;
+                ScaledRealValue magnitude;
+                ScaledArithmeticStatus status =
+                    upperMagnitude(value, magnitude);
+                ++candidate.operations;
+                ++candidate.reciprocalOperations;
+                if (status !=
+                        ScaledArithmeticStatus::Success)
+                    return status;
+                ScaledRealValue scale;
+                scale.mantissa = 0.5;
+                scale.exponent =
+                    14 - static_cast<int64_t>(
+                        request.reference->
+                            certificationPrecision);
+                ScaledRealValue roundoff;
+                status = multiplyBound(
+                    magnitude, scale, roundoff);
+                ++candidate.reciprocalOperations;
+                if (status !=
+                        ScaledArithmeticStatus::Success)
+                    return status;
+                status = addRemainder(
+                    value.radius, roundoff);
+                ++candidate.reciprocalOperations;
+                return status;
+            };
+            auto composeReciprocal = [&](
+                    const ScaledComplexBall* denominator,
+                    const ScaledRealValue&
+                        denominatorRemainder,
+                    std::vector<ScaledComplexBall>& output,
+                    ScaledRealValue& outputRemainder,
+                    const ScaledRealValue*
+                        clearanceScale = nullptr) {
+                auto failReciprocal = [&](
+                        ExpressionTaylorJetStatus status,
+                        const char* reason,
+                        bool pole = false) {
+                    candidate.status = status;
+                    candidate.reason = reason;
+                    candidate.poleRejected =
+                        candidate.poleRejected || pole;
+                    return false;
+                };
+                if (!denominator)
+                    return failReciprocal(
+                        ExpressionTaylorJetStatus::
+                            InvalidTape,
+                        "reciprocal denominator is missing");
+
+                ScaledComplexBall constant = denominator[0];
+                ScaledRealValue inputRemainder =
+                    denominatorRemainder;
+                ScaledArithmeticStatus arithmetic =
+                    addRemainder(
+                        inputRemainder, constant.radius);
+                ++candidate.reciprocalOperations;
+                constant.radius = {};
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success)
+                    return failReciprocal(
+                        statusForArithmetic(arithmetic),
+                        "reciprocal constant uncertainty overflowed");
+
+                ScaledRealValue polynomialVariation;
+                // Reciprocal clearance and tails use the maximum-component
+                // norm throughout. Complex products therefore carry the
+                // sharp-enough factor two used below.
+                for (int degree = 1;
+                     degree <= order; ++degree) {
+                    ScaledRealValue magnitude;
+                    arithmetic = upperMaxComponent(
+                        denominator[
+                            static_cast<size_t>(degree)],
+                        magnitude);
+                    ++candidate.operations;
+                    ++candidate.reciprocalOperations;
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        return failReciprocal(
+                            statusForArithmetic(arithmetic),
+                            "reciprocal denominator coefficient bound failed");
+                    arithmetic = addRemainder(
+                        polynomialVariation, magnitude);
+                    ++candidate.reciprocalOperations;
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        return failReciprocal(
+                            statusForArithmetic(arithmetic),
+                            "reciprocal denominator variation overflowed");
+                }
+                arithmetic = addRemainder(
+                    polynomialVariation, inputRemainder);
+                ++candidate.reciprocalOperations;
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success)
+                    return failReciprocal(
+                        statusForArithmetic(arithmetic),
+                        "reciprocal denominator remainder overflowed");
+
+                ScaledRealValue clearance;
+                arithmetic =
+                    lowerMaxComponentAfterVariation(
+                    constant.value,
+                    polynomialVariation, clearance);
+                ++candidate.operations;
+                ++candidate.reciprocalOperations;
+                if (arithmetic ==
+                        ScaledArithmeticStatus::Singular)
+                    return failReciprocal(
+                        ExpressionTaylorJetStatus::
+                            PoleRejected,
+                        "denominator ball overlaps zero",
+                        true);
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success)
+                    return failReciprocal(
+                        statusForArithmetic(arithmetic),
+                        "denominator clearance is outside certified range");
+                ScaledRealValue conservativeClearance;
+                arithmetic = scaledDivideByDouble(
+                    clearance, 2.0,
+                    conservativeClearance);
+                ++candidate.operations;
+                ++candidate.reciprocalOperations;
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success ||
+                    conservativeClearance.isZero())
+                    return failReciprocal(
+                        ExpressionTaylorJetStatus::
+                            PoleRejected,
+                        "denominator clearance has no conservative margin",
+                        true);
+                ScaledRealValue reportedClearance =
+                    conservativeClearance;
+                if (clearanceScale) {
+                    // If both factors have max-component lower bounds a,b,
+                    // their product has max-component magnitude at least
+                    // a*b/sqrt(2); division by two is conservative.
+                    arithmetic = multiplyNonnegativeDown(
+                        clearance, *clearanceScale,
+                        reportedClearance);
+                    ++candidate.operations;
+                    ++candidate.reciprocalOperations;
+                    if (arithmetic ==
+                            ScaledArithmeticStatus::Success)
+                        arithmetic = scaledDivideByDouble(
+                            reportedClearance, 2.0,
+                            reportedClearance);
+                    ++candidate.operations;
+                    ++candidate.reciprocalOperations;
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        return failReciprocal(
+                            statusForArithmetic(arithmetic),
+                            "denominator clearance product overflowed");
+                }
+                if (!candidate.hasDenominatorClearance ||
+                    compareScaledNonnegative(
+                        reportedClearance,
+                        candidate.
+                            minimumDenominatorClearance) < 0) {
+                    candidate.minimumDenominatorClearance =
+                        reportedClearance;
+                    candidate.hasDenominatorClearance = true;
+                }
+
+                std::fill(
+                    output.begin(), output.end(),
+                    ScaledComplexBall{});
+                arithmetic = reciprocalScaledValue(
+                    constant.value, output[0]);
+                ++candidate.operations;
+                ++candidate.reciprocalOperations;
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success)
+                    return failReciprocal(
+                        statusForArithmetic(arithmetic),
+                        "reciprocal constant is not representable");
+
+                for (int degree = 1;
+                     degree <= order; ++degree) {
+                    bool haveSum = false;
+                    ScaledComplexBall sum;
+                    for (int first = 1;
+                         first <= degree; ++first) {
+                        ScaledComplexBall term;
+                        arithmetic = multiplyBall(
+                            denominator[
+                                static_cast<size_t>(first)],
+                            output[
+                                static_cast<size_t>(
+                                    degree - first)],
+                            term);
+                        ++candidate.reciprocalOperations;
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            break;
+                        if (!haveSum) {
+                            sum = term;
+                            haveSum = true;
+                        } else {
+                            arithmetic = addBall(
+                                sum, term, sum);
+                            ++candidate.reciprocalOperations;
+                            if (arithmetic !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                break;
+                        }
+                    }
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        break;
+                    ScaledComplexBall coefficient;
+                    arithmetic = multiplyBall(
+                        output[0], sum, coefficient);
+                    ++candidate.reciprocalOperations;
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        break;
+                    arithmetic = scaledNegate(
+                        coefficient.value,
+                        coefficient.value);
+                    ++candidate.operations;
+                    ++candidate.reciprocalOperations;
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        break;
+                    output[
+                        static_cast<size_t>(degree)] =
+                            coefficient;
+                }
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success)
+                    return failReciprocal(
+                        statusForArithmetic(arithmetic),
+                        "formal reciprocal coefficient division failed");
+
+                ScaledRealValue identityResidual;
+                for (int degree = 0;
+                     degree <= 2 * order; ++degree) {
+                    bool haveSum = false;
+                    ScaledComplexBall sum;
+                    const int firstMinimum =
+                        std::max(0, degree - order);
+                    const int firstMaximum =
+                        std::min(order, degree);
+                    for (int first = firstMinimum;
+                         first <= firstMaximum; ++first) {
+                        const ScaledComplexBall&
+                            denominatorCoefficient =
+                                first == 0
+                                ? constant
+                                : denominator[
+                                      static_cast<size_t>(
+                                          first)];
+                        ScaledComplexBall term;
+                        arithmetic = multiplyBall(
+                            denominatorCoefficient,
+                            output[
+                                static_cast<size_t>(
+                                    degree - first)],
+                            term);
+                        ++candidate.reciprocalOperations;
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            break;
+                        if (!haveSum) {
+                            sum = term;
+                            haveSum = true;
+                        } else {
+                            arithmetic = addBall(
+                                sum, term, sum);
+                            ++candidate.reciprocalOperations;
+                            if (arithmetic !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                break;
+                        }
+                    }
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        break;
+                    if (degree == 0) {
+                        ScaledComplexBall one;
+                        arithmetic = makeScaledRealValue(
+                            1.0, one.value.re);
+                        ++candidate.operations;
+                        ++candidate.reciprocalOperations;
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            arithmetic = subtractBall(
+                                one, sum, sum);
+                        ++candidate.reciprocalOperations;
+                    } else {
+                        arithmetic = scaledNegate(
+                            sum.value, sum.value);
+                        ++candidate.operations;
+                        ++candidate.reciprocalOperations;
+                    }
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        break;
+                    ScaledRealValue magnitude;
+                    arithmetic = upperMaxComponent(
+                        sum, magnitude);
+                    ++candidate.operations;
+                    ++candidate.reciprocalOperations;
+                    if (arithmetic ==
+                            ScaledArithmeticStatus::Success)
+                        arithmetic = addRemainder(
+                            identityResidual, magnitude);
+                    ++candidate.reciprocalOperations;
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        break;
+                }
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success)
+                    return failReciprocal(
+                        statusForArithmetic(arithmetic),
+                        "reciprocal identity residual bound failed");
+
+                ScaledRealValue reciprocalSup;
+                for (int degree = 0;
+                     degree <= order; ++degree) {
+                    ScaledRealValue magnitude;
+                    arithmetic = upperMaxComponent(
+                        output[
+                            static_cast<size_t>(degree)],
+                        magnitude);
+                    ++candidate.operations;
+                    ++candidate.reciprocalOperations;
+                    if (arithmetic ==
+                            ScaledArithmeticStatus::Success)
+                        arithmetic = addRemainder(
+                            reciprocalSup, magnitude);
+                    ++candidate.reciprocalOperations;
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        break;
+                }
+                ScaledRealValue inputAmplification;
+                if (arithmetic ==
+                        ScaledArithmeticStatus::Success)
+                    arithmetic = multiplyBound(
+                        inputRemainder, reciprocalSup,
+                        inputAmplification);
+                ++candidate.reciprocalOperations;
+                if (arithmetic ==
+                        ScaledArithmeticStatus::Success) {
+                    ScaledRealValue doubled;
+                    arithmetic = scaledAddUp(
+                        inputAmplification,
+                        inputAmplification, doubled);
+                    ++candidate.operations;
+                    ++candidate.reciprocalOperations;
+                    if (arithmetic ==
+                            ScaledArithmeticStatus::Success)
+                        inputAmplification = doubled;
+                }
+                if (arithmetic ==
+                        ScaledArithmeticStatus::Success)
+                    arithmetic = addRemainder(
+                        identityResidual,
+                        inputAmplification);
+                ++candidate.reciprocalOperations;
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success)
+                    return failReciprocal(
+                        statusForArithmetic(arithmetic),
+                        "reciprocal input-remainder amplification failed");
+
+                ScaledRealValue doubledResidual;
+                if (arithmetic ==
+                        ScaledArithmeticStatus::Success)
+                    arithmetic = scaledAddUp(
+                        identityResidual,
+                        identityResidual,
+                        doubledResidual);
+                ++candidate.operations;
+                ++candidate.reciprocalOperations;
+                if (arithmetic ==
+                        ScaledArithmeticStatus::Success)
+                    arithmetic = divideNonnegativeUp(
+                    doubledResidual, clearance,
+                    outputRemainder);
+                ++candidate.operations;
+                ++candidate.reciprocalOperations;
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success)
+                    return failReciprocal(
+                        statusForArithmetic(arithmetic),
+                        "reciprocal omitted tail is not representable");
+                ++candidate.reciprocalCount;
+                candidate.maximumReciprocalOrder =
+                    std::max(
+                        candidate.maximumReciprocalOrder,
+                        order);
+                if (compareScaledNonnegative(
+                        outputRemainder,
+                        candidate.maximumReciprocalTail) >
+                    0)
+                    candidate.maximumReciprocalTail =
+                        outputRemainder;
+                return true;
+            };
+            auto dividePolynomials = [&](
+                    const ScaledComplexBall* numerator,
+                    const ScaledRealValue&
+                        numeratorRemainder,
+                    const ScaledComplexBall* denominator,
+                    const ScaledRealValue&
+                        denominatorRemainder,
+                    const ScaledComplexBall&
+                        referenceOutput,
+                    ScaledComplexBall* output,
+                    ScaledRealValue& outputRemainder,
+                    const ScaledRealValue*
+                        clearanceScale = nullptr) {
+                ScaledRealValue reciprocalRemainder;
+                if (!composeReciprocal(
+                        denominator,
+                        denominatorRemainder,
+                        reciprocalCoefficients,
+                        reciprocalRemainder,
+                        clearanceScale))
+                    return false;
+                const uint64_t operationsBefore =
+                    candidate.operations;
+                ScaledArithmeticStatus arithmetic =
+                    multiplyPolynomials(
+                        numerator, numeratorRemainder,
+                        reciprocalCoefficients.data(),
+                        reciprocalRemainder,
+                        quotientCoefficients,
+                        outputRemainder);
+                candidate.reciprocalOperations +=
+                    candidate.operations - operationsBefore;
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success) {
+                    candidate.status =
+                        statusForArithmetic(arithmetic);
+                    candidate.reason =
+                        "division polynomial multiplication failed";
+                    return false;
+                }
+                for (int degree = 0;
+                     degree <= order; ++degree)
+                    output[static_cast<size_t>(degree)] =
+                        quotientCoefficients[
+                            static_cast<size_t>(degree)];
+                arithmetic = subtractBall(
+                    output[0], referenceOutput,
+                    output[0]);
+                ++candidate.reciprocalOperations;
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success) {
+                    candidate.status =
+                        statusForArithmetic(arithmetic);
+                    candidate.reason =
+                        "division reference rebase failed";
+                    return false;
+                }
                 return true;
             };
 
@@ -1839,6 +2731,107 @@ bool ExpressionTaylorJetBuilder::build(
                             remainders[local] = tail;
                         break;
                     }
+                    case Op::Divide: {
+                        if ((node.flags &
+                             OracleTraceSingularPoint) != 0) {
+                            candidate.status =
+                                ExpressionTaylorJetStatus::
+                                    PoleRejected;
+                            candidate.reason =
+                                "division reference is an exact pole";
+                            candidate.poleRejected = true;
+                            break;
+                        }
+                        if ((node.flags &
+                             OracleTraceUndefined) != 0) {
+                            candidate.status =
+                                ExpressionTaylorJetStatus::
+                                    Nonfinite;
+                            candidate.reason =
+                                "division reference is undefined";
+                            break;
+                        }
+                        if ((node.flags &
+                             OracleTraceHasDenominator) == 0 ||
+                            node.leftNode == UINT16_MAX ||
+                            node.rightNode == UINT16_MAX) {
+                            candidate.status =
+                                ExpressionTaylorJetStatus::
+                                    InvalidTape;
+                            candidate.reason =
+                                "division denominator tape is missing";
+                            break;
+                        }
+                        ScaledComplexBall numeratorBase;
+                        ScaledComplexBall denominatorBase;
+                        arithmetic = nodeBase(
+                            sampleOffset, node.leftNode,
+                            numeratorBase.value);
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            arithmetic = nodeBase(
+                                sampleOffset, node.rightNode,
+                                denominatorBase.value);
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            break;
+                        arithmetic = addBall(
+                            numeratorBase,
+                            coefficient(
+                                node.leftNode, 0),
+                            meromorphicNumerator[0]);
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            arithmetic = addBall(
+                                denominatorBase,
+                                coefficient(
+                                    node.rightNode, 0),
+                                meromorphicDenominator[0]);
+                        for (int degree = 1;
+                             arithmetic ==
+                                 ScaledArithmeticStatus::
+                                     Success &&
+                             degree <= order; ++degree) {
+                            meromorphicNumerator[
+                                static_cast<size_t>(degree)] =
+                                    coefficient(
+                                        node.leftNode,
+                                        degree);
+                            meromorphicDenominator[
+                                static_cast<size_t>(degree)] =
+                                    coefficient(
+                                        node.rightNode,
+                                        degree);
+                        }
+                        ScaledComplexBall referenceOutput;
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            arithmetic =
+                                makeScaledComplexValue(
+                                    node.output,
+                                    node.outputDefect,
+                                    referenceOutput.value);
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            break;
+                        if (!dividePolynomials(
+                                meromorphicNumerator.data(),
+                                remainders[node.leftNode],
+                                meromorphicDenominator.data(),
+                                remainders[node.rightNode],
+                                referenceOutput,
+                                &coefficient(local, 0),
+                                remainders[local]))
+                            arithmetic =
+                                ScaledArithmeticStatus::
+                                    Success;
+                        break;
+                    }
                     case Op::Exp:
                     case Op::Sin:
                     case Op::Cos:
@@ -1851,6 +2844,255 @@ bool ExpressionTaylorJetBuilder::build(
                                 ScaledArithmeticStatus::
                                     Success;
                         break;
+                    case Op::Tan:
+                    case Op::Tanh: {
+                        if ((node.flags &
+                             OracleTraceSingularPoint) != 0) {
+                            candidate.status =
+                                ExpressionTaylorJetStatus::
+                                    PoleRejected;
+                            candidate.reason =
+                                "tangent reference is an exact pole";
+                            candidate.poleRejected = true;
+                            break;
+                        }
+                        if ((node.flags &
+                             OracleTraceUndefined) != 0) {
+                            candidate.status =
+                                ExpressionTaylorJetStatus::
+                                    Nonfinite;
+                            candidate.reason =
+                                "tangent reference is undefined";
+                            break;
+                        }
+                        if ((node.flags &
+                             OracleTraceHasDenominator) == 0 ||
+                            (node.flags &
+                             OracleTraceHasCompanion) == 0 ||
+                            node.leftNode == UINT16_MAX) {
+                            candidate.status =
+                                ExpressionTaylorJetStatus::
+                                    InvalidTape;
+                            candidate.reason =
+                                "tangent denominator companion is missing";
+                            break;
+                        }
+                        if ((node.flags &
+                             OracleTraceHasAsymptoticLogPhase) !=
+                                0) {
+                            candidate.status =
+                                ExpressionTaylorJetStatus::
+                                    AccuracyBudget;
+                            candidate.reason =
+                                "asymptotic tangent reference has no direct denominator jet";
+                            break;
+                        }
+                        ScaledComplexBall referenceOutput;
+                        ScaledComplexBall tangentBase;
+                        ScaledComplexBall denominatorBase;
+                        arithmetic = makeScaledComplexValue(
+                            node.output, node.outputDefect,
+                            referenceOutput.value);
+                        tangentBase = referenceOutput;
+                        tangentBase.radius =
+                            node.outputError;
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            arithmetic =
+                                makeScaledComplexValue(
+                                    node.auxiliary,
+                                    node.auxiliaryDefect,
+                                    denominatorBase.value);
+                        denominatorBase.radius =
+                            node.auxiliaryError;
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            arithmetic =
+                                inflateReferenceValue(
+                                    tangentBase);
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            arithmetic =
+                                inflateReferenceValue(
+                                    denominatorBase);
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            break;
+
+                        ScaledRealValue pointVariation =
+                            denominatorBase.radius;
+                        ScaledRealValue pointClearance;
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            arithmetic =
+                                lowerMaxComponentAfterVariation(
+                                    denominatorBase.value,
+                                    pointVariation,
+                                    pointClearance);
+                        ++candidate.operations;
+                        ++candidate.reciprocalOperations;
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Singular) {
+                            candidate.status =
+                                ExpressionTaylorJetStatus::
+                                    PoleRejected;
+                            candidate.reason =
+                                "tangent point denominator ball overlaps zero";
+                            candidate.poleRejected = true;
+                            arithmetic =
+                                ScaledArithmeticStatus::
+                                    Success;
+                            break;
+                        }
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            break;
+                        ScaledRealValue conservativePoint;
+                        arithmetic = scaledDivideByDouble(
+                            pointClearance, 2.0,
+                            conservativePoint);
+                        ++candidate.operations;
+                        ++candidate.reciprocalOperations;
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success ||
+                            conservativePoint.isZero()) {
+                            candidate.status =
+                                ExpressionTaylorJetStatus::
+                                    PoleRejected;
+                            candidate.reason =
+                                "tangent point denominator has no conservative margin";
+                            candidate.poleRejected = true;
+                            arithmetic =
+                                ScaledArithmeticStatus::
+                                    Success;
+                            break;
+                        }
+                        ScaledComplexBall zero;
+                        ScaledComplexBall one;
+                        arithmetic = makeScaledRealValue(
+                            1.0, one.value.re);
+                        ++candidate.operations;
+                        ++candidate.
+                            functionSeriesOperations;
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            break;
+                        ScaledRealValue sineRemainder;
+                        ScaledRealValue cosineRemainder;
+                        const bool hyperbolic =
+                            op == Op::Tanh;
+                        if (!composeEntire(
+                                local, node,
+                                sineRemainder,
+                                meromorphicNumerator.data(),
+                                hyperbolic
+                                    ? ExpressionOracleOperation::
+                                          Sinh
+                                    : ExpressionOracleOperation::
+                                          Sin,
+                                &zero,
+                                &one) ||
+                            !composeEntire(
+                                local, node,
+                                cosineRemainder,
+                                meromorphicDenominator.data(),
+                                hyperbolic
+                                    ? ExpressionOracleOperation::
+                                          Cosh
+                                    : ExpressionOracleOperation::
+                                          Cos,
+                                &one,
+                                &zero)) {
+                            arithmetic =
+                                ScaledArithmeticStatus::
+                                    Success;
+                            break;
+                        }
+                        arithmetic = addBall(
+                            one,
+                            meromorphicDenominator[0],
+                            meromorphicDenominator[0]);
+                        ScaledRealValue
+                            numeratorRemainder;
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            arithmetic = scalePolynomial(
+                                meromorphicDenominator.
+                                    data(),
+                                cosineRemainder,
+                                tangentBase,
+                                functionScratch,
+                                numeratorRemainder);
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            arithmetic =
+                                addPolynomialTerm(
+                                    functionScratch,
+                                    numeratorRemainder,
+                                    meromorphicNumerator,
+                                    sineRemainder,
+                                    false);
+                        ScaledRealValue scaledSineRemainder;
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            arithmetic = scalePolynomial(
+                                meromorphicNumerator.data(),
+                                sineRemainder,
+                                tangentBase,
+                                functionFirst,
+                                scaledSineRemainder);
+                        for (int degree = 0;
+                             arithmetic ==
+                                 ScaledArithmeticStatus::
+                                     Success &&
+                             degree <= order; ++degree)
+                            functionTerm[
+                                static_cast<size_t>(degree)] =
+                                    meromorphicDenominator[
+                                        static_cast<size_t>(
+                                            degree)];
+                        ScaledRealValue denominatorRemainder =
+                            cosineRemainder;
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            arithmetic =
+                                addPolynomialTerm(
+                                    functionTerm,
+                                    denominatorRemainder,
+                                    functionFirst,
+                                    scaledSineRemainder,
+                                    !hyperbolic);
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            break;
+                        if (!dividePolynomials(
+                                functionScratch.data(),
+                                numeratorRemainder,
+                                functionTerm.data(),
+                                denominatorRemainder,
+                                referenceOutput,
+                                &coefficient(local, 0),
+                                remainders[local],
+                                &conservativePoint))
+                            arithmetic =
+                                ScaledArithmeticStatus::
+                                    Success;
+                        break;
+                    }
                     default:
                         arithmetic =
                             ScaledArithmeticStatus::Singular;
@@ -2058,6 +3300,32 @@ bool ExpressionTaylorJetBuilder::build(
     if (!haveBest)
         return finish(lastStatus, lastReason, false);
 
+    size_t resultPeak = validationBytes;
+    if (!checkedAddSize(
+            resultPeak, best.coefficients.capacity(),
+            sizeof(ScaledComplexBall)) ||
+        !checkedAddSize(
+            resultPeak, best.margins.capacity(),
+            sizeof(ScaledRealValue)) ||
+        !checkedAddSize(
+            resultPeak, best.coefficients.size(),
+            sizeof(ScaledComplexValue)) ||
+        !checkedAddSize(
+            resultPeak, best.coefficients.size(),
+            sizeof(ScaledRealValue)))
+        return finish(
+            ExpressionTaylorJetStatus::ResourceLimit,
+            "Taylor result memory calculation overflow",
+            false);
+    peakMemory = std::max(peakMemory, resultPeak);
+    result.memoryBytes = peakMemory;
+    if (request.memoryLimitBytes != 0 &&
+        peakMemory > request.memoryLimitBytes)
+        return finish(
+            ExpressionTaylorJetStatus::ResourceLimit,
+            "Taylor retained result exceeds memory policy",
+            false);
+
     result.order = best.order;
     result.landingIteration = best.landing;
     result.landingSample =
@@ -2074,6 +3342,17 @@ bool ExpressionTaylorJetBuilder::build(
         best.functionSeriesOperations;
     result.maximumFunctionSeriesTail =
         best.maximumFunctionSeriesTail;
+    result.maximumReciprocalOrder =
+        best.maximumReciprocalOrder;
+    result.reciprocalCount =
+        best.reciprocalCount;
+    result.reciprocalOperationCount =
+        best.reciprocalOperations;
+    result.minimumDenominatorClearance =
+        best.minimumDenominatorClearance;
+    result.maximumReciprocalTail =
+        best.maximumReciprocalTail;
+    result.poleRejected = best.poleRejected;
     result.remainderRadius = best.remainder;
     result.intermediateEscapeMargins =
         std::move(best.margins);

@@ -73,14 +73,17 @@ Controls:
 `expression-scaled` runs the non-GUI MPFR-tape/scaled-residual e500 prototype,
 including exact escape comparisons and the scaled-versus-per-pixel-MPFR timing.
 `expression-taylor` verifies the certified adaptive order-8..20 Taylor-jet
-prefix, normalized-frame containment, MPFR landing bounds, renderer parity,
-and the practical acceleration gate.
+prefix for arithmetic, entire functions, and pole-free divide/tan/tanh,
+including normalized-frame containment, reciprocal-tail and denominator
+clearance proofs, MPFR landing bounds, renderer parity, and the practical
+acceleration gate.
 `expression-deep-render` verifies the production-shaped tiled frame API,
 higher-precision-MPFR-relative arithmetic certification, rigorous bailout
 intervals, automatic per-pixel MPFR fallback, cancellation, determinism,
-adversarial views, and e500 timing. Certified arithmetic also falls back
-conservatively near MPFR's runtime exponent limits. Transcendental,
-branch-sensitive, and unsupported programs default to MPFR.
+adversarial views, and e500 timing. Certified paths also fall back
+conservatively near poles and MPFR's runtime exponent limits. Logarithmic,
+power, square-root, argument, absolute-value, and polar programs remain
+outside certified Taylor dispatch and default to MPFR.
 The API is not dispatched by the GUI backend yet.
 
 ### Compute backend
