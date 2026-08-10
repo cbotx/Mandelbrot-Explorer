@@ -398,6 +398,8 @@ ExpressionDeepFallbackReason reasonForCapability(
             CertifiedMeromorphicCandidate:
     case ExpressionScaledResidualCapability::
             CertifiedBranchCandidate:
+    case ExpressionScaledResidualCapability::
+            CertifiedRealCandidate:
         return ExpressionDeepFallbackReason::
             CertificationFailure;
     case ExpressionScaledResidualCapability::UncertifiedSeries:
@@ -422,7 +424,10 @@ bool certifiedTaylorCapability(
                    CertifiedMeromorphicCandidate ||
            capability ==
                ExpressionScaledResidualCapability::
-                   CertifiedBranchCandidate;
+                   CertifiedBranchCandidate ||
+           capability ==
+               ExpressionScaledResidualCapability::
+                   CertifiedRealCandidate;
 }
 
 bool certifiedReferenceCapability(
@@ -798,6 +803,9 @@ bool renderExpressionDeepFrame(
         if (request.taylor.minimumLanding < 1 ||
             request.taylor.minimumOrder < 8 ||
             request.taylor.maximumOrder > 20 ||
+            request.taylor.maximumBivariateOrder < 8 ||
+            request.taylor.maximumBivariateOrder >
+                ExpressionTaylorMaximumBivariateOrder ||
             request.taylor.minimumOrder >
                 request.taylor.order ||
             request.taylor.order >
@@ -1480,6 +1488,9 @@ bool renderExpressionDeepFrame(
                         request.taylor.order;
                     jetRequest.maximumOrder =
                         request.taylor.maximumOrder;
+                    jetRequest.maximumBivariateOrder =
+                        request.taylor.
+                            maximumBivariateOrder;
                     jetRequest.maximumCompositionOrder =
                         request.taylor.
                             maximumCompositionOrder;
@@ -1525,6 +1536,14 @@ bool renderExpressionDeepFrame(
                 result.taylorFailureReason =
                     taylorJet.failureReason;
                 result.taylorOrder = taylorJet.order;
+                result.taylorLayout =
+                    taylorJet.layout;
+                result.taylorMonomialCount =
+                    taylorJet.monomialCount;
+                result.
+                    taylorBivariateConvolutionOperationCount =
+                        taylorJet.
+                            bivariateConvolutionOperationCount;
                 result.taylorCoveredIterations =
                     taylorJet.landingIteration;
                 result.taylorMaximumFunctionSeriesOrder =
@@ -1590,7 +1609,16 @@ bool renderExpressionDeepFrame(
                     const long double evaluation =
                         static_cast<long double>(
                             pixelCount64) *
-                        (2.0L * taylorJet.order + 2.0L);
+                        (taylorJet.layout ==
+                                 ExpressionTaylorJetLayout::
+                                     RealBivariate
+                             ? 2.0L *
+                                   static_cast<long double>(
+                                       taylorJet.
+                                           monomialCount) +
+                                   taylorJet.order + 2.0L
+                             : 2.0L * taylorJet.order +
+                                   2.0L);
                     const long double predictedCost =
                         static_cast<long double>(
                             taylorJet.operationCount) +

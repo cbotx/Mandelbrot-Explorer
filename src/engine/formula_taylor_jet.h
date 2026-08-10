@@ -30,6 +30,25 @@ enum class ExpressionTaylorJetStatus : uint8_t {
 const char* expressionTaylorJetStatusName(
     ExpressionTaylorJetStatus status);
 
+enum class ExpressionTaylorJetLayout : uint8_t {
+    ComplexUnivariate,
+    RealBivariate
+};
+
+const char* expressionTaylorJetLayoutName(
+    ExpressionTaylorJetLayout layout);
+
+constexpr int ExpressionTaylorMaximumBivariateOrder = 12;
+
+bool expressionTaylorBivariateMonomialCount(
+    int order, size_t& count);
+bool expressionTaylorBivariateIndex(
+    int order, int qDegree, int conjugateDegree,
+    size_t& index);
+bool expressionTaylorBivariateExponents(
+    int order, size_t index, int& qDegree,
+    int& conjugateDegree);
+
 struct ExpressionTaylorJetRequest {
     const ExpressionProgram* program = nullptr;
     const ExpressionReferenceOrbitResult* reference = nullptr;
@@ -40,6 +59,10 @@ struct ExpressionTaylorJetRequest {
     int minimumOrder = 8;
     int preferredOrder = 12;
     int maximumOrder = 20;
+    // Real-bivariate jets use triangular storage and quadratic convolution
+    // work, so they have an independent, explicit production cap.
+    int maximumBivariateOrder =
+        ExpressionTaylorMaximumBivariateOrder;
     // Independent function-series composition limit.
     int maximumCompositionOrder = 24;
     int minimumLanding = 8;
@@ -61,9 +84,13 @@ struct ExpressionTaylorJetResult {
     FormulaParameter pixelParameter = FormulaParameter::C;
     ScaledComplexValue parameterScale;
     uint64_t programSemanticHash = 0;
+    ExpressionTaylorJetLayout layout =
+        ExpressionTaylorJetLayout::ComplexUnivariate;
     int landingIteration = 0;
     size_t landingSample = 0;
     int order = 0;
+    size_t monomialCount = 0;
+    uint64_t bivariateConvolutionOperationCount = 0;
     int maximumFunctionSeriesOrder = 0;
     uint64_t functionSeriesCount = 0;
     uint64_t functionSeriesOperationCount = 0;
@@ -111,8 +138,10 @@ public:
 
 class ExpressionTaylorJetEvaluator {
 public:
-    // q may carry a certified construction radius. Evaluation is allocation
-    // free and the immutable jet can be shared by renderer threads.
+    // q may carry a certified construction radius. In real-bivariate mode its
+    // conjugate is derived exactly from the same ball; it is not an
+    // independent pixel input. Evaluation is allocation free and the
+    // immutable jet can be shared by renderer threads.
     static bool evaluate(
         const ExpressionTaylorJetResult& jet,
         const ScaledComplexBall& q,

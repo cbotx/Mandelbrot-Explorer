@@ -915,12 +915,12 @@ enum class InsideStatus : uint8_t {
 InsideStatus certifyInside(
         const ScaledComplexValue& base,
         const ScaledComplexBall* coefficients,
-        int order,
+        size_t coefficientCount,
         const ScaledRealValue& remainder,
         const TaylorThreshold& threshold,
         ScaledRealValue& margin,
         ScaledArithmeticStatus& arithmetic) {
-    if (!coefficients || order < 0 ||
+    if (!coefficients || coefficientCount == 0 ||
         !validRadius(remainder)) {
         arithmetic = ScaledArithmeticStatus::ExponentRange;
         return InsideStatus::Error;
@@ -932,8 +932,8 @@ InsideStatus certifyInside(
     if (arithmetic != ScaledArithmeticStatus::Success)
         return InsideStatus::Error;
     ScaledRealValue tail = remainder;
-    for (int coefficient = 1;
-         coefficient <= order; ++coefficient) {
+    for (size_t coefficient = 1;
+         coefficient < coefficientCount; ++coefficient) {
         ScaledRealValue magnitude;
         arithmetic = upperMagnitude(
             coefficients[coefficient], magnitude);
@@ -980,6 +980,24 @@ InsideStatus certifyInside(
     return InsideStatus::Inside;
 }
 
+InsideStatus certifyInside(
+        const ScaledComplexValue& base,
+        const ScaledComplexBall* coefficients,
+        int order,
+        const ScaledRealValue& remainder,
+        const TaylorThreshold& threshold,
+        ScaledRealValue& margin,
+        ScaledArithmeticStatus& arithmetic) {
+    if (order < 0) {
+        arithmetic = ScaledArithmeticStatus::ExponentRange;
+        return InsideStatus::Error;
+    }
+    return certifyInside(
+        base, coefficients,
+        static_cast<size_t>(order) + 1,
+        remainder, threshold, margin, arithmetic);
+}
+
 struct Candidate {
     ExpressionTaylorJetStatus status =
         ExpressionTaylorJetStatus::NoCoverage;
@@ -990,6 +1008,7 @@ struct Candidate {
     ScaledRealValue remainder;
     std::vector<ScaledRealValue> margins;
     uint64_t operations = 0;
+    uint64_t bivariateConvolutionOperations = 0;
     uint64_t functionSeriesCount = 0;
     uint64_t functionSeriesOperations = 0;
     int maximumFunctionSeriesOrder = 0;
@@ -1047,6 +1066,114 @@ const char* expressionTaylorJetStatusName(
         return "branch-rejected";
     }
     return "invalid-request";
+}
+
+const char* expressionTaylorJetLayoutName(
+        ExpressionTaylorJetLayout layout) {
+    switch (layout) {
+    case ExpressionTaylorJetLayout::ComplexUnivariate:
+        return "complex-univariate";
+    case ExpressionTaylorJetLayout::RealBivariate:
+        return "real-bivariate";
+    }
+    return "complex-univariate";
+}
+
+namespace {
+
+constexpr size_t MaximumBivariateMonomials =
+    (ExpressionTaylorMaximumBivariateOrder + 1) *
+    (ExpressionTaylorMaximumBivariateOrder + 2) / 2;
+
+bool triangularStart(size_t degree, size_t& start) {
+    size_t left = degree;
+    size_t right = degree + 1;
+    if (right == 0)
+        return false;
+    if ((left & 1) == 0)
+        left /= 2;
+    else
+        right /= 2;
+    if (right != 0 &&
+        left > std::numeric_limits<size_t>::max() / right)
+        return false;
+    start = left * right;
+    return true;
+}
+
+} // namespace
+
+bool expressionTaylorBivariateMonomialCount(
+        int order, size_t& count) {
+    count = 0;
+    if (order < 0)
+        return false;
+    const size_t degree = static_cast<size_t>(order);
+    size_t start = 0;
+    if (!triangularStart(degree + 1, start))
+        return false;
+    count = start;
+    return true;
+}
+
+bool expressionTaylorBivariateIndex(
+        int order, int qDegree, int conjugateDegree,
+        size_t& index) {
+    index = 0;
+    if (order < 0 || qDegree < 0 ||
+        conjugateDegree < 0 ||
+        qDegree > order - conjugateDegree)
+        return false;
+    size_t count = 0;
+    if (!expressionTaylorBivariateMonomialCount(
+            order, count))
+        return false;
+    const size_t degree =
+        static_cast<size_t>(qDegree) +
+        static_cast<size_t>(conjugateDegree);
+    size_t start = 0;
+    if (!triangularStart(degree, start) ||
+        static_cast<size_t>(conjugateDegree) >
+            std::numeric_limits<size_t>::max() - start)
+        return false;
+    index =
+        start + static_cast<size_t>(conjugateDegree);
+    return index < count;
+}
+
+bool expressionTaylorBivariateExponents(
+        int order, size_t index, int& qDegree,
+        int& conjugateDegree) {
+    qDegree = 0;
+    conjugateDegree = 0;
+    size_t count = 0;
+    if (!expressionTaylorBivariateMonomialCount(
+            order, count) ||
+        index >= count)
+        return false;
+    size_t low = 0;
+    size_t high = static_cast<size_t>(order) + 1;
+    while (low + 1 < high) {
+        const size_t middle = low + (high - low) / 2;
+        size_t start = 0;
+        if (!triangularStart(middle, start))
+            return false;
+        if (start <= index)
+            low = middle;
+        else
+            high = middle;
+    }
+    size_t start = 0;
+    if (!triangularStart(low, start))
+        return false;
+    const size_t conjugate = index - start;
+    if (conjugate > low ||
+        low > static_cast<size_t>(
+            std::numeric_limits<int>::max()))
+        return false;
+    conjugateDegree = static_cast<int>(conjugate);
+    qDegree = static_cast<int>(low - conjugate);
+    return true;
 }
 
 bool makeExpressionTaylorFrameScale(
@@ -1127,11 +1254,1645 @@ bool expressionTaylorQInsideUnitDisk(
     return compareScaledNonnegative(bound, one) <= 0;
 }
 
+class ExpressionRealTaylorJetBuilder {
+public:
+    static bool build(
+            const ExpressionTaylorJetRequest& request,
+            ExpressionTaylorJetResult& result) {
+        const Clock::time_point start = Clock::now();
+        result = {};
+        result.layout =
+            ExpressionTaylorJetLayout::RealBivariate;
+        auto finish = [&](ExpressionTaylorJetStatus status,
+                          const std::string& reason,
+                          bool success) {
+            result.status = status;
+            result.failureReason = reason;
+            result.buildSeconds =
+                std::chrono::duration<double>(
+                    Clock::now() - start).count();
+            return success;
+        };
+
+        if (!request.program || !request.reference ||
+            !request.program->valid() ||
+            !request.reference->valid ||
+            request.reference->status !=
+                ExpressionReferenceBuildStatus::Success ||
+            !request.reference->
+                certifiedAgainstHigherPrecision ||
+            request.program->scaledResidualCapability() !=
+                ExpressionScaledResidualCapability::
+                    CertifiedRealCandidate ||
+            (request.pixelParameter != FormulaParameter::C &&
+             request.pixelParameter !=
+                 FormulaParameter::InitialZ) ||
+            request.minimumOrder < 8 ||
+            request.maximumOrder > 20 ||
+            request.maximumBivariateOrder < 8 ||
+            request.maximumBivariateOrder >
+                ExpressionTaylorMaximumBivariateOrder ||
+            request.minimumOrder > request.preferredOrder ||
+            request.preferredOrder > request.maximumOrder ||
+            request.minimumOrder >
+                request.maximumBivariateOrder ||
+            request.minimumLanding < 1 ||
+            !(request.bailout > 0.0) ||
+            !std::isfinite(request.bailout) ||
+            !(request.accuracyBudget > 0.0) ||
+            !std::isfinite(request.accuracyBudget) ||
+            !request.parameterScale.isNormalized() ||
+            request.parameterScale.isZero())
+            return finish(
+                ExpressionTaylorJetStatus::InvalidRequest,
+                "real-bivariate Taylor jet request is invalid",
+                false);
+        if (request.reference->programSemanticHash !=
+                request.program->semanticHash() ||
+            request.reference->programSource !=
+                request.program->source())
+            return finish(
+                ExpressionTaylorJetStatus::InvalidTape,
+                "real-bivariate Taylor reference semantic identity mismatch",
+                false);
+        if (request.reference->samples.size() < 2)
+            return finish(
+                ExpressionTaylorJetStatus::NoCoverage,
+                "real-bivariate Taylor reference has no skippable prefix",
+                false);
+        if (certifyScaledMpfrExponentRange(
+                request.parameterScale) !=
+                ScaledArithmeticStatus::Success)
+            return finish(
+                ExpressionTaylorJetStatus::ExponentRange,
+                "real-bivariate Taylor parameter scale is outside MPFR guards",
+                false);
+
+        using Op = ExpressionProgram::Op;
+        for (const ExpressionProgram::Instruction& instruction :
+             request.program->_code) {
+            switch (instruction.op) {
+            case Op::Constant:
+            case Op::Z:
+            case Op::C:
+            case Op::Z0:
+            case Op::Iteration:
+            case Op::Parameter:
+            case Op::Negate:
+            case Op::Add:
+            case Op::Subtract:
+            case Op::Multiply:
+            case Op::Square:
+            case Op::Norm:
+            case Op::Conjugate:
+            case Op::Real:
+            case Op::Imaginary:
+            case Op::MakeComplex:
+                break;
+            default:
+                return finish(
+                    ExpressionTaylorJetStatus::
+                        UnsupportedProgram,
+                    "operation has no certified real-bivariate Taylor semantics",
+                    false);
+            }
+        }
+
+        size_t validationBytes = 0;
+        if (!ExpressionScaledResidualEvaluator::
+                estimateWorkspaceBytes(
+                    *request.program, *request.reference,
+                    validationBytes))
+            return finish(
+                ExpressionTaylorJetStatus::ResourceLimit,
+                "real-bivariate tape validation workspace size overflow",
+                false);
+        if (request.memoryLimitBytes != 0 &&
+            validationBytes > request.memoryLimitBytes)
+            return finish(
+                ExpressionTaylorJetStatus::ResourceLimit,
+                "real-bivariate tape validation exceeds memory policy",
+                false);
+        ExpressionScaledResidualEvaluator validator;
+        try {
+            if (!validator.prepare(
+                    *request.program, *request.reference))
+                return finish(
+                    ExpressionTaylorJetStatus::InvalidTape,
+                    validator.error().empty()
+                        ? "real-bivariate tape validation failed"
+                        : validator.error(),
+                    false);
+        } catch (const std::bad_alloc&) {
+            return finish(
+                ExpressionTaylorJetStatus::ResourceLimit,
+                "real-bivariate tape validation allocation failed",
+                false);
+        } catch (const std::length_error&) {
+            return finish(
+                ExpressionTaylorJetStatus::ResourceLimit,
+                "real-bivariate tape validation length overflow",
+                false);
+        }
+        if (validator.workspaceBytes() > validationBytes)
+            return finish(
+                ExpressionTaylorJetStatus::ResourceLimit,
+                "real-bivariate tape validation exceeded its preflight bound",
+                false);
+
+        ScaledRealValue accuracyBudget;
+        if (makeScaledRealValue(
+                request.accuracyBudget, accuracyBudget) !=
+                ScaledArithmeticStatus::Success)
+            return finish(
+                ExpressionTaylorJetStatus::InvalidRequest,
+                "real-bivariate Taylor accuracy budget is not representable",
+                false);
+        TaylorThreshold threshold;
+        if (!makeThreshold(request.bailout, threshold))
+            return finish(
+                ExpressionTaylorJetStatus::InvalidRequest,
+                "real-bivariate Taylor bailout is not representable",
+                false);
+
+        const int maximumLanding = std::min<int>(
+            request.maximumCandidateIteration > 0
+                ? request.maximumCandidateIteration
+                : static_cast<int>(
+                      request.reference->samples.size()),
+            static_cast<int>(
+                request.reference->samples.size()));
+        if (maximumLanding < request.minimumLanding)
+            return finish(
+                ExpressionTaylorJetStatus::NoCoverage,
+                "real-bivariate reference is shorter than minimum landing",
+                false);
+
+        Candidate best;
+        bool haveBest = false;
+        uint64_t totalOperations = 0;
+        uint64_t totalConvolutionOperations = 0;
+        size_t peakMemory = 0;
+        ExpressionTaylorJetStatus lastStatus =
+            ExpressionTaylorJetStatus::NoCoverage;
+        std::string lastReason =
+            "real-bivariate Taylor prefix has no coverage";
+
+        const int maximumOrder = std::min(
+            request.maximumOrder,
+            request.maximumBivariateOrder);
+        for (int order = request.minimumOrder;
+             order <= maximumOrder; ++order) {
+            if (request.shouldCancel && request.shouldCancel())
+                return finish(
+                    ExpressionTaylorJetStatus::Cancelled,
+                    "real-bivariate Taylor build cancelled",
+                    false);
+
+            size_t monomialCount = 0;
+            if (!expressionTaylorBivariateMonomialCount(
+                    order, monomialCount) ||
+                monomialCount == 0 ||
+                monomialCount >
+                    MaximumBivariateMonomials) {
+                lastStatus =
+                    ExpressionTaylorJetStatus::ResourceLimit;
+                lastReason =
+                    "real-bivariate monomial count overflow";
+                break;
+            }
+            const size_t nodeCount =
+                request.program->instructionCount();
+            if (nodeCount != 0 &&
+                monomialCount >
+                    std::numeric_limits<size_t>::max() /
+                        nodeCount) {
+                lastStatus =
+                    ExpressionTaylorJetStatus::ResourceLimit;
+                lastReason =
+                    "real-bivariate node count overflow";
+                break;
+            }
+            const size_t nodeEntries =
+                nodeCount * monomialCount;
+            size_t candidateBytes = validationBytes;
+            if (haveBest &&
+                (!checkedAddSize(
+                     candidateBytes,
+                     best.coefficients.capacity(),
+                     sizeof(ScaledComplexBall)) ||
+                 !checkedAddSize(
+                     candidateBytes,
+                     best.margins.capacity(),
+                     sizeof(ScaledRealValue)))) {
+                lastStatus =
+                    ExpressionTaylorJetStatus::ResourceLimit;
+                lastReason =
+                    "retained real-bivariate candidate size overflow";
+                break;
+            }
+            if (!checkedAddSize(
+                    candidateBytes, nodeEntries,
+                    sizeof(ScaledComplexBall)) ||
+                !checkedAddSize(
+                    candidateBytes, nodeCount,
+                    sizeof(ScaledRealValue)) ||
+                !checkedAddSize(
+                    candidateBytes, monomialCount * 2,
+                    sizeof(ScaledComplexBall)) ||
+                !checkedAddSize(
+                    candidateBytes,
+                    static_cast<size_t>(maximumLanding) + 1,
+                    sizeof(ScaledRealValue))) {
+                lastStatus =
+                    ExpressionTaylorJetStatus::ResourceLimit;
+                lastReason =
+                    "real-bivariate Taylor workspace size overflow";
+                break;
+            }
+            peakMemory = std::max(
+                peakMemory, candidateBytes);
+            if (request.memoryLimitBytes != 0 &&
+                candidateBytes >
+                    request.memoryLimitBytes) {
+                lastStatus =
+                    ExpressionTaylorJetStatus::ResourceLimit;
+                lastReason =
+                    "real-bivariate Taylor workspace exceeds memory policy";
+                break;
+            }
+
+            Candidate candidate;
+            candidate.order = order;
+            candidate.memoryBytes = candidateBytes;
+            try {
+                std::array<
+                    uint8_t, MaximumBivariateMonomials>
+                    qDegrees{};
+                std::array<
+                    uint8_t, MaximumBivariateMonomials>
+                    conjugateDegrees{};
+                std::array<
+                    size_t, MaximumBivariateMonomials>
+                    conjugateIndices{};
+                for (size_t index = 0;
+                     index < monomialCount; ++index) {
+                    int qDegree = 0;
+                    int conjugateDegree = 0;
+                    size_t conjugateIndex = 0;
+                    if (!expressionTaylorBivariateExponents(
+                            order, index, qDegree,
+                            conjugateDegree) ||
+                        !expressionTaylorBivariateIndex(
+                            order, conjugateDegree,
+                            qDegree, conjugateIndex)) {
+                        candidate.status =
+                            ExpressionTaylorJetStatus::
+                                ResourceLimit;
+                        candidate.reason =
+                            "real-bivariate index mapping failed";
+                        break;
+                    }
+                    qDegrees[index] =
+                        static_cast<uint8_t>(qDegree);
+                    conjugateDegrees[index] =
+                        static_cast<uint8_t>(
+                            conjugateDegree);
+                    conjugateIndices[index] =
+                        conjugateIndex;
+                }
+                if (!candidate.reason.empty())
+                    throw std::length_error(
+                        candidate.reason);
+
+                std::vector<ScaledComplexBall> nodes(
+                    nodeEntries);
+                std::vector<ScaledRealValue> remainders(
+                    nodeCount);
+                std::vector<ScaledComplexBall> state(
+                    monomialCount);
+                std::vector<ScaledComplexBall> nextState(
+                    monomialCount);
+                candidate.margins.reserve(
+                    static_cast<size_t>(maximumLanding) + 1);
+                size_t actualCandidateBytes =
+                    validationBytes;
+                if ((haveBest &&
+                     (!checkedAddSize(
+                          actualCandidateBytes,
+                          best.coefficients.capacity(),
+                          sizeof(ScaledComplexBall)) ||
+                      !checkedAddSize(
+                          actualCandidateBytes,
+                          best.margins.capacity(),
+                          sizeof(ScaledRealValue)))) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        nodes.capacity(),
+                        sizeof(ScaledComplexBall)) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        remainders.capacity(),
+                        sizeof(ScaledRealValue)) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        state.capacity(),
+                        sizeof(ScaledComplexBall)) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        nextState.capacity(),
+                        sizeof(ScaledComplexBall)) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        candidate.margins.capacity(),
+                        sizeof(ScaledRealValue))) {
+                    candidate.status =
+                        ExpressionTaylorJetStatus::
+                            ResourceLimit;
+                    candidate.reason =
+                        "real-bivariate Taylor vector capacity calculation overflow";
+                    throw std::length_error(
+                        candidate.reason);
+                }
+                candidate.memoryBytes =
+                    actualCandidateBytes;
+                peakMemory = std::max(
+                    peakMemory, actualCandidateBytes);
+                if (request.memoryLimitBytes != 0 &&
+                    actualCandidateBytes >
+                        request.memoryLimitBytes) {
+                    candidate.status =
+                        ExpressionTaylorJetStatus::
+                            ResourceLimit;
+                    candidate.reason =
+                        "real-bivariate Taylor vector capacities exceed memory policy";
+                    throw std::length_error(
+                        candidate.reason);
+                }
+
+                auto count = [](uint64_t& target,
+                                uint64_t amount = 1) {
+                    target =
+                        amount >
+                            std::numeric_limits<uint64_t>::
+                                max() - target
+                        ? std::numeric_limits<uint64_t>::max()
+                        : target + amount;
+                };
+                auto coefficient = [&](
+                        size_t node, size_t index)
+                        -> ScaledComplexBall& {
+                    return nodes[
+                        node * monomialCount + index];
+                };
+                auto nodeBase = [&](
+                        size_t sampleOffset, uint16_t node,
+                        ScaledComplexValue& value) {
+                    const ExpressionReferenceTapeNode& tape =
+                        request.reference->tape[
+                            sampleOffset + node];
+                    ScaledArithmeticStatus status =
+                        makeScaledComplexValue(
+                            tape.output,
+                            tape.outputDefect, value);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                    return certifyScaledMpfrExponentRange(
+                        value);
+                };
+                auto addRemainder = [&](
+                        ScaledRealValue& target,
+                        const ScaledRealValue& value) {
+                    count(candidate.operations);
+                    return addUp(target, value);
+                };
+                auto addBall = [&](
+                        const ScaledComplexBall& left,
+                        const ScaledComplexBall& right,
+                        ScaledComplexBall& output) {
+                    count(candidate.operations);
+                    return certifiedScaledAdd(
+                        left, right, output);
+                };
+                auto subtractBall = [&](
+                        const ScaledComplexBall& left,
+                        const ScaledComplexBall& right,
+                        ScaledComplexBall& output) {
+                    count(candidate.operations);
+                    return certifiedScaledSubtract(
+                        left, right, output);
+                };
+                auto multiplyBall = [&](
+                        const ScaledComplexBall& left,
+                        const ScaledComplexBall& right,
+                        ScaledComplexBall& output) {
+                    count(candidate.operations);
+                    return certifiedScaledMultiply(
+                        left, right, output);
+                };
+                auto multiplyBound = [&](
+                        const ScaledRealValue& left,
+                        const ScaledRealValue& right,
+                        ScaledRealValue& output) {
+                    count(candidate.operations);
+                    return multiplyUp(left, right, output);
+                };
+                auto conjugateBall = [&](
+                        const ScaledComplexBall& input,
+                        ScaledComplexBall& output) {
+                    output.value.re = input.value.re;
+                    output.radius = input.radius;
+                    count(candidate.operations);
+                    return scaledNegate(
+                        input.value.im, output.value.im);
+                };
+                auto halfBall = [&](
+                        const ScaledComplexBall& input,
+                        ScaledComplexBall& output) {
+                    count(candidate.operations, 2);
+                    ScaledArithmeticStatus status =
+                        scaledDivideByDouble(
+                            input.value, 2.0,
+                            output.value);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = scaledDivideByDouble(
+                            input.radius, 2.0,
+                            output.radius);
+                    return status;
+                };
+                auto rotateMinusI = [&](
+                        const ScaledComplexBall& input,
+                        ScaledComplexBall& output) {
+                    output.value.re = input.value.im;
+                    output.radius = input.radius;
+                    count(candidate.operations);
+                    return scaledNegate(
+                        input.value.re, output.value.im);
+                };
+                auto rotatePlusI = [&](
+                        const ScaledComplexBall& input,
+                        ScaledComplexBall& output) {
+                    output.value.im = input.value.re;
+                    output.radius = input.radius;
+                    count(candidate.operations);
+                    return scaledNegate(
+                        input.value.im, output.value.re);
+                };
+                auto realCoefficient = [&](
+                        uint16_t source, size_t index,
+                        ScaledComplexBall& output) {
+                    ScaledComplexBall swapped;
+                    ScaledArithmeticStatus status =
+                        conjugateBall(
+                            coefficient(
+                                source,
+                                conjugateIndices[index]),
+                            swapped);
+                    ScaledComplexBall sum;
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addBall(
+                            coefficient(source, index),
+                            swapped, sum);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = halfBall(sum, output);
+                    return status;
+                };
+                auto imaginaryCoefficient = [&](
+                        uint16_t source, size_t index,
+                        ScaledComplexBall& output) {
+                    ScaledComplexBall swapped;
+                    ScaledArithmeticStatus status =
+                        conjugateBall(
+                            coefficient(
+                                source,
+                                conjugateIndices[index]),
+                            swapped);
+                    ScaledComplexBall difference;
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = subtractBall(
+                            coefficient(source, index),
+                            swapped, difference);
+                    ScaledComplexBall rotated;
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = rotateMinusI(
+                            difference, rotated);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = halfBall(
+                            rotated, output);
+                    return status;
+                };
+                auto polynomialSup = [&](
+                        uint16_t node,
+                        ScaledRealValue& output) {
+                    output = {};
+                    for (size_t index = 0;
+                         index < monomialCount; ++index) {
+                        ScaledRealValue magnitude;
+                        ScaledArithmeticStatus status =
+                            upperMagnitude(
+                                coefficient(node, index),
+                                magnitude);
+                        count(candidate.operations);
+                        if (status !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return status;
+                        status = addRemainder(
+                            output, magnitude);
+                        if (status !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return status;
+                    }
+                    return ScaledArithmeticStatus::Success;
+                };
+                auto multiplyPolynomials = [&](
+                        size_t sampleOffset,
+                        uint16_t left, uint16_t right,
+                        bool conjugateRight,
+                        uint16_t outputNode) {
+                    ScaledComplexValue leftBaseValue;
+                    ScaledComplexValue rightBaseValue;
+                    ScaledArithmeticStatus status =
+                        nodeBase(
+                            sampleOffset, left,
+                            leftBaseValue);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                    status = nodeBase(
+                        sampleOffset, right,
+                        rightBaseValue);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                    ScaledComplexBall leftBase;
+                    ScaledComplexBall rightBase;
+                    leftBase.value = leftBaseValue;
+                    rightBase.value = rightBaseValue;
+                    if (conjugateRight) {
+                        ScaledComplexBall conjugated;
+                        status = conjugateBall(
+                            rightBase, conjugated);
+                        if (status !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return status;
+                        rightBase = conjugated;
+                        rightBaseValue = rightBase.value;
+                    }
+
+                    std::array<
+                        ScaledRealValue,
+                        MaximumBivariateMonomials>
+                            leftMagnitudes{};
+                    std::array<
+                        ScaledRealValue,
+                        MaximumBivariateMonomials>
+                            rightMagnitudes{};
+                    ScaledRealValue leftSup;
+                    ScaledRealValue rightSup;
+                    for (size_t index = 0;
+                         index < monomialCount; ++index) {
+                        ScaledComplexBall rightValue;
+                        if (conjugateRight) {
+                            status = conjugateBall(
+                                coefficient(
+                                    right,
+                                    conjugateIndices[index]),
+                                rightValue);
+                        } else {
+                            rightValue =
+                                coefficient(right, index);
+                        }
+                        if (status !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return status;
+
+                        ScaledComplexBall sum;
+                        ScaledComplexBall term;
+                        status = multiplyBall(
+                            leftBase, rightValue, sum);
+                        if (status ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            status = multiplyBall(
+                                rightBase,
+                                coefficient(left, index),
+                                term);
+                        if (status ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            status = addBall(
+                                sum, term, sum);
+                        if (status !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return status;
+                        coefficient(outputNode, index) =
+                            sum;
+
+                        status = upperMagnitude(
+                            coefficient(left, index),
+                            leftMagnitudes[index]);
+                        count(candidate.operations);
+                        if (status ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            status = upperMagnitude(
+                                rightValue,
+                                rightMagnitudes[index]);
+                        count(candidate.operations);
+                        if (status ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            status = addRemainder(
+                                leftSup,
+                                leftMagnitudes[index]);
+                        if (status ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            status = addRemainder(
+                                rightSup,
+                                rightMagnitudes[index]);
+                        if (status !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return status;
+                    }
+
+                    ScaledRealValue leftBaseMagnitude;
+                    ScaledRealValue rightBaseMagnitude;
+                    status = upperMagnitude(
+                        leftBaseValue,
+                        leftBaseMagnitude);
+                    count(candidate.operations);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = upperMagnitude(
+                            rightBaseValue,
+                            rightBaseMagnitude);
+                    count(candidate.operations);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+
+                    ScaledRealValue tail;
+                    auto addProduct = [&](
+                            const ScaledRealValue& first,
+                            const ScaledRealValue& second,
+                            bool doubleProduct = false,
+                            bool convolution = false) {
+                        ScaledRealValue product;
+                        ScaledArithmeticStatus local =
+                            multiplyBound(
+                                first, second, product);
+                        if (convolution)
+                            count(
+                                candidate.
+                                    bivariateConvolutionOperations);
+                        if (local !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return local;
+                        if (doubleProduct) {
+                            ScaledRealValue doubled;
+                            local = scaledAddUp(
+                                product, product,
+                                doubled);
+                            count(candidate.operations);
+                            if (local !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                return local;
+                            product = doubled;
+                        }
+                        local = addRemainder(
+                            tail, product);
+                        if (convolution)
+                            count(
+                                candidate.
+                                    bivariateConvolutionOperations);
+                        return local;
+                    };
+                    status = addProduct(
+                        leftBaseMagnitude,
+                        remainders[right]);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addProduct(
+                            rightBaseMagnitude,
+                            remainders[left]);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addProduct(
+                            leftSup, remainders[right]);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addProduct(
+                            rightSup, remainders[left]);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addProduct(
+                            remainders[left],
+                            remainders[right], true);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+
+                    for (size_t first = 0;
+                         first < monomialCount; ++first) {
+                        for (size_t second = 0;
+                             second < monomialCount;
+                             ++second) {
+                            const int qDegree =
+                                qDegrees[first] +
+                                qDegrees[second];
+                            const int conjugateDegree =
+                                conjugateDegrees[first] +
+                                conjugateDegrees[second];
+                            if (qDegree + conjugateDegree >
+                                    order) {
+                                status = addProduct(
+                                    leftMagnitudes[first],
+                                    rightMagnitudes[second],
+                                    false, true);
+                                if (status !=
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    return status;
+                                continue;
+                            }
+                            size_t outputIndex = 0;
+                            if (!expressionTaylorBivariateIndex(
+                                    order, qDegree,
+                                    conjugateDegree,
+                                    outputIndex))
+                                return
+                                    ScaledArithmeticStatus::
+                                        ExponentRange;
+                            ScaledComplexBall rightValue;
+                            if (conjugateRight) {
+                                status = conjugateBall(
+                                    coefficient(
+                                        right,
+                                        conjugateIndices[
+                                            second]),
+                                    rightValue);
+                            } else {
+                                rightValue =
+                                    coefficient(
+                                        right, second);
+                            }
+                            if (status !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                return status;
+                            ScaledComplexBall term;
+                            status = multiplyBall(
+                                coefficient(left, first),
+                                rightValue, term);
+                            count(
+                                candidate.
+                                    bivariateConvolutionOperations);
+                            if (status ==
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                status = addBall(
+                                    coefficient(
+                                        outputNode,
+                                        outputIndex),
+                                    term,
+                                    coefficient(
+                                        outputNode,
+                                        outputIndex));
+                            count(
+                                candidate.
+                                    bivariateConvolutionOperations);
+                            if (status !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                return status;
+                        }
+                    }
+                    remainders[outputNode] = tail;
+                    return ScaledArithmeticStatus::Success;
+                };
+                auto addNodeRoundoff = [&](
+                        const ExpressionReferenceTapeNode& node,
+                        size_t sampleOffset,
+                        ScaledRealValue& remainder) {
+                    if (request.reference->
+                            certificationPrecision <= 16)
+                        return
+                            ScaledArithmeticStatus::Success;
+                    const bool arithmeticOperation =
+                        node.operation ==
+                            ExpressionOracleOperation::Add ||
+                        node.operation ==
+                            ExpressionOracleOperation::
+                                Subtract ||
+                        node.operation ==
+                            ExpressionOracleOperation::
+                                Multiply ||
+                        node.operation ==
+                            ExpressionOracleOperation::
+                                Square ||
+                        node.operation ==
+                            ExpressionOracleOperation::Norm;
+                    if (!arithmeticOperation)
+                        return
+                            ScaledArithmeticStatus::Success;
+                    auto fullBound = [&](
+                            uint16_t child,
+                            ScaledRealValue& output) {
+                        ScaledComplexValue base;
+                        ScaledArithmeticStatus localStatus =
+                            nodeBase(
+                                sampleOffset, child, base);
+                        if (localStatus !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return localStatus;
+                        ScaledRealValue baseMagnitude;
+                        localStatus = upperMagnitude(
+                            base, baseMagnitude);
+                        count(candidate.operations);
+                        if (localStatus !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return localStatus;
+                        ScaledRealValue polynomial;
+                        localStatus = polynomialSup(
+                            child, polynomial);
+                        if (localStatus !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return localStatus;
+                        output = baseMagnitude;
+                        localStatus = addRemainder(
+                            output, polynomial);
+                        if (localStatus ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            localStatus = addRemainder(
+                                output,
+                                remainders[child]);
+                        if (localStatus ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            localStatus = addRemainder(
+                                output,
+                                remainders[child]);
+                        return localStatus;
+                    };
+
+                    ScaledRealValue left;
+                    ScaledRealValue right;
+                    ScaledRealValue operationMagnitude;
+                    ScaledArithmeticStatus status =
+                        fullBound(node.leftNode, left);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                    if (node.operation ==
+                            ExpressionOracleOperation::
+                                Square ||
+                        node.operation ==
+                            ExpressionOracleOperation::Norm) {
+                        status = multiplyBound(
+                            left, left,
+                            operationMagnitude);
+                    } else {
+                        status = fullBound(
+                            node.rightNode, right);
+                        if (status !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return status;
+                        if (node.operation ==
+                                ExpressionOracleOperation::
+                                    Add ||
+                            node.operation ==
+                                ExpressionOracleOperation::
+                                    Subtract) {
+                            operationMagnitude = left;
+                            status = addRemainder(
+                                operationMagnitude, right);
+                        } else {
+                            status = multiplyBound(
+                                left, right,
+                                operationMagnitude);
+                        }
+                    }
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                    ScaledRealValue scale;
+                    scale.mantissa = 0.5;
+                    scale.exponent =
+                        9 - static_cast<int64_t>(
+                            request.reference->
+                                certificationPrecision);
+                    ScaledRealValue roundoff;
+                    status = multiplyBound(
+                        operationMagnitude, scale,
+                        roundoff);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                    return addRemainder(
+                        remainder, roundoff);
+                };
+
+                size_t qIndex = 0;
+                if (!expressionTaylorBivariateIndex(
+                        order, 1, 0, qIndex)) {
+                    candidate.status =
+                        ExpressionTaylorJetStatus::
+                            ResourceLimit;
+                    candidate.reason =
+                        "real-bivariate q index is unavailable";
+                } else if (request.pixelParameter ==
+                               FormulaParameter::InitialZ) {
+                    state[qIndex].value =
+                        request.parameterScale;
+                }
+                ScaledRealValue stateRemainder =
+                    request.reference->samples[0].zError;
+                if (candidate.reason.empty() &&
+                    request.pixelParameter ==
+                        FormulaParameter::InitialZ &&
+                    addRemainder(
+                        stateRemainder,
+                        request.reference->z0Error) !=
+                        ScaledArithmeticStatus::Success) {
+                    candidate.status =
+                        ExpressionTaylorJetStatus::
+                            ExponentRange;
+                    candidate.reason =
+                        "initial real-bivariate Taylor radius overflow";
+                }
+
+                if (candidate.reason.empty()) {
+                    ScaledComplexValue initialBase;
+                    ScaledArithmeticStatus arithmetic =
+                        makeScaledComplexValue(
+                            request.reference->samples[0].z,
+                            request.reference->samples[0].
+                                zDefect,
+                            initialBase);
+                    ScaledRealValue margin;
+                    const InsideStatus inside =
+                        arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success
+                        ? certifyInside(
+                              initialBase, state.data(),
+                              monomialCount, stateRemainder,
+                              threshold, margin, arithmetic)
+                        : InsideStatus::Error;
+                    if (inside == InsideStatus::Inside) {
+                        candidate.margins.push_back(
+                            margin);
+                    } else {
+                        candidate.status =
+                            inside ==
+                                InsideStatus::Uncertain
+                            ? ExpressionTaylorJetStatus::
+                                  BailoutUncertain
+                            : statusForArithmetic(arithmetic);
+                        candidate.reason =
+                            "initial real-bivariate Taylor frame overlaps bailout";
+                    }
+                }
+
+                int landing = 0;
+                while (candidate.reason.empty() &&
+                       landing < maximumLanding) {
+                    if (request.shouldCancel &&
+                        request.shouldCancel()) {
+                        candidate.status =
+                            ExpressionTaylorJetStatus::
+                                Cancelled;
+                        candidate.reason =
+                            "real-bivariate Taylor build cancelled";
+                        break;
+                    }
+                    const ExpressionReferenceSample& sample =
+                        request.reference->samples[
+                            static_cast<size_t>(landing)];
+                    const size_t sampleOffset =
+                        static_cast<size_t>(
+                            sample.tapeOffset);
+                    std::fill(
+                        nodes.begin(), nodes.end(),
+                        ScaledComplexBall{});
+                    std::fill(
+                        remainders.begin(),
+                        remainders.end(),
+                        ScaledRealValue{});
+                    ScaledArithmeticStatus arithmetic =
+                        ScaledArithmeticStatus::Success;
+
+                    for (size_t local = 0;
+                         local < sample.tapeCount;
+                         ++local) {
+                        const ExpressionReferenceTapeNode&
+                            node =
+                                request.reference->tape[
+                                    sampleOffset + local];
+                        const Op op =
+                            request.program->_code[local].
+                                op;
+                        auto copyNode = [&](
+                                uint16_t source) {
+                            for (size_t index = 0;
+                                 index < monomialCount;
+                                 ++index)
+                                coefficient(local, index) =
+                                    coefficient(
+                                        source, index);
+                            remainders[local] =
+                                remainders[source];
+                        };
+
+                        switch (op) {
+                        case Op::Constant:
+                        case Op::Iteration:
+                        case Op::Parameter:
+                            break;
+                        case Op::Z:
+                            for (size_t index = 0;
+                                 index < monomialCount;
+                                 ++index)
+                                coefficient(local, index) =
+                                    state[index];
+                            remainders[local] =
+                                stateRemainder;
+                            break;
+                        case Op::C:
+                            if (request.pixelParameter ==
+                                    FormulaParameter::C)
+                                coefficient(
+                                    local, qIndex).value =
+                                        request.
+                                            parameterScale;
+                            remainders[local] =
+                                request.reference->cError;
+                            break;
+                        case Op::Z0:
+                            if (request.pixelParameter ==
+                                    FormulaParameter::
+                                        InitialZ)
+                                coefficient(
+                                    local, qIndex).value =
+                                        request.
+                                            parameterScale;
+                            remainders[local] =
+                                request.reference->z0Error;
+                            break;
+                        case Op::Negate:
+                            copyNode(node.leftNode);
+                            for (size_t index = 0;
+                                 index < monomialCount;
+                                 ++index) {
+                                arithmetic = scaledNegate(
+                                    coefficient(
+                                        node.leftNode,
+                                        index).value,
+                                    coefficient(
+                                        local,
+                                        index).value);
+                                count(candidate.operations);
+                                if (arithmetic !=
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    break;
+                            }
+                            break;
+                        case Op::Add:
+                        case Op::Subtract:
+                            for (size_t index = 0;
+                                 index < monomialCount;
+                                 ++index) {
+                                arithmetic =
+                                    op == Op::Add
+                                    ? addBall(
+                                          coefficient(
+                                              node.leftNode,
+                                              index),
+                                          coefficient(
+                                              node.rightNode,
+                                              index),
+                                          coefficient(
+                                              local, index))
+                                    : subtractBall(
+                                          coefficient(
+                                              node.leftNode,
+                                              index),
+                                          coefficient(
+                                              node.rightNode,
+                                              index),
+                                          coefficient(
+                                              local, index));
+                                if (arithmetic !=
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    break;
+                            }
+                            if (arithmetic ==
+                                    ScaledArithmeticStatus::
+                                        Success) {
+                                remainders[local] =
+                                    remainders[
+                                        node.leftNode];
+                                arithmetic = addRemainder(
+                                    remainders[local],
+                                    remainders[
+                                        node.rightNode]);
+                            }
+                            break;
+                        case Op::Multiply:
+                            arithmetic =
+                                multiplyPolynomials(
+                                    sampleOffset,
+                                    node.leftNode,
+                                    node.rightNode, false,
+                                    static_cast<uint16_t>(
+                                        local));
+                            break;
+                        case Op::Square:
+                            arithmetic =
+                                multiplyPolynomials(
+                                    sampleOffset,
+                                    node.leftNode,
+                                    node.leftNode, false,
+                                    static_cast<uint16_t>(
+                                        local));
+                            break;
+                        case Op::Conjugate:
+                            for (size_t index = 0;
+                                 index < monomialCount;
+                                 ++index) {
+                                arithmetic =
+                                    conjugateBall(
+                                        coefficient(
+                                            node.leftNode,
+                                            conjugateIndices[
+                                                index]),
+                                        coefficient(
+                                            local, index));
+                                if (arithmetic !=
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    break;
+                            }
+                            remainders[local] =
+                                remainders[node.leftNode];
+                            break;
+                        case Op::Real:
+                            for (size_t index = 0;
+                                 index < monomialCount;
+                                 ++index) {
+                                arithmetic =
+                                    realCoefficient(
+                                        node.leftNode,
+                                        index,
+                                        coefficient(
+                                            local, index));
+                                if (arithmetic !=
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    break;
+                            }
+                            remainders[local] =
+                                remainders[node.leftNode];
+                            break;
+                        case Op::Imaginary:
+                            for (size_t index = 0;
+                                 index < monomialCount;
+                                 ++index) {
+                                arithmetic =
+                                    imaginaryCoefficient(
+                                        node.leftNode,
+                                        index,
+                                        coefficient(
+                                            local, index));
+                                if (arithmetic !=
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    break;
+                            }
+                            remainders[local] =
+                                remainders[node.leftNode];
+                            break;
+                        case Op::MakeComplex:
+                            for (size_t index = 0;
+                                 index < monomialCount;
+                                 ++index) {
+                                ScaledComplexBall realLeft;
+                                ScaledComplexBall realRight;
+                                ScaledComplexBall imaginary;
+                                arithmetic =
+                                    realCoefficient(
+                                        node.leftNode,
+                                        index, realLeft);
+                                if (arithmetic ==
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    arithmetic =
+                                        realCoefficient(
+                                            node.rightNode,
+                                            index,
+                                            realRight);
+                                if (arithmetic ==
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    arithmetic =
+                                        rotatePlusI(
+                                            realRight,
+                                            imaginary);
+                                if (arithmetic ==
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    arithmetic = addBall(
+                                        realLeft,
+                                        imaginary,
+                                        coefficient(
+                                            local, index));
+                                if (arithmetic !=
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    break;
+                            }
+                            remainders[local] =
+                                remainders[node.leftNode];
+                            if (arithmetic ==
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                arithmetic = addRemainder(
+                                    remainders[local],
+                                    remainders[
+                                        node.rightNode]);
+                            break;
+                        case Op::Norm:
+                            arithmetic =
+                                multiplyPolynomials(
+                                    sampleOffset,
+                                    node.leftNode,
+                                    node.leftNode, true,
+                                    static_cast<uint16_t>(
+                                        local));
+                            break;
+                        default:
+                            arithmetic =
+                                ScaledArithmeticStatus::
+                                    Singular;
+                            break;
+                        }
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            break;
+                        arithmetic = addRemainder(
+                            remainders[local],
+                            node.outputError);
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success)
+                            arithmetic = addNodeRoundoff(
+                                    node, sampleOffset,
+                                remainders[local]);
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            break;
+                        for (size_t index = 0;
+                             index < monomialCount;
+                             ++index) {
+                            if (certifyScaledMpfrExponentRange(
+                                    coefficient(
+                                        local, index)) !=
+                                    ScaledArithmeticStatus::
+                                        Success) {
+                                arithmetic =
+                                    ScaledArithmeticStatus::
+                                        ExponentRange;
+                                break;
+                            }
+                        }
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success ||
+                            certifyScaledMpfrExponentRange(
+                                remainders[local]) !=
+                                ScaledArithmeticStatus::
+                                    Success) {
+                            arithmetic =
+                                ScaledArithmeticStatus::
+                                    ExponentRange;
+                            break;
+                        }
+                    }
+
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success) {
+                        candidate.status =
+                            statusForArithmetic(arithmetic);
+                        candidate.reason =
+                            "real-bivariate Taylor bytecode propagation failed";
+                        break;
+                    }
+                    const uint16_t root = sample.rootNode;
+                    if (compareScaledNonnegative(
+                            remainders[root],
+                            accuracyBudget) > 0) {
+                        candidate.status =
+                            ExpressionTaylorJetStatus::
+                                AccuracyBudget;
+                        candidate.reason =
+                            "real-bivariate Taylor truncation radius exceeds accuracy budget";
+                        break;
+                    }
+
+                    ScaledComplexValue outputBase;
+                    arithmetic = makeScaledComplexValue(
+                        sample.next, sample.rootDefect,
+                        outputBase);
+                    ScaledRealValue margin;
+                    const InsideStatus inside =
+                        arithmetic ==
+                                ScaledArithmeticStatus::
+                                    Success
+                        ? certifyInside(
+                              outputBase,
+                              &coefficient(root, 0),
+                              monomialCount,
+                              remainders[root],
+                              threshold, margin,
+                              arithmetic)
+                        : InsideStatus::Error;
+                    if (inside != InsideStatus::Inside) {
+                        candidate.status =
+                            inside ==
+                                InsideStatus::Uncertain
+                            ? ExpressionTaylorJetStatus::
+                                  BailoutUncertain
+                            : statusForArithmetic(arithmetic);
+                        candidate.reason =
+                            "real-bivariate Taylor prefix reaches an uncertain or escaping state";
+                        break;
+                    }
+
+                    if (static_cast<size_t>(landing + 1) ==
+                            request.reference->
+                                samples.size()) {
+                        for (size_t index = 0;
+                             index < monomialCount;
+                             ++index)
+                            state[index] =
+                                coefficient(root, index);
+                        stateRemainder =
+                            remainders[root];
+                        ++landing;
+                        candidate.margins.push_back(
+                            margin);
+                        candidate.
+                            landingUsesSampleOutput = true;
+                        break;
+                    }
+
+                    const ExpressionReferenceSample&
+                        nextSample =
+                            request.reference->samples[
+                                static_cast<size_t>(
+                                    landing + 1)];
+                    ScaledComplexValue nextBaseValue;
+                    arithmetic = makeScaledComplexValue(
+                        nextSample.z,
+                        nextSample.zDefect,
+                        nextBaseValue);
+                    ScaledComplexBall rootBase;
+                    ScaledComplexBall nextBase;
+                    rootBase.value = outputBase;
+                    nextBase.value = nextBaseValue;
+                    ScaledComplexBall rebase;
+                    if (arithmetic ==
+                            ScaledArithmeticStatus::Success)
+                        arithmetic = subtractBall(
+                            rootBase, nextBase, rebase);
+                    for (size_t index = 0;
+                         arithmetic ==
+                             ScaledArithmeticStatus::
+                                 Success &&
+                         index < monomialCount;
+                         ++index)
+                        nextState[index] =
+                            coefficient(root, index);
+                    if (arithmetic ==
+                            ScaledArithmeticStatus::Success)
+                        arithmetic = addBall(
+                            nextState[0], rebase,
+                            nextState[0]);
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success) {
+                        candidate.status =
+                            statusForArithmetic(arithmetic);
+                        candidate.reason =
+                            "real-bivariate Taylor compact rebase failed";
+                        break;
+                    }
+                    state.swap(nextState);
+                    stateRemainder = remainders[root];
+                    ++landing;
+                    candidate.margins.push_back(margin);
+                }
+
+                candidate.landing = landing;
+                candidate.coefficients =
+                    std::move(state);
+                candidate.remainder = stateRemainder;
+                if (candidate.reason.empty())
+                    candidate.status =
+                        ExpressionTaylorJetStatus::Success;
+            } catch (const std::bad_alloc&) {
+                candidate.status =
+                    ExpressionTaylorJetStatus::
+                        ResourceLimit;
+                candidate.reason =
+                    "real-bivariate Taylor workspace allocation failed";
+            } catch (const std::length_error&) {
+                if (candidate.reason.empty()) {
+                    candidate.status =
+                        ExpressionTaylorJetStatus::
+                            ResourceLimit;
+                    candidate.reason =
+                        "real-bivariate Taylor workspace length overflow";
+                }
+            }
+
+            totalOperations =
+                candidate.operations >
+                    std::numeric_limits<uint64_t>::max() -
+                        totalOperations
+                ? std::numeric_limits<uint64_t>::max()
+                : totalOperations + candidate.operations;
+            totalConvolutionOperations =
+                candidate.bivariateConvolutionOperations >
+                    std::numeric_limits<uint64_t>::max() -
+                        totalConvolutionOperations
+                ? std::numeric_limits<uint64_t>::max()
+                : totalConvolutionOperations +
+                      candidate.
+                          bivariateConvolutionOperations;
+            lastStatus = candidate.status;
+            lastReason = candidate.reason.empty()
+                ? expressionTaylorJetStatusName(
+                      candidate.status)
+                : candidate.reason;
+            if (!haveBest ||
+                candidate.landing > best.landing ||
+                (candidate.landing == best.landing &&
+                 candidate.order < best.order)) {
+                best = std::move(candidate);
+                haveBest = true;
+            }
+            if (haveBest &&
+                best.landing >= maximumLanding)
+                break;
+            if (lastStatus ==
+                    ExpressionTaylorJetStatus::Cancelled ||
+                lastStatus ==
+                    ExpressionTaylorJetStatus::
+                        ResourceLimit ||
+                lastStatus ==
+                    ExpressionTaylorJetStatus::
+                        ExponentRange ||
+                lastStatus ==
+                    ExpressionTaylorJetStatus::Nonfinite)
+                break;
+        }
+
+        result.operationCount = totalOperations;
+        result.bivariateConvolutionOperationCount =
+            totalConvolutionOperations;
+        result.memoryBytes = peakMemory;
+        result.pixelParameter = request.pixelParameter;
+        result.parameterScale = request.parameterScale;
+        result.programSemanticHash =
+            request.program->semanticHash();
+        if (lastStatus ==
+                ExpressionTaylorJetStatus::Cancelled)
+            return finish(
+                ExpressionTaylorJetStatus::Cancelled,
+                lastReason, false);
+        if (!haveBest)
+            return finish(
+                lastStatus, lastReason, false);
+
+        try {
+            result.coefficients.reserve(
+                best.coefficients.size());
+            result.coefficientRadii.reserve(
+                best.coefficients.size());
+        } catch (const std::bad_alloc&) {
+            return finish(
+                ExpressionTaylorJetStatus::ResourceLimit,
+                "real-bivariate Taylor result allocation failed",
+                false);
+        } catch (const std::length_error&) {
+            return finish(
+                ExpressionTaylorJetStatus::ResourceLimit,
+                "real-bivariate Taylor result length overflow",
+                false);
+        }
+        size_t resultPeak = validationBytes;
+        if (!checkedAddSize(
+                resultPeak,
+                best.coefficients.capacity(),
+                sizeof(ScaledComplexBall)) ||
+            !checkedAddSize(
+                resultPeak, best.margins.capacity(),
+                sizeof(ScaledRealValue)) ||
+            !checkedAddSize(
+                resultPeak, result.coefficients.capacity(),
+                sizeof(ScaledComplexValue)) ||
+            !checkedAddSize(
+                resultPeak,
+                result.coefficientRadii.capacity(),
+                sizeof(ScaledRealValue)))
+            return finish(
+                ExpressionTaylorJetStatus::ResourceLimit,
+                "real-bivariate Taylor result memory calculation overflow",
+                false);
+        peakMemory = std::max(peakMemory, resultPeak);
+        result.memoryBytes = peakMemory;
+        if (request.memoryLimitBytes != 0 &&
+            peakMemory > request.memoryLimitBytes)
+            return finish(
+                ExpressionTaylorJetStatus::ResourceLimit,
+                "real-bivariate Taylor retained result exceeds memory policy",
+                false);
+
+        result.order = best.order;
+        result.monomialCount =
+            best.coefficients.size();
+        result.landingIteration = best.landing;
+        result.landingSample =
+            best.landingUsesSampleOutput
+            ? static_cast<size_t>(best.landing - 1)
+            : static_cast<size_t>(best.landing);
+        result.landingUsesSampleOutput =
+            best.landingUsesSampleOutput;
+        result.remainderRadius = best.remainder;
+        result.intermediateEscapeMargins =
+            std::move(best.margins);
+        for (const ScaledComplexBall& coefficient :
+             best.coefficients) {
+            result.coefficients.push_back(
+                coefficient.value);
+            result.coefficientRadii.push_back(
+                coefficient.radius);
+        }
+        if (best.landing < request.minimumLanding)
+            return finish(
+                best.status ==
+                    ExpressionTaylorJetStatus::Success
+                    ? ExpressionTaylorJetStatus::NoCoverage
+                    : best.status,
+                best.reason.empty()
+                    ? "real-bivariate Taylor prefix is shorter than minimum landing"
+                    : best.reason,
+                false);
+
+        result.valid = true;
+        result.certified = true;
+        return finish(
+            ExpressionTaylorJetStatus::Success,
+            best.reason, true);
+    }
+};
+
 bool ExpressionTaylorJetBuilder::build(
         const ExpressionTaylorJetRequest& request,
         ExpressionTaylorJetResult& result) {
     const Clock::time_point start = Clock::now();
     result = {};
+    if (request.program && request.program->valid() &&
+        request.program->scaledResidualCapability() ==
+            ExpressionScaledResidualCapability::
+                CertifiedRealCandidate)
+        return ExpressionRealTaylorJetBuilder::build(
+            request, result);
     auto finish = [&](ExpressionTaylorJetStatus status,
                       const std::string& reason,
                       bool success) {
@@ -4489,6 +6250,10 @@ bool ExpressionTaylorJetBuilder::build(
             false);
 
     result.order = best.order;
+    result.layout =
+        ExpressionTaylorJetLayout::ComplexUnivariate;
+    result.monomialCount =
+        static_cast<size_t>(best.order) + 1;
     result.landingIteration = best.landing;
     result.landingSample =
         best.landingUsesSampleOutput
@@ -4564,10 +6329,21 @@ bool ExpressionTaylorJetEvaluator::evaluate(
         const ScaledComplexBall& q,
         ExpressionTaylorJetEvaluation& result) {
     result = {};
+    size_t expectedCoefficientCount = 0;
+    if (jet.layout ==
+            ExpressionTaylorJetLayout::RealBivariate) {
+        if (!expressionTaylorBivariateMonomialCount(
+                jet.order, expectedCoefficientCount))
+            expectedCoefficientCount = 0;
+    } else if (jet.order >= 0) {
+        expectedCoefficientCount =
+            static_cast<size_t>(jet.order) + 1;
+    }
     if (!jet.valid || !jet.certified ||
         jet.order < 1 ||
         jet.coefficients.size() !=
-            static_cast<size_t>(jet.order) + 1 ||
+            expectedCoefficientCount ||
+        jet.monomialCount != expectedCoefficientCount ||
         jet.coefficientRadii.size() !=
             jet.coefficients.size() ||
         !validRadius(jet.remainderRadius) ||
@@ -4577,14 +6353,13 @@ bool ExpressionTaylorJetEvaluator::evaluate(
         return false;
     }
     ScaledComplexBall value;
-    value.value = jet.coefficients.back();
-    value.radius = jet.coefficientRadii.back();
-    for (int degree = jet.order - 1;
-         degree >= 0; --degree) {
-        ScaledComplexBall product;
+    if (jet.layout ==
+            ExpressionTaylorJetLayout::RealBivariate) {
+        ScaledComplexBall conjugateQ = q;
         ScaledArithmeticStatus arithmetic =
-            certifiedScaledMultiply(
-                value, q, product);
+            scaledNegate(
+                q.value.im,
+                conjugateQ.value.im);
         ++result.operationCount;
         if (arithmetic !=
                 ScaledArithmeticStatus::Success) {
@@ -4592,21 +6367,170 @@ bool ExpressionTaylorJetEvaluator::evaluate(
                 statusForArithmetic(arithmetic);
             return false;
         }
-        ScaledComplexBall coefficient;
-        coefficient.value =
-            jet.coefficients[
-                static_cast<size_t>(degree)];
-        coefficient.radius =
-            jet.coefficientRadii[
-                static_cast<size_t>(degree)];
-        arithmetic = certifiedScaledAdd(
-            product, coefficient, value);
-        ++result.operationCount;
-        if (arithmetic !=
-                ScaledArithmeticStatus::Success) {
-            result.status =
-                statusForArithmetic(arithmetic);
-            return false;
+        bool haveValue = false;
+        for (int conjugateDegree = jet.order;
+             conjugateDegree >= 0;
+             --conjugateDegree) {
+            const int maximumQDegree =
+                jet.order - conjugateDegree;
+            size_t coefficientIndex = 0;
+            if (!expressionTaylorBivariateIndex(
+                    jet.order, maximumQDegree,
+                    conjugateDegree,
+                    coefficientIndex)) {
+                result.status =
+                    ExpressionTaylorJetStatus::
+                        InvalidRequest;
+                return false;
+            }
+            ScaledComplexBall row;
+            row.value =
+                jet.coefficients[coefficientIndex];
+            row.radius =
+                jet.coefficientRadii[coefficientIndex];
+            for (int qDegree = maximumQDegree - 1;
+                 qDegree >= 0; --qDegree) {
+                ScaledComplexBall product;
+                arithmetic = certifiedScaledMultiply(
+                    row, q, product);
+                ++result.operationCount;
+                if (arithmetic !=
+                        ScaledArithmeticStatus::
+                            Success) {
+                    result.status =
+                        statusForArithmetic(arithmetic);
+                    return false;
+                }
+                if (!expressionTaylorBivariateIndex(
+                        jet.order, qDegree,
+                        conjugateDegree,
+                        coefficientIndex)) {
+                    result.status =
+                        ExpressionTaylorJetStatus::
+                            InvalidRequest;
+                    return false;
+                }
+                ScaledComplexBall coefficient;
+                coefficient.value =
+                    jet.coefficients[
+                        coefficientIndex];
+                coefficient.radius =
+                    jet.coefficientRadii[
+                        coefficientIndex];
+                const bool productZero =
+                    product.value.isZero() &&
+                    product.radius.isZero();
+                const bool coefficientZero =
+                    coefficient.value.isZero() &&
+                    coefficient.radius.isZero();
+                if (productZero && coefficientZero) {
+                    row = product;
+                    row.value.re.mantissa =
+                        std::signbit(product.value.re.mantissa) ||
+                        std::signbit(coefficient.value.re.mantissa)
+                        ? -0.0 : 0.0;
+                    row.value.im.mantissa =
+                        std::signbit(product.value.im.mantissa) ||
+                        std::signbit(coefficient.value.im.mantissa)
+                        ? -0.0 : 0.0;
+                } else if (productZero) {
+                    row = coefficient;
+                } else if (coefficientZero) {
+                    row = product;
+                } else {
+                    arithmetic = certifiedScaledAdd(
+                        product, coefficient, row);
+                    ++result.operationCount;
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::
+                                Success) {
+                        result.status =
+                            statusForArithmetic(arithmetic);
+                        return false;
+                    }
+                }
+            }
+            if (!haveValue) {
+                value = row;
+                haveValue = true;
+            } else {
+                ScaledComplexBall product;
+                arithmetic = certifiedScaledMultiply(
+                    value, conjugateQ, product);
+                ++result.operationCount;
+                if (arithmetic !=
+                        ScaledArithmeticStatus::
+                            Success) {
+                    result.status =
+                        statusForArithmetic(arithmetic);
+                    return false;
+                }
+                const bool productZero =
+                    product.value.isZero() &&
+                    product.radius.isZero();
+                const bool rowZero =
+                    row.value.isZero() &&
+                    row.radius.isZero();
+                if (productZero && rowZero) {
+                    value = product;
+                    value.value.re.mantissa =
+                        std::signbit(product.value.re.mantissa) ||
+                        std::signbit(row.value.re.mantissa)
+                        ? -0.0 : 0.0;
+                    value.value.im.mantissa =
+                        std::signbit(product.value.im.mantissa) ||
+                        std::signbit(row.value.im.mantissa)
+                        ? -0.0 : 0.0;
+                } else if (productZero) {
+                    value = row;
+                } else if (rowZero) {
+                    value = product;
+                } else {
+                    arithmetic = certifiedScaledAdd(
+                        product, row, value);
+                    ++result.operationCount;
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::
+                                Success) {
+                        result.status =
+                            statusForArithmetic(arithmetic);
+                        return false;
+                    }
+                }
+            }
+        }
+    } else {
+        value.value = jet.coefficients.back();
+        value.radius = jet.coefficientRadii.back();
+        for (int degree = jet.order - 1;
+             degree >= 0; --degree) {
+            ScaledComplexBall product;
+            ScaledArithmeticStatus arithmetic =
+                certifiedScaledMultiply(
+                    value, q, product);
+            ++result.operationCount;
+            if (arithmetic !=
+                    ScaledArithmeticStatus::Success) {
+                result.status =
+                    statusForArithmetic(arithmetic);
+                return false;
+            }
+            ScaledComplexBall coefficient;
+            coefficient.value =
+                jet.coefficients[
+                    static_cast<size_t>(degree)];
+            coefficient.radius =
+                jet.coefficientRadii[
+                    static_cast<size_t>(degree)];
+            arithmetic = certifiedScaledAdd(
+                product, coefficient, value);
+            ++result.operationCount;
+            if (arithmetic !=
+                    ScaledArithmeticStatus::Success) {
+                result.status =
+                    statusForArithmetic(arithmetic);
+                return false;
+            }
         }
     }
     if (addUp(

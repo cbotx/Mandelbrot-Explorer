@@ -19,6 +19,7 @@ class ExpressionOrbitPlan;
 class ExpressionCenteredEvaluator;
 class ExpressionScaledResidualEvaluator;
 class ExpressionTaylorJetBuilder;
+class ExpressionRealTaylorJetBuilder;
 
 struct ExpressionError {
     size_t position = 0;
@@ -53,6 +54,7 @@ enum class ExpressionScaledResidualCapability : uint8_t {
     CertifiedEntireCandidate,
     CertifiedMeromorphicCandidate,
     CertifiedBranchCandidate,
+    CertifiedRealCandidate,
     UncertifiedSeries,
     BranchSensitive,
     Unsupported
@@ -155,6 +157,7 @@ private:
     friend class ExpressionCenteredEvaluator;
     friend class ExpressionScaledResidualEvaluator;
     friend class ExpressionTaylorJetBuilder;
+    friend class ExpressionRealTaylorJetBuilder;
 };
 
 class ExpressionOrbitPlan {

@@ -6363,6 +6363,33 @@ static int runExpressionTaylorCase() {
         { "quadratic-c-e1000", "z*z+c",
           FormulaParameter::C, quadratic,
           "-0.25", "0.1", -3600, 3600, true },
+        { "conjugate-c-e500", "conj(z)+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -1800, 1800, false },
+        { "real-c-e500", "real(z)+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -1800, 1800, false },
+        { "imaginary-c-e500",
+          "imag(z)*complex(0,1)+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -1800, 1800, false },
+        { "norm-c-e500", "norm(z)+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -1800, 1800, false },
+        { "make-complex-c-e500",
+          "complex(real(z),imag(c))+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -1800, 1800, false },
+        { "mixed-real-polynomial-e500",
+          "(z*z+c)*conj(z+c)+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -1800, 1800, false },
+        { "conjugate-z0-e500", "conj(z)+c",
+          FormulaParameter::InitialZ, z0Plane,
+          "0", "0", -1800, 1800, false },
+        { "norm-c-e1000", "norm(z)+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -3600, 3600, false },
         { "exp-moderate", "exp(z)-1+c",
           FormulaParameter::C, quadratic,
           "0", "0", -3, 512, true },
@@ -6493,12 +6520,29 @@ static int runExpressionTaylorCase() {
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
                     CertifiedBranchCandidate;
-        if (!ExpressionTaylorJetBuilder::build(
-                request, jet) ||
+        const bool realCandidate =
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    CertifiedRealCandidate;
+        const bool built =
+            ExpressionTaylorJetBuilder::build(
+                request, jet);
+        size_t expectedCoefficientCount =
+            static_cast<size_t>(jet.order) + 1;
+        if (realCandidate &&
+            !formula::expressionTaylorBivariateMonomialCount(
+                jet.order, expectedCoefficientCount))
+            expectedCoefficientCount = 0;
+        if (!built ||
             jet.landingIteration < 1 ||
             !jet.certified ||
             jet.coefficients.size() !=
-                static_cast<size_t>(jet.order) + 1 ||
+                expectedCoefficientCount ||
+            jet.monomialCount != expectedCoefficientCount ||
+            (realCandidate &&
+             (jet.layout !=
+                  formula::ExpressionTaylorJetLayout::
+                      RealBivariate)) ||
             (entireCandidate &&
              (jet.functionSeriesCount == 0 ||
               jet.functionSeriesOperationCount == 0 ||
@@ -6664,6 +6708,27 @@ static int runExpressionTaylorCase() {
             { "pow(z,2.5)+c",
               formula::ExpressionScaledResidualCapability::
                   CertifiedBranchCandidate },
+            { "conj(z)+c",
+              formula::ExpressionScaledResidualCapability::
+                  CertifiedRealCandidate },
+            { "real(z)+c",
+              formula::ExpressionScaledResidualCapability::
+                  CertifiedRealCandidate },
+            { "imag(z)+c",
+              formula::ExpressionScaledResidualCapability::
+                  CertifiedRealCandidate },
+            { "norm(z)+c",
+              formula::ExpressionScaledResidualCapability::
+                  CertifiedRealCandidate },
+            { "complex(real(z),imag(c))+c",
+              formula::ExpressionScaledResidualCapability::
+                  CertifiedRealCandidate },
+            { "sin(conj(z))+c",
+              formula::ExpressionScaledResidualCapability::
+                  Unsupported },
+            { "conj(z)/(c+2)+c",
+              formula::ExpressionScaledResidualCapability::
+                  Unsupported },
             { "arg(z)+c",
               formula::ExpressionScaledResidualCapability::
                   BranchSensitive },
@@ -6696,30 +6761,211 @@ static int runExpressionTaylorCase() {
         }
     }
     {
-        ProgramPair pair;
-        ExpressionReferenceOrbitResult reference;
-        ExpressionContext fixed;
-        bool okay = compilePair(
-            "conj(z)+c", FormulaParameter::C,
-            fixed, pair) &&
-            buildReference(
-                pair, fixed, FormulaParameter::C,
-                "0", "0", 12, 512, reference);
-        ExpressionTaylorJetRequest request;
-        request.program = &pair.runtime;
-        request.reference = &reference;
-        request.pixelParameter = FormulaParameter::C;
-        request.parameterScale = makeScale(-600);
-        request.minimumLanding = 1;
-        ExpressionTaylorJetResult jet;
-        okay = okay &&
-            !ExpressionTaylorJetBuilder::build(
-                request, jet) &&
-            jet.status ==
-                ExpressionTaylorJetStatus::
-                    UnsupportedProgram;
+        size_t count = 0;
+        size_t qIndex = 0;
+        size_t conjugateIndex = 0;
+        int qDegree = -1;
+        int conjugateDegree = -1;
+        const bool okay =
+            formula::expressionTaylorBivariateMonomialCount(
+                8, count) &&
+            count == 45 &&
+            formula::expressionTaylorBivariateIndex(
+                8, 1, 0, qIndex) &&
+            formula::expressionTaylorBivariateIndex(
+                8, 0, 1, conjugateIndex) &&
+            qIndex == 1 && conjugateIndex == 2 &&
+            formula::expressionTaylorBivariateExponents(
+                8, conjugateIndex, qDegree,
+                conjugateDegree) &&
+            qDegree == 0 && conjugateDegree == 1;
         if (!okay) {
-            printf("  Taylor non-holomorphic rejection failed\n");
+            printf("  real-bivariate Taylor index mapping failed\n");
+            ++failures;
+        }
+    }
+    {
+        auto buildIdentityJet = [&](
+                const char* source,
+                ExpressionTaylorJetResult& jet) {
+            ProgramPair pair;
+            ExpressionReferenceOrbitResult reference;
+            ExpressionContext fixed;
+            if (!compilePair(
+                    source, FormulaParameter::C,
+                    fixed, pair) ||
+                !buildReference(
+                    pair, fixed, FormulaParameter::C,
+                    "0", "0", 2, 512, reference))
+                return false;
+            ExpressionTaylorJetRequest request;
+            request.program = &pair.runtime;
+            request.reference = &reference;
+            request.pixelParameter = FormulaParameter::C;
+            request.parameterScale = makeScale(-100);
+            request.minimumLanding = 1;
+            request.maximumCandidateIteration = 1;
+            return ExpressionTaylorJetBuilder::build(
+                       request, jet) &&
+                   jet.layout ==
+                       formula::ExpressionTaylorJetLayout::
+                           RealBivariate;
+        };
+        auto sameScaled = [](
+                const ScaledRealValue& left,
+                const ScaledRealValue& right) {
+            return left.mantissa == right.mantissa &&
+                   left.exponent == right.exponent;
+        };
+        auto containsZero = [](
+                const ScaledComplexBall& ball) {
+            ScaledRealValue real = ball.value.re;
+            ScaledRealValue imaginary = ball.value.im;
+            real.mantissa = std::abs(real.mantissa);
+            imaginary.mantissa =
+                std::abs(imaginary.mantissa);
+            return formula::compareScaledNonnegative(
+                       real, ball.radius) <= 0 &&
+                   formula::compareScaledNonnegative(
+                       imaginary, ball.radius) <= 0;
+        };
+        auto symmetryHolds = [&](
+                const ExpressionTaylorJetResult& jet) {
+            for (size_t index = 0;
+                 index < jet.coefficients.size();
+                 ++index) {
+                int qDegree = 0;
+                int conjugateDegree = 0;
+                size_t swappedIndex = 0;
+                if (!formula::
+                        expressionTaylorBivariateExponents(
+                            jet.order, index, qDegree,
+                            conjugateDegree) ||
+                    !formula::expressionTaylorBivariateIndex(
+                        jet.order, conjugateDegree,
+                        qDegree, swappedIndex))
+                    return false;
+                ScaledComplexBall left{
+                    jet.coefficients[index],
+                    jet.coefficientRadii[index] };
+                ScaledComplexBall right{
+                    jet.coefficients[swappedIndex],
+                    jet.coefficientRadii[swappedIndex] };
+                if (formula::scaledNegate(
+                        right.value.im,
+                        right.value.im) !=
+                        ScaledArithmeticStatus::Success)
+                    return false;
+                ScaledComplexBall difference;
+                if (formula::certifiedScaledSubtract(
+                        left, right, difference) !=
+                        ScaledArithmeticStatus::Success ||
+                    !containsZero(difference))
+                    return false;
+            }
+            return true;
+        };
+
+        size_t qIndex = 0;
+        size_t conjugateIndex = 0;
+        size_t normIndex = 0;
+        bool okay =
+            formula::expressionTaylorBivariateIndex(
+                8, 1, 0, qIndex) &&
+            formula::expressionTaylorBivariateIndex(
+                8, 0, 1, conjugateIndex) &&
+            formula::expressionTaylorBivariateIndex(
+                8, 1, 1, normIndex);
+        const ScaledComplexValue scale = makeScale(-100);
+        ScaledRealValue halfScale;
+        ScaledRealValue normScale;
+        okay = okay &&
+            formula::scaledDivideByDouble(
+                scale.re, 2.0, halfScale) ==
+                ScaledArithmeticStatus::Success &&
+            formula::scaledMultiply(
+                scale.re, scale.re, normScale) ==
+                ScaledArithmeticStatus::Success;
+
+        ExpressionTaylorJetResult conjugateJet;
+        okay = okay &&
+            buildIdentityJet("conj(c)", conjugateJet) &&
+            conjugateJet.coefficients[qIndex].isZero() &&
+            sameScaled(
+                conjugateJet.coefficients[
+                    conjugateIndex].re,
+                scale.re) &&
+            conjugateJet.coefficients[
+                conjugateIndex].im.isZero() &&
+            std::signbit(
+                conjugateJet.coefficients[
+                    conjugateIndex].im.mantissa);
+        ScaledComplexBall signedAxisQ;
+        ExpressionTaylorJetEvaluation conjugateEvaluation;
+        okay = okay &&
+            formula::makeScaledComplexValue(
+                Complex{ 0.5, 0.0 },
+                signedAxisQ.value) ==
+                    ScaledArithmeticStatus::Success &&
+            ExpressionTaylorJetEvaluator::evaluate(
+                conjugateJet, signedAxisQ,
+                conjugateEvaluation) &&
+            conjugateEvaluation.residual.value.im.isZero() &&
+            std::signbit(
+                conjugateEvaluation.residual.value.im.mantissa);
+
+        ExpressionTaylorJetResult realJet;
+        okay = okay &&
+            buildIdentityJet("real(c)", realJet) &&
+            sameScaled(
+                realJet.coefficients[qIndex].re,
+                halfScale) &&
+            sameScaled(
+                realJet.coefficients[
+                    conjugateIndex].re,
+                halfScale) &&
+            symmetryHolds(realJet);
+
+        ExpressionTaylorJetResult imaginaryJet;
+        okay = okay &&
+            buildIdentityJet("imag(c)", imaginaryJet) &&
+            sameScaled(
+                imaginaryJet.coefficients[qIndex].im,
+                ScaledRealValue{
+                    -halfScale.mantissa,
+                    halfScale.exponent }) &&
+            sameScaled(
+                imaginaryJet.coefficients[
+                    conjugateIndex].im,
+                halfScale) &&
+            symmetryHolds(imaginaryJet);
+
+        ExpressionTaylorJetResult normJet;
+        okay = okay &&
+            buildIdentityJet("norm(c)", normJet) &&
+            sameScaled(
+                normJet.coefficients[normIndex].re,
+                normScale) &&
+            normJet.coefficients[normIndex].im.isZero() &&
+            normJet.bivariateConvolutionOperationCount > 0 &&
+            symmetryHolds(normJet);
+
+        ExpressionTaylorJetResult makeComplexJet;
+        okay = okay &&
+            buildIdentityJet(
+                "complex(real(c),imag(c))",
+                makeComplexJet) &&
+            sameScaled(
+                makeComplexJet.coefficients[qIndex].re,
+                scale.re) &&
+            makeComplexJet.coefficients[qIndex].im.isZero() &&
+            containsZero(ScaledComplexBall{
+                makeComplexJet.coefficients[
+                    conjugateIndex],
+                makeComplexJet.coefficientRadii[
+                    conjugateIndex] });
+        if (!okay) {
+            printf("  real-bivariate coefficient identities failed\n");
             ++failures;
         }
     }
@@ -6924,6 +7170,79 @@ static int runExpressionTaylorCase() {
         }
         if (!okay) {
             printf("  branch Taylor workspace accounting failed\n");
+            ++failures;
+        }
+    }
+    // Real-bivariate workspace accounting includes triangular node storage,
+    // retained best candidates, and the quadratic convolution workset.
+    {
+        ProgramPair pair;
+        ExpressionReferenceOrbitResult reference;
+        ExpressionContext fixed;
+        bool okay = compilePair(
+            "(z*z+c)*conj(z+c)+norm(z)",
+            FormulaParameter::C, fixed, pair) &&
+            buildReference(
+                pair, fixed, FormulaParameter::C,
+                "0", "0", 24, 512, reference);
+        ExpressionTaylorJetRequest request;
+        request.program = &pair.runtime;
+        request.reference = &reference;
+        request.pixelParameter = FormulaParameter::C;
+        request.parameterScale = makeScale(-600);
+        request.minimumLanding = 1;
+        request.maximumCandidateIteration = 12;
+        ExpressionTaylorJetResult baseline;
+        okay = okay &&
+            ExpressionTaylorJetBuilder::build(
+                request, baseline) &&
+            baseline.layout ==
+                formula::ExpressionTaylorJetLayout::
+                    RealBivariate &&
+            baseline.memoryBytes > 1 &&
+            baseline.bivariateConvolutionOperationCount > 0;
+        if (okay) {
+            request.memoryLimitBytes =
+                baseline.memoryBytes - 1;
+            ExpressionTaylorJetResult constrained;
+            okay =
+                !ExpressionTaylorJetBuilder::build(
+                    request, constrained) &&
+                constrained.status ==
+                    ExpressionTaylorJetStatus::
+                        ResourceLimit &&
+                constrained.coefficients.empty() &&
+                constrained.coefficientRadii.empty();
+        }
+        request.memoryLimitBytes = size_t{ 1 } << 30;
+        request.maximumBivariateOrder = 7;
+        ExpressionTaylorJetResult invalidLow;
+        okay = okay &&
+            !ExpressionTaylorJetBuilder::build(
+                request, invalidLow) &&
+            invalidLow.status ==
+                ExpressionTaylorJetStatus::InvalidRequest;
+        request.maximumBivariateOrder =
+            formula::ExpressionTaylorMaximumBivariateOrder +
+            1;
+        ExpressionTaylorJetResult invalidHigh;
+        okay = okay &&
+            !ExpressionTaylorJetBuilder::build(
+                request, invalidHigh) &&
+            invalidHigh.status ==
+                ExpressionTaylorJetStatus::InvalidRequest;
+        request.maximumBivariateOrder =
+            formula::ExpressionTaylorMaximumBivariateOrder;
+        request.parameterScale.re.exponent =
+            static_cast<int64_t>(mpfr_get_emax());
+        ExpressionTaylorJetResult exponentBoundary;
+        okay = okay &&
+            !ExpressionTaylorJetBuilder::build(
+                request, exponentBoundary) &&
+            exponentBoundary.status ==
+                ExpressionTaylorJetStatus::ExponentRange;
+        if (!okay) {
+            printf("  real-bivariate Taylor workspace policy failed\n");
             ++failures;
         }
     }
@@ -7189,6 +7508,39 @@ static int runExpressionTaylorCase() {
                      NoCoverage);
         if (!okay) {
             printf("  entire Taylor first-escape stop failed landing=%d status=%s\n",
+                   jet.landingIteration,
+                   formula::expressionTaylorJetStatusName(
+                       jet.status));
+            ++failures;
+        }
+    }
+    {
+        ProgramPair pair;
+        ExpressionReferenceOrbitResult reference;
+        ExpressionContext fixed;
+        bool okay = compilePair(
+            "conj(z)+3", FormulaParameter::C,
+            fixed, pair) &&
+            buildReference(
+                pair, fixed, FormulaParameter::C,
+                "0", "0", 4, 512, reference);
+        ExpressionTaylorJetRequest request;
+        request.program = &pair.runtime;
+        request.reference = &reference;
+        request.pixelParameter = FormulaParameter::C;
+        request.parameterScale = makeScale(-600);
+        request.minimumLanding = 1;
+        request.maximumCandidateIteration = 3;
+        ExpressionTaylorJetResult jet;
+        okay = okay &&
+            ExpressionTaylorJetBuilder::build(
+                request, jet) &&
+            jet.landingIteration == 1 &&
+            jet.layout ==
+                formula::ExpressionTaylorJetLayout::
+                    RealBivariate;
+        if (!okay) {
+            printf("  real-bivariate Taylor first-escape stop failed landing=%d status=%s\n",
                    jet.landingIteration,
                    formula::expressionTaylorJetStatusName(
                        jet.status));
@@ -7675,7 +8027,10 @@ static int runExpressionDeepRenderCase() {
                     CertifiedMeromorphicCandidate ||
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
-                    CertifiedBranchCandidate;
+                    CertifiedBranchCandidate ||
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    CertifiedRealCandidate;
         const bool meromorphicCandidate =
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
@@ -7684,12 +8039,17 @@ static int runExpressionDeepRenderCase() {
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
                     CertifiedBranchCandidate;
+        const bool realCandidate =
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    CertifiedRealCandidate;
         const bool allMpfrTaylorCandidate =
             (pair.runtime.scaledResidualCapability() ==
                  formula::ExpressionScaledResidualCapability::
                      CertifiedEntireCandidate ||
              meromorphicCandidate ||
-             branchCandidate) &&
+             branchCandidate ||
+             realCandidate) &&
             expectedFallback == pixelCount;
         const bool uncertainReason =
             expectedReason ==
@@ -7746,15 +8106,28 @@ static int runExpressionDeepRenderCase() {
                          isZero() ||
                      result.taylorMinimumBranchZeroClearance.
                          isZero()
+                   : realCandidate
+                   ? result.taylorLayout !=
+                           formula::ExpressionTaylorJetLayout::
+                               RealBivariate ||
+                     result.taylorMonomialCount == 0
                    : result.taylorFunctionSeriesCount == 0 ||
                      result.taylorFunctionSeriesOperationCount == 0 ||
                      result.taylorMaximumFunctionSeriesOrder < 1))) ||
             result.rendererBytes == 0) {
-            printf("  exact frame mismatch [%s] fast/fallback=%llu/%llu precision=%lld reasons cert/bailout/exhausted=%llu/%llu/%llu Taylor=%s/%s\n",
+            printf("  exact frame mismatch [%s] oracle/equal=%d/%d fast/fallback=%llu/%llu uncertain/undefined=%llu/%llu maxreason=%llu tiles=%llu rate=%.3f precision=%lld/%lld reasons cert/bailout/exhausted=%llu/%llu/%llu Taylor=%s/%s accepted=%d px=%llu landing=%d layout=%s monomials=%zu ref/renderer=%zu/%zu\n",
                    name,
+                   oracleOkay ? 1 : 0,
+                   actual == expected ? 1 : 0,
                    (unsigned long long)result.fastPixelCount,
                    (unsigned long long)result.fallbackPixelCount,
+                   (unsigned long long)result.uncertainPixelCount,
+                   (unsigned long long)result.undefinedPixelCount,
+                   (unsigned long long)result.maxFallbackReasonCount,
+                   (unsigned long long)result.fallbackTileCount,
+                   result.maxTileFallbackRate,
                    (long long)result.selectedPrecision,
+                   (long long)result.certificationPrecision,
                    (unsigned long long)reasonCount(
                        result,
                        ExpressionDeepFallbackReason::
@@ -7769,7 +8142,16 @@ static int runExpressionDeepRenderCase() {
                            ReferenceExhausted),
                    formula::expressionTaylorJetStatusName(
                        result.taylorStatus),
-                   result.taylorFailureReason.c_str());
+                   result.taylorFailureReason.c_str(),
+                   result.taylorAccepted ? 1 : 0,
+                   (unsigned long long)
+                       result.taylorAcceptedPixelCount,
+                   result.taylorCoveredIterations,
+                   formula::expressionTaylorJetLayoutName(
+                       result.taylorLayout),
+                   result.taylorMonomialCount,
+                   result.referenceBytes,
+                   result.rendererBytes);
             ++failures;
             return;
         }
@@ -7845,6 +8227,59 @@ static int runExpressionDeepRenderCase() {
         FormulaParameter::InitialZ, z0Fixed,
         "0", "0", 7, 5, 20, 0,
         ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "conjugate-taylor", "conj(z)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "real-taylor", "real(z)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "imaginary-taylor",
+        "imag(z)*complex(0,1)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "norm-taylor", "norm(z)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "make-complex-taylor",
+        "complex(real(z),imag(c))+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "mixed-real-polynomial-taylor",
+        "(z*z+c)*conj(z+c)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "conjugate-z0-taylor", "conj(z)+c",
+        FormulaParameter::InitialZ, z0Fixed,
+        "0", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "unsupported-real-entire",
+        "sin(conj(z))+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 7, 5, 20, 35,
+        ExpressionDeepFallbackReason::
+            UnsupportedOperation,
+        false);
+    verifyFrame(
+        "unsupported-real-branch",
+        "log(conj(z)+2)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 7, 5, 20, 35,
+        ExpressionDeepFallbackReason::BranchSensitive,
+        false);
     verifyFrame(
         "rational-cost-fallback", "z/(c+2)+c",
         FormulaParameter::C, transcendentalFixed,
@@ -8407,7 +8842,7 @@ static int runExpressionDeepRenderCase() {
         }
     }
 
-    // Certified entire jets must agree with Taylor-off, all-MPFR, and
+    // Every certified jet layout must agree with Taylor-off, all-MPFR, and
     // single-thread rendering.
     {
         struct EntireFrame {
@@ -8429,6 +8864,29 @@ static int runExpressionDeepRenderCase() {
             { "cosh", "cosh(z)-1+c", FormulaParameter::C,
               &transcendentalFixed, "0" },
             { "sin-z0", "sin(z)+c",
+              FormulaParameter::InitialZ, &z0Fixed, "0" },
+            { "conjugate", "conj(z)+c",
+              FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "real", "real(z)+c",
+              FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "imaginary",
+              "imag(z)*complex(0,1)+c",
+              FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "norm", "norm(z)+c",
+              FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "make-complex",
+              "complex(real(z),imag(c))+c",
+              FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "mixed-real-polynomial",
+              "(z*z+c)*conj(z+c)+c",
+              FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "conjugate-z0", "conj(z)+c",
               FormulaParameter::InitialZ, &z0Fixed, "0" },
             { "divide", "z/(c+2)+c", FormulaParameter::C,
               &transcendentalFixed, "0" },
@@ -8529,6 +8987,11 @@ static int runExpressionDeepRenderCase() {
                     formula::
                         ExpressionScaledResidualCapability::
                             CertifiedBranchCandidate;
+            const bool real =
+                pair.runtime.scaledResidualCapability() ==
+                    formula::
+                        ExpressionScaledResidualCapability::
+                            CertifiedRealCandidate;
             if (!okay || enabled != disabled ||
                 enabled != mpfr || enabled != single ||
                 !enabledResult.taylorAccepted ||
@@ -8553,6 +9016,11 @@ static int runExpressionDeepRenderCase() {
                       enabledResult.
                           taylorMinimumBranchZeroClearance.
                               isZero()
+                    : real
+                    ? enabledResult.taylorLayout !=
+                          formula::ExpressionTaylorJetLayout::
+                              RealBivariate ||
+                      enabledResult.taylorMonomialCount == 0
                     : enabledResult.
                           taylorFunctionSeriesCount == 0) ||
                 disabledResult.fastPixelCount != 0 ||
@@ -8642,6 +9110,211 @@ static int runExpressionDeepRenderCase() {
                 tinyResult.fallbackPixelCount !=
                     tinyOutput.size()) {
                 printf("  entire Taylor cost auto-disable failed\n");
+                ++failures;
+            }
+        }
+
+        ProgramPair realBenchmark;
+        if (!compilePair(
+                "(z*z+c)*conj(z+c)+c",
+                FormulaParameter::C,
+                transcendentalFixed, realBenchmark)) {
+            ++failures;
+        } else {
+            bool benchmarkOkay = true;
+            bool accepted = false;
+            bool acceptanceInitialized = false;
+            double jetSeconds[2]{};
+            double mpfrSeconds[2]{};
+            double buildSeconds = 0.0;
+            double evaluationSeconds = 0.0;
+            uint64_t fallback = 0;
+            size_t monomials = 0;
+            uint64_t convolutionOperations = 0;
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                std::vector<float> jetOutput, mpfrOutput;
+                ExpressionDeepRenderRequest jetRequest =
+                    makeRequest(
+                        realBenchmark,
+                        transcendentalFixed,
+                        FormulaParameter::C,
+                        "0", "0", 80, 50, 120,
+                        jetOutput);
+                ExpressionDeepRenderResult jetResult;
+                const Clock::time_point jetStart =
+                    Clock::now();
+                benchmarkOkay = benchmarkOkay &&
+                    formula::renderExpressionDeepFrame(
+                        jetRequest, jetResult);
+                jetSeconds[repeat] =
+                    std::chrono::duration<double>(
+                        Clock::now() - jetStart).count();
+
+                ExpressionDeepRenderRequest mpfrRequest =
+                    makeRequest(
+                        realBenchmark,
+                        transcendentalFixed,
+                        FormulaParameter::C,
+                        "0", "0", 80, 50, 120,
+                        mpfrOutput);
+                mpfrRequest.
+                    forceMpfrFallbackForVerification = true;
+                ExpressionDeepRenderResult mpfrResult;
+                const Clock::time_point mpfrStart =
+                    Clock::now();
+                benchmarkOkay = benchmarkOkay &&
+                    formula::renderExpressionDeepFrame(
+                        mpfrRequest, mpfrResult);
+                mpfrSeconds[repeat] =
+                    std::chrono::duration<double>(
+                        Clock::now() - mpfrStart).count();
+
+                if (!acceptanceInitialized) {
+                    accepted = jetResult.taylorAccepted;
+                    acceptanceInitialized = true;
+                } else {
+                    benchmarkOkay = benchmarkOkay &&
+                        accepted ==
+                            jetResult.taylorAccepted;
+                }
+                buildSeconds =
+                    jetResult.taylorBuildSeconds;
+                evaluationSeconds =
+                    jetResult.taylorEvaluationSeconds;
+                fallback =
+                    jetResult.fallbackPixelCount;
+                monomials =
+                    jetResult.taylorMonomialCount;
+                convolutionOperations =
+                    jetResult.
+                        taylorBivariateConvolutionOperationCount;
+                benchmarkOkay = benchmarkOkay &&
+                    jetOutput == mpfrOutput &&
+                    (jetResult.taylorAccepted
+                         ? jetResult.taylorLayout ==
+                               formula::
+                                   ExpressionTaylorJetLayout::
+                                       RealBivariate &&
+                           jetResult.
+                               taylorAcceptedPixelCount > 0 &&
+                           jetResult.
+                               taylorMonomialCount > 0 &&
+                           jetResult.
+                               taylorBivariateConvolutionOperationCount >
+                               0 &&
+                           jetSeconds[repeat] <
+                               mpfrSeconds[repeat]
+                         : jetResult.fastPixelCount == 0 &&
+                           jetResult.fallbackPixelCount ==
+                               jetOutput.size());
+            }
+            printf("  real-bivariate Taylor e500 jet/MPFR %.3f/%.3f and %.3f/%.3f s accepted=%d build/eval=%.3f/%.3f fallback=%llu monomials=%zu convolution=%llu\n",
+                   jetSeconds[0], mpfrSeconds[0],
+                   jetSeconds[1], mpfrSeconds[1],
+                   accepted ? 1 : 0,
+                   buildSeconds, evaluationSeconds,
+                   (unsigned long long)fallback,
+                   monomials,
+                   (unsigned long long)
+                       convolutionOperations);
+            if (!benchmarkOkay) {
+                printf("  real-bivariate Taylor repeated speed/auto-disable gate failed\n");
+                ++failures;
+            }
+
+            std::vector<float> tinyOutput;
+            ExpressionDeepRenderRequest tinyRequest =
+                makeRequest(
+                    realBenchmark, transcendentalFixed,
+                    FormulaParameter::C, "0", "0",
+                    3, 3, 9, tinyOutput);
+            ExpressionDeepRenderResult tinyResult;
+            if (!formula::renderExpressionDeepFrame(
+                    tinyRequest, tinyResult) ||
+                !tinyResult.taylorAttempted ||
+                tinyResult.taylorAccepted ||
+                tinyResult.fastPixelCount != 0 ||
+                tinyResult.fallbackPixelCount !=
+                    tinyOutput.size()) {
+                printf("  real-bivariate Taylor cost auto-disable failed\n");
+                ++failures;
+            }
+
+            std::vector<float> baseline, constrained, mpfr;
+            ExpressionDeepRenderRequest baselineRequest =
+                makeRequest(
+                    realBenchmark,
+                    transcendentalFixed,
+                    FormulaParameter::C,
+                    "0", "0", 80, 50, 300,
+                    baseline);
+            baselineRequest.threading.threads = 1;
+            ExpressionDeepRenderResult baselineResult;
+            bool memoryOkay =
+                formula::renderExpressionDeepFrame(
+                    baselineRequest, baselineResult) &&
+                baselineResult.taylorAccepted &&
+                baselineResult.taylorMemoryBytes > 0;
+            ExpressionDeepRenderRequest mpfrRequest =
+                makeRequest(
+                    realBenchmark,
+                    transcendentalFixed,
+                    FormulaParameter::C,
+                    "0", "0", 80, 50, 300,
+                    mpfr);
+            mpfrRequest.
+                forceMpfrFallbackForVerification = true;
+            mpfrRequest.threading.threads = 1;
+            ExpressionDeepRenderResult mpfrResult;
+            memoryOkay = memoryOkay &&
+                formula::renderExpressionDeepFrame(
+                    mpfrRequest, mpfrResult);
+            size_t constrainedLimit = 0;
+            if (memoryOkay) {
+                const size_t fullPeak =
+                    baselineResult.referenceBytes +
+                    baselineResult.rendererBytes;
+                const size_t reduction = std::max<size_t>(
+                    1,
+                    baselineResult.taylorMemoryBytes / 2);
+                constrainedLimit =
+                    fullPeak > reduction
+                    ? fullPeak - reduction : 1;
+                constrainedLimit = std::max(
+                    constrainedLimit,
+                    mpfrResult.rendererBytes + 4096);
+                memoryOkay =
+                    constrainedLimit < fullPeak;
+            }
+            ExpressionDeepRenderRequest constrainedRequest =
+                makeRequest(
+                    realBenchmark,
+                    transcendentalFixed,
+                    FormulaParameter::C,
+                    "0", "0", 80, 50, 300,
+                    constrained);
+            constrainedRequest.memory.memoryLimitBytes =
+                constrainedLimit;
+            constrainedRequest.threading.threads = 1;
+            ExpressionDeepRenderResult constrainedResult;
+            memoryOkay = memoryOkay &&
+                formula::renderExpressionDeepFrame(
+                    constrainedRequest,
+                    constrainedResult);
+            const uint64_t pixels =
+                static_cast<uint64_t>(
+                    constrained.size());
+            if (!memoryOkay ||
+                baseline != mpfr ||
+                constrained != mpfr ||
+                constrainedResult.taylorAccepted ||
+                constrainedResult.fastPixelCount != 0 ||
+                constrainedResult.fallbackPixelCount !=
+                    pixels ||
+                constrainedResult.referenceBytes != 0 ||
+                constrainedResult.rendererBytes >
+                    constrainedLimit) {
+                printf("  real-bivariate Taylor memory fallback failed\n");
                 ++failures;
             }
         }
@@ -9159,6 +9832,8 @@ static int runExpressionDeepRenderCase() {
             const char* source, bool fallbackPhase) {
         const bool branchFast =
             std::string(source) == "log(z+2)+c";
+        const bool realFast =
+            std::string(source) == "conj(z)+c";
         ProgramPair pair;
         const FormulaParameter pixel = FormulaParameter::C;
         if (!compilePair(
@@ -9170,10 +9845,12 @@ static int runExpressionDeepRenderCase() {
         ExpressionDeepRenderRequest request = makeRequest(
             pair, mandelbrotFixed, pixel,
             fallbackPhase ? "0" :
-                branchFast ? "0" : "-2",
+                (branchFast || realFast) ? "0" : "-2",
             "0",
-            fallbackPhase ? 96 : branchFast ? 400 : 48,
-            fallbackPhase ? 64 : branchFast ? 240 : 28,
+            fallbackPhase ? 96 :
+                (branchFast || realFast) ? 400 : 48,
+            fallbackPhase ? 64 :
+                (branchFast || realFast) ? 240 : 28,
             fallbackPhase ? 30 : 850,
             output);
         std::atomic<int> phase{
@@ -9200,7 +9877,8 @@ static int runExpressionDeepRenderCase() {
                        1, std::memory_order_relaxed) >
                        (fallbackPhase
                             ? 20
-                            : branchFast ? 0 : 300);
+                            : (branchFast || realFast)
+                                ? 0 : 300);
         };
         ExpressionDeepRenderResult result;
         const bool okay =
@@ -9224,6 +9902,7 @@ static int runExpressionDeepRenderCase() {
     cancellationCase("z*z+c", false);
     cancellationCase("sin(z)+c", false);
     cancellationCase("log(z+2)+c", false);
+    cancellationCase("conj(z)+c", false);
     cancellationCase("0.001/(c-c)", true);
 
     // Worker and per-iteration allocation failures must not let any thread
@@ -9242,7 +9921,8 @@ static int runExpressionDeepRenderCase() {
         std::vector<float> output;
         const bool largeFastFrame =
             std::string(source) == "1/(z+2)+c" ||
-            std::string(source) == "log(z+2)+c";
+            std::string(source) == "log(z+2)+c" ||
+            std::string(source) == "norm(z)+c";
         ExpressionDeepRenderRequest request = makeRequest(
             pair, mandelbrotFixed, FormulaParameter::C,
             largeFastFrame ? "0" : "-1", "0",
@@ -9311,6 +9991,16 @@ static int runExpressionDeepRenderCase() {
         ExpressionDeepVerificationFault::
             FastIterationAllocation,
         "branch fast iteration allocation");
+    workerFaultCase(
+        "norm(z)+c",
+        ExpressionDeepVerificationFault::
+            FastWorkerAllocation,
+        "real-bivariate fast worker allocation");
+    workerFaultCase(
+        "norm(z)+c",
+        ExpressionDeepVerificationFault::
+            FastIterationAllocation,
+        "real-bivariate fast iteration allocation");
     workerFaultCase(
         "0.001/(c-c)",
         ExpressionDeepVerificationFault::
@@ -9537,7 +10227,7 @@ static int runExpressionDeepRenderCase() {
     }
 
     printf("=== expression deep frame renderer e500\n");
-    printf("  exact frames=%d certified entire/meromorphic/branch jets plus MPFR pole/branch fallback\n",
+    printf("  exact frames=%d certified entire/meromorphic/branch/real jets plus MPFR fallback\n",
            exactFrames);
     printf("  64x40 reference/scaled/all-MPFR %.3f/%.3f/%.3f s speedup %.2fx\n",
            benchmarkReference, benchmarkScaled,

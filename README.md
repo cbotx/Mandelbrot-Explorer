@@ -72,19 +72,21 @@ Controls:
 
 `expression-scaled` runs the non-GUI MPFR-tape/scaled-residual e500 prototype,
 including exact escape comparisons and the scaled-versus-per-pixel-MPFR timing.
-`expression-taylor` verifies the certified adaptive order-8..20 Taylor-jet
-prefix for arithmetic, entire functions, pole-free divide/tan/tanh, and
-principal-branch log/log10/sqrt/power, including normalized-frame containment,
-reciprocal tails, denominator and branch-cut/zero clearance proofs, signed-zero
-lip fallback, MPFR landing bounds, renderer parity, and the practical
-acceleration gate.
+`expression-taylor` verifies the certified adaptive order-8..20 univariate
+Taylor-jet prefix for holomorphic arithmetic, entire functions, pole-free
+divide/tan/tanh, and principal-branch log/log10/sqrt/power. It also verifies
+the independently capped order-8..12 real-bivariate layout for conjugate,
+real, imaginary, norm, and complex construction. Coverage includes
+normalized-frame containment, reciprocal and omitted-tail bounds,
+denominator/branch-cut/zero clearance proofs, signed-zero behavior, MPFR
+landing bounds, renderer parity, memory fallback, and the acceleration gate.
 `expression-deep-render` verifies the production-shaped tiled frame API,
 higher-precision-MPFR-relative arithmetic certification, rigorous bailout
 intervals, automatic per-pixel MPFR fallback, cancellation, determinism,
 adversarial views, and e500 timing. Certified paths also fall back
 conservatively near poles, branch cuts/zero, and MPFR's runtime exponent
-limits. Argument, absolute-value, norm, polar, and other nonholomorphic
-operations remain outside certified Taylor dispatch and default to MPFR.
+limits. Mixed real/transcendental formulas, argument, absolute value, polar,
+and other unsupported operations default to MPFR.
 The API is not dispatched by the GUI backend yet.
 
 ### Compute backend

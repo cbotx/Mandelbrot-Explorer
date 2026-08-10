@@ -45,6 +45,8 @@ struct ExpressionDeepTaylorPolicy {
     int order = 12;
     int minimumOrder = 8;
     int maximumOrder = 20;
+    int maximumBivariateOrder =
+        ExpressionTaylorMaximumBivariateOrder;
     int maximumCompositionOrder = 24;
     int maximumCandidateIteration = 0;
     double accuracyBudget = 0x1p-40;
@@ -158,6 +160,10 @@ struct ExpressionDeepRenderResult {
     bool taylorAttempted = false;
     bool taylorAccepted = false;
     int taylorOrder = 0;
+    ExpressionTaylorJetLayout taylorLayout =
+        ExpressionTaylorJetLayout::ComplexUnivariate;
+    size_t taylorMonomialCount = 0;
+    uint64_t taylorBivariateConvolutionOperationCount = 0;
     int taylorCoveredIterations = 0;
     int taylorMaximumFunctionSeriesOrder = 0;
     uint64_t taylorFunctionSeriesCount = 0;
@@ -204,6 +210,9 @@ const char* expressionDeepFallbackReasonName(
 // denominator neighborhood that is not proven pole-free. Log/log10/sqrt/power
 // use a certified principal-branch tier and reject any full-frame input
 // neighborhood that is not proven clear of zero and the negative-real cut.
+// Conjugate/real/imaginary/norm/complex formulas use a separate certified
+// real-bivariate q/conjugate(q) tier. Unsupported mixed transcendental real
+// formulas release fast resources and render through MPFR.
 // Interior output means only that no escape was observed before maxIterations,
 // not mathematical membership.
 bool renderExpressionDeepFrame(
