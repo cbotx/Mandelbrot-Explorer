@@ -212,10 +212,18 @@ public:
         const long centeredY =
             static_cast<long>(2LL * y -
                               (request.height - 1LL));
-        mpfr_mul_si(output.re, dxHalf, centeredX, RND);
-        mpfr_add(output.re, output.re, center.re, RND);
-        mpfr_mul_si(output.im, dyHalf, centeredY, RND);
-        mpfr_add(output.im, output.im, center.im, RND);
+        if (centeredX == 0) {
+            mpfr_set(output.re, center.re, RND);
+        } else {
+            mpfr_mul_si(output.re, dxHalf, centeredX, RND);
+            mpfr_add(output.re, output.re, center.re, RND);
+        }
+        if (centeredY == 0) {
+            mpfr_set(output.im, center.im, RND);
+        } else {
+            mpfr_mul_si(output.im, dyHalf, centeredY, RND);
+            mpfr_add(output.im, output.im, center.im, RND);
+        }
         return mpfr_number_p(output.re) &&
                mpfr_number_p(output.im);
     }
@@ -388,6 +396,8 @@ ExpressionDeepFallbackReason reasonForCapability(
             CertifiedEntireCandidate:
     case ExpressionScaledResidualCapability::
             CertifiedMeromorphicCandidate:
+    case ExpressionScaledResidualCapability::
+            CertifiedBranchCandidate:
         return ExpressionDeepFallbackReason::
             CertificationFailure;
     case ExpressionScaledResidualCapability::UncertifiedSeries:
@@ -400,6 +410,27 @@ ExpressionDeepFallbackReason reasonForCapability(
         break;
     }
     return ExpressionDeepFallbackReason::InvalidTape;
+}
+
+bool certifiedTaylorCapability(
+        ExpressionScaledResidualCapability capability) {
+    return capability ==
+               ExpressionScaledResidualCapability::
+                   CertifiedEntireCandidate ||
+           capability ==
+               ExpressionScaledResidualCapability::
+                   CertifiedMeromorphicCandidate ||
+           capability ==
+               ExpressionScaledResidualCapability::
+                   CertifiedBranchCandidate;
+}
+
+bool certifiedReferenceCapability(
+        ExpressionScaledResidualCapability capability) {
+    return capability ==
+               ExpressionScaledResidualCapability::
+                   ExactCenteredArithmetic ||
+           certifiedTaylorCapability(capability);
 }
 
 ExpressionDeepFallbackReason reasonForResidualStatus(
@@ -905,12 +936,7 @@ bool renderExpressionDeepFrame(
         result.capability =
             request.runtimeProgram->scaledResidualCapability();
         const bool certifiedTaylorCandidate =
-            result.capability ==
-                ExpressionScaledResidualCapability::
-                    CertifiedEntireCandidate ||
-            result.capability ==
-                ExpressionScaledResidualCapability::
-                    CertifiedMeromorphicCandidate;
+            certifiedTaylorCapability(result.capability);
         const bool certifiedTaylorEligible =
             !certifiedTaylorCandidate ||
             (request.taylor.enableTaylor &&
@@ -919,15 +945,8 @@ bool renderExpressionDeepFrame(
         bool runFast =
             !request.forceMpfrFallbackForVerification &&
             certifiedTaylorEligible &&
-            (result.capability ==
-                ExpressionScaledResidualCapability::
-                    ExactCenteredArithmetic ||
-            result.capability ==
-                ExpressionScaledResidualCapability::
-                    CertifiedEntireCandidate ||
-            result.capability ==
-                ExpressionScaledResidualCapability::
-                    CertifiedMeromorphicCandidate ||
+            (certifiedReferenceCapability(
+                 result.capability) ||
             (result.capability ==
                  ExpressionScaledResidualCapability::
                     UncertifiedSeries &&
@@ -1032,15 +1051,8 @@ bool renderExpressionDeepFrame(
                 request.memory.fallbackGuardBits;
 
         if (runFast &&
-            (result.capability ==
-                 ExpressionScaledResidualCapability::
-                     ExactCenteredArithmetic ||
-             result.capability ==
-                 ExpressionScaledResidualCapability::
-                     CertifiedEntireCandidate ||
-             result.capability ==
-                 ExpressionScaledResidualCapability::
-                     CertifiedMeromorphicCandidate)) {
+            certifiedReferenceCapability(
+                result.capability)) {
             const mpfr_prec_t certificationGuard =
                 std::max<mpfr_prec_t>(
                     128, precision.guardBits);
@@ -1111,15 +1123,8 @@ bool renderExpressionDeepFrame(
                 request.maxIterations;
             referenceRequest.precision = precision;
             referenceRequest.certificationPrecision =
-                (result.capability ==
-                     ExpressionScaledResidualCapability::
-                         ExactCenteredArithmetic ||
-                 result.capability ==
-                     ExpressionScaledResidualCapability::
-                         CertifiedEntireCandidate ||
-                 result.capability ==
-                     ExpressionScaledResidualCapability::
-                         CertifiedMeromorphicCandidate)
+                certifiedReferenceCapability(
+                    result.capability)
                 ? result.certificationPrecision : 0;
             referenceRequest.memoryLimitBytes =
                 request.memory.memoryLimitBytes;
@@ -1140,15 +1145,8 @@ bool renderExpressionDeepFrame(
                     "render cancelled while building the reference");
             if (!referenceBuilt) {
                 const bool mayFallback =
-                    (result.capability ==
-                         ExpressionScaledResidualCapability::
-                             ExactCenteredArithmetic ||
-                     result.capability ==
-                         ExpressionScaledResidualCapability::
-                             CertifiedEntireCandidate ||
-                     result.capability ==
-                         ExpressionScaledResidualCapability::
-                             CertifiedMeromorphicCandidate) &&
+                    certifiedReferenceCapability(
+                        result.capability) &&
                     reference.status !=
                         ExpressionReferenceBuildStatus::
                             ProgramMismatch &&
@@ -1174,15 +1172,8 @@ bool renderExpressionDeepFrame(
                 reference = {};
                 result.referenceBytes = 0;
             } else if (
-                (result.capability ==
-                     ExpressionScaledResidualCapability::
-                         ExactCenteredArithmetic ||
-                 result.capability ==
-                     ExpressionScaledResidualCapability::
-                         CertifiedEntireCandidate ||
-                 result.capability ==
-                     ExpressionScaledResidualCapability::
-                         CertifiedMeromorphicCandidate) &&
+                certifiedReferenceCapability(
+                    result.capability) &&
                 (!reference.
                      certifiedAgainstHigherPrecision ||
                  reference.certificationPrecision !=
@@ -1435,15 +1426,8 @@ bool renderExpressionDeepFrame(
             validationEvaluator.reset();
 
             if (runFast && request.taylor.enableTaylor &&
-                (result.capability ==
-                     ExpressionScaledResidualCapability::
-                         ExactCenteredArithmetic ||
-                 result.capability ==
-                     ExpressionScaledResidualCapability::
-                         CertifiedEntireCandidate ||
-                 result.capability ==
-                     ExpressionScaledResidualCapability::
-                         CertifiedMeromorphicCandidate) &&
+                certifiedReferenceCapability(
+                    result.capability) &&
                 request.maxIterations >
                     request.taylor.minimumLanding) {
                 result.taylorAttempted = true;
@@ -1563,6 +1547,20 @@ bool renderExpressionDeepFrame(
                     taylorJet.maximumReciprocalTail;
                 result.taylorPoleRejected =
                     taylorJet.poleRejected;
+                result.taylorMaximumBranchSeriesOrder =
+                    taylorJet.maximumBranchSeriesOrder;
+                result.taylorBranchCompositionCount =
+                    taylorJet.branchCompositionCount;
+                result.taylorBranchCompositionOperationCount =
+                    taylorJet.branchCompositionOperationCount;
+                result.taylorMaximumBranchSeriesTail =
+                    taylorJet.maximumBranchSeriesTail;
+                result.taylorMinimumBranchCutClearance =
+                    taylorJet.minimumBranchCutClearance;
+                result.taylorMinimumBranchZeroClearance =
+                    taylorJet.minimumBranchZeroClearance;
+                result.taylorBranchRejected =
+                    taylorJet.branchRejected;
                 if (cancelled.load(
                         std::memory_order_acquire) ||
                     taylorJet.status ==
@@ -1573,12 +1571,8 @@ bool renderExpressionDeepFrame(
                             Cancelled,
                         "render cancelled while building Taylor jet");
                 if (useTaylor &&
-                    (result.capability ==
-                         ExpressionScaledResidualCapability::
-                             CertifiedEntireCandidate ||
-                     result.capability ==
-                         ExpressionScaledResidualCapability::
-                             CertifiedMeromorphicCandidate) &&
+                    certifiedTaylorCapability(
+                        result.capability) &&
                     !request.allowUncertifiedForBenchmark &&
                     taylorJet.landingIteration <
                         request.maxIterations) {
@@ -1671,12 +1665,8 @@ bool renderExpressionDeepFrame(
                 result.taylorAccepted = useTaylor;
             }
             if (runFast &&
-                (result.capability ==
-                     ExpressionScaledResidualCapability::
-                         CertifiedEntireCandidate ||
-                 result.capability ==
-                     ExpressionScaledResidualCapability::
-                         CertifiedMeromorphicCandidate) &&
+                certifiedTaylorCapability(
+                    result.capability) &&
                 !request.allowUncertifiedForBenchmark &&
                 !useTaylor) {
                 runFast = false;
@@ -2024,12 +2014,8 @@ bool renderExpressionDeepFrame(
                                                     fetch_add(
                                                         1,
                                                         std::memory_order_relaxed);
-                                                if ((result.capability ==
-                                                         ExpressionScaledResidualCapability::
-                                                             CertifiedEntireCandidate ||
-                                                     result.capability ==
-                                                         ExpressionScaledResidualCapability::
-                                                             CertifiedMeromorphicCandidate) &&
+                                                if (certifiedTaylorCapability(
+                                                        result.capability) &&
                                                     !request.
                                                         allowUncertifiedForBenchmark) {
                                                     pixel.reason =

@@ -6086,7 +6086,7 @@ static int runExpressionScaledCase() {
            benchmarkMinimumSpeedup);
     printf("  reference memory=%zu bytes (%zu/sample); nonlinear result is explicitly uncertified\n",
            benchmarkMemory, benchmarkBytesPerSample);
-    printf("  branch/pole neighborhood certification and GUI dispatch remain disabled\n");
+    printf("  per-step branch/pole certification and GUI dispatch remain disabled\n");
     printf("  => %s\n\n",
            failures == 0
                ? "PASS"
@@ -6421,7 +6421,34 @@ static int runExpressionTaylorCase() {
           "0", "0", -7, 512, false },
         { "reciprocal-z0", "1/(z+2)+c",
           FormulaParameter::InitialZ, z0Plane,
-          "0", "0", -7, 512, false }
+          "0", "0", -7, 512, false },
+        { "standalone-log", "log(c+2)",
+          FormulaParameter::C, quadratic,
+          "0", "0", -7, 512, false },
+        { "standalone-log10", "log10(c+2)",
+          FormulaParameter::C, quadratic,
+          "0", "0", -7, 512, false },
+        { "standalone-sqrt", "sqrt(c+2)",
+          FormulaParameter::C, quadratic,
+          "0", "0", -7, 512, false },
+        { "variable-power", "pow(c+2,c+0.25)",
+          FormulaParameter::C, quadratic,
+          "0", "0", -9, 512, false },
+        { "large-exponent-power",
+          "pow(c+1.25,20+c)*0.001",
+          FormulaParameter::C, quadratic,
+          "0", "0", -10, 512, false },
+        { "small-exponent-power",
+          "pow(c+2,0.001+c)-1",
+          FormulaParameter::C, quadratic,
+          "0", "0", -10, 512, false },
+        { "nested-branch-entire-division",
+          "exp(log(c+2))-1+sin(sqrt(c+3))/(c+4)",
+          FormulaParameter::C, quadratic,
+          "0", "0", -9, 512, false },
+        { "branch-z0", "log(z+2)+c",
+          FormulaParameter::InitialZ, z0Plane,
+          "0", "0", -9, 512, false }
     };
 
     for (const FormulaCase& test : cases) {
@@ -6462,6 +6489,10 @@ static int runExpressionTaylorCase() {
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
                     CertifiedMeromorphicCandidate;
+        const bool branchCandidate =
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    CertifiedBranchCandidate;
         if (!ExpressionTaylorJetBuilder::build(
                 request, jet) ||
             jet.landingIteration < 1 ||
@@ -6480,7 +6511,13 @@ static int runExpressionTaylorCase() {
              (jet.reciprocalCount == 0 ||
               jet.reciprocalOperationCount == 0 ||
               jet.maximumReciprocalOrder < 8 ||
-              jet.minimumDenominatorClearance.isZero()))) {
+              jet.minimumDenominatorClearance.isZero())) ||
+            (branchCandidate &&
+             (jet.branchCompositionCount == 0 ||
+              jet.branchCompositionOperationCount == 0 ||
+              jet.maximumBranchSeriesOrder < 1 ||
+              jet.minimumBranchCutClearance.isZero() ||
+              jet.minimumBranchZeroClearance.isZero()))) {
             printf("  Taylor build failed [%s]: %s/%s landing=%d\n",
                    test.name,
                    formula::expressionTaylorJetStatusName(
@@ -6617,17 +6654,23 @@ static int runExpressionTaylorCase() {
                   CertifiedMeromorphicCandidate },
             { "log(z)+c",
               formula::ExpressionScaledResidualCapability::
-                  BranchSensitive },
+                  CertifiedBranchCandidate },
             { "log10(z)+c",
               formula::ExpressionScaledResidualCapability::
-                  BranchSensitive },
+                  CertifiedBranchCandidate },
             { "sqrt(z)+c",
               formula::ExpressionScaledResidualCapability::
-                  BranchSensitive },
+                  CertifiedBranchCandidate },
             { "pow(z,2.5)+c",
               formula::ExpressionScaledResidualCapability::
-                  BranchSensitive },
+                  CertifiedBranchCandidate },
             { "arg(z)+c",
+              formula::ExpressionScaledResidualCapability::
+                  BranchSensitive },
+            { "log(abs(z)+2)+c",
+              formula::ExpressionScaledResidualCapability::
+                  BranchSensitive },
+            { "log(norm(z)+2)+c",
               formula::ExpressionScaledResidualCapability::
                   BranchSensitive },
             { "abs(z)+c",
@@ -6677,6 +6720,210 @@ static int runExpressionTaylorCase() {
                     UnsupportedProgram;
         if (!okay) {
             printf("  Taylor non-holomorphic rejection failed\n");
+            ++failures;
+        }
+    }
+
+    // Principal-branch clearance is certified over the entire q-frame. Point
+    // cut metadata, including signed-zero lip labels, is never sufficient.
+    {
+        auto checkBranchFrame = [&](
+                const char* name,
+                const char* source,
+                const char* centerReal,
+                const char* centerImaginary,
+                int64_t scaleExponent,
+                bool expectAccepted) {
+            ProgramPair pair;
+            ExpressionReferenceOrbitResult reference;
+            ExpressionContext fixed;
+            bool okay = compilePair(
+                source, FormulaParameter::C,
+                fixed, pair) &&
+                buildReference(
+                    pair, fixed, FormulaParameter::C,
+                    centerReal, centerImaginary,
+                    4, 512, reference);
+            ExpressionTaylorJetRequest request;
+            request.program = &pair.runtime;
+            request.reference = &reference;
+            request.pixelParameter = FormulaParameter::C;
+            request.parameterScale =
+                makeScale(scaleExponent);
+            request.minimumLanding = 1;
+            request.maximumCandidateIteration = 1;
+            request.accuracyBudget = 0x1p-40;
+            ExpressionTaylorJetResult jet;
+            const bool built =
+                okay &&
+                ExpressionTaylorJetBuilder::build(
+                    request, jet);
+            if (expectAccepted) {
+                okay = built &&
+                    jet.branchCompositionCount > 0 &&
+                    jet.branchCompositionOperationCount > 0 &&
+                    jet.maximumBranchSeriesOrder > 0 &&
+                    !jet.minimumBranchCutClearance.isZero() &&
+                    !jet.minimumBranchZeroClearance.isZero() &&
+                    !jet.branchRejected;
+            } else {
+                okay = okay && !built &&
+                    jet.status ==
+                        ExpressionTaylorJetStatus::
+                            BranchRejected &&
+                    jet.branchRejected &&
+                    (jet.minimumBranchCutClearance.isZero() ||
+                     jet.minimumBranchZeroClearance.isZero()) &&
+                    jet.failureReason.find("branch input") !=
+                        std::string::npos;
+            }
+            if (!okay) {
+                printf("  branch-clearance proof failed [%s] built=%d status=%s reason=%s cut=(%.6g,e%lld) zero=(%.6g,e%lld)\n",
+                       name, built ? 1 : 0,
+                       formula::expressionTaylorJetStatusName(
+                           jet.status),
+                       jet.failureReason.c_str(),
+                       jet.minimumBranchCutClearance.mantissa,
+                       (long long)
+                           jet.minimumBranchCutClearance.exponent,
+                       jet.minimumBranchZeroClearance.mantissa,
+                       (long long)
+                           jet.minimumBranchZeroClearance.exponent);
+                ++failures;
+            }
+        };
+        checkBranchFrame(
+            "log-near-cut-safe", "log(c)*0.001",
+            "-2", "0.04", -5, true);
+        checkBranchFrame(
+            "log-near-cut-overlap", "log(c)*0.001",
+            "-2", "0.02", -5, false);
+        checkBranchFrame(
+            "log10-negative-neighborhood",
+            "log10(c)*0.001",
+            "-2", "0.04", -5, true);
+        checkBranchFrame(
+            "sqrt-near-cut-safe", "sqrt(c)*0.001",
+            "-2", "-0.04", -5, true);
+        checkBranchFrame(
+            "power-near-cut-overlap",
+            "pow(c,0.25)*0.001",
+            "-2", "-0.02", -5, false);
+        checkBranchFrame(
+            "exact-upper-lip", "log(c)*0.001",
+            "-2", "0", -20, false);
+        checkBranchFrame(
+            "exact-lower-lip", "log(c)*0.001",
+            "-2", "-0", -20, false);
+        checkBranchFrame(
+            "origin", "sqrt(c)*0.001",
+            "0", "0", -20, false);
+        checkBranchFrame(
+            "zero-overlap", "log(c)*0.001",
+            "0.001", "0", -8, false);
+
+        for (const char* source :
+             { "log(c)", "log10(c)", "sqrt(c)",
+               "pow(c,0.25)" }) {
+            ExpressionProgram program;
+            ExpressionError error;
+            ExpressionOracleContext upper(512);
+            ExpressionOracleContext lower(512);
+            MpfrComplex upperValue(512);
+            MpfrComplex lowerValue(512);
+            upper.c.set(-2.0, 0.0);
+            lower.c.set(-2.0, -0.0);
+            std::string upperError, lowerError;
+            const bool okay =
+                program.compile(source, &error) &&
+                ExpressionOracle::evaluate(
+                    program, upper, upperValue,
+                    &upperError) &&
+                ExpressionOracle::evaluate(
+                    program, lower, lowerValue,
+                    &lowerError) &&
+                mpfr_sgn(upperValue.im) > 0 &&
+                mpfr_sgn(lowerValue.im) < 0 &&
+                !mpfr_signbit(upperValue.im) &&
+                mpfr_signbit(lowerValue.im);
+            if (!okay) {
+                printf("  principal signed-zero lip semantics failed [%s]\n",
+                       source);
+                ++failures;
+            }
+        }
+
+        ProgramPair largePower;
+        ExpressionReferenceOrbitResult largeReference;
+        ExpressionContext fixed;
+        bool largeOkay = compilePair(
+            "pow(c+1.001,1000+c)-1",
+            FormulaParameter::C, fixed, largePower) &&
+            buildReference(
+                largePower, fixed, FormulaParameter::C,
+                "0", "0", 4, 512, largeReference);
+        ExpressionTaylorJetRequest largeRequest;
+        largeRequest.program = &largePower.runtime;
+        largeRequest.reference = &largeReference;
+        largeRequest.pixelParameter = FormulaParameter::C;
+        largeRequest.parameterScale = makeScale(-24);
+        largeRequest.minimumLanding = 1;
+        largeRequest.maximumCandidateIteration = 1;
+        ExpressionTaylorJetResult largeJet;
+        largeOkay = largeOkay &&
+            !ExpressionTaylorJetBuilder::build(
+                largeRequest, largeJet) &&
+            largeJet.status ==
+                ExpressionTaylorJetStatus::AccuracyBudget;
+        if (!largeOkay) {
+            printf("  large-exponent power fallback failed status=%s reason=%s\n",
+                   formula::expressionTaylorJetStatusName(
+                       largeJet.status),
+                   largeJet.failureReason.c_str());
+            ++failures;
+        }
+    }
+
+    // Branch workspace accounting includes the normalization, logarithm
+    // series, power-product, and nested entire-composition buffers.
+    {
+        ProgramPair pair;
+        ExpressionReferenceOrbitResult reference;
+        ExpressionContext fixed;
+        bool okay = compilePair(
+            "pow(c+2,c+0.25)", FormulaParameter::C,
+            fixed, pair) &&
+            buildReference(
+                pair, fixed, FormulaParameter::C,
+                "0", "0", 8, 512, reference);
+        ExpressionTaylorJetRequest request;
+        request.program = &pair.runtime;
+        request.reference = &reference;
+        request.pixelParameter = FormulaParameter::C;
+        request.parameterScale = makeScale(-10);
+        request.minimumLanding = 1;
+        request.maximumCandidateIteration = 4;
+        ExpressionTaylorJetResult baseline;
+        okay = okay &&
+            ExpressionTaylorJetBuilder::build(
+                request, baseline) &&
+            baseline.memoryBytes > 1 &&
+            baseline.branchCompositionCount > 0;
+        if (okay) {
+            request.memoryLimitBytes =
+                baseline.memoryBytes - 1;
+            ExpressionTaylorJetResult constrained;
+            okay =
+                !ExpressionTaylorJetBuilder::build(
+                    request, constrained) &&
+                constrained.status ==
+                    ExpressionTaylorJetStatus::
+                        ResourceLimit &&
+                constrained.coefficients.empty() &&
+                constrained.coefficientRadii.empty();
+        }
+        if (!okay) {
+            printf("  branch Taylor workspace accounting failed\n");
             ++failures;
         }
     }
@@ -6942,6 +7189,41 @@ static int runExpressionTaylorCase() {
                      NoCoverage);
         if (!okay) {
             printf("  entire Taylor first-escape stop failed landing=%d status=%s\n",
+                   jet.landingIteration,
+                   formula::expressionTaylorJetStatusName(
+                       jet.status));
+            ++failures;
+        }
+    }
+    {
+        ProgramPair pair;
+        ExpressionReferenceOrbitResult reference;
+        ExpressionContext fixed;
+        bool okay = compilePair(
+            "10*log(c+2)", FormulaParameter::C,
+            fixed, pair) &&
+            buildReference(
+                pair, fixed, FormulaParameter::C,
+                "0", "0", 4, 512, reference);
+        ExpressionTaylorJetRequest request;
+        request.program = &pair.runtime;
+        request.reference = &reference;
+        request.pixelParameter = FormulaParameter::C;
+        request.parameterScale = makeScale(-20);
+        request.minimumLanding = 1;
+        request.maximumCandidateIteration = 2;
+        ExpressionTaylorJetResult jet;
+        okay = okay &&
+            !ExpressionTaylorJetBuilder::build(
+                request, jet) &&
+            jet.landingIteration == 0 &&
+            (jet.status ==
+                 ExpressionTaylorJetStatus::
+                     BailoutUncertain ||
+             jet.status ==
+                 ExpressionTaylorJetStatus::NoCoverage);
+        if (!okay) {
+            printf("  branch Taylor first-escape stop failed landing=%d status=%s\n",
                    jet.landingIteration,
                    formula::expressionTaylorJetStatusName(
                        jet.status));
@@ -7359,6 +7641,8 @@ static int runExpressionDeepRenderCase() {
         ExpressionDeepRenderRequest request = makeRequest(
             pair, fixed, pixel, centerReal, centerImaginary,
             width, height, iterations, actual);
+        if (expectTaylorAccepted)
+            request.taylor.requirePredictedBenefit = false;
         ExpressionDeepRenderResult result;
         if (!formula::renderExpressionDeepFrame(
                 request, result)) {
@@ -7388,16 +7672,24 @@ static int runExpressionDeepRenderCase() {
                     CertifiedEntireCandidate ||
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
-                    CertifiedMeromorphicCandidate;
+                    CertifiedMeromorphicCandidate ||
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    CertifiedBranchCandidate;
         const bool meromorphicCandidate =
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
                     CertifiedMeromorphicCandidate;
+        const bool branchCandidate =
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    CertifiedBranchCandidate;
         const bool allMpfrTaylorCandidate =
             (pair.runtime.scaledResidualCapability() ==
                  formula::ExpressionScaledResidualCapability::
                      CertifiedEntireCandidate ||
-             meromorphicCandidate) &&
+             meromorphicCandidate ||
+             branchCandidate) &&
             expectedFallback == pixelCount;
         const bool uncertainReason =
             expectedReason ==
@@ -7444,6 +7736,15 @@ static int runExpressionDeepRenderCase() {
                      result.taylorReciprocalOperationCount == 0 ||
                      result.taylorMaximumReciprocalOrder < 8 ||
                      result.taylorMinimumDenominatorClearance.
+                         isZero()
+                   : branchCandidate
+                   ? result.taylorBranchCompositionCount == 0 ||
+                     result.
+                         taylorBranchCompositionOperationCount == 0 ||
+                     result.taylorMaximumBranchSeriesOrder < 1 ||
+                     result.taylorMinimumBranchCutClearance.
+                         isZero() ||
+                     result.taylorMinimumBranchZeroClearance.
                          isZero()
                    : result.taylorFunctionSeriesCount == 0 ||
                      result.taylorFunctionSeriesOperationCount == 0 ||
@@ -7584,11 +7885,36 @@ static int runExpressionDeepRenderCase() {
     ExpressionContext branchFixed;
     branchFixed.z0 = { 1.0, 0.0 };
     verifyFrame(
-        "branch-fallback", "log(z+2)+c",
+        "log-taylor", "log(z+2)+c",
         FormulaParameter::C, branchFixed,
-        "0", "0", 7, 5, 12, 35,
-        ExpressionDeepFallbackReason::BranchSensitive,
-        false);
+        "0", "0", 7, 5, 12, 0,
+        ExpressionDeepFallbackReason::InvalidTape,
+        true);
+    verifyFrame(
+        "log10-taylor", "log10(z+2)+c",
+        FormulaParameter::C, branchFixed,
+        "0", "0", 7, 5, 12, 0,
+        ExpressionDeepFallbackReason::InvalidTape,
+        true);
+    verifyFrame(
+        "sqrt-taylor", "0.25*sqrt(z+2)+c",
+        FormulaParameter::C, branchFixed,
+        "0", "0", 7, 5, 12, 0,
+        ExpressionDeepFallbackReason::InvalidTape,
+        true);
+    verifyFrame(
+        "power-taylor", "0.1*pow(z+2,c+0.25)+c",
+        FormulaParameter::C, branchFixed,
+        "0", "0", 7, 5, 12, 0,
+        ExpressionDeepFallbackReason::InvalidTape,
+        true);
+    verifyFrame(
+        "nested-branch-taylor",
+        "0.1*exp(log(z+2))+0.1*sin(sqrt(z+3))/(z+4)+c",
+        FormulaParameter::C, branchFixed,
+        "0", "0", 7, 5, 12, 0,
+        ExpressionDeepFallbackReason::InvalidTape,
+        true);
 
     // Pole clearance is a whole-frame proof, not point-only tape metadata.
     // A frame whose denominator neighborhood crosses zero must release the
@@ -7675,6 +8001,113 @@ static int runExpressionDeepRenderCase() {
             };
             runPoleFrame("10", false);
             runPoleFrame("320", true);
+        }
+    }
+
+    // Principal-cut clearance is also a whole-frame proof. Rejected frames
+    // release every fast resource and use exact MPFR for every pixel.
+    {
+        ProgramPair pair;
+        const char* source = "0.001*log(c)";
+        if (!compilePair(
+                source, FormulaParameter::C,
+                transcendentalFixed, pair)) {
+            ++failures;
+        } else {
+            auto runBranchFrame = [&](
+                    const char* name,
+                    const char* centerImaginary,
+                    const char* scale,
+                    bool expectAccepted) {
+                std::vector<float> actual, expected;
+                ExpressionDeepRenderRequest request =
+                    makeRequest(
+                        pair, transcendentalFixed,
+                        FormulaParameter::C,
+                        "-2", centerImaginary,
+                        64, 40, 20, actual);
+                request.scale.decimal = scale;
+                ExpressionDeepRenderResult result;
+                bool okay =
+                    formula::renderExpressionDeepFrame(
+                        request, result) &&
+                    renderOracle(
+                        pair.runtime,
+                        transcendentalFixed,
+                        FormulaParameter::C,
+                        "-2", centerImaginary, scale,
+                        64, 40, 20, 4.0,
+                        result.fallbackPrecision,
+                        expected) &&
+                    actual == expected &&
+                    result.taylorAttempted;
+                if (expectAccepted) {
+                    okay = okay &&
+                        result.taylorAccepted &&
+                        result.taylorAcceptedPixelCount > 0 &&
+                        result.fallbackPixelCount == 0 &&
+                        result.taylorBranchCompositionCount > 0 &&
+                        !result.
+                            taylorMinimumBranchCutClearance.
+                                isZero() &&
+                        !result.
+                            taylorMinimumBranchZeroClearance.
+                                isZero();
+                } else {
+                    const uint64_t pixels =
+                        static_cast<uint64_t>(
+                            actual.size());
+                    okay = okay &&
+                        !result.taylorAccepted &&
+                        result.taylorBranchRejected &&
+                        result.taylorStatus ==
+                            formula::
+                                ExpressionTaylorJetStatus::
+                                    BranchRejected &&
+                        result.fastPixelCount == 0 &&
+                        result.fallbackPixelCount == pixels &&
+                        result.referenceBytes == 0 &&
+                        reasonCount(
+                            result,
+                            ExpressionDeepFallbackReason::
+                                CertificationFailure) ==
+                            pixels;
+                }
+                if (!okay) {
+                    printf("  branch-clearance frame failed [%s] accepted=%d status=%s reason=%s cut=(%.17g,e%lld) zero=(%.17g,e%lld)\n",
+                           name,
+                           result.taylorAccepted ? 1 : 0,
+                           formula::
+                               expressionTaylorJetStatusName(
+                                   result.taylorStatus),
+                           result.taylorFailureReason.c_str(),
+                           result.
+                               taylorMinimumBranchCutClearance.
+                                   mantissa,
+                           (long long)result.
+                               taylorMinimumBranchCutClearance.
+                                   exponent,
+                           result.
+                               taylorMinimumBranchZeroClearance.
+                                   mantissa,
+                           (long long)result.
+                               taylorMinimumBranchZeroClearance.
+                                   exponent);
+                    ++failures;
+                }
+            };
+            runBranchFrame(
+                "near-cut-overlap", "0.1", "10",
+                false);
+            runBranchFrame(
+                "near-cut-safe", "0.1", "320",
+                true);
+            runBranchFrame(
+                "upper-lip", "0", "1e500",
+                false);
+            runBranchFrame(
+                "lower-lip", "-0", "1e500",
+                false);
         }
     }
 
@@ -8011,7 +8444,23 @@ static int runExpressionDeepRenderCase() {
               FormulaParameter::C,
               &transcendentalFixed, "0" },
             { "reciprocal-z0", "1/(z+2)+c",
-              FormulaParameter::InitialZ, &z0Fixed, "0" }
+              FormulaParameter::InitialZ, &z0Fixed, "0" },
+            { "log", "log(z+2)+c",
+              FormulaParameter::C,
+              &branchFixed, "0" },
+            { "log10", "log10(z+2)+c",
+              FormulaParameter::C,
+              &branchFixed, "0" },
+            { "sqrt", "0.25*sqrt(z+2)+c",
+              FormulaParameter::C,
+              &branchFixed, "0" },
+            { "power", "0.1*pow(z+2,c+0.25)+c",
+              FormulaParameter::C,
+              &branchFixed, "0" },
+            { "nested-branch",
+              "0.1*exp(log(z+2))+0.1*sin(sqrt(z+3))/(z+4)+c",
+              FormulaParameter::C,
+              &branchFixed, "0" }
         };
         for (const EntireFrame& frame : frames) {
             ProgramPair pair;
@@ -8027,6 +8476,8 @@ static int runExpressionDeepRenderCase() {
                     pair, *frame.fixed, frame.pixel,
                     frame.centerReal, "0",
                     11, 7, 30, enabled);
+            enabledRequest.taylor.requirePredictedBenefit =
+                false;
             ExpressionDeepRenderResult enabledResult;
             bool okay = formula::renderExpressionDeepFrame(
                 enabledRequest, enabledResult);
@@ -8060,6 +8511,8 @@ static int runExpressionDeepRenderCase() {
                     frame.centerReal, "0",
                     11, 7, 30, single);
             singleRequest.threading.threads = 1;
+            singleRequest.taylor.requirePredictedBenefit =
+                false;
             ExpressionDeepRenderResult singleResult;
             okay = okay &&
                 formula::renderExpressionDeepFrame(
@@ -8071,6 +8524,11 @@ static int runExpressionDeepRenderCase() {
                     formula::
                         ExpressionScaledResidualCapability::
                             CertifiedMeromorphicCandidate;
+            const bool branch =
+                pair.runtime.scaledResidualCapability() ==
+                    formula::
+                        ExpressionScaledResidualCapability::
+                            CertifiedBranchCandidate;
             if (!okay || enabled != disabled ||
                 enabled != mpfr || enabled != single ||
                 !enabledResult.taylorAccepted ||
@@ -8082,6 +8540,18 @@ static int runExpressionDeepRenderCase() {
                           taylorReciprocalOperationCount == 0 ||
                       enabledResult.
                           taylorMinimumDenominatorClearance.
+                              isZero()
+                    : branch
+                    ? enabledResult.
+                          taylorBranchCompositionCount == 0 ||
+                      enabledResult.
+                          taylorBranchCompositionOperationCount ==
+                              0 ||
+                      enabledResult.
+                          taylorMinimumBranchCutClearance.
+                              isZero() ||
+                      enabledResult.
+                          taylorMinimumBranchZeroClearance.
                               isZero()
                     : enabledResult.
                           taylorFunctionSeriesCount == 0) ||
@@ -8172,6 +8642,83 @@ static int runExpressionDeepRenderCase() {
                 tinyResult.fallbackPixelCount !=
                     tinyOutput.size()) {
                 printf("  entire Taylor cost auto-disable failed\n");
+                ++failures;
+            }
+        }
+
+        ProgramPair branchBenchmark;
+        if (!compilePair(
+                "log(z+2)+c", FormulaParameter::C,
+                branchFixed, branchBenchmark)) {
+            ++failures;
+        } else {
+            bool speedOkay = true;
+            double jetSeconds[2]{};
+            double mpfrSeconds[2]{};
+            uint64_t fallback = 0;
+            formula::ScaledRealValue cutClearance;
+            formula::ScaledRealValue zeroClearance;
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                std::vector<float> jetOutput, mpfrOutput;
+                ExpressionDeepRenderRequest jetRequest =
+                    makeRequest(
+                        branchBenchmark, branchFixed,
+                        FormulaParameter::C,
+                        "0", "0", 80, 50, 120,
+                        jetOutput);
+                ExpressionDeepRenderResult jetResult;
+                const Clock::time_point jetStart =
+                    Clock::now();
+                speedOkay = speedOkay &&
+                    formula::renderExpressionDeepFrame(
+                        jetRequest, jetResult);
+                jetSeconds[repeat] =
+                    std::chrono::duration<double>(
+                        Clock::now() - jetStart).count();
+
+                ExpressionDeepRenderRequest mpfrRequest =
+                    makeRequest(
+                        branchBenchmark, branchFixed,
+                        FormulaParameter::C,
+                        "0", "0", 80, 50, 120,
+                        mpfrOutput);
+                mpfrRequest.
+                    forceMpfrFallbackForVerification = true;
+                ExpressionDeepRenderResult mpfrResult;
+                const Clock::time_point mpfrStart =
+                    Clock::now();
+                speedOkay = speedOkay &&
+                    formula::renderExpressionDeepFrame(
+                        mpfrRequest, mpfrResult);
+                mpfrSeconds[repeat] =
+                    std::chrono::duration<double>(
+                        Clock::now() - mpfrStart).count();
+                fallback = jetResult.fallbackPixelCount;
+                cutClearance =
+                    jetResult.
+                        taylorMinimumBranchCutClearance;
+                zeroClearance =
+                    jetResult.
+                        taylorMinimumBranchZeroClearance;
+                speedOkay = speedOkay &&
+                    jetOutput == mpfrOutput &&
+                    jetResult.taylorAccepted &&
+                    jetResult.taylorBranchCompositionCount >
+                        0 &&
+                    jetResult.taylorAcceptedPixelCount > 0 &&
+                    jetSeconds[repeat] <
+                        mpfrSeconds[repeat];
+            }
+            printf("  branch Taylor e500 jet/MPFR %.3f/%.3f and %.3f/%.3f s fallback=%llu cut=(%.6g,e%lld) zero=(%.6g,e%lld)\n",
+                   jetSeconds[0], mpfrSeconds[0],
+                   jetSeconds[1], mpfrSeconds[1],
+                   (unsigned long long)fallback,
+                   cutClearance.mantissa,
+                   (long long)cutClearance.exponent,
+                   zeroClearance.mantissa,
+                   (long long)zeroClearance.exponent);
+            if (!speedOkay) {
+                printf("  branch Taylor repeated speed gate failed\n");
                 ++failures;
             }
         }
@@ -8610,6 +9157,8 @@ static int runExpressionDeepRenderCase() {
     // Cancellation leaves all unfinished pixels at EMPTY in both phases.
     auto cancellationCase = [&](
             const char* source, bool fallbackPhase) {
+        const bool branchFast =
+            std::string(source) == "log(z+2)+c";
         ProgramPair pair;
         const FormulaParameter pixel = FormulaParameter::C;
         if (!compilePair(
@@ -8620,9 +9169,11 @@ static int runExpressionDeepRenderCase() {
         std::vector<float> output;
         ExpressionDeepRenderRequest request = makeRequest(
             pair, mandelbrotFixed, pixel,
-            fallbackPhase ? "0" : "-2", "0",
-            fallbackPhase ? 96 : 48,
-            fallbackPhase ? 64 : 28,
+            fallbackPhase ? "0" :
+                branchFast ? "0" : "-2",
+            "0",
+            fallbackPhase ? 96 : branchFast ? 400 : 48,
+            fallbackPhase ? 64 : branchFast ? 240 : 28,
             fallbackPhase ? 30 : 850,
             output);
         std::atomic<int> phase{
@@ -8647,7 +9198,9 @@ static int runExpressionDeepRenderCase() {
             return target &&
                    polls.fetch_add(
                        1, std::memory_order_relaxed) >
-                       (fallbackPhase ? 20 : 300);
+                       (fallbackPhase
+                            ? 20
+                            : branchFast ? 0 : 300);
         };
         ExpressionDeepRenderResult result;
         const bool okay =
@@ -8661,14 +9214,16 @@ static int runExpressionDeepRenderCase() {
             result.status !=
                 ExpressionDeepRenderStatus::Cancelled ||
             empty == 0) {
-            printf("  %s cancellation failed empty=%zu\n",
+            printf("  %s cancellation failed [%s] empty=%zu\n",
                    fallbackPhase ? "fallback" : "fast",
+                   source,
                    empty);
             ++failures;
         }
     };
     cancellationCase("z*z+c", false);
     cancellationCase("sin(z)+c", false);
+    cancellationCase("log(z+2)+c", false);
     cancellationCase("0.001/(c-c)", true);
 
     // Worker and per-iteration allocation failures must not let any thread
@@ -8686,7 +9241,8 @@ static int runExpressionDeepRenderCase() {
         }
         std::vector<float> output;
         const bool largeFastFrame =
-            std::string(source) == "1/(z+2)+c";
+            std::string(source) == "1/(z+2)+c" ||
+            std::string(source) == "log(z+2)+c";
         ExpressionDeepRenderRequest request = makeRequest(
             pair, mandelbrotFixed, FormulaParameter::C,
             largeFastFrame ? "0" : "-1", "0",
@@ -8745,6 +9301,16 @@ static int runExpressionDeepRenderCase() {
         ExpressionDeepVerificationFault::
             FastIterationAllocation,
         "meromorphic fast iteration allocation");
+    workerFaultCase(
+        "log(z+2)+c",
+        ExpressionDeepVerificationFault::
+            FastWorkerAllocation,
+        "branch fast worker allocation");
+    workerFaultCase(
+        "log(z+2)+c",
+        ExpressionDeepVerificationFault::
+            FastIterationAllocation,
+        "branch fast iteration allocation");
     workerFaultCase(
         "0.001/(c-c)",
         ExpressionDeepVerificationFault::
@@ -8971,7 +9537,7 @@ static int runExpressionDeepRenderCase() {
     }
 
     printf("=== expression deep frame renderer e500\n");
-    printf("  exact frames=%d certified entire/meromorphic jets plus MPFR pole/branch fallback\n",
+    printf("  exact frames=%d certified entire/meromorphic/branch jets plus MPFR pole/branch fallback\n",
            exactFrames);
     printf("  64x40 reference/scaled/all-MPFR %.3f/%.3f/%.3f s speedup %.2fx\n",
            benchmarkReference, benchmarkScaled,

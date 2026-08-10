@@ -52,6 +52,7 @@ enum class ExpressionScaledResidualCapability : uint8_t {
     ExactCenteredArithmetic,
     CertifiedEntireCandidate,
     CertifiedMeromorphicCandidate,
+    CertifiedBranchCandidate,
     UncertifiedSeries,
     BranchSensitive,
     Unsupported
