@@ -384,6 +384,10 @@ void configureFixed(
 ExpressionDeepFallbackReason reasonForCapability(
         ExpressionScaledResidualCapability capability) {
     switch (capability) {
+    case ExpressionScaledResidualCapability::
+            CertifiedEntireCandidate:
+        return ExpressionDeepFallbackReason::
+            CertificationFailure;
     case ExpressionScaledResidualCapability::UncertifiedSeries:
         return ExpressionDeepFallbackReason::UncertifiedSeries;
     case ExpressionScaledResidualCapability::BranchSensitive:
@@ -765,6 +769,8 @@ bool renderExpressionDeepFrame(
                 request.taylor.order ||
             request.taylor.order >
                 request.taylor.maximumOrder ||
+            request.taylor.maximumCompositionOrder < 1 ||
+            request.taylor.maximumCompositionOrder > 24 ||
             request.taylor.maximumCandidateIteration < 0 ||
             !(request.taylor.accuracyBudget > 0.0) ||
             !std::isfinite(
@@ -896,17 +902,31 @@ bool renderExpressionDeepFrame(
 
         result.capability =
             request.runtimeProgram->scaledResidualCapability();
+        const bool entireCandidate =
+            result.capability ==
+                ExpressionScaledResidualCapability::
+                    CertifiedEntireCandidate;
+        const bool entireTaylorEligible =
+            !entireCandidate ||
+            (request.taylor.enableTaylor &&
+             request.maxIterations >
+                 request.taylor.minimumLanding);
         bool runFast =
             !request.forceMpfrFallbackForVerification &&
+            entireTaylorEligible &&
             (result.capability ==
                 ExpressionScaledResidualCapability::
                     ExactCenteredArithmetic ||
+            result.capability ==
+                ExpressionScaledResidualCapability::
+                    CertifiedEntireCandidate ||
             (result.capability ==
                  ExpressionScaledResidualCapability::
                     UncertifiedSeries &&
              request.allowUncertifiedForBenchmark));
         bool certificationUnavailable =
-            request.forceMpfrFallbackForVerification;
+            request.forceMpfrFallbackForVerification ||
+            (entireCandidate && !entireTaylorEligible);
 
         size_t rendererBaseBytes = 0;
         if ((runFast &&
@@ -953,10 +973,32 @@ bool renderExpressionDeepFrame(
         result.rendererBytes = rendererBytes;
         if (request.memory.memoryLimitBytes != 0 &&
             rendererBytes >
-                request.memory.memoryLimitBytes)
-            return fail(
-                ExpressionDeepRenderStatus::ResourceLimit,
-                "renderer exceeds memory limit");
+                request.memory.memoryLimitBytes) {
+            if (!entireCandidate)
+                return fail(
+                    ExpressionDeepRenderStatus::ResourceLimit,
+                    "renderer exceeds memory limit");
+            runFast = false;
+            certificationUnavailable = true;
+            rendererBaseBytes = 0;
+            if (!checkedAddSize(
+                    rendererBaseBytes, pixelCount,
+                    sizeof(uint8_t)) ||
+                !checkedAddSize(
+                    rendererBaseBytes, pixelCount,
+                    sizeof(size_t)))
+                return fail(
+                    ExpressionDeepRenderStatus::ResourceLimit,
+                    "fallback renderer memory calculation overflow");
+            fastThreadBytesTotal = 0;
+            rendererBytes = rendererBaseBytes;
+            result.rendererBytes = rendererBytes;
+            if (rendererBytes >
+                    request.memory.memoryLimitBytes)
+                return fail(
+                    ExpressionDeepRenderStatus::ResourceLimit,
+                    "fallback renderer exceeds memory limit");
+        }
 
         ExpressionReferencePrecisionPolicy precision =
             request.precision;
@@ -981,9 +1023,12 @@ bool renderExpressionDeepFrame(
                 request.memory.fallbackGuardBits;
 
         if (runFast &&
-            result.capability ==
-                ExpressionScaledResidualCapability::
-                    ExactCenteredArithmetic) {
+            (result.capability ==
+                 ExpressionScaledResidualCapability::
+                     ExactCenteredArithmetic ||
+             result.capability ==
+                 ExpressionScaledResidualCapability::
+                     CertifiedEntireCandidate)) {
             const mpfr_prec_t certificationGuard =
                 std::max<mpfr_prec_t>(
                     128, precision.guardBits);
@@ -1054,9 +1099,12 @@ bool renderExpressionDeepFrame(
                 request.maxIterations;
             referenceRequest.precision = precision;
             referenceRequest.certificationPrecision =
-                result.capability ==
-                    ExpressionScaledResidualCapability::
-                        ExactCenteredArithmetic
+                (result.capability ==
+                     ExpressionScaledResidualCapability::
+                         ExactCenteredArithmetic ||
+                 result.capability ==
+                     ExpressionScaledResidualCapability::
+                         CertifiedEntireCandidate)
                 ? result.certificationPrecision : 0;
             referenceRequest.memoryLimitBytes =
                 request.memory.memoryLimitBytes;
@@ -1077,9 +1125,12 @@ bool renderExpressionDeepFrame(
                     "render cancelled while building the reference");
             if (!referenceBuilt) {
                 const bool mayFallback =
-                    result.capability ==
-                        ExpressionScaledResidualCapability::
-                            ExactCenteredArithmetic &&
+                    (result.capability ==
+                         ExpressionScaledResidualCapability::
+                             ExactCenteredArithmetic ||
+                     result.capability ==
+                         ExpressionScaledResidualCapability::
+                             CertifiedEntireCandidate) &&
                     reference.status !=
                         ExpressionReferenceBuildStatus::
                             ProgramMismatch &&
@@ -1105,9 +1156,12 @@ bool renderExpressionDeepFrame(
                 reference = {};
                 result.referenceBytes = 0;
             } else if (
-                result.capability ==
-                    ExpressionScaledResidualCapability::
-                        ExactCenteredArithmetic &&
+                (result.capability ==
+                     ExpressionScaledResidualCapability::
+                         ExactCenteredArithmetic ||
+                 result.capability ==
+                     ExpressionScaledResidualCapability::
+                         CertifiedEntireCandidate) &&
                 (!reference.
                      certifiedAgainstHigherPrecision ||
                  reference.certificationPrecision !=
@@ -1130,10 +1184,29 @@ bool renderExpressionDeepFrame(
                      request.memory.memoryLimitBytes ||
                  rendererBytes >
                      request.memory.memoryLimitBytes -
-                         reference.memoryBytes))
-                return fail(
-                    ExpressionDeepRenderStatus::ResourceLimit,
-                    "reference plus renderer exceeds memory limit");
+                         reference.memoryBytes)) {
+                if (!entireCandidate)
+                    return fail(
+                        ExpressionDeepRenderStatus::ResourceLimit,
+                        "reference plus renderer exceeds memory limit");
+                runFast = false;
+                certificationUnavailable = true;
+                reference = {};
+                result.referenceBytes = 0;
+                rendererBaseBytes = 0;
+                if (!checkedAddSize(
+                        rendererBaseBytes, pixelCount,
+                        sizeof(uint8_t)) ||
+                    !checkedAddSize(
+                        rendererBaseBytes, pixelCount,
+                        sizeof(size_t)))
+                    return fail(
+                        ExpressionDeepRenderStatus::ResourceLimit,
+                        "fallback renderer memory calculation overflow");
+                fastThreadBytesTotal = 0;
+                rendererBytes = rendererBaseBytes;
+                result.rendererBytes = rendererBytes;
+            }
         }
 
         std::vector<uint8_t> fallbackReason(
@@ -1309,19 +1382,44 @@ bool renderExpressionDeepFrame(
                          request.memory.memoryLimitBytes ||
                      rendererBytes >
                          request.memory.memoryLimitBytes -
-                             reference.memoryBytes))
-                    return fail(
-                        ExpressionDeepRenderStatus::ResourceLimit,
-                        "validation workspace exceeds memory limit");
+                             reference.memoryBytes)) {
+                    if (!entireCandidate)
+                        return fail(
+                            ExpressionDeepRenderStatus::ResourceLimit,
+                            "validation workspace exceeds memory limit");
+                    runFast = false;
+                    certificationUnavailable = true;
+                    reference = {};
+                    result.referenceBytes = 0;
+                    validationEvaluator.reset();
+                    std::vector<ScaledOffset>().swap(xOffsets);
+                    std::vector<ScaledOffset>().swap(yOffsets);
+                    rendererBaseBytes = 0;
+                    if (!checkedAddSize(
+                            rendererBaseBytes, pixelCount,
+                            sizeof(uint8_t)) ||
+                        !checkedAddSize(
+                            rendererBaseBytes, pixelCount,
+                            sizeof(size_t)))
+                        return fail(
+                            ExpressionDeepRenderStatus::ResourceLimit,
+                            "fallback renderer memory calculation overflow");
+                    fastThreadBytesTotal = 0;
+                    rendererBytes = rendererBaseBytes;
+                    result.rendererBytes = rendererBytes;
+                }
             }
             // Validation is complete; destroy its retained vector capacities
             // before Taylor construction and the parallel render peak.
             validationEvaluator.reset();
 
             if (runFast && request.taylor.enableTaylor &&
-                result.capability ==
-                    ExpressionScaledResidualCapability::
-                        ExactCenteredArithmetic &&
+                (result.capability ==
+                     ExpressionScaledResidualCapability::
+                         ExactCenteredArithmetic ||
+                 result.capability ==
+                     ExpressionScaledResidualCapability::
+                         CertifiedEntireCandidate) &&
                 request.maxIterations >
                     request.taylor.minimumLanding) {
                 result.taylorAttempted = true;
@@ -1374,6 +1472,9 @@ bool renderExpressionDeepFrame(
                         request.taylor.order;
                     jetRequest.maximumOrder =
                         request.taylor.maximumOrder;
+                    jetRequest.maximumCompositionOrder =
+                        request.taylor.
+                            maximumCompositionOrder;
                     jetRequest.minimumLanding =
                         request.taylor.minimumLanding;
                     jetRequest.maximumCandidateIteration =
@@ -1418,6 +1519,14 @@ bool renderExpressionDeepFrame(
                 result.taylorOrder = taylorJet.order;
                 result.taylorCoveredIterations =
                     taylorJet.landingIteration;
+                result.taylorMaximumFunctionSeriesOrder =
+                    taylorJet.maximumFunctionSeriesOrder;
+                result.taylorFunctionSeriesCount =
+                    taylorJet.functionSeriesCount;
+                result.taylorFunctionSeriesOperationCount =
+                    taylorJet.functionSeriesOperationCount;
+                result.taylorMaximumFunctionSeriesTail =
+                    taylorJet.maximumFunctionSeriesTail;
                 if (cancelled.load(
                         std::memory_order_acquire) ||
                     taylorJet.status ==
@@ -1427,6 +1536,17 @@ bool renderExpressionDeepFrame(
                         ExpressionDeepRenderStatus::
                             Cancelled,
                         "render cancelled while building Taylor jet");
+                if (useTaylor &&
+                    result.capability ==
+                        ExpressionScaledResidualCapability::
+                            CertifiedEntireCandidate &&
+                    !request.allowUncertifiedForBenchmark &&
+                    taylorJet.landingIteration <
+                        request.maxIterations) {
+                    useTaylor = false;
+                    result.taylorFailureReason =
+                        "certified entire Taylor jet does not cover the full iteration horizon";
+                }
                 if (useTaylor &&
                     request.taylor.
                         requirePredictedBenefit) {
@@ -1510,6 +1630,39 @@ bool renderExpressionDeepFrame(
                         taylorJet.intermediateEscapeMargins);
                 }
                 result.taylorAccepted = useTaylor;
+            }
+            if (runFast &&
+                result.capability ==
+                    ExpressionScaledResidualCapability::
+                        CertifiedEntireCandidate &&
+                !request.allowUncertifiedForBenchmark &&
+                !useTaylor) {
+                runFast = false;
+                certificationUnavailable = true;
+                reference = {};
+                result.referenceBytes = 0;
+                std::vector<ScaledOffset>().swap(xOffsets);
+                std::vector<ScaledOffset>().swap(yOffsets);
+                retainedTaylorBytes = 0;
+                rendererBaseBytes = 0;
+                if (!checkedAddSize(
+                        rendererBaseBytes, pixelCount,
+                        sizeof(uint8_t)) ||
+                    !checkedAddSize(
+                        rendererBaseBytes, pixelCount,
+                        sizeof(size_t)))
+                    return fail(
+                        ExpressionDeepRenderStatus::ResourceLimit,
+                        "fallback renderer memory calculation overflow");
+                fastThreadBytesTotal = 0;
+                rendererBytes = rendererBaseBytes;
+                result.rendererBytes = rendererBytes;
+                std::fill(
+                    fallbackReason.begin(),
+                    fallbackReason.end(),
+                    static_cast<uint8_t>(
+                        ExpressionDeepFallbackReason::
+                            CertificationFailure));
             }
         }
         if (!runFast &&
@@ -1753,9 +1906,16 @@ bool renderExpressionDeepFrame(
                                                         landingValue;
                                                     arithmetic =
                                                         makeScaledComplexValue(
-                                                            landingSample.z,
-                                                            landingSample.
-                                                                zDefect,
+                                                            taylorJet.
+                                                                landingUsesSampleOutput
+                                                            ? landingSample.next
+                                                            : landingSample.z,
+                                                            taylorJet.
+                                                                landingUsesSampleOutput
+                                                            ? landingSample.
+                                                                  rootDefect
+                                                            : landingSample.
+                                                                  zDefect,
                                                             landingBase.value);
                                                     if (arithmetic ==
                                                             ScaledArithmeticStatus::
@@ -1810,11 +1970,29 @@ bool renderExpressionDeepFrame(
                                                     fetch_add(
                                                         1,
                                                         std::memory_order_relaxed);
+                                                if (firstIteration ==
+                                                        request.
+                                                            maxIterations) {
+                                                    pixel.decided = true;
+                                                    pixel.output =
+                                                        ExpressionDeepInteriorPixel;
+                                                }
                                             } else {
                                                 taylorFallbackPixels.
                                                     fetch_add(
                                                         1,
                                                         std::memory_order_relaxed);
+                                                if (result.capability ==
+                                                        ExpressionScaledResidualCapability::
+                                                            CertifiedEntireCandidate &&
+                                                    !request.
+                                                        allowUncertifiedForBenchmark) {
+                                                    pixel.reason =
+                                                        ExpressionDeepFallbackReason::
+                                                            CertificationFailure;
+                                                    firstIteration =
+                                                        request.maxIterations;
+                                                }
                                             }
                                         }
                                         const Clock::time_point

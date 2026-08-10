@@ -584,7 +584,8 @@ ExpressionProgram::scaledResidualCapability() const {
     if (hasUnsupported)
         return ExpressionScaledResidualCapability::Unsupported;
     if (hasSeries)
-        return ExpressionScaledResidualCapability::UncertifiedSeries;
+        return ExpressionScaledResidualCapability::
+            CertifiedEntireCandidate;
     return ExpressionScaledResidualCapability::ExactCenteredArithmetic;
 }
 

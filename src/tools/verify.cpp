@@ -6283,7 +6283,10 @@ static int runExpressionTaylorCase() {
             reference.samples[jet.landingSample];
         ScaledComplexBall base;
         if (formula::makeScaledComplexValue(
-                sample.z, sample.zDefect,
+                jet.landingUsesSampleOutput
+                ? sample.next : sample.z,
+                jet.landingUsesSampleOutput
+                ? sample.rootDefect : sample.zDefect,
                 base.value) !=
                 ScaledArithmeticStatus::Success ||
             formula::certifiedScaledAdd(
@@ -6298,7 +6301,7 @@ static int runExpressionTaylorCase() {
 
     int failures = 0;
     int containmentChecks = 0;
-    const Complex qValues[] = {
+    std::vector<Complex> qValues = {
         { 0.0, 0.0 },
         { 0.25, -0.5 },
         { -0.6, 0.2 },
@@ -6312,6 +6315,23 @@ static int runExpressionTaylorCase() {
         { 0.198, 0.613 },
         { -0.623, 0.109 }
     };
+    uint64_t randomState = 0x9e3779b97f4a7c15ULL;
+    while (qValues.size() < 32) {
+        randomState =
+            randomState * 6364136223846793005ULL + 1;
+        const double x =
+            (static_cast<double>(
+                 (randomState >> 11) & 0x1fffff) /
+                 1048576.0 - 1.0) * 0.7;
+        randomState =
+            randomState * 6364136223846793005ULL + 1;
+        const double y =
+            (static_cast<double>(
+                 (randomState >> 11) & 0x1fffff) /
+                 1048576.0 - 1.0) * 0.7;
+        if (std::abs(x) + std::abs(y) <= 0.9)
+            qValues.emplace_back(x, y);
+    }
     struct FormulaCase {
         const char* name;
         const char* source;
@@ -6321,6 +6341,7 @@ static int runExpressionTaylorCase() {
         const char* centerImaginary;
         int64_t scaleExponent;
         mpfr_prec_t viewBits;
+        bool firstCoefficientIsScale;
     };
     ExpressionContext quadratic;
     ExpressionContext parameterized;
@@ -6329,19 +6350,59 @@ static int runExpressionTaylorCase() {
     z0Plane.c = { -0.35, 0.2 };
     const FormulaCase cases[] = {
         { "quadratic-c", "z*z+c", FormulaParameter::C,
-          quadratic, "-0.25", "0.1", -1800, 1800 },
+          quadratic, "-0.25", "0.1", -1800, 1800, true },
         { "parameter-poly", "z*z+c+p0*z",
           FormulaParameter::C, parameterized,
-          "-0.2", "0.15", -1800, 1800 },
+          "-0.2", "0.15", -1800, 1800, true },
         { "generic-cubic", "z*z*z+c",
           FormulaParameter::C, quadratic,
-          "-0.1", "0.2", -1800, 1800 },
+          "-0.1", "0.2", -1800, 1800, true },
         { "quadratic-z0", "z*z+c",
           FormulaParameter::InitialZ, z0Plane,
-          "0.1", "-0.2", -1800, 1800 },
+          "0.1", "-0.2", -1800, 1800, false },
         { "quadratic-c-e1000", "z*z+c",
           FormulaParameter::C, quadratic,
-          "-0.25", "0.1", -3600, 3600 }
+          "-0.25", "0.1", -3600, 3600, true },
+        { "exp-moderate", "exp(z)-1+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -3, 512, true },
+        { "sin-moderate", "sin(z)+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -3, 512, true },
+        { "cos-moderate", "cos(z)-1+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -3, 512, true },
+        { "sinh-moderate", "sinh(z)+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -3, 512, true },
+        { "cosh-moderate", "cosh(z)-1+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -3, 512, true },
+        { "standalone-exp", "exp(c)-1",
+          FormulaParameter::C, quadratic,
+          "0", "0", -3, 512, true },
+        { "standalone-sin", "sin(c)",
+          FormulaParameter::C, quadratic,
+          "0", "0", -3, 512, true },
+        { "standalone-cos", "cos(c)-1",
+          FormulaParameter::C, quadratic,
+          "0", "0", -3, 512, false },
+        { "standalone-sinh", "sinh(c)",
+          FormulaParameter::C, quadratic,
+          "0", "0", -3, 512, true },
+        { "standalone-cosh", "cosh(c)-1",
+          FormulaParameter::C, quadratic,
+          "0", "0", -3, 512, false },
+        { "composed-sin-e500", "sin(z*z+c)+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -1800, 1800, false },
+        { "mixed-hyperbolic-e500",
+          "sinh(0.25*z)+cosh(0.25*z)-1+c",
+          FormulaParameter::C, quadratic,
+          "0", "0", -1800, 1800, true },
+        { "sin-z0-e500", "sin(z)+c",
+          FormulaParameter::InitialZ, z0Plane,
+          "0", "0", -1800, 1800, false }
     };
 
     for (const FormulaCase& test : cases) {
@@ -6374,12 +6435,24 @@ static int runExpressionTaylorCase() {
         request.bailout = 4.0;
         request.accuracyBudget = 0x1p-40;
         ExpressionTaylorJetResult jet;
+        const bool entireCandidate =
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    CertifiedEntireCandidate;
         if (!ExpressionTaylorJetBuilder::build(
                 request, jet) ||
             jet.landingIteration < 1 ||
             !jet.certified ||
             jet.coefficients.size() !=
-                static_cast<size_t>(jet.order) + 1) {
+                static_cast<size_t>(jet.order) + 1 ||
+            (entireCandidate &&
+             (jet.functionSeriesCount == 0 ||
+              jet.functionSeriesOperationCount == 0 ||
+              jet.maximumFunctionSeriesOrder < 1 ||
+              formula::compareScaledNonnegative(
+                  jet.maximumFunctionSeriesTail,
+                  ScaledRealValue{
+                      0.5, -39 }) > 0))) {
             printf("  Taylor build failed [%s]: %s/%s landing=%d\n",
                    test.name,
                    formula::expressionTaylorJetStatusName(
@@ -6405,6 +6478,7 @@ static int runExpressionTaylorCase() {
             }
             if (landing == 1 &&
                 test.pixel == FormulaParameter::C &&
+                test.firstCoefficientIsScale &&
                 (prefix.coefficients[1].re.mantissa !=
                      scale.re.mantissa ||
                  prefix.coefficients[1].re.exponent !=
@@ -6590,6 +6664,101 @@ static int runExpressionTaylorCase() {
         }
     }
 
+    // Finite-series tails, companion metadata, and large derivative/reference
+    // factors must reject rather than relying on coefficient decay.
+    {
+        auto expectTailRejection = [&](
+                const char* name, const char* source,
+                int maximumCompositionOrder) {
+            ProgramPair pair;
+            ExpressionReferenceOrbitResult reference;
+            ExpressionContext fixed;
+            bool okay = compilePair(
+                    source, FormulaParameter::C,
+                    fixed, pair) &&
+                buildReference(
+                    pair, fixed, FormulaParameter::C,
+                    "0", "0", 4, 512, reference);
+            ExpressionTaylorJetRequest request;
+            request.program = &pair.runtime;
+            request.reference = &reference;
+            request.pixelParameter = FormulaParameter::C;
+            request.parameterScale = makeScale(-3);
+            request.minimumLanding = 1;
+            request.maximumCandidateIteration = 1;
+            request.maximumCompositionOrder =
+                maximumCompositionOrder;
+            ExpressionTaylorJetResult jet;
+            okay = okay &&
+                !ExpressionTaylorJetBuilder::build(
+                    request, jet) &&
+                jet.status ==
+                    ExpressionTaylorJetStatus::
+                        AccuracyBudget &&
+                jet.failureReason.find("tail") !=
+                    std::string::npos;
+            if (!okay) {
+                printf("  Taylor certified-tail rejection failed [%s] status=%s reason=%s\n",
+                       name,
+                       formula::expressionTaylorJetStatusName(
+                           jet.status),
+                       jet.failureReason.c_str());
+                ++failures;
+            }
+        };
+        expectTailRejection(
+            "high-exp-derivative",
+            "exp(100*c)-1+c", 24);
+        expectTailRejection(
+            "large-exp-reference",
+            "exp(c+100)*0+c", 24);
+        expectTailRejection(
+            "large-sin-companion",
+            "sin(c+complex(0,100))*0+c", 24);
+        expectTailRejection(
+            "bounded-composition-order",
+            "exp(c)-1+c", 1);
+    }
+    {
+        ProgramPair pair;
+        ExpressionReferenceOrbitResult reference;
+        ExpressionContext fixed;
+        bool okay = compilePair(
+                "sin(z)+c", FormulaParameter::C,
+                fixed, pair) &&
+            buildReference(
+                pair, fixed, FormulaParameter::C,
+                "0", "0", 4, 512, reference);
+        if (okay) {
+            for (auto& node : reference.tape) {
+                if (node.operation ==
+                        formula::ExpressionOracleOperation::
+                            Sin) {
+                    node.flags &=
+                        ~formula::OracleTraceHasCompanion;
+                    break;
+                }
+            }
+            ExpressionTaylorJetRequest request;
+            request.program = &pair.runtime;
+            request.reference = &reference;
+            request.pixelParameter = FormulaParameter::C;
+            request.parameterScale = makeScale(-16);
+            request.minimumLanding = 1;
+            request.maximumCandidateIteration = 1;
+            ExpressionTaylorJetResult jet;
+            okay =
+                !ExpressionTaylorJetBuilder::build(
+                    request, jet) &&
+                jet.status ==
+                    ExpressionTaylorJetStatus::InvalidTape;
+        }
+        if (!okay) {
+            printf("  Taylor companion guard failed\n");
+            ++failures;
+        }
+    }
+
     // The certified prefix must stop before a known escape.
     {
         ProgramPair pair;
@@ -6616,6 +6785,42 @@ static int runExpressionTaylorCase() {
         if (!okay) {
             printf("  Taylor first-escape stop failed landing=%d\n",
                    jet.landingIteration);
+            ++failures;
+        }
+    }
+    {
+        ProgramPair pair;
+        ExpressionReferenceOrbitResult reference;
+        ExpressionContext fixed;
+        bool okay = compilePair(
+                "exp(c)+c", FormulaParameter::C,
+                fixed, pair) &&
+            buildReference(
+                pair, fixed, FormulaParameter::C,
+                "1.5", "0", 4, 512, reference);
+        ExpressionTaylorJetRequest request;
+        request.program = &pair.runtime;
+        request.reference = &reference;
+        request.pixelParameter = FormulaParameter::C;
+        request.parameterScale = makeScale(-600);
+        request.minimumLanding = 1;
+        request.maximumCandidateIteration = 2;
+        ExpressionTaylorJetResult jet;
+        okay = okay &&
+            !ExpressionTaylorJetBuilder::build(
+                request, jet) &&
+            jet.landingIteration == 0 &&
+            (jet.status ==
+                 ExpressionTaylorJetStatus::
+                     BailoutUncertain ||
+             jet.status ==
+                 ExpressionTaylorJetStatus::
+                     NoCoverage);
+        if (!okay) {
+            printf("  entire Taylor first-escape stop failed landing=%d status=%s\n",
+                   jet.landingIteration,
+                   formula::expressionTaylorJetStatusName(
+                       jet.status));
             ++failures;
         }
     }
@@ -7018,7 +7223,8 @@ static int runExpressionDeepRenderCase() {
             const char* centerImaginary,
             int width, int height, int iterations,
             uint64_t expectedFallback,
-            ExpressionDeepFallbackReason expectedReason) {
+            ExpressionDeepFallbackReason expectedReason,
+            bool expectTaylorAccepted) {
         ProgramPair pair;
         if (!compilePair(source, pixel, fixed, pair)) {
             printf("  compile failed [%s]\n", name);
@@ -7052,7 +7258,10 @@ static int runExpressionDeepRenderCase() {
         const bool expectsReference =
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
-                    ExactCenteredArithmetic;
+                    ExactCenteredArithmetic ||
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    CertifiedEntireCandidate;
         const bool uncertainReason =
             expectedReason ==
                 ExpressionDeepFallbackReason::
@@ -7087,8 +7296,15 @@ static int runExpressionDeepRenderCase() {
                   result.certificationPrecision <=
                       result.selectedPrecision
                 : result.referenceBytes != 0) ||
+            (expectTaylorAccepted &&
+             (!result.taylorAccepted ||
+              result.taylorAcceptedPixelCount == 0 ||
+              result.taylorCoveredIterations != iterations ||
+              result.taylorFunctionSeriesCount == 0 ||
+              result.taylorFunctionSeriesOperationCount == 0 ||
+              result.taylorMaximumFunctionSeriesOrder < 1)) ||
             result.rendererBytes == 0) {
-            printf("  exact frame mismatch [%s] fast/fallback=%llu/%llu precision=%lld reasons cert/bailout/exhausted=%llu/%llu/%llu\n",
+            printf("  exact frame mismatch [%s] fast/fallback=%llu/%llu precision=%lld reasons cert/bailout/exhausted=%llu/%llu/%llu Taylor=%s/%s\n",
                    name,
                    (unsigned long long)result.fastPixelCount,
                    (unsigned long long)result.fallbackPixelCount,
@@ -7104,7 +7320,10 @@ static int runExpressionDeepRenderCase() {
                    (unsigned long long)reasonCount(
                        result,
                        ExpressionDeepFallbackReason::
-                           ReferenceExhausted));
+                           ReferenceExhausted),
+                   formula::expressionTaylorJetStatusName(
+                       result.taylorStatus),
+                   result.taylorFailureReason.c_str());
             ++failures;
             return;
         }
@@ -7126,7 +7345,8 @@ static int runExpressionDeepRenderCase() {
         "arithmetic-c-tail", "z*z+c",
         FormulaParameter::C, mandelbrotFixed,
         "-2", "0", 15, 9, 850, 135,
-        ExpressionDeepFallbackReason::BailoutUncertain);
+        ExpressionDeepFallbackReason::BailoutUncertain,
+        false);
 
     ExpressionContext z0Fixed;
     z0Fixed.c = {};
@@ -7134,46 +7354,65 @@ static int runExpressionDeepRenderCase() {
         "arithmetic-z0-tail", "2*z",
         FormulaParameter::InitialZ, z0Fixed,
         "0", "0", 13, 7, 1670, 0,
-        ExpressionDeepFallbackReason::InvalidTape);
+        ExpressionDeepFallbackReason::InvalidTape, false);
     verifyFrame(
         "initial-escape", "z+1",
         FormulaParameter::InitialZ, z0Fixed,
         "5", "0", 9, 5, 20, 0,
-        ExpressionDeepFallbackReason::InvalidTape);
+        ExpressionDeepFallbackReason::InvalidTape, false);
     verifyFrame(
         "finite-interior", "z",
         FormulaParameter::C, mandelbrotFixed,
         "3", "0", 7, 5, 12, 0,
-        ExpressionDeepFallbackReason::InvalidTape);
+        ExpressionDeepFallbackReason::InvalidTape, false);
     verifyFrame(
         "bailout-gate-fallback", "z",
         FormulaParameter::InitialZ, z0Fixed,
         "4", "0", 7, 5, 2, 35,
-        ExpressionDeepFallbackReason::BailoutUncertain);
+        ExpressionDeepFallbackReason::BailoutUncertain,
+        false);
 
     ExpressionContext transcendentalFixed;
     verifyFrame(
-        "sine-fallback", "sin(z)+c",
+        "sine-taylor", "sin(z)+c",
         FormulaParameter::C, transcendentalFixed,
-        "0", "0", 7, 5, 20, 35,
-        ExpressionDeepFallbackReason::UncertifiedSeries);
+        "0", "0", 7, 5, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
     verifyFrame(
-        "exp-fallback", "exp(0.1*z)+c",
+        "exp-taylor", "exp(0.1*z)+c",
         FormulaParameter::C, transcendentalFixed,
-        "-1", "0", 7, 5, 20, 35,
-        ExpressionDeepFallbackReason::UncertifiedSeries);
+        "-1", "0", 7, 5, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "composed-sine-taylor", "sin(z*z+c)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 7, 5, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "mixed-hyperbolic-taylor",
+        "sinh(0.25*z)+cosh(0.25*z)-1+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "sine-z0-taylor", "sin(z)+c",
+        FormulaParameter::InitialZ, z0Fixed,
+        "0", "0", 7, 5, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
     verifyFrame(
         "rational-fallback", "z/(c+2)+c",
         FormulaParameter::C, transcendentalFixed,
         "0", "0", 7, 5, 20, 35,
-        ExpressionDeepFallbackReason::UnsupportedOperation);
+        ExpressionDeepFallbackReason::UnsupportedOperation,
+        false);
     ExpressionContext branchFixed;
     branchFixed.z0 = { 1.0, 0.0 };
     verifyFrame(
         "branch-fallback", "log(z+2)+c",
         FormulaParameter::C, branchFixed,
         "0", "0", 7, 5, 12, 35,
-        ExpressionDeepFallbackReason::BranchSensitive);
+        ExpressionDeepFallbackReason::BranchSensitive,
+        false);
 
     // Independently rebuild the higher-precision point orbit and verify that
     // every retained compact arithmetic value lies inside its stored radius.
@@ -7471,7 +7710,183 @@ static int runExpressionDeepRenderCase() {
         }
     }
 
-    // The opt-in series path is informational only and is never the default.
+    // Certified entire jets must agree with Taylor-off, all-MPFR, and
+    // single-thread rendering.
+    {
+        struct EntireFrame {
+            const char* name;
+            const char* source;
+            FormulaParameter pixel;
+            const ExpressionContext* fixed;
+            const char* centerReal;
+        };
+        const EntireFrame frames[] = {
+            { "sin", "sin(z)+c", FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "cos", "cos(z)-1+c", FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "exp", "exp(0.1*z)+c", FormulaParameter::C,
+              &transcendentalFixed, "-1" },
+            { "sinh", "sinh(z)+c", FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "cosh", "cosh(z)-1+c", FormulaParameter::C,
+              &transcendentalFixed, "0" },
+            { "sin-z0", "sin(z)+c",
+              FormulaParameter::InitialZ, &z0Fixed, "0" }
+        };
+        for (const EntireFrame& frame : frames) {
+            ProgramPair pair;
+            std::vector<float> enabled, disabled, mpfr, single;
+            if (!compilePair(
+                    frame.source, frame.pixel,
+                    *frame.fixed, pair)) {
+                ++failures;
+                continue;
+            }
+            ExpressionDeepRenderRequest enabledRequest =
+                makeRequest(
+                    pair, *frame.fixed, frame.pixel,
+                    frame.centerReal, "0",
+                    11, 7, 30, enabled);
+            ExpressionDeepRenderResult enabledResult;
+            bool okay = formula::renderExpressionDeepFrame(
+                enabledRequest, enabledResult);
+
+            ExpressionDeepRenderRequest disabledRequest =
+                makeRequest(
+                    pair, *frame.fixed, frame.pixel,
+                    frame.centerReal, "0",
+                    11, 7, 30, disabled);
+            disabledRequest.taylor.enableTaylor = false;
+            ExpressionDeepRenderResult disabledResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    disabledRequest, disabledResult);
+
+            ExpressionDeepRenderRequest mpfrRequest =
+                makeRequest(
+                    pair, *frame.fixed, frame.pixel,
+                    frame.centerReal, "0",
+                    11, 7, 30, mpfr);
+            mpfrRequest.forceMpfrFallbackForVerification =
+                true;
+            ExpressionDeepRenderResult mpfrResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    mpfrRequest, mpfrResult);
+
+            ExpressionDeepRenderRequest singleRequest =
+                makeRequest(
+                    pair, *frame.fixed, frame.pixel,
+                    frame.centerReal, "0",
+                    11, 7, 30, single);
+            singleRequest.threading.threads = 1;
+            ExpressionDeepRenderResult singleResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    singleRequest, singleResult);
+            const uint64_t pixels =
+                static_cast<uint64_t>(enabled.size());
+            if (!okay || enabled != disabled ||
+                enabled != mpfr || enabled != single ||
+                !enabledResult.taylorAccepted ||
+                enabledResult.taylorAcceptedPixelCount == 0 ||
+                enabledResult.taylorCoveredIterations != 30 ||
+                enabledResult.taylorFunctionSeriesCount == 0 ||
+                disabledResult.fastPixelCount != 0 ||
+                disabledResult.fallbackPixelCount != pixels ||
+                mpfrResult.fastPixelCount != 0 ||
+                mpfrResult.fallbackPixelCount != pixels) {
+                printf("  entire Taylor parity failed [%s] accepted=%d landing=%d\n",
+                       frame.name,
+                       enabledResult.taylorAccepted ? 1 : 0,
+                       enabledResult.taylorCoveredIterations);
+                ++failures;
+            }
+        }
+
+        ProgramPair benchmarkPair;
+        if (!compilePair(
+                "sin(z)+c", FormulaParameter::C,
+                transcendentalFixed, benchmarkPair)) {
+            ++failures;
+        } else {
+            bool speedOkay = true;
+            double jetSeconds[2]{};
+            double mpfrSeconds[2]{};
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                std::vector<float> jetOutput, mpfrOutput;
+                ExpressionDeepRenderRequest jetRequest =
+                    makeRequest(
+                        benchmarkPair,
+                        transcendentalFixed,
+                        FormulaParameter::C,
+                        "0", "0", 80, 50, 120,
+                        jetOutput);
+                ExpressionDeepRenderResult jetResult;
+                const Clock::time_point jetStart =
+                    Clock::now();
+                speedOkay = speedOkay &&
+                    formula::renderExpressionDeepFrame(
+                        jetRequest, jetResult);
+                jetSeconds[repeat] =
+                    std::chrono::duration<double>(
+                        Clock::now() - jetStart).count();
+
+                ExpressionDeepRenderRequest mpfrRequest =
+                    makeRequest(
+                        benchmarkPair,
+                        transcendentalFixed,
+                        FormulaParameter::C,
+                        "0", "0", 80, 50, 120,
+                        mpfrOutput);
+                mpfrRequest.
+                    forceMpfrFallbackForVerification = true;
+                ExpressionDeepRenderResult mpfrResult;
+                const Clock::time_point mpfrStart =
+                    Clock::now();
+                speedOkay = speedOkay &&
+                    formula::renderExpressionDeepFrame(
+                        mpfrRequest, mpfrResult);
+                mpfrSeconds[repeat] =
+                    std::chrono::duration<double>(
+                        Clock::now() - mpfrStart).count();
+                speedOkay = speedOkay &&
+                    jetOutput == mpfrOutput &&
+                    jetResult.taylorAccepted &&
+                    jetResult.taylorAcceptedPixelCount > 0 &&
+                    jetSeconds[repeat] < mpfrSeconds[repeat];
+            }
+            printf("  entire Taylor e500 total jet/MPFR %.3f/%.3f and %.3f/%.3f s\n",
+                   jetSeconds[0], mpfrSeconds[0],
+                   jetSeconds[1], mpfrSeconds[1]);
+            if (!speedOkay) {
+                printf("  entire Taylor repeated speed gate failed\n");
+                ++failures;
+            }
+
+            std::vector<float> tinyOutput;
+            ExpressionDeepRenderRequest tinyRequest =
+                makeRequest(
+                    benchmarkPair, transcendentalFixed,
+                    FormulaParameter::C, "0", "0",
+                    3, 3, 9, tinyOutput);
+            ExpressionDeepRenderResult tinyResult;
+            if (!formula::renderExpressionDeepFrame(
+                    tinyRequest, tinyResult) ||
+                !tinyResult.taylorAttempted ||
+                tinyResult.taylorAccepted ||
+                tinyResult.fastPixelCount != 0 ||
+                tinyResult.fallbackPixelCount !=
+                    tinyOutput.size()) {
+                printf("  entire Taylor cost auto-disable failed\n");
+                ++failures;
+            }
+        }
+    }
+
+    // The opt-in per-step series path remains informational and is never the
+    // default.
     {
         ProgramPair pair;
         std::vector<float> output, expected;
@@ -7482,6 +7897,7 @@ static int runExpressionDeepRenderCase() {
                 pair, transcendentalFixed, FormulaParameter::C,
                 "0", "0", 9, 7, 20, output);
             request.allowUncertifiedForBenchmark = true;
+            request.taylor.enableTaylor = false;
             ExpressionDeepRenderResult result;
             if (!formula::renderExpressionDeepFrame(
                     request, result)) {
@@ -7700,7 +8116,7 @@ static int runExpressionDeepRenderCase() {
         runRangeCase(
             "exp-overflow-domain", "exp(c)*0",
             ExpressionDeepFallbackReason::
-                UncertifiedSeries);
+                CertificationFailure);
 
         mpfr_clears(
             value, scale, temporary, (mpfr_ptr)0);
@@ -7767,7 +8183,8 @@ static int runExpressionDeepRenderCase() {
         }
     };
     cancellationCase("z*z+c", false);
-    cancellationCase("sin(z)+c", true);
+    cancellationCase("sin(z)+c", false);
+    cancellationCase("z/(c+2)+c", true);
 
     // Worker and per-iteration allocation failures must not let any thread
     // bypass an OpenMP worksharing barrier.
@@ -7821,10 +8238,20 @@ static int runExpressionDeepRenderCase() {
     workerFaultCase(
         "sin(z)+c",
         ExpressionDeepVerificationFault::
+            FastWorkerAllocation,
+        "entire fast worker allocation");
+    workerFaultCase(
+        "sin(z)+c",
+        ExpressionDeepVerificationFault::
+            FastIterationAllocation,
+        "entire fast iteration allocation");
+    workerFaultCase(
+        "z/(c+2)+c",
+        ExpressionDeepVerificationFault::
             FallbackWorkerAllocation,
         "fallback worker allocation");
     workerFaultCase(
-        "sin(z)+c",
+        "z/(c+2)+c",
         ExpressionDeepVerificationFault::
             FallbackIterationAllocation,
         "fallback iteration allocation");
@@ -8044,7 +8471,7 @@ static int runExpressionDeepRenderCase() {
     }
 
     printf("=== expression deep frame renderer e500\n");
-    printf("  exact frames=%d default MPFR fallback covers series/rational/branch formulas\n",
+    printf("  exact frames=%d certified entire jets plus MPFR rational/branch fallback\n",
            exactFrames);
     printf("  64x40 reference/scaled/all-MPFR %.3f/%.3f/%.3f s speedup %.2fx\n",
            benchmarkReference, benchmarkScaled,

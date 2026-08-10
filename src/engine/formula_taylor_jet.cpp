@@ -112,6 +112,63 @@ ScaledArithmeticStatus multiplyUp(
     return scaledMultiplyUp(left, right, output);
 }
 
+ScaledArithmeticStatus finiteSeriesTailBound(
+        const ScaledRealValue& radius,
+        int retainedOrder,
+        ScaledRealValue& output) {
+    output = {};
+    if (!validRadius(radius) || retainedOrder < 0)
+        return ScaledArithmeticStatus::ExponentRange;
+    if (radius.isZero())
+        return ScaledArithmeticStatus::Success;
+    if (certifyScaledMpfrExponentRange(radius) !=
+            ScaledArithmeticStatus::Success)
+        return ScaledArithmeticStatus::ExponentRange;
+
+    mpfr_t r, exponential, power, factorial, bound;
+    mpfr_inits2(
+        256, r, exponential, power, factorial, bound,
+        (mpfr_ptr)0);
+    const mpfr_flags_t saved = mpfr_flags_save();
+    mpfr_flags_clear(MPFR_FLAGS_ALL);
+    bool okay =
+        setMpfrFromScaledValue(r, radius, MPFR_RNDU);
+    if (okay) {
+        mpfr_exp(exponential, r, MPFR_RNDU);
+        mpfr_pow_ui(
+            power, r,
+            static_cast<unsigned long>(retainedOrder + 1),
+            MPFR_RNDU);
+        mpfr_mul(bound, exponential, power, MPFR_RNDU);
+        mpfr_fac_ui(
+            factorial,
+            static_cast<unsigned long>(retainedOrder + 1),
+            MPFR_RNDN);
+        mpfr_div(bound, bound, factorial, MPFR_RNDU);
+        const mpfr_flags_t rangeFlags = mpfr_flags_test(
+            MPFR_FLAGS_UNDERFLOW |
+            MPFR_FLAGS_OVERFLOW |
+            MPFR_FLAGS_ERANGE);
+        okay =
+            rangeFlags == 0 &&
+            mpfr_number_p(bound) &&
+            mpfr_sgn(bound) >= 0 &&
+            !mpfr_zero_p(bound);
+    }
+    ScaledArithmeticStatus status =
+        ScaledArithmeticStatus::ExponentRange;
+    if (okay)
+        status = makeScaledNonnegativeUpward(
+            bound, output);
+    mpfr_flags_restore(saved, MPFR_FLAGS_ALL);
+    mpfr_clears(
+        r, exponential, power, factorial, bound,
+        (mpfr_ptr)0);
+    if (status != ScaledArithmeticStatus::Success)
+        return status;
+    return certifyScaledMpfrExponentRange(output);
+}
+
 struct TaylorThreshold {
     ScaledRealValue midpoint;
     ScaledRealValue error;
@@ -211,6 +268,11 @@ struct Candidate {
     ScaledRealValue remainder;
     std::vector<ScaledRealValue> margins;
     uint64_t operations = 0;
+    uint64_t functionSeriesCount = 0;
+    uint64_t functionSeriesOperations = 0;
+    int maximumFunctionSeriesOrder = 0;
+    ScaledRealValue maximumFunctionSeriesTail;
+    bool landingUsesSampleOutput = false;
     size_t memoryBytes = 0;
 };
 
@@ -345,14 +407,19 @@ bool ExpressionTaylorJetBuilder::build(
         request.reference->status !=
             ExpressionReferenceBuildStatus::Success ||
         !request.reference->certifiedAgainstHigherPrecision ||
-        request.program->scaledResidualCapability() !=
-            ExpressionScaledResidualCapability::
-                ExactCenteredArithmetic ||
+        (request.program->scaledResidualCapability() !=
+             ExpressionScaledResidualCapability::
+                 ExactCenteredArithmetic &&
+         request.program->scaledResidualCapability() !=
+             ExpressionScaledResidualCapability::
+                 CertifiedEntireCandidate) ||
         (request.pixelParameter != FormulaParameter::C &&
          request.pixelParameter !=
              FormulaParameter::InitialZ) ||
         request.minimumOrder < 8 ||
         request.maximumOrder > 20 ||
+        request.maximumCompositionOrder < 1 ||
+        request.maximumCompositionOrder > 24 ||
         request.minimumOrder > request.preferredOrder ||
         request.preferredOrder > request.maximumOrder ||
         request.minimumLanding < 1 ||
@@ -401,6 +468,11 @@ bool ExpressionTaylorJetBuilder::build(
         case Op::Subtract:
         case Op::Multiply:
         case Op::Square:
+        case Op::Exp:
+        case Op::Sin:
+        case Op::Cos:
+        case Op::Sinh:
+        case Op::Cosh:
             break;
         default:
             return finish(
@@ -472,9 +544,9 @@ bool ExpressionTaylorJetBuilder::build(
         request.maximumCandidateIteration > 0
             ? request.maximumCandidateIteration
             : static_cast<int>(
-                  request.reference->samples.size()) - 1,
+                  request.reference->samples.size()),
         static_cast<int>(
-            request.reference->samples.size()) - 1);
+            request.reference->samples.size()));
     if (maximumLanding < request.minimumLanding)
         return finish(
             ExpressionTaylorJetStatus::NoCoverage,
@@ -507,7 +579,7 @@ bool ExpressionTaylorJetBuilder::build(
                 candidateBytes, nodeCount,
                 sizeof(ScaledRealValue)) ||
             !checkedAddSize(
-                candidateBytes, stride * 4,
+                candidateBytes, stride * 8,
                 sizeof(ScaledComplexBall)) ||
             !checkedAddSize(
                 candidateBytes,
@@ -538,6 +610,10 @@ bool ExpressionTaylorJetBuilder::build(
                 nodeCount);
             std::vector<ScaledComplexBall> state(stride);
             std::vector<ScaledComplexBall> nextState(stride);
+            std::vector<ScaledComplexBall> functionTerm(stride);
+            std::vector<ScaledComplexBall> functionScratch(stride);
+            std::vector<ScaledComplexBall> functionFirst(stride);
+            std::vector<ScaledComplexBall> functionSecond(stride);
             candidate.margins.reserve(
                 static_cast<size_t>(maximumLanding) + 1);
 
@@ -623,21 +699,308 @@ bool ExpressionTaylorJetBuilder::build(
                 ++candidate.operations;
                 return multiplyUp(left, right, output);
             };
+            auto functionAddBall = [&](
+                    const ScaledComplexBall& left,
+                    const ScaledComplexBall& right,
+                    ScaledComplexBall& output) {
+                ++candidate.functionSeriesOperations;
+                return addBall(left, right, output);
+            };
+            auto functionSubtractBall = [&](
+                    const ScaledComplexBall& left,
+                    const ScaledComplexBall& right,
+                    ScaledComplexBall& output) {
+                ++candidate.functionSeriesOperations;
+                return subtractBall(left, right, output);
+            };
+            auto functionMultiplyBall = [&](
+                    const ScaledComplexBall& left,
+                    const ScaledComplexBall& right,
+                    ScaledComplexBall& output) {
+                ++candidate.functionSeriesOperations;
+                return multiplyBall(left, right, output);
+            };
+            auto functionAddRemainder = [&](
+                    ScaledRealValue& target,
+                    const ScaledRealValue& value) {
+                ++candidate.functionSeriesOperations;
+                return addRemainder(target, value);
+            };
+            auto functionMultiplyBound = [&](
+                    const ScaledRealValue& left,
+                    const ScaledRealValue& right,
+                    ScaledRealValue& output) {
+                ++candidate.functionSeriesOperations;
+                return multiplyBound(left, right, output);
+            };
+            auto polynomialArraySup = [&](
+                    const ScaledComplexBall* coefficients,
+                    ScaledRealValue& output) {
+                output = {};
+                for (int degree = 0;
+                     degree <= order; ++degree) {
+                    ScaledRealValue magnitude;
+                    ScaledArithmeticStatus status =
+                        upperMagnitude(
+                            coefficients[
+                                static_cast<size_t>(degree)],
+                            magnitude);
+                    ++candidate.operations;
+                    ++candidate.functionSeriesOperations;
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                    status = functionAddRemainder(
+                        output, magnitude);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                }
+                return ScaledArithmeticStatus::Success;
+            };
+            auto multiplyPolynomials = [&](
+                    const ScaledComplexBall* left,
+                    const ScaledRealValue& leftRemainder,
+                    const ScaledComplexBall* right,
+                    const ScaledRealValue& rightRemainder,
+                    std::vector<ScaledComplexBall>& output,
+                    ScaledRealValue& outputRemainder) {
+                std::fill(
+                    output.begin(), output.end(),
+                    ScaledComplexBall{});
+                ScaledArithmeticStatus status =
+                    ScaledArithmeticStatus::Success;
+                for (int degree = 0;
+                     degree <= order; ++degree) {
+                    bool haveSum = false;
+                    ScaledComplexBall sum;
+                    for (int first = 0;
+                         first <= degree; ++first) {
+                        ScaledComplexBall term;
+                        status = functionMultiplyBall(
+                            left[
+                                static_cast<size_t>(first)],
+                            right[
+                                static_cast<size_t>(
+                                    degree - first)],
+                            term);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return status;
+                        if (!haveSum) {
+                            sum = term;
+                            haveSum = true;
+                        } else {
+                            status = functionAddBall(
+                                sum, term, sum);
+                            if (status !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                return status;
+                        }
+                    }
+                    output[static_cast<size_t>(degree)] =
+                        sum;
+                }
+
+                ScaledRealValue leftSup, rightSup;
+                status = polynomialArraySup(
+                    left, leftSup);
+                if (status !=
+                        ScaledArithmeticStatus::Success)
+                    return status;
+                status = polynomialArraySup(
+                    right, rightSup);
+                if (status !=
+                        ScaledArithmeticStatus::Success)
+                    return status;
+
+                outputRemainder = {};
+                auto addProduct = [&](
+                        const ScaledRealValue& first,
+                        const ScaledRealValue& second,
+                        bool doubleProduct = false) {
+                    ScaledRealValue product;
+                    ScaledArithmeticStatus local =
+                        functionMultiplyBound(
+                            first, second, product);
+                    if (local !=
+                            ScaledArithmeticStatus::Success)
+                        return local;
+                    if (doubleProduct) {
+                        ScaledRealValue doubled;
+                        local = scaledAddUp(
+                            product, product, doubled);
+                        ++candidate.operations;
+                        ++candidate.functionSeriesOperations;
+                        if (local !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return local;
+                        product = doubled;
+                    }
+                    return functionAddRemainder(
+                        outputRemainder, product);
+                };
+                status = addProduct(
+                    leftSup, rightRemainder);
+                if (status ==
+                        ScaledArithmeticStatus::Success)
+                    status = addProduct(
+                        rightSup, leftRemainder);
+                if (status ==
+                        ScaledArithmeticStatus::Success)
+                    status = addProduct(
+                        leftRemainder, rightRemainder,
+                        true);
+                for (int first = 0;
+                     status ==
+                         ScaledArithmeticStatus::Success &&
+                     first <= order; ++first) {
+                    ScaledRealValue firstMagnitude;
+                    status = upperMagnitude(
+                        left[static_cast<size_t>(first)],
+                        firstMagnitude);
+                    ++candidate.operations;
+                    ++candidate.functionSeriesOperations;
+                    for (int second =
+                             order + 1 - first;
+                         status ==
+                             ScaledArithmeticStatus::Success &&
+                         second <= order; ++second) {
+                        if (second < 0) continue;
+                        ScaledRealValue secondMagnitude;
+                        status = upperMagnitude(
+                            right[
+                                static_cast<size_t>(second)],
+                            secondMagnitude);
+                        ++candidate.operations;
+                        ++candidate.functionSeriesOperations;
+                        if (status ==
+                                ScaledArithmeticStatus::Success)
+                            status = addProduct(
+                                firstMagnitude,
+                                secondMagnitude);
+                    }
+                }
+                return status;
+            };
+            auto scalePolynomial = [&](
+                    const ScaledComplexBall* input,
+                    const ScaledRealValue& inputRemainder,
+                    const ScaledComplexBall& factor,
+                    std::vector<ScaledComplexBall>& output,
+                    ScaledRealValue& outputRemainder) {
+                ScaledArithmeticStatus status =
+                    ScaledArithmeticStatus::Success;
+                for (int degree = 0;
+                     degree <= order; ++degree) {
+                    status = functionMultiplyBall(
+                        input[static_cast<size_t>(degree)],
+                        factor,
+                        output[static_cast<size_t>(degree)]);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                }
+                ScaledRealValue factorMagnitude;
+                status = upperMagnitude(
+                    factor, factorMagnitude);
+                ++candidate.operations;
+                ++candidate.functionSeriesOperations;
+                if (status !=
+                        ScaledArithmeticStatus::Success)
+                    return status;
+                return functionMultiplyBound(
+                    factorMagnitude, inputRemainder,
+                    outputRemainder);
+            };
+            auto addPolynomialTerm = [&](
+                    std::vector<ScaledComplexBall>& target,
+                    ScaledRealValue& targetRemainder,
+                    const std::vector<ScaledComplexBall>& term,
+                    const ScaledRealValue& termRemainder,
+                    bool negate) {
+                for (int degree = 0;
+                     degree <= order; ++degree) {
+                    ScaledComplexBall contribution =
+                        term[static_cast<size_t>(degree)];
+                    if (negate) {
+                        ScaledArithmeticStatus local =
+                            scaledNegate(
+                                contribution.value,
+                                contribution.value);
+                        ++candidate.operations;
+                        ++candidate.functionSeriesOperations;
+                        if (local !=
+                                ScaledArithmeticStatus::Success)
+                            return local;
+                    }
+                    ScaledArithmeticStatus local =
+                        functionAddBall(
+                            target[
+                                static_cast<size_t>(degree)],
+                            contribution,
+                            target[
+                                static_cast<size_t>(degree)]);
+                    if (local !=
+                            ScaledArithmeticStatus::Success)
+                        return local;
+                }
+                return functionAddRemainder(
+                    targetRemainder, termRemainder);
+            };
+            auto reciprocalBall = [&](
+                    int divisor,
+                    ScaledComplexBall& output) {
+                output = {};
+                if (divisor <= 0)
+                    return ScaledArithmeticStatus::
+                        ExponentRange;
+                const double reciprocal =
+                    1.0 / static_cast<double>(divisor);
+                ScaledArithmeticStatus status =
+                    makeScaledRealValue(
+                        reciprocal, output.value.re);
+                if (status !=
+                        ScaledArithmeticStatus::Success)
+                    return status;
+                if (divisor == 1)
+                    return status;
+                return makeScaledRealValue(
+                    std::ldexp(
+                        std::abs(reciprocal), -50),
+                    output.radius);
+            };
             auto addNodeRoundoff = [&](
+                    size_t local,
                     const ExpressionReferenceTapeNode& node,
                     size_t sampleOffset,
                     ScaledRealValue& remainder) {
                 if (request.reference->
                         certificationPrecision <= 16)
                     return ScaledArithmeticStatus::Success;
-                if (node.operation !=
-                        ExpressionOracleOperation::Add &&
-                    node.operation !=
-                        ExpressionOracleOperation::Subtract &&
-                    node.operation !=
-                        ExpressionOracleOperation::Multiply &&
-                    node.operation !=
-                        ExpressionOracleOperation::Square)
+                const bool arithmeticOperation =
+                    node.operation ==
+                        ExpressionOracleOperation::Add ||
+                    node.operation ==
+                        ExpressionOracleOperation::Subtract ||
+                    node.operation ==
+                        ExpressionOracleOperation::Multiply ||
+                    node.operation ==
+                        ExpressionOracleOperation::Square;
+                const bool entireOperation =
+                    node.operation ==
+                        ExpressionOracleOperation::Exp ||
+                    node.operation ==
+                        ExpressionOracleOperation::Sin ||
+                    node.operation ==
+                        ExpressionOracleOperation::Cos ||
+                    node.operation ==
+                        ExpressionOracleOperation::Sinh ||
+                    node.operation ==
+                        ExpressionOracleOperation::Cosh;
+                if (!arithmeticOperation && !entireOperation)
                     return ScaledArithmeticStatus::Success;
 
                 auto fullBound = [&](
@@ -678,17 +1041,25 @@ bool ExpressionTaylorJetBuilder::build(
                 };
 
                 ScaledRealValue left, right;
-                ScaledArithmeticStatus status =
-                    fullBound(node.leftNode, left);
-                if (status !=
-                        ScaledArithmeticStatus::Success)
-                    return status;
                 ScaledRealValue operationMagnitude;
-                if (node.operation ==
+                ScaledArithmeticStatus status =
+                    ScaledArithmeticStatus::Success;
+                if (entireOperation) {
+                    status = fullBound(
+                        static_cast<uint16_t>(local),
+                        operationMagnitude);
+                } else {
+                    status = fullBound(node.leftNode, left);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                }
+                if (!entireOperation &&
+                    node.operation ==
                         ExpressionOracleOperation::Square) {
                     status = multiplyBound(
                         left, left, operationMagnitude);
-                } else {
+                } else if (!entireOperation) {
                     status = fullBound(
                         node.rightNode, right);
                     if (status !=
@@ -724,6 +1095,355 @@ bool ExpressionTaylorJetBuilder::build(
                     return status;
                 return addRemainder(
                     remainder, roundoff);
+            };
+            auto composeEntire = [&](
+                    size_t local,
+                    const ExpressionReferenceTapeNode& node,
+                    ScaledRealValue& outputRemainder) {
+                auto failComposition = [&](
+                        ExpressionTaylorJetStatus status,
+                        const char* reason) {
+                    candidate.status = status;
+                    candidate.reason = reason;
+                    return false;
+                };
+                if ((node.flags & OracleTraceUndefined) != 0)
+                    return failComposition(
+                        ExpressionTaylorJetStatus::Nonfinite,
+                        "entire-function reference node is undefined");
+
+                const bool needsCompanion =
+                    node.operation ==
+                        ExpressionOracleOperation::Sin ||
+                    node.operation ==
+                        ExpressionOracleOperation::Cos ||
+                    node.operation ==
+                        ExpressionOracleOperation::Sinh ||
+                    node.operation ==
+                        ExpressionOracleOperation::Cosh;
+                if (needsCompanion &&
+                    (node.flags & OracleTraceHasCompanion) == 0)
+                    return failComposition(
+                        ExpressionTaylorJetStatus::InvalidTape,
+                        "entire-function reference companion is missing");
+
+                ScaledComplexBall base;
+                ScaledArithmeticStatus arithmetic =
+                    makeScaledComplexValue(
+                        node.output, node.outputDefect,
+                        base.value);
+                base.radius = node.outputError;
+                if (arithmetic ==
+                        ScaledArithmeticStatus::Success)
+                    arithmetic =
+                        certifyScaledMpfrExponentRange(base);
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success)
+                    return failComposition(
+                        statusForArithmetic(arithmetic),
+                        "entire-function reference output is outside certified range");
+
+                ScaledComplexBall companion;
+                if (needsCompanion) {
+                    arithmetic = makeScaledComplexValue(
+                        node.auxiliary,
+                        node.auxiliaryDefect,
+                        companion.value);
+                    companion.radius =
+                        node.auxiliaryError;
+                    if (arithmetic ==
+                            ScaledArithmeticStatus::Success)
+                        arithmetic =
+                            certifyScaledMpfrExponentRange(
+                                companion);
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        return failComposition(
+                            statusForArithmetic(arithmetic),
+                            "entire-function reference companion is outside certified range");
+                }
+
+                const uint16_t inputNode = node.leftNode;
+                if (inputNode == UINT16_MAX)
+                    return failComposition(
+                        ExpressionTaylorJetStatus::InvalidTape,
+                        "entire-function reference input is missing");
+                ScaledRealValue inputRadius;
+                arithmetic = polynomialArraySup(
+                    &coefficient(inputNode, 0),
+                    inputRadius);
+                if (arithmetic ==
+                        ScaledArithmeticStatus::Success)
+                    arithmetic = functionAddRemainder(
+                        inputRadius,
+                        remainders[inputNode]);
+                if (arithmetic ==
+                        ScaledArithmeticStatus::Success)
+                    arithmetic = functionAddRemainder(
+                        inputRadius,
+                        remainders[inputNode]);
+                if (arithmetic ==
+                        ScaledArithmeticStatus::Success)
+                    arithmetic =
+                        certifyScaledMpfrExponentRange(
+                            inputRadius);
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success)
+                    return failComposition(
+                        statusForArithmetic(arithmetic),
+                        "entire-function input radius is outside certified range");
+
+                std::fill(
+                    functionFirst.begin(),
+                    functionFirst.end(),
+                    ScaledComplexBall{});
+                std::fill(
+                    functionSecond.begin(),
+                    functionSecond.end(),
+                    ScaledComplexBall{});
+                for (int degree = 0;
+                     degree <= order; ++degree)
+                    functionTerm[
+                        static_cast<size_t>(degree)] =
+                            coefficient(
+                                inputNode, degree);
+                ScaledRealValue termRemainder =
+                    remainders[inputNode];
+                ScaledRealValue firstRemainder;
+                ScaledRealValue secondRemainder;
+                ScaledRealValue certifiedTail;
+                int retainedOrder = 0;
+
+                for (int seriesOrder = 1;
+                     seriesOrder <=
+                         request.maximumCompositionOrder;
+                     ++seriesOrder) {
+                    if (seriesOrder > 1) {
+                        ScaledRealValue productRemainder;
+                        arithmetic = multiplyPolynomials(
+                            functionTerm.data(),
+                            termRemainder,
+                            &coefficient(inputNode, 0),
+                            remainders[inputNode],
+                            functionScratch,
+                            productRemainder);
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return failComposition(
+                                statusForArithmetic(arithmetic),
+                                "entire-function polynomial power failed");
+                        ScaledComplexBall reciprocal;
+                        arithmetic = reciprocalBall(
+                            seriesOrder, reciprocal);
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return failComposition(
+                                statusForArithmetic(arithmetic),
+                                "entire-function reciprocal is not representable");
+                        arithmetic = scalePolynomial(
+                            functionScratch.data(),
+                            productRemainder,
+                            reciprocal,
+                            functionTerm,
+                            termRemainder);
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return failComposition(
+                                statusForArithmetic(arithmetic),
+                                "entire-function Taylor term scaling failed");
+                    }
+
+                    const bool exponential =
+                        node.operation ==
+                            ExpressionOracleOperation::Exp;
+                    const bool hyperbolic =
+                        node.operation ==
+                            ExpressionOracleOperation::Sinh ||
+                        node.operation ==
+                            ExpressionOracleOperation::Cosh;
+                    const bool even =
+                        (seriesOrder & 1) == 0;
+                    const bool useFirst =
+                        exponential || even;
+                    bool negate = false;
+                    if (!exponential && !hyperbolic) {
+                        if (even)
+                            negate =
+                                ((seriesOrder / 2) & 1) != 0;
+                        else
+                            negate =
+                                (((seriesOrder - 1) / 2) &
+                                 1) != 0;
+                    }
+                    arithmetic = addPolynomialTerm(
+                        useFirst
+                            ? functionFirst
+                            : functionSecond,
+                        useFirst
+                            ? firstRemainder
+                            : secondRemainder,
+                        functionTerm,
+                        termRemainder,
+                        negate);
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        return failComposition(
+                            statusForArithmetic(arithmetic),
+                            "entire-function Taylor accumulation failed");
+
+                    ScaledRealValue scalarTail;
+                    arithmetic = finiteSeriesTailBound(
+                        inputRadius, seriesOrder,
+                        scalarTail);
+                    ++candidate.functionSeriesOperations;
+                    ++candidate.operations;
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        return failComposition(
+                            statusForArithmetic(arithmetic),
+                            "entire-function finite-series tail is not certifiable");
+
+                    ScaledRealValue weight;
+                    arithmetic = upperMagnitude(
+                        base, weight);
+                    ++candidate.operations;
+                    ++candidate.functionSeriesOperations;
+                    if (arithmetic ==
+                            ScaledArithmeticStatus::Success &&
+                        needsCompanion) {
+                        ScaledRealValue companionMagnitude;
+                        arithmetic = upperMagnitude(
+                            companion,
+                            companionMagnitude);
+                        ++candidate.operations;
+                        ++candidate.functionSeriesOperations;
+                        if (arithmetic ==
+                                ScaledArithmeticStatus::Success)
+                            arithmetic =
+                                functionAddRemainder(
+                                    weight,
+                                    companionMagnitude);
+                    }
+                    if (arithmetic ==
+                            ScaledArithmeticStatus::Success)
+                        arithmetic = functionMultiplyBound(
+                            weight, scalarTail,
+                            certifiedTail);
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        return failComposition(
+                            statusForArithmetic(arithmetic),
+                            "entire-function weighted tail overflowed");
+                    if (compareScaledNonnegative(
+                            certifiedTail,
+                            accuracyBudget) <= 0) {
+                        retainedOrder = seriesOrder;
+                        break;
+                    }
+                }
+                if (retainedOrder == 0)
+                    return failComposition(
+                        ExpressionTaylorJetStatus::
+                            AccuracyBudget,
+                        "entire-function finite-series tail exceeds accuracy budget");
+
+                ScaledRealValue firstOutputRemainder;
+                arithmetic = scalePolynomial(
+                    functionFirst.data(),
+                    firstRemainder,
+                    base,
+                    functionScratch,
+                    firstOutputRemainder);
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success)
+                    return failComposition(
+                        statusForArithmetic(arithmetic),
+                        "entire-function reference output multiplication failed");
+
+                if (!needsCompanion) {
+                    for (int degree = 0;
+                         degree <= order; ++degree)
+                        coefficient(local, degree) =
+                            functionScratch[
+                                static_cast<size_t>(degree)];
+                    outputRemainder =
+                        firstOutputRemainder;
+                } else {
+                    ScaledRealValue secondOutputRemainder;
+                    arithmetic = scalePolynomial(
+                        functionSecond.data(),
+                        secondRemainder,
+                        companion,
+                        functionTerm,
+                        secondOutputRemainder);
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        return failComposition(
+                            statusForArithmetic(arithmetic),
+                            "entire-function companion multiplication failed");
+                    const bool subtractCompanion =
+                        node.operation ==
+                            ExpressionOracleOperation::Cos;
+                    for (int degree = 0;
+                         degree <= order; ++degree) {
+                        arithmetic = subtractCompanion
+                            ? functionSubtractBall(
+                                  functionScratch[
+                                      static_cast<size_t>(
+                                          degree)],
+                                  functionTerm[
+                                      static_cast<size_t>(
+                                          degree)],
+                                  coefficient(local, degree))
+                            : functionAddBall(
+                                  functionScratch[
+                                      static_cast<size_t>(
+                                          degree)],
+                                  functionTerm[
+                                      static_cast<size_t>(
+                                          degree)],
+                                  coefficient(local, degree));
+                        if (arithmetic !=
+                                ScaledArithmeticStatus::
+                                    Success)
+                            return failComposition(
+                                statusForArithmetic(arithmetic),
+                                "entire-function reference combination failed");
+                    }
+                    outputRemainder =
+                        firstOutputRemainder;
+                    arithmetic = functionAddRemainder(
+                        outputRemainder,
+                        secondOutputRemainder);
+                    if (arithmetic !=
+                            ScaledArithmeticStatus::Success)
+                        return failComposition(
+                            statusForArithmetic(arithmetic),
+                            "entire-function remainder combination failed");
+                }
+                arithmetic = functionAddRemainder(
+                    outputRemainder, certifiedTail);
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success)
+                    return failComposition(
+                        statusForArithmetic(arithmetic),
+                        "entire-function tail accumulation failed");
+
+                ++candidate.functionSeriesCount;
+                candidate.maximumFunctionSeriesOrder =
+                    std::max(
+                        candidate.maximumFunctionSeriesOrder,
+                        retainedOrder);
+                if (compareScaledNonnegative(
+                        certifiedTail,
+                        candidate.maximumFunctionSeriesTail) >
+                    0)
+                    candidate.maximumFunctionSeriesTail =
+                        certifiedTail;
+                return true;
             };
 
             if (request.pixelParameter ==
@@ -1119,11 +1839,25 @@ bool ExpressionTaylorJetBuilder::build(
                             remainders[local] = tail;
                         break;
                     }
+                    case Op::Exp:
+                    case Op::Sin:
+                    case Op::Cos:
+                    case Op::Sinh:
+                    case Op::Cosh:
+                        if (!composeEntire(
+                                local, node,
+                                remainders[local]))
+                            arithmetic =
+                                ScaledArithmeticStatus::
+                                    Success;
+                        break;
                     default:
                         arithmetic =
                             ScaledArithmeticStatus::Singular;
                         break;
                     }
+                    if (!candidate.reason.empty())
+                        break;
                     if (arithmetic !=
                             ScaledArithmeticStatus::Success)
                         break;
@@ -1133,7 +1867,7 @@ bool ExpressionTaylorJetBuilder::build(
                     if (arithmetic ==
                             ScaledArithmeticStatus::Success)
                         arithmetic = addNodeRoundoff(
-                            node, sampleOffset,
+                            local, node, sampleOffset,
                             remainders[local]);
                     if (arithmetic !=
                             ScaledArithmeticStatus::Success)
@@ -1163,6 +1897,8 @@ bool ExpressionTaylorJetBuilder::build(
                     }
                 }
 
+                if (!candidate.reason.empty())
+                    break;
                 if (arithmetic !=
                         ScaledArithmeticStatus::Success) {
                     candidate.status =
@@ -1205,6 +1941,20 @@ bool ExpressionTaylorJetBuilder::build(
                         : statusForArithmetic(arithmetic);
                     candidate.reason =
                         "Taylor prefix reaches an uncertain or escaping state";
+                    break;
+                }
+
+                if (static_cast<size_t>(landing + 1) ==
+                        request.reference->samples.size()) {
+                    for (int degree = 0;
+                         degree <= order; ++degree)
+                        state[
+                            static_cast<size_t>(degree)] =
+                                coefficient(root, degree);
+                    stateRemainder = remainders[root];
+                    ++landing;
+                    candidate.margins.push_back(margin);
+                    candidate.landingUsesSampleOutput = true;
                     break;
                 }
 
@@ -1311,7 +2061,19 @@ bool ExpressionTaylorJetBuilder::build(
     result.order = best.order;
     result.landingIteration = best.landing;
     result.landingSample =
-        static_cast<size_t>(best.landing);
+        best.landingUsesSampleOutput
+        ? static_cast<size_t>(best.landing - 1)
+        : static_cast<size_t>(best.landing);
+    result.landingUsesSampleOutput =
+        best.landingUsesSampleOutput;
+    result.maximumFunctionSeriesOrder =
+        best.maximumFunctionSeriesOrder;
+    result.functionSeriesCount =
+        best.functionSeriesCount;
+    result.functionSeriesOperationCount =
+        best.functionSeriesOperations;
+    result.maximumFunctionSeriesTail =
+        best.maximumFunctionSeriesTail;
     result.remainderRadius = best.remainder;
     result.intermediateEscapeMargins =
         std::move(best.margins);

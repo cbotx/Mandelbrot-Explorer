@@ -38,6 +38,8 @@ struct ExpressionTaylorJetRequest {
     int minimumOrder = 8;
     int preferredOrder = 12;
     int maximumOrder = 20;
+    // Independent function-series composition limit.
+    int maximumCompositionOrder = 24;
     int minimumLanding = 8;
     // Zero selects the last reference sample that can be used as a landing.
     int maximumCandidateIteration = 0;
@@ -60,6 +62,13 @@ struct ExpressionTaylorJetResult {
     int landingIteration = 0;
     size_t landingSample = 0;
     int order = 0;
+    int maximumFunctionSeriesOrder = 0;
+    uint64_t functionSeriesCount = 0;
+    uint64_t functionSeriesOperationCount = 0;
+    ScaledRealValue maximumFunctionSeriesTail;
+    // True when landingSample identifies the sample whose next/rootDefect
+    // pair is the landing base rather than its z/zDefect pair.
+    bool landingUsesSampleOutput = false;
     // Index zero is the constant residual caused by compact rebasing.
     std::vector<ScaledComplexValue> coefficients;
     std::vector<ScaledRealValue> coefficientRadii;

@@ -45,6 +45,7 @@ struct ExpressionDeepTaylorPolicy {
     int order = 12;
     int minimumOrder = 8;
     int maximumOrder = 20;
+    int maximumCompositionOrder = 24;
     int maximumCandidateIteration = 0;
     double accuracyBudget = 0x1p-40;
     // Reject a built jet when its certified work estimate cannot amortize
@@ -158,6 +159,10 @@ struct ExpressionDeepRenderResult {
     bool taylorAccepted = false;
     int taylorOrder = 0;
     int taylorCoveredIterations = 0;
+    int taylorMaximumFunctionSeriesOrder = 0;
+    uint64_t taylorFunctionSeriesCount = 0;
+    uint64_t taylorFunctionSeriesOperationCount = 0;
+    ScaledRealValue taylorMaximumFunctionSeriesTail;
     double taylorBuildSeconds = 0.0;
     // Aggregate worker time; it may exceed fastSeconds under parallelism.
     double taylorEvaluationSeconds = 0.0;
@@ -179,9 +184,11 @@ const char* expressionDeepFallbackReasonName(
 
 // Renders finite-iteration escape classifications. The arithmetic fast path is
 // certified relative to an independently iterated higher-precision MPFR oracle;
-// ambiguous bailout intervals fall back per pixel. Other formula classes use
-// MPFR by default. Interior output means only that no escape was observed before
-// maxIterations, not mathematical membership.
+// ambiguous bailout intervals fall back per pixel. Exp/sin/cos/sinh/cosh may
+// use a certified whole-prefix Taylor jet; if that jet cannot cover the full
+// requested horizon profitably, the formula remains all-MPFR. Interior output
+// means only that no escape was observed before maxIterations, not mathematical
+// membership.
 bool renderExpressionDeepFrame(
     const ExpressionDeepRenderRequest& request,
     ExpressionDeepRenderResult& result);

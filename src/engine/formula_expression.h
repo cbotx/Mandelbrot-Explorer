@@ -50,6 +50,7 @@ enum class ExpressionColoring : uint8_t {
 
 enum class ExpressionScaledResidualCapability : uint8_t {
     ExactCenteredArithmetic,
+    CertifiedEntireCandidate,
     UncertifiedSeries,
     BranchSensitive,
     Unsupported
