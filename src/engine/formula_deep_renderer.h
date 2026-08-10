@@ -182,6 +182,12 @@ struct ExpressionDeepRenderResult {
     ScaledRealValue taylorMinimumBranchCutClearance;
     ScaledRealValue taylorMinimumBranchZeroClearance;
     bool taylorBranchRejected = false;
+    uint64_t taylorArgCompositionCount = 0;
+    std::string taylorArgRejectionReason;
+    uint64_t taylorPolarCompositionCount = 0;
+    ScaledRealValue taylorMinimumPolarRadiusClearance;
+    bool taylorPolarRejected = false;
+    std::string taylorPolarRejectionReason;
     uint64_t taylorAbsBranchCount = 0;
     uint64_t taylorAbsPositiveCellCount = 0;
     uint64_t taylorAbsNegativeCellCount = 0;
@@ -217,9 +223,13 @@ const char* expressionDeepFallbackReasonName(
 // denominator neighborhood that is not proven pole-free. Log/log10/sqrt/power
 // use a certified principal-branch tier and reject any full-frame input
 // neighborhood that is not proven clear of zero and the negative-real cut.
-// Conjugate/real/imaginary/norm/complex formulas use a separate certified
-// real-bivariate q/conjugate(q) tier. Unsupported mixed transcendental real
-// formulas release fast resources and render through MPFR.
+// Arg uses the same whole-frame principal-cut proof as Log, then projects a
+// certified log1p composition onto its real-valued imaginary component.
+// Polar proves real inputs and nonnegative radius over the whole frame, then
+// composes certified sine/cosine bivariate polynomials. Conjugate/real/
+// imaginary/norm/complex formulas share that real-bivariate q/conjugate(q)
+// tier. Unsupported mixed transcendental real formulas release fast resources
+// and render through MPFR.
 // Interior output means only that no escape was observed before maxIterations,
 // not mathematical membership.
 bool renderExpressionDeepFrame(

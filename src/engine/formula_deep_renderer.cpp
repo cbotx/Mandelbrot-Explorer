@@ -954,9 +954,13 @@ bool renderExpressionDeepFrame(
             result.capability ==
                 ExpressionScaledResidualCapability::
                     CertifiedPiecewiseCandidate;
+        const bool piecewisePerStepEligible =
+            certifiedPiecewiseCandidate &&
+            !request.runtimeProgram->
+                scaledResidualRequiresTaylor();
         const bool certifiedTaylorEligible =
             !certifiedTaylorCandidate ||
-            certifiedPiecewiseCandidate ||
+            piecewisePerStepEligible ||
             (request.taylor.enableTaylor &&
              request.maxIterations >
                  request.taylor.minimumLanding);
@@ -1590,6 +1594,18 @@ bool renderExpressionDeepFrame(
                     taylorJet.minimumBranchZeroClearance;
                 result.taylorBranchRejected =
                     taylorJet.branchRejected;
+                result.taylorArgCompositionCount =
+                    taylorJet.argCompositionCount;
+                result.taylorArgRejectionReason =
+                    taylorJet.argRejectionReason;
+                result.taylorPolarCompositionCount =
+                    taylorJet.polarCompositionCount;
+                result.taylorMinimumPolarRadiusClearance =
+                    taylorJet.minimumPolarRadiusClearance;
+                result.taylorPolarRejected =
+                    taylorJet.polarRejected;
+                result.taylorPolarRejectionReason =
+                    taylorJet.polarRejectionReason;
                 result.taylorAbsBranchCount =
                     taylorJet.absBranchCount;
                 result.taylorAbsPositiveCellCount =
@@ -1616,7 +1632,9 @@ bool renderExpressionDeepFrame(
                 if (useTaylor &&
                     certifiedTaylorCapability(
                         result.capability) &&
-                    !certifiedPiecewiseCandidate &&
+                    (!certifiedPiecewiseCandidate ||
+                     taylorJet.argCompositionCount > 0 ||
+                     taylorJet.polarCompositionCount > 0) &&
                     !request.allowUncertifiedForBenchmark &&
                     taylorJet.landingIteration <
                         request.maxIterations) {
@@ -1720,7 +1738,7 @@ bool renderExpressionDeepFrame(
             if (runFast &&
                 certifiedTaylorCapability(
                     result.capability) &&
-                !certifiedPiecewiseCandidate &&
+                !piecewisePerStepEligible &&
                 !request.allowUncertifiedForBenchmark &&
                 !useTaylor) {
                 runFast = false;

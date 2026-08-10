@@ -6506,7 +6506,15 @@ static int runExpressionTaylorCase() {
         { 0.571, -0.233 },
         { -0.284, -0.506 },
         { 0.198, 0.613 },
-        { -0.623, 0.109 }
+        { -0.623, 0.109 },
+        { 0.999, 0.0 },
+        { -0.999, 0.0 },
+        { 0.0, 0.999 },
+        { 0.0, -0.999 },
+        { 0.499, 0.499 },
+        { -0.499, 0.499 },
+        { 0.499, -0.499 },
+        { -0.499, -0.499 }
     };
     uint64_t randomState = 0x9e3779b97f4a7c15ULL;
     while (qValues.size() < 32) {
@@ -6541,6 +6549,8 @@ static int runExpressionTaylorCase() {
     parameterized.parameters[0] = { 0.125, -0.0625 };
     ExpressionContext z0Plane;
     z0Plane.c = { -0.35, 0.2 };
+    ExpressionContext fixedDivision;
+    fixedDivision.z0 = { 2.0, 0.0 };
     const FormulaCase cases[] = {
         { "quadratic-c", "z*z+c", FormulaParameter::C,
           quadratic, "-0.25", "0.1", -1800, 1800, true },
@@ -6676,7 +6686,24 @@ static int runExpressionTaylorCase() {
           "0", "0", -9, 512, false },
         { "branch-z0", "log(z+2)+c",
           FormulaParameter::InitialZ, z0Plane,
-          "0", "0", -9, 512, false }
+          "0", "0", -9, 512, false },
+        { "fixed-z0-division-e500", "c/z0",
+          FormulaParameter::C, fixedDivision,
+          "0", "0", -1800, 1800, false },
+        { "arg-c-e500", "arg(c)",
+          FormulaParameter::C, quadratic,
+          "2", "0.5", -1800, 1800, false },
+        { "arg-z-plus-c-e500", "arg(z+2)+c",
+          FormulaParameter::C, quadratic,
+          "0", "0.25", -1800, 1800, false },
+        { "polar-real-imag-e500",
+          "polar(real(c)+2,imag(z))",
+          FormulaParameter::C, quadratic,
+          "-1", "0", -1800, 1800, false },
+        { "nested-polar-arg-e500",
+          "polar(abs(real(c))+1,arg(c+2))",
+          FormulaParameter::C, quadratic,
+          "0.5", "0.25", -1800, 1800, false }
     };
 
     for (const FormulaCase& test : cases) {
@@ -6953,7 +6980,13 @@ static int runExpressionTaylorCase() {
                   Unsupported },
             { "arg(z)+c",
               formula::ExpressionScaledResidualCapability::
-                  BranchSensitive },
+                  CertifiedRealCandidate },
+            { "polar(real(c)+2,imag(z))",
+              formula::ExpressionScaledResidualCapability::
+                  CertifiedRealCandidate },
+            { "polar(abs(real(c))+1,arg(c+2))",
+              formula::ExpressionScaledResidualCapability::
+                  CertifiedPiecewiseCandidate },
             { "log(abs(z)+2)+c",
               formula::ExpressionScaledResidualCapability::
                   BranchSensitive },
@@ -7363,6 +7396,113 @@ static int runExpressionTaylorCase() {
                 ++failures;
             }
         }
+        {
+            ExpressionProgram program;
+            ExpressionError error;
+            ExpressionOracleContext upper(512);
+            ExpressionOracleContext lower(512);
+            MpfrComplex upperValue(512);
+            MpfrComplex lowerValue(512);
+            upper.c.set(-2.0, 0.0);
+            lower.c.set(-2.0, -0.0);
+            std::string upperError, lowerError;
+            const bool okay =
+                program.compile("arg(c)", &error) &&
+                ExpressionOracle::evaluate(
+                    program, upper, upperValue,
+                    &upperError) &&
+                ExpressionOracle::evaluate(
+                    program, lower, lowerValue,
+                    &lowerError) &&
+                mpfr_sgn(upperValue.re) > 0 &&
+                mpfr_sgn(lowerValue.re) < 0 &&
+                mpfr_zero_p(upperValue.im) &&
+                mpfr_zero_p(lowerValue.im);
+            if (!okay) {
+                printf("  arg signed-zero lip semantics failed\n");
+                ++failures;
+            }
+        }
+
+        auto checkArgFrame = [&](
+                const char* name,
+                const char* centerReal,
+                const char* centerImaginary,
+                int64_t scaleExponent,
+                bool expectAccepted) {
+            ProgramPair pair;
+            ExpressionReferenceOrbitResult reference;
+            ExpressionContext fixed;
+            bool okay = compilePair(
+                "0.001*arg(c)",
+                FormulaParameter::C, fixed, pair) &&
+                buildReference(
+                    pair, fixed, FormulaParameter::C,
+                    centerReal, centerImaginary,
+                    4, 512, reference);
+            ExpressionTaylorJetRequest request;
+            request.program = &pair.runtime;
+            request.reference = &reference;
+            request.pixelParameter = FormulaParameter::C;
+            request.parameterScale =
+                makeScale(scaleExponent);
+            request.minimumLanding = 1;
+            request.maximumCandidateIteration = 1;
+            ExpressionTaylorJetResult jet;
+            const bool built =
+                okay &&
+                ExpressionTaylorJetBuilder::build(
+                    request, jet);
+            if (expectAccepted) {
+                okay = built &&
+                    jet.layout ==
+                        formula::
+                            ExpressionTaylorJetLayout::
+                                RealBivariate &&
+                    jet.argCompositionCount > 0 &&
+                    jet.branchCompositionCount > 0 &&
+                    jet.branchCompositionOperationCount > 0 &&
+                    !jet.minimumBranchCutClearance.isZero() &&
+                    !jet.minimumBranchZeroClearance.isZero() &&
+                    !jet.branchRejected;
+            } else {
+                okay = okay && !built &&
+                    jet.status ==
+                        ExpressionTaylorJetStatus::
+                            BranchRejected &&
+                    jet.branchRejected &&
+                    !jet.argRejectionReason.empty();
+            }
+            if (!okay) {
+                printf("  arg-clearance proof failed [%s] built=%d status=%s reason=%s cut=(%.6g,e%lld) zero=(%.6g,e%lld)\n",
+                       name, built ? 1 : 0,
+                       formula::expressionTaylorJetStatusName(
+                           jet.status),
+                       jet.failureReason.c_str(),
+                       jet.minimumBranchCutClearance.mantissa,
+                       (long long)
+                           jet.minimumBranchCutClearance.exponent,
+                       jet.minimumBranchZeroClearance.mantissa,
+                       (long long)
+                           jet.minimumBranchZeroClearance.exponent);
+                ++failures;
+            }
+        };
+        checkArgFrame(
+            "arg-near-cut-safe",
+            "-2", "0.04", -5, true);
+        checkArgFrame(
+            "arg-near-cut-overlap",
+            "-2", "0.02", -5, false);
+        checkArgFrame(
+            "arg-upper-lip",
+            "-2", "0", -20, false);
+        checkArgFrame(
+            "arg-lower-lip",
+            "-2", "-0", -20, false);
+        checkArgFrame(
+            "arg-origin",
+            "0", "0", -20, false);
 
         ProgramPair largePower;
         ExpressionReferenceOrbitResult largeReference;
@@ -7391,6 +7531,257 @@ static int runExpressionTaylorCase() {
                    formula::expressionTaylorJetStatusName(
                        largeJet.status),
                    largeJet.failureReason.c_str());
+            ++failures;
+        }
+    }
+
+    // Polar requires real-valued operands and a radius that is either exactly
+    // zero or strictly positive over the complete q-frame.
+    {
+        auto checkPolarFrame = [&](
+                const char* name,
+                const char* source,
+                const char* centerReal,
+                const char* centerImaginary,
+                int64_t scaleExponent,
+                bool expectAccepted,
+                bool expectExactZero) {
+            ProgramPair pair;
+            ExpressionReferenceOrbitResult reference;
+            ExpressionContext fixed;
+            bool okay = compilePair(
+                source, FormulaParameter::C,
+                fixed, pair) &&
+                buildReference(
+                    pair, fixed, FormulaParameter::C,
+                    centerReal, centerImaginary,
+                    4,
+                    std::max<mpfr_prec_t>(
+                        512,
+                        -scaleExponent + 128),
+                    reference);
+            ExpressionTaylorJetRequest request;
+            request.program = &pair.runtime;
+            request.reference = &reference;
+            request.pixelParameter = FormulaParameter::C;
+            request.parameterScale =
+                makeScale(scaleExponent);
+            request.minimumLanding = 1;
+            request.maximumCandidateIteration = 1;
+            ExpressionTaylorJetResult jet;
+            const bool built =
+                okay &&
+                ExpressionTaylorJetBuilder::build(
+                    request, jet);
+            if (expectAccepted) {
+                okay = built &&
+                    jet.layout ==
+                        formula::
+                            ExpressionTaylorJetLayout::
+                                RealBivariate &&
+                    jet.polarCompositionCount > 0 &&
+                    !jet.polarRejected &&
+                    (expectExactZero
+                         ? jet.
+                               minimumPolarRadiusClearance.
+                                   isZero()
+                         : !jet.
+                                minimumPolarRadiusClearance.
+                                    isZero() &&
+                           jet.functionSeriesCount >= 2);
+            } else {
+                okay = okay && !built &&
+                    jet.status ==
+                        ExpressionTaylorJetStatus::
+                            BranchRejected &&
+                    jet.polarRejected &&
+                    !jet.polarRejectionReason.empty();
+            }
+            if (!okay) {
+                printf("  polar domain proof failed [%s] built=%d status=%s reason=%s radius=(%.6g,e%lld) count=%llu\n",
+                       name, built ? 1 : 0,
+                       formula::expressionTaylorJetStatusName(
+                           jet.status),
+                       jet.failureReason.c_str(),
+                       jet.minimumPolarRadiusClearance.
+                           mantissa,
+                       (long long)
+                           jet.minimumPolarRadiusClearance.
+                               exponent,
+                       (unsigned long long)
+                           jet.polarCompositionCount);
+                ++failures;
+            }
+        };
+        checkPolarFrame(
+            "positive-radius",
+            "polar(real(c)+2,imag(c))",
+            "0", "0", -8, true, false);
+        checkPolarFrame(
+            "exact-zero-radius",
+            "polar(0,real(c))",
+            "1e500", "-0", -1800, true, true);
+        checkPolarFrame(
+            "near-zero-safe",
+            "polar(real(c)+0.01,imag(c))",
+            "0", "0", -12, true, false);
+        checkPolarFrame(
+            "radius-crosses-negative",
+            "polar(real(c)+0.01,imag(c))",
+            "0", "0", -5, false, false);
+        {
+            ProgramPair pair;
+            ExpressionReferenceOrbitResult reference;
+            ExpressionContext fixed;
+            bool okay = compilePair(
+                "polar(1,real(c))",
+                FormulaParameter::C, fixed, pair) &&
+                buildReference(
+                    pair, fixed, FormulaParameter::C,
+                    "1e500", "0", 4, 1928,
+                    reference);
+            ExpressionTaylorJetRequest request;
+            request.program = &pair.runtime;
+            request.reference = &reference;
+            request.pixelParameter = FormulaParameter::C;
+            request.parameterScale = makeScale(-1800);
+            request.minimumLanding = 1;
+            request.maximumCandidateIteration = 1;
+            ExpressionTaylorJetResult jet;
+            okay = okay &&
+                !ExpressionTaylorJetBuilder::build(
+                    request, jet) &&
+                (jet.status ==
+                     ExpressionTaylorJetStatus::
+                         AccuracyBudget ||
+                 jet.status ==
+                     ExpressionTaylorJetStatus::
+                         ExponentRange);
+            if (!okay) {
+                printf("  polar huge-angle fallback failed status=%s reason=%s\n",
+                       formula::expressionTaylorJetStatusName(
+                           jet.status),
+                       jet.failureReason.c_str());
+                ++failures;
+            }
+        }
+
+        ExpressionProgram nonrealRadius;
+        ExpressionProgram nonrealAngle;
+        ExpressionError error;
+        const bool nonrealOkay =
+            nonrealRadius.compile(
+                "polar(c,0)", &error) &&
+            nonrealAngle.compile(
+                "polar(1,c)", &error) &&
+            nonrealRadius.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    Unsupported &&
+            nonrealAngle.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    Unsupported;
+        if (!nonrealOkay) {
+            printf("  polar nonreal operand capability failed\n");
+            ++failures;
+        }
+
+        ExpressionProgram signedPolar;
+        ExpressionOracleContext negativeZeroContext(512);
+        ExpressionOracleContext positiveZeroContext(512);
+        MpfrComplex negativeZeroOutput(512);
+        MpfrComplex positiveZeroOutput(512);
+        std::string signedError;
+        negativeZeroContext.parameters[0].set(
+            -0.0, 0.0);
+        negativeZeroContext.parameters[1].set(
+            -0.0, 0.0);
+        positiveZeroContext.parameters[0].set(
+            0.0, 0.0);
+        positiveZeroContext.parameters[1].set(
+            -0.0, 0.0);
+        const bool signedPolarOkay =
+            signedPolar.compile(
+                "polar(p0,p1)", &error) &&
+            ExpressionOracle::evaluate(
+                signedPolar,
+                negativeZeroContext,
+                negativeZeroOutput,
+                &signedError) &&
+            ExpressionOracle::evaluate(
+                signedPolar,
+                positiveZeroContext,
+                positiveZeroOutput,
+                &signedError) &&
+            mpfr_zero_p(negativeZeroOutput.re) &&
+            mpfr_signbit(negativeZeroOutput.re) &&
+            mpfr_zero_p(negativeZeroOutput.im) &&
+            !mpfr_signbit(negativeZeroOutput.im) &&
+            mpfr_zero_p(positiveZeroOutput.re) &&
+            !mpfr_signbit(positiveZeroOutput.re) &&
+            mpfr_zero_p(positiveZeroOutput.im) &&
+            mpfr_signbit(positiveZeroOutput.im);
+        if (!signedPolarOkay) {
+            printf("  polar signed-zero semantics failed\n");
+            ++failures;
+        }
+
+        ProgramPair resourcePair;
+        ExpressionReferenceOrbitResult resourceReference;
+        ExpressionContext fixed;
+        bool resourceOkay = compilePair(
+            "polar(real(c)+1,arg(c+2))",
+            FormulaParameter::C, fixed,
+            resourcePair) &&
+            buildReference(
+                resourcePair, fixed,
+                FormulaParameter::C,
+                "0", "0", 8, 512,
+                resourceReference);
+        ExpressionTaylorJetRequest resourceRequest;
+        resourceRequest.program =
+            &resourcePair.runtime;
+        resourceRequest.reference =
+            &resourceReference;
+        resourceRequest.pixelParameter =
+            FormulaParameter::C;
+        resourceRequest.parameterScale =
+            makeScale(-20);
+        resourceRequest.minimumLanding = 1;
+        resourceRequest.maximumCandidateIteration = 4;
+        ExpressionTaylorJetResult baseline;
+        resourceOkay = resourceOkay &&
+            ExpressionTaylorJetBuilder::build(
+                resourceRequest, baseline) &&
+            baseline.memoryBytes > 1 &&
+            baseline.argCompositionCount > 0 &&
+            baseline.polarCompositionCount > 0;
+        if (resourceOkay) {
+            resourceRequest.memoryLimitBytes =
+                baseline.memoryBytes - 1;
+            ExpressionTaylorJetResult constrained;
+            resourceOkay =
+                !ExpressionTaylorJetBuilder::build(
+                    resourceRequest, constrained) &&
+                constrained.status ==
+                    ExpressionTaylorJetStatus::
+                        ResourceLimit &&
+                constrained.coefficients.empty() &&
+                constrained.coefficientRadii.empty();
+        }
+        resourceRequest.memoryLimitBytes =
+            size_t{ 1 } << 30;
+        resourceRequest.shouldCancel =
+            [] { return true; };
+        ExpressionTaylorJetResult cancelled;
+        resourceOkay = resourceOkay &&
+            !ExpressionTaylorJetBuilder::build(
+                resourceRequest, cancelled) &&
+            cancelled.status ==
+                ExpressionTaylorJetStatus::Cancelled &&
+            cancelled.coefficients.empty() &&
+            cancelled.coefficientRadii.empty();
+        if (!resourceOkay) {
+            printf("  Arg/Polar Taylor resource policy failed\n");
             ++failures;
         }
     }
@@ -8315,6 +8706,12 @@ static int runExpressionDeepRenderCase() {
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
                     CertifiedPiecewiseCandidate;
+        const bool hasArg =
+            std::string(source).find("arg(") !=
+                std::string::npos;
+        const bool hasPolar =
+            std::string(source).find("polar(") !=
+                std::string::npos;
         const bool allMpfrTaylorCandidate =
             (pair.runtime.scaledResidualCapability() ==
                  formula::ExpressionScaledResidualCapability::
@@ -8364,6 +8761,18 @@ static int runExpressionDeepRenderCase() {
              (!result.taylorAccepted ||
               result.taylorAcceptedPixelCount == 0 ||
               result.taylorCoveredIterations != iterations ||
+              (hasArg &&
+               (result.taylorArgCompositionCount == 0 ||
+                result.taylorBranchCompositionCount == 0 ||
+                result.taylorMinimumBranchCutClearance.
+                    isZero() ||
+                result.taylorMinimumBranchZeroClearance.
+                    isZero())) ||
+              (hasPolar &&
+               (result.taylorPolarCompositionCount == 0 ||
+                result.taylorFunctionSeriesCount == 0 ||
+                result.taylorMinimumPolarRadiusClearance.
+                    isZero())) ||
               (meromorphicCandidate
                    ? result.taylorReciprocalCount == 0 ||
                      result.taylorReciprocalOperationCount == 0 ||
@@ -8543,6 +8952,44 @@ static int runExpressionDeepRenderCase() {
         FormulaParameter::InitialZ, z0Fixed,
         "0", "0", 21, 13, 20, 0,
         ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "arg-taylor", "arg(c+2)",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0.25", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "arg-plus-c-taylor", "arg(z+2)+c",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0.25", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "polar-taylor",
+        "polar(real(c)+2,imag(z))",
+        FormulaParameter::C, transcendentalFixed,
+        "-1", "0", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "nested-polar-arg-taylor",
+        "polar(abs(real(c))+1,arg(c+2))",
+        FormulaParameter::C, transcendentalFixed,
+        "0.5", "0.25", 21, 13, 20, 0,
+        ExpressionDeepFallbackReason::InvalidTape, true);
+    verifyFrame(
+        "arg-first-escape",
+        "arg(c+2)+5",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 7, 5, 20, 35,
+        ExpressionDeepFallbackReason::
+            CertificationFailure,
+        false);
+    verifyFrame(
+        "polar-first-escape",
+        "polar(real(c)+5,imag(c))",
+        FormulaParameter::C, transcendentalFixed,
+        "0", "0", 7, 5, 20, 35,
+        ExpressionDeepFallbackReason::
+            CertificationFailure,
+        false);
     verifyFrame(
         "unsupported-real-entire",
         "sin(conj(z))+c",
@@ -9170,6 +9617,225 @@ static int runExpressionDeepRenderCase() {
                 "lower-lip", "-0", "1e500",
                 false);
         }
+    }
+
+    // Arg and Polar use the same all-or-MPFR frame policy: a failed whole-
+    // frame proof releases the reference and every fast-path allocation.
+    {
+        ProgramPair argPair;
+        const char* source = "0.001*arg(c)";
+        if (!compilePair(
+                source, FormulaParameter::C,
+                transcendentalFixed, argPair)) {
+            ++failures;
+        } else {
+            auto runArgFrame = [&](
+                    const char* name,
+                    const char* centerImaginary,
+                    const char* scale,
+                    bool expectAccepted) {
+                std::vector<float> actual, expected;
+                ExpressionDeepRenderRequest request =
+                    makeRequest(
+                        argPair, transcendentalFixed,
+                        FormulaParameter::C,
+                        "-2", centerImaginary,
+                        32, 20, 20, actual);
+                request.scale.decimal = scale;
+                request.taylor.requirePredictedBenefit =
+                    false;
+                ExpressionDeepRenderResult result;
+                bool okay =
+                    formula::renderExpressionDeepFrame(
+                        request, result) &&
+                    renderOracle(
+                        argPair.runtime,
+                        transcendentalFixed,
+                        FormulaParameter::C,
+                        "-2", centerImaginary, scale,
+                        32, 20, 20, 4.0,
+                        result.fallbackPrecision,
+                        expected) &&
+                    actual == expected &&
+                    result.taylorAttempted;
+                if (expectAccepted) {
+                    okay = okay &&
+                        result.taylorAccepted &&
+                        result.fallbackPixelCount == 0 &&
+                        result.
+                            taylorArgCompositionCount > 0 &&
+                        result.
+                            taylorBranchCompositionCount > 0 &&
+                        !result.
+                            taylorMinimumBranchCutClearance.
+                                isZero() &&
+                        !result.
+                            taylorMinimumBranchZeroClearance.
+                                isZero();
+                } else {
+                    const uint64_t pixels =
+                        static_cast<uint64_t>(
+                            actual.size());
+                    okay = okay &&
+                        !result.taylorAccepted &&
+                        result.taylorBranchRejected &&
+                        !result.
+                            taylorArgRejectionReason.empty() &&
+                        result.fastPixelCount == 0 &&
+                        result.fallbackPixelCount == pixels &&
+                        result.referenceBytes == 0 &&
+                        reasonCount(
+                            result,
+                            ExpressionDeepFallbackReason::
+                                CertificationFailure) ==
+                            pixels;
+                }
+                if (!okay) {
+                    printf("  arg frame policy failed [%s] accepted=%d status=%s reason=%s cut=(%.6g,e%lld) zero=(%.6g,e%lld)\n",
+                           name,
+                           result.taylorAccepted ? 1 : 0,
+                           formula::
+                               expressionTaylorJetStatusName(
+                                   result.taylorStatus),
+                           result.taylorFailureReason.c_str(),
+                           result.
+                               taylorMinimumBranchCutClearance.
+                                   mantissa,
+                           (long long)result.
+                               taylorMinimumBranchCutClearance.
+                                   exponent,
+                           result.
+                               taylorMinimumBranchZeroClearance.
+                                   mantissa,
+                           (long long)result.
+                               taylorMinimumBranchZeroClearance.
+                                   exponent);
+                    ++failures;
+                }
+            };
+            runArgFrame(
+                "near-cut-overlap", "0.02", "10",
+                false);
+            runArgFrame(
+                "near-cut-safe", "0.1", "320",
+                true);
+            runArgFrame(
+                "upper-lip", "0", "1e500",
+                false);
+            runArgFrame(
+                "lower-lip", "-0", "1e500",
+                false);
+        }
+
+        auto runPolarFrame = [&](
+                const char* name,
+                const char* source,
+                const char* scale,
+                bool expectAccepted,
+                bool exactZeroRadius) {
+            ProgramPair pair;
+            bool setup = compilePair(
+                source, FormulaParameter::C,
+                transcendentalFixed, pair);
+            std::vector<float> actual, expected;
+            ExpressionDeepRenderRequest request =
+                makeRequest(
+                    pair, transcendentalFixed,
+                    FormulaParameter::C,
+                    "0", "0", 32, 20, 20, actual);
+            request.scale.decimal = scale;
+            request.taylor.requirePredictedBenefit = false;
+            ExpressionDeepRenderResult result;
+            bool okay = setup &&
+                formula::renderExpressionDeepFrame(
+                    request, result) &&
+                renderOracle(
+                    pair.runtime,
+                    transcendentalFixed,
+                    FormulaParameter::C,
+                    "0", "0", scale,
+                    32, 20, 20, 4.0,
+                    result.fallbackPrecision,
+                    expected) &&
+                actual == expected &&
+                result.taylorAttempted;
+            if (expectAccepted) {
+                okay = okay &&
+                    result.taylorAccepted &&
+                    result.fallbackPixelCount == 0 &&
+                    result.
+                        taylorPolarCompositionCount > 0 &&
+                    !result.taylorPolarRejected &&
+                    (exactZeroRadius
+                         ? result.
+                               taylorMinimumPolarRadiusClearance.
+                                   isZero()
+                         : !result.
+                                taylorMinimumPolarRadiusClearance.
+                                    isZero() &&
+                           result.
+                               taylorFunctionSeriesCount >= 2);
+            } else {
+                const uint64_t pixels =
+                    static_cast<uint64_t>(actual.size());
+                okay = okay &&
+                    !result.taylorAccepted &&
+                    result.taylorPolarRejected &&
+                    !result.
+                        taylorPolarRejectionReason.empty() &&
+                    result.fastPixelCount == 0 &&
+                    result.fallbackPixelCount == pixels &&
+                    result.referenceBytes == 0 &&
+                    reasonCount(
+                        result,
+                        ExpressionDeepFallbackReason::
+                            CertificationFailure) ==
+                        pixels;
+            }
+            if (!okay) {
+                printf("  polar frame policy failed [%s] accepted=%d status=%s reason=%s radius=(%.6g,e%lld) count=%llu rejected=%d reject-reason=%s fast/fallback=%llu/%llu ref=%zu cert-reason=%llu oracle/equal=%d/%d\n",
+                       name,
+                       result.taylorAccepted ? 1 : 0,
+                       formula::
+                           expressionTaylorJetStatusName(
+                               result.taylorStatus),
+                       result.taylorFailureReason.c_str(),
+                       result.
+                           taylorMinimumPolarRadiusClearance.
+                               mantissa,
+                       (long long)result.
+                           taylorMinimumPolarRadiusClearance.
+                               exponent,
+                       (unsigned long long)result.
+                           taylorPolarCompositionCount,
+                       result.taylorPolarRejected ? 1 : 0,
+                       result.taylorPolarRejectionReason.c_str(),
+                       (unsigned long long)
+                           result.fastPixelCount,
+                       (unsigned long long)
+                           result.fallbackPixelCount,
+                       result.referenceBytes,
+                       (unsigned long long)reasonCount(
+                           result,
+                           ExpressionDeepFallbackReason::
+                               CertificationFailure),
+                       expected.empty() ? 0 : 1,
+                       actual == expected ? 1 : 0);
+                ++failures;
+            }
+        };
+        runPolarFrame(
+            "radius-crosses-negative",
+            "polar(real(c)+0.01,imag(c))",
+            "250", false, false);
+        runPolarFrame(
+            "near-zero-safe",
+            "polar(real(c)+0.01,imag(c))",
+            "1000", true, false);
+        runPolarFrame(
+            "exact-zero",
+            "polar(0,real(c))",
+            "1e500", true, true);
     }
 
     // Independently rebuild the higher-precision point orbit and verify that
@@ -10018,6 +10684,131 @@ static int runExpressionDeepRenderCase() {
                    (long long)zeroClearance.exponent);
             if (!speedOkay) {
                 printf("  branch Taylor repeated speed gate failed\n");
+                ++failures;
+            }
+        }
+
+        ProgramPair argPolarBenchmark;
+        if (!compilePair(
+                "polar(real(c)+1,arg(c+2))",
+                FormulaParameter::C,
+                transcendentalFixed,
+                argPolarBenchmark)) {
+            ++failures;
+        } else {
+            bool speedOkay = true;
+            bool accepted = false;
+            bool acceptanceInitialized = false;
+            double jetSeconds[2]{};
+            double mpfrSeconds[2]{};
+            uint64_t fallback = 0;
+            formula::ScaledRealValue cutClearance;
+            formula::ScaledRealValue zeroClearance;
+            formula::ScaledRealValue radiusClearance;
+            std::vector<float> acceptedOutput;
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                std::vector<float> jetOutput, mpfrOutput;
+                ExpressionDeepRenderRequest jetRequest =
+                    makeRequest(
+                        argPolarBenchmark,
+                        transcendentalFixed,
+                        FormulaParameter::C,
+                        "0", "0", 80, 50, 120,
+                        jetOutput);
+                ExpressionDeepRenderResult jetResult;
+                const Clock::time_point jetStart =
+                    Clock::now();
+                speedOkay = speedOkay &&
+                    formula::renderExpressionDeepFrame(
+                        jetRequest, jetResult);
+                jetSeconds[repeat] =
+                    std::chrono::duration<double>(
+                        Clock::now() - jetStart).count();
+
+                ExpressionDeepRenderRequest mpfrRequest =
+                    makeRequest(
+                        argPolarBenchmark,
+                        transcendentalFixed,
+                        FormulaParameter::C,
+                        "0", "0", 80, 50, 120,
+                        mpfrOutput);
+                mpfrRequest.
+                    forceMpfrFallbackForVerification = true;
+                ExpressionDeepRenderResult mpfrResult;
+                const Clock::time_point mpfrStart =
+                    Clock::now();
+                speedOkay = speedOkay &&
+                    formula::renderExpressionDeepFrame(
+                        mpfrRequest, mpfrResult);
+                mpfrSeconds[repeat] =
+                    std::chrono::duration<double>(
+                        Clock::now() - mpfrStart).count();
+
+                if (!acceptanceInitialized) {
+                    accepted = jetResult.taylorAccepted;
+                    acceptanceInitialized = true;
+                } else {
+                    speedOkay = speedOkay &&
+                        accepted ==
+                            jetResult.taylorAccepted;
+                }
+                fallback = jetResult.fallbackPixelCount;
+                cutClearance =
+                    jetResult.
+                        taylorMinimumBranchCutClearance;
+                zeroClearance =
+                    jetResult.
+                        taylorMinimumBranchZeroClearance;
+                radiusClearance =
+                    jetResult.
+                        taylorMinimumPolarRadiusClearance;
+                speedOkay = speedOkay &&
+                    jetOutput == mpfrOutput &&
+                    jetResult.taylorAccepted &&
+                    jetResult.taylorArgCompositionCount > 0 &&
+                    jetResult.
+                        taylorPolarCompositionCount > 0 &&
+                    jetResult.taylorAcceptedPixelCount > 0 &&
+                    jetResult.fallbackPixelCount == 0 &&
+                    !cutClearance.isZero() &&
+                    !zeroClearance.isZero() &&
+                    !radiusClearance.isZero() &&
+                    jetSeconds[repeat] <
+                        mpfrSeconds[repeat];
+                if (repeat == 0)
+                    acceptedOutput = jetOutput;
+            }
+            std::vector<float> disabledOutput;
+            ExpressionDeepRenderRequest disabledRequest =
+                makeRequest(
+                    argPolarBenchmark,
+                    transcendentalFixed,
+                    FormulaParameter::C,
+                    "0", "0", 80, 50, 120,
+                    disabledOutput);
+            disabledRequest.taylor.enableTaylor = false;
+            ExpressionDeepRenderResult disabledResult;
+            speedOkay = speedOkay &&
+                formula::renderExpressionDeepFrame(
+                    disabledRequest, disabledResult) &&
+                disabledOutput == acceptedOutput &&
+                !disabledResult.taylorAttempted &&
+                disabledResult.fastPixelCount == 0 &&
+                disabledResult.fallbackPixelCount ==
+                    disabledOutput.size();
+            printf("  Arg/Polar Taylor e500 jet/MPFR %.3f/%.3f and %.3f/%.3f s accepted=%d fallback=%llu cut=(%.6g,e%lld) zero=(%.6g,e%lld) radius=(%.6g,e%lld)\n",
+                   jetSeconds[0], mpfrSeconds[0],
+                   jetSeconds[1], mpfrSeconds[1],
+                   accepted ? 1 : 0,
+                   (unsigned long long)fallback,
+                   cutClearance.mantissa,
+                   (long long)cutClearance.exponent,
+                   zeroClearance.mantissa,
+                   (long long)zeroClearance.exponent,
+                   radiusClearance.mantissa,
+                   (long long)radiusClearance.exponent);
+            if (!speedOkay) {
+                printf("  Arg/Polar Taylor repeated speed gate failed\n");
                 ++failures;
             }
         }

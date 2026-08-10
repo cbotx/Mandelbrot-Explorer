@@ -540,7 +540,8 @@ ExpressionProgram::scaledResidualCapability() const {
     bool hasSeries = false;
     bool hasMeromorphic = false;
     bool hasCertifiedBranch = false;
-    bool hasUncertifiedBranch = false;
+    bool hasBivariateBranch = false;
+    bool hasPolar = false;
     bool hasBranchIncompatible = false;
     bool hasRealSmooth = false;
     bool hasPiecewise = false;
@@ -658,7 +659,9 @@ ExpressionProgram::scaledResidualCapability() const {
             break;
         case Op::Arg:
             kind.real = true;
-            hasUncertifiedBranch = true;
+            hasBivariateBranch = true;
+            hasBranchIncompatible = true;
+            hasRealSmooth = true;
             break;
         case Op::Abs:
             kind.real = true;
@@ -670,22 +673,36 @@ ExpressionProgram::scaledResidualCapability() const {
                 hasUnsupported = true;
             break;
         case Op::Polar:
-            hasUnsupported = true;
+            if (!kinds[left].real ||
+                !kinds[right].real)
+                hasUnsupported = true;
+            else
+                hasPolar = true;
             hasBranchIncompatible = true;
+            hasRealSmooth = true;
             break;
         }
         kinds[index] = kind;
         stack.push_back(index);
     }
-    if (hasUncertifiedBranch ||
-        (hasCertifiedBranch &&
-         (hasBranchIncompatible || hasPiecewise)))
+    if (hasCertifiedBranch &&
+        (hasBranchIncompatible || hasPiecewise ||
+         hasBivariateBranch || hasPolar))
         return ExpressionScaledResidualCapability::BranchSensitive;
     if (hasCertifiedBranch)
         return ExpressionScaledResidualCapability::
             CertifiedBranchCandidate;
     if (hasUnsupported)
         return ExpressionScaledResidualCapability::Unsupported;
+    if (hasBivariateBranch || hasPolar) {
+        if (hasSeries || hasMeromorphic)
+            return ExpressionScaledResidualCapability::Unsupported;
+        if (hasPiecewise)
+            return ExpressionScaledResidualCapability::
+                CertifiedPiecewiseCandidate;
+        return ExpressionScaledResidualCapability::
+            CertifiedRealCandidate;
+    }
     if (hasPiecewise) {
         if (hasSeries || hasMeromorphic)
             return ExpressionScaledResidualCapability::Unsupported;
@@ -705,6 +722,16 @@ ExpressionProgram::scaledResidualCapability() const {
         return ExpressionScaledResidualCapability::
             CertifiedEntireCandidate;
     return ExpressionScaledResidualCapability::ExactCenteredArithmetic;
+}
+
+bool ExpressionProgram::scaledResidualRequiresTaylor() const {
+    if (!_valid) return true;
+    return std::any_of(
+        _code.begin(), _code.end(),
+        [](const Instruction& instruction) {
+            return instruction.op == Op::Arg ||
+                   instruction.op == Op::Polar;
+        });
 }
 
 uint64_t ExpressionProgram::semanticHash() const {

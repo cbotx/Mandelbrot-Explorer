@@ -108,6 +108,12 @@ struct ExpressionTaylorJetResult {
     ScaledRealValue minimumBranchCutClearance;
     ScaledRealValue minimumBranchZeroClearance;
     bool branchRejected = false;
+    uint64_t argCompositionCount = 0;
+    std::string argRejectionReason;
+    uint64_t polarCompositionCount = 0;
+    ScaledRealValue minimumPolarRadiusClearance;
+    bool polarRejected = false;
+    std::string polarRejectionReason;
     uint64_t absBranchCount = 0;
     uint64_t absPositiveCellCount = 0;
     uint64_t absNegativeCellCount = 0;

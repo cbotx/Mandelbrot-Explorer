@@ -102,6 +102,7 @@ public:
     bool batchCompatible() const { return _batchCompatible; }
     bool derivativeCompatible() const { return _derivativeCompatible; }
     ExpressionScaledResidualCapability scaledResidualCapability() const;
+    bool scaledResidualRequiresTaylor() const;
 
 private:
     enum class Op : uint8_t {

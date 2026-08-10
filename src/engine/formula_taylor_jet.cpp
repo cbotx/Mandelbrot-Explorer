@@ -162,7 +162,9 @@ enum class PrincipalFunction : uint8_t {
     Log,
     Log10,
     Sqrt,
-    Exp
+    Exp,
+    Sin,
+    Cos
 };
 
 enum class PrincipalClearanceFailure : uint8_t {
@@ -358,6 +360,29 @@ ScaledArithmeticStatus makePrincipalFunctionBall(
                 value.re, magnitude, first, MPFR_RNDN);
             mpfr_mul(
                 value.im, magnitude, second, MPFR_RNDN);
+            break;
+        case PrincipalFunction::Sin:
+            mpfr_sin_cos(
+                first, second, argument.re, MPFR_RNDN);
+            mpfr_sinh_cosh(
+                third, magnitude, argument.im,
+                MPFR_RNDN);
+            mpfr_mul(
+                value.re, first, magnitude, MPFR_RNDN);
+            mpfr_mul(
+                value.im, second, third, MPFR_RNDN);
+            break;
+        case PrincipalFunction::Cos:
+            mpfr_sin_cos(
+                first, second, argument.re, MPFR_RNDN);
+            mpfr_sinh_cosh(
+                third, magnitude, argument.im,
+                MPFR_RNDN);
+            mpfr_mul(
+                value.re, second, magnitude, MPFR_RNDN);
+            mpfr_mul(
+                value.im, first, third, MPFR_RNDN);
+            mpfr_neg(value.im, value.im, MPFR_RNDN);
             break;
         }
     }
@@ -1029,6 +1054,13 @@ struct Candidate {
     bool hasBranchCutClearance = false;
     bool hasBranchZeroClearance = false;
     bool branchRejected = false;
+    uint64_t argCompositionCount = 0;
+    std::string argRejectionReason;
+    uint64_t polarCompositionCount = 0;
+    ScaledRealValue minimumPolarRadiusClearance;
+    bool hasPolarRadiusClearance = false;
+    bool polarRejected = false;
+    std::string polarRejectionReason;
     uint64_t absBranchCount = 0;
     uint64_t absPositiveCellCount = 0;
     uint64_t absNegativeCellCount = 0;
@@ -1300,6 +1332,8 @@ public:
                  FormulaParameter::InitialZ) ||
             request.minimumOrder < 8 ||
             request.maximumOrder > 20 ||
+            request.maximumCompositionOrder < 1 ||
+            request.maximumCompositionOrder > 24 ||
             request.maximumBivariateOrder < 8 ||
             request.maximumBivariateOrder >
                 ExpressionTaylorMaximumBivariateOrder ||
@@ -1360,6 +1394,8 @@ public:
             case Op::Imaginary:
             case Op::MakeComplex:
             case Op::Abs:
+            case Op::Arg:
+            case Op::Polar:
                 break;
             default:
                 return finish(
@@ -1516,7 +1552,7 @@ public:
                     candidateBytes, nodeCount,
                     sizeof(uint8_t)) ||
                 !checkedAddSize(
-                    candidateBytes, monomialCount * 2,
+                    candidateBytes, monomialCount * 10,
                     sizeof(ScaledComplexBall)) ||
                 !checkedAddSize(
                     candidateBytes,
@@ -1595,6 +1631,22 @@ public:
                     monomialCount);
                 std::vector<ScaledComplexBall> nextState(
                     monomialCount);
+                std::vector<ScaledComplexBall> functionTerm(
+                    monomialCount);
+                std::vector<ScaledComplexBall> functionScratch(
+                    monomialCount);
+                std::vector<ScaledComplexBall> functionFirst(
+                    monomialCount);
+                std::vector<ScaledComplexBall> functionSecond(
+                    monomialCount);
+                std::vector<ScaledComplexBall> functionThird(
+                    monomialCount);
+                std::vector<ScaledComplexBall> functionOutput1(
+                    monomialCount);
+                std::vector<ScaledComplexBall> functionOutput2(
+                    monomialCount);
+                std::vector<ScaledComplexBall> functionOutput3(
+                    monomialCount);
                 candidate.margins.reserve(
                     static_cast<size_t>(maximumLanding) + 1);
                 size_t actualCandidateBytes =
@@ -1631,6 +1683,38 @@ public:
                     !checkedAddSize(
                         actualCandidateBytes,
                         nextState.capacity(),
+                        sizeof(ScaledComplexBall)) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        functionTerm.capacity(),
+                        sizeof(ScaledComplexBall)) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        functionScratch.capacity(),
+                        sizeof(ScaledComplexBall)) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        functionFirst.capacity(),
+                        sizeof(ScaledComplexBall)) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        functionSecond.capacity(),
+                        sizeof(ScaledComplexBall)) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        functionThird.capacity(),
+                        sizeof(ScaledComplexBall)) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        functionOutput1.capacity(),
+                        sizeof(ScaledComplexBall)) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        functionOutput2.capacity(),
+                        sizeof(ScaledComplexBall)) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        functionOutput3.capacity(),
                         sizeof(ScaledComplexBall)) ||
                     !checkedAddSize(
                         actualCandidateBytes,
@@ -1727,6 +1811,29 @@ public:
                         ScaledRealValue& output) {
                     count(candidate.operations);
                     return multiplyUp(left, right, output);
+                };
+                auto reciprocalBall = [&](
+                        int divisor,
+                        ScaledComplexBall& output) {
+                    output = {};
+                    if (divisor <= 0)
+                        return ScaledArithmeticStatus::
+                            ExponentRange;
+                    const double reciprocal =
+                        1.0 /
+                        static_cast<double>(divisor);
+                    ScaledArithmeticStatus status =
+                        makeScaledRealValue(
+                            reciprocal,
+                            output.value.re);
+                    if (status !=
+                            ScaledArithmeticStatus::Success ||
+                        divisor == 1)
+                        return status;
+                    return makeScaledRealValue(
+                        std::ldexp(
+                            std::abs(reciprocal), -50),
+                        output.radius);
                 };
                 auto conjugateBall = [&](
                         const ScaledComplexBall& input,
@@ -2215,6 +2322,844 @@ public:
                     }
                     remainders[outputNode] = tail;
                     return ScaledArithmeticStatus::Success;
+                };
+                auto polynomialArraySup = [&](
+                        const ScaledComplexBall* values,
+                        ScaledRealValue& output) {
+                    output = {};
+                    for (size_t index = 0;
+                         index < monomialCount; ++index) {
+                        ScaledRealValue magnitude;
+                        ScaledArithmeticStatus status =
+                            upperMagnitude(
+                                values[index], magnitude);
+                        count(candidate.operations);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return status;
+                        status = addRemainder(
+                            output, magnitude);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return status;
+                    }
+                    return ScaledArithmeticStatus::Success;
+                };
+                auto multiplyPolynomialArrays = [&](
+                        const ScaledComplexBall* left,
+                        const ScaledRealValue& leftRemainder,
+                        const ScaledComplexBall* right,
+                        const ScaledRealValue& rightRemainder,
+                        ScaledComplexBall* output,
+                        ScaledRealValue& outputRemainder) {
+                    std::fill(
+                        output, output + monomialCount,
+                        ScaledComplexBall{});
+                    std::array<
+                        ScaledRealValue,
+                        MaximumBivariateMonomials>
+                            leftMagnitudes{};
+                    std::array<
+                        ScaledRealValue,
+                        MaximumBivariateMonomials>
+                            rightMagnitudes{};
+                    ScaledRealValue leftSup;
+                    ScaledRealValue rightSup;
+                    ScaledArithmeticStatus status =
+                        ScaledArithmeticStatus::Success;
+                    for (size_t index = 0;
+                         index < monomialCount; ++index) {
+                        status = upperMagnitude(
+                            left[index],
+                            leftMagnitudes[index]);
+                        count(candidate.operations);
+                        if (status ==
+                                ScaledArithmeticStatus::Success)
+                            status = upperMagnitude(
+                                right[index],
+                                rightMagnitudes[index]);
+                        count(candidate.operations);
+                        if (status ==
+                                ScaledArithmeticStatus::Success)
+                            status = addRemainder(
+                                leftSup,
+                                leftMagnitudes[index]);
+                        if (status ==
+                                ScaledArithmeticStatus::Success)
+                            status = addRemainder(
+                                rightSup,
+                                rightMagnitudes[index]);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return status;
+                    }
+                    outputRemainder = {};
+                    auto addProduct = [&](
+                            const ScaledRealValue& first,
+                            const ScaledRealValue& second,
+                            bool twice = false) {
+                        ScaledRealValue product;
+                        ScaledArithmeticStatus local =
+                            multiplyBound(
+                                first, second, product);
+                        if (local !=
+                                ScaledArithmeticStatus::Success)
+                            return local;
+                        if (twice) {
+                            ScaledRealValue doubled;
+                            local = scaledAddUp(
+                                product, product, doubled);
+                            count(candidate.operations);
+                            if (local !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                return local;
+                            product = doubled;
+                        }
+                        return addRemainder(
+                            outputRemainder, product);
+                    };
+                    status = addProduct(
+                        leftSup, rightRemainder);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addProduct(
+                            rightSup, leftRemainder);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addProduct(
+                            leftRemainder,
+                            rightRemainder, true);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+
+                    for (size_t first = 0;
+                         first < monomialCount; ++first) {
+                        for (size_t second = 0;
+                             second < monomialCount;
+                             ++second) {
+                            const int qDegree =
+                                qDegrees[first] +
+                                qDegrees[second];
+                            const int conjugateDegree =
+                                conjugateDegrees[first] +
+                                conjugateDegrees[second];
+                            if (qDegree + conjugateDegree >
+                                    order) {
+                                status = addProduct(
+                                    leftMagnitudes[first],
+                                    rightMagnitudes[second]);
+                                count(
+                                    candidate.
+                                        bivariateConvolutionOperations);
+                                if (status !=
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    return status;
+                                continue;
+                            }
+                            size_t outputIndex = 0;
+                            if (!expressionTaylorBivariateIndex(
+                                    order, qDegree,
+                                    conjugateDegree,
+                                    outputIndex))
+                                return
+                                    ScaledArithmeticStatus::
+                                        ExponentRange;
+                            ScaledComplexBall term;
+                            status = multiplyBall(
+                                left[first], right[second],
+                                term);
+                            count(
+                                candidate.
+                                    bivariateConvolutionOperations);
+                            if (status ==
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                status = addBall(
+                                    output[outputIndex],
+                                    term,
+                                    output[outputIndex]);
+                            count(
+                                candidate.
+                                    bivariateConvolutionOperations);
+                            if (status !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                return status;
+                        }
+                    }
+                    return ScaledArithmeticStatus::Success;
+                };
+                auto scalePolynomialArray = [&](
+                        const ScaledComplexBall* input,
+                        const ScaledRealValue& inputRemainder,
+                        const ScaledComplexBall& factor,
+                        ScaledComplexBall* output,
+                        ScaledRealValue& outputRemainder) {
+                    ScaledArithmeticStatus status =
+                        ScaledArithmeticStatus::Success;
+                    for (size_t index = 0;
+                         index < monomialCount; ++index) {
+                        status = multiplyBall(
+                            input[index], factor,
+                            output[index]);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return status;
+                    }
+                    ScaledRealValue factorMagnitude;
+                    status = upperMagnitude(
+                        factor, factorMagnitude);
+                    count(candidate.operations);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = multiplyBound(
+                            factorMagnitude,
+                            inputRemainder,
+                            outputRemainder);
+                    return status;
+                };
+                auto addPolynomialArrays = [&](
+                        const ScaledComplexBall* left,
+                        const ScaledRealValue& leftRemainder,
+                        const ScaledComplexBall* right,
+                        const ScaledRealValue& rightRemainder,
+                        bool subtract,
+                        ScaledComplexBall* output,
+                        ScaledRealValue& outputRemainder) {
+                    ScaledArithmeticStatus status =
+                        ScaledArithmeticStatus::Success;
+                    for (size_t index = 0;
+                         index < monomialCount; ++index) {
+                        status = subtract
+                            ? subtractBall(
+                                  left[index], right[index],
+                                  output[index])
+                            : addBall(
+                                  left[index], right[index],
+                                  output[index]);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return status;
+                    }
+                    outputRemainder = leftRemainder;
+                    return addRemainder(
+                        outputRemainder, rightRemainder);
+                };
+                auto projectImaginaryArray = [&](
+                        const ScaledComplexBall* input,
+                        const ScaledRealValue& inputRemainder,
+                        ScaledComplexBall* output,
+                        ScaledRealValue& outputRemainder) {
+                    for (size_t index = 0;
+                         index < monomialCount; ++index) {
+                        ScaledComplexBall swapped;
+                        ScaledArithmeticStatus status =
+                            conjugateBall(
+                                input[
+                                    conjugateIndices[index]],
+                                swapped);
+                        ScaledComplexBall difference;
+                        if (status ==
+                                ScaledArithmeticStatus::Success)
+                            status = subtractBall(
+                                input[index], swapped,
+                                difference);
+                        ScaledComplexBall rotated;
+                        if (status ==
+                                ScaledArithmeticStatus::Success)
+                            status = rotateMinusI(
+                                difference, rotated);
+                        if (status ==
+                                ScaledArithmeticStatus::Success)
+                            status = halfBall(
+                                rotated, output[index]);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return status;
+                    }
+                    outputRemainder = inputRemainder;
+                    return ScaledArithmeticStatus::Success;
+                };
+                auto makeExpansionInput = [&](
+                        size_t sampleOffset,
+                        uint16_t source,
+                        ScaledComplexBall& center,
+                        ScaledComplexBall* variation,
+                        ScaledRealValue& variationRemainder) {
+                    ScaledArithmeticStatus status =
+                        nodeBase(
+                            sampleOffset, source,
+                            center.value);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addBall(
+                            center,
+                            coefficient(source, 0),
+                            center);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                    std::fill(
+                        variation,
+                        variation + monomialCount,
+                        ScaledComplexBall{});
+                    for (size_t index = 1;
+                         index < monomialCount; ++index)
+                        variation[index] =
+                            coefficient(source, index);
+                    variationRemainder =
+                        remainders[source];
+                    status = addRemainder(
+                        variationRemainder,
+                        center.radius);
+                    center.radius = {};
+                    return status;
+                };
+                auto recordClearance = [](
+                        const ScaledRealValue& clearance,
+                        ScaledRealValue& minimum,
+                        bool& haveMinimum) {
+                    if (!haveMinimum ||
+                        compareScaledNonnegative(
+                            clearance, minimum) < 0) {
+                        minimum = clearance;
+                        haveMinimum = true;
+                    }
+                };
+                auto composeBivariateLogVariation = [&](
+                        size_t sampleOffset,
+                        uint16_t source,
+                        ScaledComplexBall* output,
+                        ScaledRealValue& outputRemainder,
+                        ScaledComplexBall& baseLog) {
+                    auto failArg = [&](
+                            ExpressionTaylorJetStatus status,
+                            const char* reason,
+                            bool rejected = false) {
+                        candidate.status = status;
+                        candidate.reason = reason;
+                        candidate.branchRejected =
+                            candidate.branchRejected ||
+                            rejected;
+                        if (rejected)
+                            candidate.argRejectionReason =
+                                reason;
+                        return false;
+                    };
+                    ScaledComplexBall center;
+                    ScaledRealValue variationRemainder;
+                    ScaledArithmeticStatus status =
+                        makeExpansionInput(
+                            sampleOffset, source, center,
+                            functionFirst.data(),
+                            variationRemainder);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return failArg(
+                            statusForArithmetic(status),
+                            "arg reference input is outside certified range");
+                    ScaledRealValue enclosureVariation =
+                        variationRemainder;
+                    for (size_t index = 1;
+                         index < monomialCount; ++index) {
+                        ScaledRealValue magnitude;
+                        status = upperMagnitude(
+                            functionFirst[index],
+                            magnitude);
+                        count(candidate.operations);
+                        if (status ==
+                                ScaledArithmeticStatus::Success)
+                            status = addRemainder(
+                                enclosureVariation,
+                                magnitude);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return failArg(
+                                statusForArithmetic(status),
+                                "arg input enclosure overflowed");
+                    }
+                    ScaledRealValue zeroClearance;
+                    ScaledRealValue cutClearance;
+                    PrincipalClearanceFailure failure =
+                        PrincipalClearanceFailure::None;
+                    status = principalBranchClearance(
+                        center.value, enclosureVariation,
+                        zeroClearance, cutClearance, failure);
+                    count(candidate.operations);
+                    recordClearance(
+                        zeroClearance,
+                        candidate.
+                            minimumBranchZeroClearance,
+                        candidate.
+                            hasBranchZeroClearance);
+                    recordClearance(
+                        cutClearance,
+                        candidate.
+                            minimumBranchCutClearance,
+                        candidate.
+                            hasBranchCutClearance);
+                    if (status ==
+                            ScaledArithmeticStatus::Singular)
+                        return failArg(
+                            ExpressionTaylorJetStatus::
+                                BranchRejected,
+                            failure ==
+                                    PrincipalClearanceFailure::
+                                        Zero
+                                ? "arg input enclosure touches or contains zero"
+                                : "arg input enclosure touches the negative-real cut or has an ambiguous signed lip",
+                            true);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return failArg(
+                            statusForArithmetic(status),
+                            "arg clearance is outside certified range");
+
+                    ScaledComplexBall reciprocal;
+                    status = reciprocalScaledValue(
+                        center.value, reciprocal);
+                    count(candidate.operations);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return failArg(
+                            ExpressionTaylorJetStatus::
+                                BranchRejected,
+                            "arg expansion center is zero or not representable",
+                            true);
+                    ScaledRealValue normalizedRemainder;
+                    status = scalePolynomialArray(
+                        functionFirst.data(),
+                        variationRemainder,
+                        reciprocal,
+                        functionSecond.data(),
+                        normalizedRemainder);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return failArg(
+                            statusForArithmetic(status),
+                            "arg normalized polynomial failed");
+                    ScaledRealValue rho;
+                    status = polynomialArraySup(
+                        functionSecond.data(), rho);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addRemainder(
+                            rho, normalizedRemainder);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addRemainder(
+                            rho, normalizedRemainder);
+                    ScaledRealValue one;
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = makeScaledRealValue(
+                            1.0, one);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return failArg(
+                            statusForArithmetic(status),
+                            "arg normalized radius overflowed");
+                    if (compareScaledNonnegative(
+                            rho, one) >= 0)
+                        return failArg(
+                            ExpressionTaylorJetStatus::
+                                AccuracyBudget,
+                            "arg normalized radius is not strictly below one");
+
+                    std::fill(
+                        functionThird.begin(),
+                        functionThird.end(),
+                        ScaledComplexBall{});
+                    functionTerm = functionSecond;
+                    ScaledRealValue termRemainder =
+                        normalizedRemainder;
+                    ScaledRealValue seriesRemainder;
+                    ScaledRealValue certifiedTail;
+                    ScaledRealValue tailBudget;
+                    status = scaledDivideByDouble(
+                        accuracyBudget, 16.0,
+                        tailBudget);
+                    count(candidate.operations);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return failArg(
+                            statusForArithmetic(status),
+                            "arg tail budget is not representable");
+                    int retainedOrder = 0;
+                    for (int seriesOrder = 1;
+                         seriesOrder <=
+                             request.
+                                 maximumCompositionOrder;
+                         ++seriesOrder) {
+                        ScaledComplexBall reciprocalOrder;
+                        status = reciprocalBall(
+                            seriesOrder,
+                            reciprocalOrder);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return failArg(
+                                statusForArithmetic(status),
+                                "arg-series reciprocal is not representable");
+                        ScaledRealValue scaledRemainder;
+                        status = scalePolynomialArray(
+                            functionTerm.data(),
+                            termRemainder,
+                            reciprocalOrder,
+                            functionScratch.data(),
+                            scaledRemainder);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return failArg(
+                                statusForArithmetic(status),
+                                "arg-series term scaling failed");
+                        for (size_t index = 0;
+                             index < monomialCount;
+                             ++index) {
+                            status =
+                                (seriesOrder & 1) == 0
+                                ? subtractBall(
+                                      functionThird[index],
+                                      functionScratch[index],
+                                      functionThird[index])
+                                : addBall(
+                                      functionThird[index],
+                                      functionScratch[index],
+                                      functionThird[index]);
+                            if (status !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                return failArg(
+                                    statusForArithmetic(
+                                        status),
+                                    "arg-series accumulation failed");
+                        }
+                        status = addRemainder(
+                            seriesRemainder,
+                            scaledRemainder);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return failArg(
+                                statusForArithmetic(status),
+                                "arg-series remainder accumulation failed");
+                        status = logarithmSeriesTailBound(
+                            rho, seriesOrder,
+                            certifiedTail);
+                        count(candidate.operations);
+                        count(
+                            candidate.
+                                functionSeriesOperations);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return failArg(
+                                ExpressionTaylorJetStatus::
+                                    AccuracyBudget,
+                                "arg logarithm tail is not certifiable");
+                        if (compareScaledNonnegative(
+                                certifiedTail,
+                                tailBudget) <= 0) {
+                            retainedOrder = seriesOrder;
+                            break;
+                        }
+                        ScaledRealValue nextRemainder;
+                        status =
+                            multiplyPolynomialArrays(
+                                functionTerm.data(),
+                                termRemainder,
+                                functionSecond.data(),
+                                normalizedRemainder,
+                                functionScratch.data(),
+                                nextRemainder);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return failArg(
+                                statusForArithmetic(status),
+                                "arg polynomial power failed");
+                        functionTerm.swap(
+                            functionScratch);
+                        termRemainder = nextRemainder;
+                    }
+                    if (retainedOrder == 0)
+                        return failArg(
+                            ExpressionTaylorJetStatus::
+                                AccuracyBudget,
+                            "arg logarithm tail exceeds accuracy budget");
+                    outputRemainder = seriesRemainder;
+                    status = addRemainder(
+                        outputRemainder, certifiedTail);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return failArg(
+                            statusForArithmetic(status),
+                            "arg tail accumulation failed");
+                    std::copy(
+                        functionThird.begin(),
+                        functionThird.end(), output);
+                    status = makePrincipalFunctionBall(
+                        center.value,
+                        PrincipalFunction::Log,
+                        request.reference->
+                            certificationPrecision,
+                        baseLog);
+                    count(candidate.operations);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return failArg(
+                            statusForArithmetic(status),
+                            "arg principal logarithm base is outside certified range");
+                    ++candidate.branchCompositionCount;
+                    candidate.maximumBranchSeriesOrder =
+                        std::max(
+                            candidate.
+                                maximumBranchSeriesOrder,
+                            retainedOrder);
+                    if (compareScaledNonnegative(
+                            certifiedTail,
+                            candidate.
+                                maximumBranchSeriesTail) > 0)
+                        candidate.
+                            maximumBranchSeriesTail =
+                                certifiedTail;
+                    return true;
+                };
+                auto composeBivariateEntireVariation = [&](
+                        size_t sampleOffset,
+                        uint16_t source,
+                        PrincipalFunction function,
+                        ScaledComplexBall* output,
+                        ScaledRealValue& outputRemainder,
+                        ScaledComplexBall& base) {
+                    ScaledComplexBall center;
+                    ScaledRealValue variationRemainder;
+                    ScaledArithmeticStatus status =
+                        makeExpansionInput(
+                            sampleOffset, source, center,
+                            functionFirst.data(),
+                            variationRemainder);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return false;
+                    ScaledRealValue inputRadius;
+                    status = polynomialArraySup(
+                        functionFirst.data(), inputRadius);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addRemainder(
+                            inputRadius,
+                            variationRemainder);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addRemainder(
+                            inputRadius,
+                            variationRemainder);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return false;
+
+                    status = makePrincipalFunctionBall(
+                        center.value, function,
+                        request.reference->
+                            certificationPrecision,
+                        base);
+                    count(candidate.operations);
+                    ScaledComplexBall companion;
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = makePrincipalFunctionBall(
+                            center.value,
+                            function ==
+                                    PrincipalFunction::Sin
+                                ? PrincipalFunction::Cos
+                                : PrincipalFunction::Sin,
+                            request.reference->
+                                certificationPrecision,
+                            companion);
+                    count(candidate.operations);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return false;
+
+                    std::fill(
+                        functionSecond.begin(),
+                        functionSecond.end(),
+                        ScaledComplexBall{});
+                    std::fill(
+                        functionThird.begin(),
+                        functionThird.end(),
+                        ScaledComplexBall{});
+                    functionTerm = functionFirst;
+                    ScaledRealValue termRemainder =
+                        variationRemainder;
+                    ScaledRealValue evenRemainder;
+                    ScaledRealValue oddRemainder;
+                    ScaledRealValue certifiedTail;
+                    int retainedOrder = 0;
+                    for (int seriesOrder = 1;
+                         seriesOrder <=
+                             request.
+                                 maximumCompositionOrder;
+                         ++seriesOrder) {
+                        if (seriesOrder > 1) {
+                            ScaledRealValue productRemainder;
+                            status =
+                                multiplyPolynomialArrays(
+                                    functionTerm.data(),
+                                    termRemainder,
+                                    functionFirst.data(),
+                                    variationRemainder,
+                                    functionScratch.data(),
+                                    productRemainder);
+                            if (status !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                return false;
+                            ScaledComplexBall reciprocalOrder;
+                            status = reciprocalBall(
+                                seriesOrder,
+                                reciprocalOrder);
+                            if (status !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                return false;
+                            status = scalePolynomialArray(
+                                functionScratch.data(),
+                                productRemainder,
+                                reciprocalOrder,
+                                functionTerm.data(),
+                                termRemainder);
+                            if (status !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                return false;
+                        }
+                        const bool even =
+                            (seriesOrder & 1) == 0;
+                        bool negate =
+                            ((seriesOrder / 2) & 1) != 0;
+                        ScaledComplexBall* destination =
+                            even
+                            ? functionSecond.data()
+                            : functionThird.data();
+                        ScaledRealValue& destinationRemainder =
+                            even
+                            ? evenRemainder
+                            : oddRemainder;
+                        for (size_t index = 0;
+                             index < monomialCount;
+                             ++index) {
+                            status = negate
+                                ? subtractBall(
+                                      destination[index],
+                                      functionTerm[index],
+                                      destination[index])
+                                : addBall(
+                                      destination[index],
+                                      functionTerm[index],
+                                      destination[index]);
+                            if (status !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                return false;
+                        }
+                        status = addRemainder(
+                            destinationRemainder,
+                            termRemainder);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return false;
+                        status = finiteSeriesTailBound(
+                            inputRadius, seriesOrder,
+                            certifiedTail);
+                        count(candidate.operations);
+                        count(
+                            candidate.
+                                functionSeriesOperations);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return false;
+                        ScaledRealValue weight;
+                        status = upperMagnitude(
+                            base, weight);
+                        count(candidate.operations);
+                        ScaledRealValue companionMagnitude;
+                        if (status ==
+                                ScaledArithmeticStatus::Success)
+                            status = upperMagnitude(
+                                companion,
+                                companionMagnitude);
+                        count(candidate.operations);
+                        if (status ==
+                                ScaledArithmeticStatus::Success)
+                            status = addRemainder(
+                                weight,
+                                companionMagnitude);
+                        if (status ==
+                                ScaledArithmeticStatus::Success)
+                            status = multiplyBound(
+                                weight, certifiedTail,
+                                certifiedTail);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return false;
+                        if (compareScaledNonnegative(
+                                certifiedTail,
+                                accuracyBudget) <= 0) {
+                            retainedOrder = seriesOrder;
+                            break;
+                        }
+                    }
+                    if (retainedOrder == 0)
+                        return false;
+                    ScaledRealValue firstRemainder;
+                    status = scalePolynomialArray(
+                        functionSecond.data(),
+                        evenRemainder, base,
+                        functionScratch.data(),
+                        firstRemainder);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return false;
+                    ScaledRealValue secondRemainder;
+                    status = scalePolynomialArray(
+                        functionThird.data(),
+                        oddRemainder, companion,
+                        functionFirst.data(),
+                        secondRemainder);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return false;
+                    status = addPolynomialArrays(
+                        functionScratch.data(),
+                        firstRemainder,
+                        functionFirst.data(),
+                        secondRemainder,
+                        function ==
+                            PrincipalFunction::Cos,
+                        output, outputRemainder);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addRemainder(
+                            outputRemainder,
+                            certifiedTail);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return false;
+                    ++candidate.functionSeriesCount;
+                    candidate.maximumFunctionSeriesOrder =
+                        std::max(
+                            candidate.
+                                maximumFunctionSeriesOrder,
+                            retainedOrder);
+                    if (compareScaledNonnegative(
+                            certifiedTail,
+                            candidate.
+                                maximumFunctionSeriesTail) > 0)
+                        candidate.
+                            maximumFunctionSeriesTail =
+                                certifiedTail;
+                    return true;
                 };
                 auto addNodeRoundoff = [&](
                         const ExpressionReferenceTapeNode& node,
@@ -2745,6 +3690,363 @@ public:
                                     static_cast<uint16_t>(
                                         local));
                             break;
+                        case Op::Arg: {
+                            const uint64_t operationsBefore =
+                                candidate.operations;
+                            if ((node.flags &
+                                 OracleTraceUndefined) != 0) {
+                                candidate.status =
+                                    ExpressionTaylorJetStatus::
+                                        Nonfinite;
+                                candidate.reason =
+                                    "arg reference node is undefined";
+                                break;
+                            }
+                            ScaledRealValue logRemainder;
+                            ScaledComplexBall baseLog;
+                            if (!composeBivariateLogVariation(
+                                    sampleOffset,
+                                    node.leftNode,
+                                    functionOutput1.data(),
+                                    logRemainder,
+                                    baseLog)) {
+                                arithmetic =
+                                    ScaledArithmeticStatus::
+                                        Success;
+                                break;
+                            }
+                            arithmetic =
+                                projectImaginaryArray(
+                                    functionOutput1.data(),
+                                    logRemainder,
+                                    &coefficient(local, 0),
+                                    remainders[local]);
+                            ScaledComplexBall baseArg;
+                            if (arithmetic ==
+                                    ScaledArithmeticStatus::
+                                        Success) {
+                                baseArg.value.re =
+                                    baseLog.value.im;
+                                baseArg.value.im = {};
+                                baseArg.radius =
+                                    baseLog.radius;
+                                ScaledComplexBall
+                                    referenceOutput;
+                                arithmetic = nodeBase(
+                                    sampleOffset,
+                                    static_cast<uint16_t>(
+                                        local),
+                                    referenceOutput.value);
+                                ScaledComplexBall baseDelta;
+                                if (arithmetic ==
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    arithmetic =
+                                        subtractBall(
+                                            baseArg,
+                                            referenceOutput,
+                                            baseDelta);
+                                if (arithmetic ==
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    arithmetic = addBall(
+                                        coefficient(local, 0),
+                                        baseDelta,
+                                        coefficient(local, 0));
+                            }
+                            if (arithmetic ==
+                                    ScaledArithmeticStatus::
+                                        Success) {
+                                exactReal[local] = 1;
+                                ++candidate.
+                                    argCompositionCount;
+                                candidate.
+                                    branchCompositionOperations +=
+                                        candidate.operations -
+                                        operationsBefore;
+                            }
+                            break;
+                        }
+                        case Op::Polar: {
+                            auto rejectPolar = [&](
+                                    const char* reason) {
+                                candidate.status =
+                                    ExpressionTaylorJetStatus::
+                                        BranchRejected;
+                                candidate.reason = reason;
+                                candidate.polarRejected = true;
+                                candidate.
+                                    polarRejectionReason =
+                                        reason;
+                            };
+                            if (!exactReal[node.leftNode] ||
+                                !exactReal[node.rightNode]) {
+                                rejectPolar(
+                                    "polar operands are not certified real-valued over the full frame");
+                                break;
+                            }
+                            ScaledComplexBall radiusCenter;
+                            ScaledRealValue radiusRemainder;
+                            arithmetic = makeExpansionInput(
+                                sampleOffset,
+                                node.leftNode,
+                                radiusCenter,
+                                functionOutput3.data(),
+                                radiusRemainder);
+                            if (arithmetic !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                break;
+                            if (!radiusCenter.value.im.
+                                    isZero()) {
+                                candidate.status =
+                                    ExpressionTaylorJetStatus::
+                                        InvalidTape;
+                                candidate.reason =
+                                    "polar radius is semantically real but its certified center is not";
+                                break;
+                            }
+
+                            ScaledRealValue radiusVariation =
+                                radiusRemainder;
+                            for (size_t index = 1;
+                                 index < monomialCount;
+                                 ++index) {
+                                ScaledRealValue magnitude;
+                                arithmetic = upperMagnitude(
+                                    functionOutput3[index],
+                                    magnitude);
+                                count(candidate.operations);
+                                if (arithmetic ==
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    arithmetic = addRemainder(
+                                        radiusVariation,
+                                        magnitude);
+                                if (arithmetic !=
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    break;
+                            }
+                            if (arithmetic !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                break;
+
+                            const bool exactZeroRadius =
+                                exactZero[node.leftNode] != 0;
+                            if (!exactZeroRadius) {
+                                const ScaledRealValue
+                                    centerMagnitude =
+                                        absoluteValue(
+                                            radiusCenter.
+                                                value.re);
+                                if (radiusCenter.value.re.
+                                            mantissa <= 0.0 ||
+                                    compareScaledNonnegative(
+                                        centerMagnitude,
+                                        radiusVariation) <= 0) {
+                                    rejectPolar(
+                                        "polar radius enclosure touches or contains negative values");
+                                    break;
+                                }
+                                ScaledRealValue clearance;
+                                arithmetic = scaledSubtract(
+                                    centerMagnitude,
+                                    radiusVariation,
+                                    clearance);
+                                count(candidate.operations);
+                                ScaledRealValue conservative;
+                                if (arithmetic ==
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    arithmetic =
+                                        scaledDivideByDouble(
+                                            clearance, 2.0,
+                                            conservative);
+                                count(candidate.operations);
+                                if (arithmetic !=
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    break;
+                                recordClearance(
+                                    conservative,
+                                    candidate.
+                                        minimumPolarRadiusClearance,
+                                    candidate.
+                                        hasPolarRadiusClearance);
+                            }
+
+                            ScaledComplexBall angleCenter;
+                            ScaledRealValue angleRemainder;
+                            arithmetic = makeExpansionInput(
+                                sampleOffset,
+                                node.rightNode,
+                                angleCenter,
+                                functionOutput1.data(),
+                                angleRemainder);
+                            if (arithmetic !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                break;
+                            if (!angleCenter.value.im.
+                                    isZero()) {
+                                candidate.status =
+                                    ExpressionTaylorJetStatus::
+                                        InvalidTape;
+                                candidate.reason =
+                                    "polar angle is semantically real but its certified center is not";
+                                break;
+                            }
+                            ScaledRealValue angleBound;
+                            arithmetic = polynomialArraySup(
+                                functionOutput1.data(),
+                                angleBound);
+                            if (arithmetic ==
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                arithmetic = addRemainder(
+                                    angleBound,
+                                    angleRemainder);
+                            if (arithmetic ==
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                arithmetic =
+                                    certifyScaledMpfrExponentRange(
+                                        angleBound);
+                            if (arithmetic !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                break;
+
+                            if (exactZeroRadius) {
+                                for (size_t index = 0;
+                                     index < monomialCount;
+                                     ++index)
+                                    coefficient(local, index) =
+                                        {};
+                                remainders[local] = {};
+                                exactReal[local] = 1;
+                                exactZero[local] = 1;
+                                ++candidate.
+                                    polarCompositionCount;
+                                break;
+                            }
+
+                            ScaledComplexBall baseSin;
+                            ScaledRealValue sinRemainder;
+                            if (!composeBivariateEntireVariation(
+                                    sampleOffset,
+                                    node.rightNode,
+                                    PrincipalFunction::Sin,
+                                    functionOutput1.data(),
+                                    sinRemainder,
+                                    baseSin)) {
+                                candidate.status =
+                                    ExpressionTaylorJetStatus::
+                                        AccuracyBudget;
+                                candidate.reason =
+                                    "polar sine composition is not certifiable";
+                                arithmetic =
+                                    ScaledArithmeticStatus::
+                                        Success;
+                                break;
+                            }
+                            arithmetic = addBall(
+                                functionOutput1[0],
+                                baseSin,
+                                functionOutput1[0]);
+                            ScaledComplexBall baseCos;
+                            ScaledRealValue cosRemainder;
+                            if (arithmetic ==
+                                    ScaledArithmeticStatus::
+                                        Success &&
+                                !composeBivariateEntireVariation(
+                                    sampleOffset,
+                                    node.rightNode,
+                                    PrincipalFunction::Cos,
+                                    functionOutput2.data(),
+                                    cosRemainder,
+                                    baseCos)) {
+                                candidate.status =
+                                    ExpressionTaylorJetStatus::
+                                        AccuracyBudget;
+                                candidate.reason =
+                                    "polar cosine composition is not certifiable";
+                                arithmetic =
+                                    ScaledArithmeticStatus::
+                                        Success;
+                                break;
+                            }
+                            if (arithmetic ==
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                arithmetic = addBall(
+                                    functionOutput2[0],
+                                    baseCos,
+                                    functionOutput2[0]);
+                            ScaledRealValue unitRemainder =
+                                cosRemainder;
+                            if (arithmetic ==
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                arithmetic = addRemainder(
+                                    unitRemainder,
+                                    sinRemainder);
+                            for (size_t index = 0;
+                                 arithmetic ==
+                                     ScaledArithmeticStatus::
+                                         Success &&
+                                 index < monomialCount;
+                                 ++index) {
+                                ScaledComplexBall imaginary;
+                                arithmetic = rotatePlusI(
+                                    functionOutput1[index],
+                                    imaginary);
+                                if (arithmetic ==
+                                        ScaledArithmeticStatus::
+                                            Success)
+                                    arithmetic = addBall(
+                                        functionOutput2[index],
+                                        imaginary,
+                                        functionTerm[index]);
+                            }
+                            functionOutput3[0] =
+                                radiusCenter;
+                            if (arithmetic ==
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                arithmetic =
+                                    multiplyPolynomialArrays(
+                                        functionOutput3.data(),
+                                        radiusRemainder,
+                                        functionTerm.data(),
+                                        unitRemainder,
+                                        &coefficient(local, 0),
+                                        remainders[local]);
+                            ScaledComplexBall referenceOutput;
+                            if (arithmetic ==
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                arithmetic = nodeBase(
+                                    sampleOffset,
+                                    static_cast<uint16_t>(
+                                        local),
+                                    referenceOutput.value);
+                            if (arithmetic ==
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                arithmetic = subtractBall(
+                                    coefficient(local, 0),
+                                    referenceOutput,
+                                    coefficient(local, 0));
+                            if (arithmetic ==
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                ++candidate.
+                                    polarCompositionCount;
+                            break;
+                        }
                         case Op::Abs: {
                             ++candidate.absBranchCount;
                             int sign = 0;
@@ -3137,6 +4439,40 @@ public:
             : static_cast<size_t>(best.landing);
         result.landingUsesSampleOutput =
             best.landingUsesSampleOutput;
+        result.maximumFunctionSeriesOrder =
+            best.maximumFunctionSeriesOrder;
+        result.functionSeriesCount =
+            best.functionSeriesCount;
+        result.functionSeriesOperationCount =
+            best.functionSeriesOperations;
+        result.maximumFunctionSeriesTail =
+            best.maximumFunctionSeriesTail;
+        result.maximumBranchSeriesOrder =
+            best.maximumBranchSeriesOrder;
+        result.branchCompositionCount =
+            best.branchCompositionCount;
+        result.branchCompositionOperationCount =
+            best.branchCompositionOperations;
+        result.maximumBranchSeriesTail =
+            best.maximumBranchSeriesTail;
+        result.minimumBranchCutClearance =
+            best.minimumBranchCutClearance;
+        result.minimumBranchZeroClearance =
+            best.minimumBranchZeroClearance;
+        result.branchRejected =
+            best.branchRejected;
+        result.argCompositionCount =
+            best.argCompositionCount;
+        result.argRejectionReason =
+            best.argRejectionReason;
+        result.polarCompositionCount =
+            best.polarCompositionCount;
+        result.minimumPolarRadiusClearance =
+            best.minimumPolarRadiusClearance;
+        result.polarRejected =
+            best.polarRejected;
+        result.polarRejectionReason =
+            best.polarRejectionReason;
         result.absBranchCount =
             best.absBranchCount;
         result.absPositiveCellCount =
