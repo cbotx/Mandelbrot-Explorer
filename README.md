@@ -76,7 +76,8 @@ including exact escape comparisons and the scaled-versus-per-pixel-MPFR timing.
 Taylor-jet prefix for holomorphic arithmetic, entire functions, pole-free
 divide/tan/tanh, and principal-branch log/log10/sqrt/power. It also verifies
 the independently capped order-8..12 real-bivariate layout for conjugate,
-real, imaginary, norm, and complex construction. Coverage includes
+real, imaginary, norm, complex construction, and fixed-cell scalar-real
+absolute-value branches. Coverage includes
 normalized-frame containment, reciprocal and omitted-tail bounds,
 denominator/branch-cut/zero clearance proofs, signed-zero behavior, MPFR
 landing bounds, renderer parity, memory fallback, and the acceleration gate.
@@ -85,8 +86,10 @@ higher-precision-MPFR-relative arithmetic certification, rigorous bailout
 intervals, automatic per-pixel MPFR fallback, cancellation, determinism,
 adversarial views, and e500 timing. Certified paths also fall back
 conservatively near poles, branch cuts/zero, and MPFR's runtime exponent
-limits. Mixed real/transcendental formulas, argument, absolute value, polar,
-and other unsupported operations default to MPFR.
+limits. Scalar-real component absolute values use certified per-pixel branch
+selection (and fixed-cell Taylor only when the entire cell stays on one side
+of the fold); general complex-modulus `abs(z)`, mixed real/transcendental
+formulas, argument, polar, and other unsupported operations default to MPFR.
 The API is not dispatched by the GUI backend yet.
 
 ### Compute backend

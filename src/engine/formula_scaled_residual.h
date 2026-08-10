@@ -33,6 +33,11 @@ struct ScaledComplexBall {
     ScaledRealValue radius;
 };
 
+struct ScaledRealBall {
+    ScaledRealValue value;
+    ScaledRealValue radius;
+};
+
 enum class ScaledArithmeticStatus : uint8_t {
     Success,
     Nonfinite,
@@ -154,6 +159,15 @@ enum class ExpressionScaledResidualStatus : uint8_t {
 const char* expressionScaledResidualStatusName(
     ExpressionScaledResidualStatus status);
 
+// Computes |reference+residual|-|reference| without subtracting the two
+// magnitudes. Both arguments are correlated real balls: residual bounds the
+// endpoint displacement from the same reference value. A ball that contains
+// zero cannot certify an absolute-value branch.
+ExpressionScaledResidualStatus certifiedScaledDiffAbsReal(
+    const ScaledRealBall& reference,
+    const ScaledRealBall& residual,
+    ScaledRealBall& output);
+
 struct ExpressionScaledResidualInput {
     // Every delta is relative to the fast reconstruction of primary+defect;
     // the corresponding input error includes compact/reference discrepancy.
@@ -221,6 +235,8 @@ private:
     struct NodeState {
         ScaledComplexValue residual;
         ScaledRealValue radius;
+        bool realValued = false;
+        bool zeroValued = false;
     };
 
     const ExpressionProgram* _program = nullptr;

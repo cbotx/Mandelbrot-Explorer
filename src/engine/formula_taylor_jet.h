@@ -108,6 +108,13 @@ struct ExpressionTaylorJetResult {
     ScaledRealValue minimumBranchCutClearance;
     ScaledRealValue minimumBranchZeroClearance;
     bool branchRejected = false;
+    uint64_t absBranchCount = 0;
+    uint64_t absPositiveCellCount = 0;
+    uint64_t absNegativeCellCount = 0;
+    ScaledRealValue minimumFoldClearance;
+    bool foldRejected = false;
+    int foldRejectionIteration = -1;
+    std::string foldRejectionReason;
     // True when landingSample identifies the sample whose next/rootDefect
     // pair is the landing base rather than its z/zDefect pair.
     bool landingUsesSampleOutput = false;

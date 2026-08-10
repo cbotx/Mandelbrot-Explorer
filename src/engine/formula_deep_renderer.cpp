@@ -400,6 +400,8 @@ ExpressionDeepFallbackReason reasonForCapability(
             CertifiedBranchCandidate:
     case ExpressionScaledResidualCapability::
             CertifiedRealCandidate:
+    case ExpressionScaledResidualCapability::
+            CertifiedPiecewiseCandidate:
         return ExpressionDeepFallbackReason::
             CertificationFailure;
     case ExpressionScaledResidualCapability::UncertifiedSeries:
@@ -427,7 +429,10 @@ bool certifiedTaylorCapability(
                    CertifiedBranchCandidate ||
            capability ==
                ExpressionScaledResidualCapability::
-                   CertifiedRealCandidate;
+                   CertifiedRealCandidate ||
+           capability ==
+               ExpressionScaledResidualCapability::
+                   CertifiedPiecewiseCandidate;
 }
 
 bool certifiedReferenceCapability(
@@ -945,8 +950,13 @@ bool renderExpressionDeepFrame(
             request.runtimeProgram->scaledResidualCapability();
         const bool certifiedTaylorCandidate =
             certifiedTaylorCapability(result.capability);
+        const bool certifiedPiecewiseCandidate =
+            result.capability ==
+                ExpressionScaledResidualCapability::
+                    CertifiedPiecewiseCandidate;
         const bool certifiedTaylorEligible =
             !certifiedTaylorCandidate ||
+            certifiedPiecewiseCandidate ||
             (request.taylor.enableTaylor &&
              request.maxIterations >
                  request.taylor.minimumLanding);
@@ -1580,6 +1590,20 @@ bool renderExpressionDeepFrame(
                     taylorJet.minimumBranchZeroClearance;
                 result.taylorBranchRejected =
                     taylorJet.branchRejected;
+                result.taylorAbsBranchCount =
+                    taylorJet.absBranchCount;
+                result.taylorAbsPositiveCellCount =
+                    taylorJet.absPositiveCellCount;
+                result.taylorAbsNegativeCellCount =
+                    taylorJet.absNegativeCellCount;
+                result.taylorMinimumFoldClearance =
+                    taylorJet.minimumFoldClearance;
+                result.taylorFoldRejected =
+                    taylorJet.foldRejected;
+                result.taylorFoldRejectionIteration =
+                    taylorJet.foldRejectionIteration;
+                result.taylorFoldRejectionReason =
+                    taylorJet.foldRejectionReason;
                 if (cancelled.load(
                         std::memory_order_acquire) ||
                     taylorJet.status ==
@@ -1592,6 +1616,7 @@ bool renderExpressionDeepFrame(
                 if (useTaylor &&
                     certifiedTaylorCapability(
                         result.capability) &&
+                    !certifiedPiecewiseCandidate &&
                     !request.allowUncertifiedForBenchmark &&
                     taylorJet.landingIteration <
                         request.maxIterations) {
@@ -1695,6 +1720,7 @@ bool renderExpressionDeepFrame(
             if (runFast &&
                 certifiedTaylorCapability(
                     result.capability) &&
+                !certifiedPiecewiseCandidate &&
                 !request.allowUncertifiedForBenchmark &&
                 !useTaylor) {
                 runFast = false;
@@ -2044,6 +2070,7 @@ bool renderExpressionDeepFrame(
                                                         std::memory_order_relaxed);
                                                 if (certifiedTaylorCapability(
                                                         result.capability) &&
+                                                    !certifiedPiecewiseCandidate &&
                                                     !request.
                                                         allowUncertifiedForBenchmark) {
                                                     pixel.reason =
@@ -2100,9 +2127,10 @@ bool renderExpressionDeepFrame(
                                                         UncertifiedSeries;
                                                 break;
                                             }
-                                            if (result.capability ==
-                                                    ExpressionScaledResidualCapability::
-                                                        ExactCenteredArithmetic &&
+                                            if ((result.capability ==
+                                                     ExpressionScaledResidualCapability::
+                                                         ExactCenteredArithmetic ||
+                                                 certifiedPiecewiseCandidate) &&
                                                 !evaluated.certified) {
                                                 pixel.reason =
                                                     ExpressionDeepFallbackReason::

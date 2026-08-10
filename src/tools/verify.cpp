@@ -4674,6 +4674,7 @@ static int runExpressionScaledCase() {
     using formula::MpfrComplex;
     using formula::ScaledArithmeticStatus;
     using formula::ScaledComplexValue;
+    using formula::ScaledRealBall;
     using formula::ScaledRealValue;
 
     int failures = 0;
@@ -4723,6 +4724,198 @@ static int runExpressionScaledCase() {
         return sameScaled(left.re, right.re) &&
                sameScaled(left.im, right.im);
     };
+    {
+        struct DiffAbsCase {
+            const char* name;
+            ScaledRealBall reference;
+            ScaledRealBall residual;
+            ExpressionScaledResidualStatus expected;
+            bool expectPositiveZero = false;
+        };
+        auto value = [](double mantissa, int64_t exponent) {
+            return ScaledRealValue{ mantissa, exponent };
+        };
+        const DiffAbsCase cases[] = {
+            { "same-positive",
+              { value(0.75, 3), {} },
+              { value(0.5, 0), {} },
+              ExpressionScaledResidualStatus::Success },
+            { "same-negative",
+              { value(-0.75, 3), {} },
+              { value(0.5, 0), {} },
+              ExpressionScaledResidualStatus::Success },
+            { "same-positive-radii",
+              { value(0.75, 3), value(0.5, -2) },
+              { value(0.5, 0), value(0.5, -3) },
+              ExpressionScaledResidualStatus::Success },
+            { "cross-positive-negative",
+              { value(0.5, 2), {} },
+              { value(-0.75, 3), {} },
+              ExpressionScaledResidualStatus::Success },
+            { "cross-negative-positive",
+              { value(-0.5, 2), {} },
+              { value(0.75, 3), {} },
+              ExpressionScaledResidualStatus::Success },
+            { "cross-positive-negative-radii",
+              { value(0.5, 2), value(0.5, -3) },
+              { value(-0.75, 3), value(0.5, -2) },
+              ExpressionScaledResidualStatus::Success },
+            { "subnormal-delta",
+              { value(0.75, 0), {} },
+              { value(0.5, -1073), {} },
+              ExpressionScaledResidualStatus::Success },
+            { "e500-delta",
+              { value(0.75, 0), {} },
+              { value(-0.5, -1660), {} },
+              ExpressionScaledResidualStatus::Success },
+            { "negative-positive-zero-delta",
+              { value(-0.75, 0), {} },
+              { value(0.0, 0), {} },
+              ExpressionScaledResidualStatus::Success,
+              true },
+            { "negative-negative-zero-delta",
+              { value(-0.75, 0), {} },
+              { value(-0.0, 0), {} },
+              ExpressionScaledResidualStatus::Success,
+              true },
+            { "reference-positive-zero",
+              { value(0.0, 0), {} },
+              { value(0.5, 0), {} },
+              ExpressionScaledResidualStatus::
+                  BranchUncertain },
+            { "reference-negative-zero",
+              { value(-0.0, 0), {} },
+              { value(-0.5, 0), {} },
+              ExpressionScaledResidualStatus::
+                  BranchUncertain },
+            { "pixel-positive-zero",
+              { value(0.5, 1), {} },
+              { value(-0.5, 1), {} },
+              ExpressionScaledResidualStatus::
+                  BranchUncertain },
+            { "touching-zero",
+              { value(0.5, 1), value(0.5, 1) },
+              { value(0.5, 0), {} },
+              ExpressionScaledResidualStatus::
+                  BranchUncertain }
+        };
+        mpfr_t reference, residual, endpoint, exact;
+        mpfr_t referenceRadius, residualRadius;
+        mpfr_t actualReference, actualResidual;
+        mpfr_t midpoint, radius, difference;
+        mpfr_inits2(
+            4096, reference, residual, endpoint, exact,
+            referenceRadius, residualRadius,
+            actualReference, actualResidual,
+            midpoint, radius, difference, (mpfr_ptr)0);
+        for (const DiffAbsCase& test : cases) {
+            ScaledRealBall output;
+            const ExpressionScaledResidualStatus status =
+                formula::certifiedScaledDiffAbsReal(
+                    test.reference, test.residual, output);
+            bool okay = status == test.expected;
+            if (okay &&
+                status ==
+                    ExpressionScaledResidualStatus::Success) {
+                okay =
+                    formula::setMpfrFromScaledValue(
+                        reference,
+                        test.reference.value) &&
+                    formula::setMpfrFromScaledValue(
+                        residual,
+                        test.residual.value) &&
+                    formula::setMpfrFromScaledValue(
+                        referenceRadius,
+                        test.reference.radius) &&
+                    formula::setMpfrFromScaledValue(
+                        residualRadius,
+                        test.residual.radius) &&
+                    formula::setMpfrFromScaledValue(
+                        midpoint, output.value) &&
+                    formula::setMpfrFromScaledValue(
+                        radius, output.radius);
+                for (int referenceSide = -1;
+                     okay && referenceSide <= 1;
+                     ++referenceSide) {
+                    mpfr_set(
+                        actualReference, reference,
+                        MPFR_RNDN);
+                    if (referenceSide < 0)
+                        mpfr_sub(
+                            actualReference,
+                            actualReference,
+                            referenceRadius,
+                            MPFR_RNDN);
+                    else if (referenceSide > 0)
+                        mpfr_add(
+                            actualReference,
+                            actualReference,
+                            referenceRadius,
+                            MPFR_RNDN);
+                    for (int residualSide = -1;
+                         okay && residualSide <= 1;
+                         ++residualSide) {
+                        mpfr_set(
+                            actualResidual, residual,
+                            MPFR_RNDN);
+                        if (residualSide < 0)
+                            mpfr_sub(
+                                actualResidual,
+                                actualResidual,
+                                residualRadius,
+                                MPFR_RNDN);
+                        else if (residualSide > 0)
+                            mpfr_add(
+                                actualResidual,
+                                actualResidual,
+                                residualRadius,
+                                MPFR_RNDN);
+                        mpfr_add(
+                            endpoint,
+                            actualReference,
+                            actualResidual,
+                            MPFR_RNDN);
+                        mpfr_abs(
+                            endpoint, endpoint,
+                            MPFR_RNDN);
+                        mpfr_abs(
+                            exact, actualReference,
+                            MPFR_RNDN);
+                        mpfr_sub(
+                            exact, endpoint, exact,
+                            MPFR_RNDN);
+                        mpfr_sub(
+                            difference, exact,
+                            midpoint, MPFR_RNDU);
+                        mpfr_abs(
+                            difference, difference,
+                            MPFR_RNDU);
+                        okay =
+                            mpfr_cmp(
+                                difference,
+                                radius) <= 0;
+                    }
+                }
+                if (test.expectPositiveZero)
+                    okay = okay && output.value.isZero() &&
+                           !std::signbit(
+                               output.value.mantissa);
+            }
+            if (!okay) {
+                printf("  certified diffabs failed [%s] status=%s\n",
+                       test.name,
+                       formula::
+                           expressionScaledResidualStatusName(
+                               status));
+                ++failures;
+            }
+        }
+        mpfr_clears(
+            reference, residual, endpoint, exact,
+            referenceRadius, residualRadius,
+            actualReference, actualResidual,
+            midpoint, radius, difference, (mpfr_ptr)0);
+    }
     auto configureOracle = [](
             ExpressionOracleContext& context,
             const ExpressionContext& fixed,
@@ -6086,7 +6279,7 @@ static int runExpressionScaledCase() {
            benchmarkMinimumSpeedup);
     printf("  reference memory=%zu bytes (%zu/sample); nonlinear result is explicitly uncertified\n",
            benchmarkMemory, benchmarkBytesPerSample);
-    printf("  per-step branch/pole certification and GUI dispatch remain disabled\n");
+    printf("  scalar-real diffabs is certified; principal branch/pole per-step and GUI dispatch remain disabled\n");
     printf("  => %s\n\n",
            failures == 0
                ? "PASS"
@@ -6390,6 +6583,14 @@ static int runExpressionTaylorCase() {
         { "norm-c-e1000", "norm(z)+c",
           FormulaParameter::C, quadratic,
           "0", "0", -3600, 3600, false },
+        { "abs-real-positive",
+          "abs(real(c))",
+          FormulaParameter::C, quadratic,
+          "2", "0", -10, 512, false },
+        { "abs-real-negative",
+          "abs(real(c))",
+          FormulaParameter::C, quadratic,
+          "-2", "0", -10, 512, false },
         { "exp-moderate", "exp(z)-1+c",
           FormulaParameter::C, quadratic,
           "0", "0", -3, 512, true },
@@ -6524,12 +6725,18 @@ static int runExpressionTaylorCase() {
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
                     CertifiedRealCandidate;
+        const bool piecewiseCandidate =
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    CertifiedPiecewiseCandidate;
+        const bool realBivariateCandidate =
+            realCandidate || piecewiseCandidate;
         const bool built =
             ExpressionTaylorJetBuilder::build(
                 request, jet);
         size_t expectedCoefficientCount =
             static_cast<size_t>(jet.order) + 1;
-        if (realCandidate &&
+        if (realBivariateCandidate &&
             !formula::expressionTaylorBivariateMonomialCount(
                 jet.order, expectedCoefficientCount))
             expectedCoefficientCount = 0;
@@ -6539,7 +6746,7 @@ static int runExpressionTaylorCase() {
             jet.coefficients.size() !=
                 expectedCoefficientCount ||
             jet.monomialCount != expectedCoefficientCount ||
-            (realCandidate &&
+            (realBivariateCandidate &&
              (jet.layout !=
                   formula::ExpressionTaylorJetLayout::
                       RealBivariate)) ||
@@ -6561,7 +6768,13 @@ static int runExpressionTaylorCase() {
               jet.branchCompositionOperationCount == 0 ||
               jet.maximumBranchSeriesOrder < 1 ||
               jet.minimumBranchCutClearance.isZero() ||
-              jet.minimumBranchZeroClearance.isZero()))) {
+              jet.minimumBranchZeroClearance.isZero())) ||
+            (piecewiseCandidate &&
+             (jet.absBranchCount == 0 ||
+              jet.minimumFoldClearance.isZero() ||
+              jet.absPositiveCellCount +
+                      jet.absNegativeCellCount ==
+                  0))) {
             printf("  Taylor build failed [%s]: %s/%s landing=%d\n",
                    test.name,
                    formula::expressionTaylorJetStatusName(
@@ -6723,6 +6936,15 @@ static int runExpressionTaylorCase() {
             { "complex(real(z),imag(c))+c",
               formula::ExpressionScaledResidualCapability::
                   CertifiedRealCandidate },
+            { "abs(real(z))+c",
+              formula::ExpressionScaledResidualCapability::
+                  CertifiedPiecewiseCandidate },
+            { "abs(complex(real(z),0))+c",
+              formula::ExpressionScaledResidualCapability::
+                  CertifiedPiecewiseCandidate },
+            { "sqr(complex(abs(real(z)),abs(imag(z))))+c",
+              formula::ExpressionScaledResidualCapability::
+                  CertifiedPiecewiseCandidate },
             { "sin(conj(z))+c",
               formula::ExpressionScaledResidualCapability::
                   Unsupported },
@@ -6756,6 +6978,49 @@ static int runExpressionTaylorCase() {
                     test.expected) {
                 printf("  Taylor capability tier mismatch [%s]\n",
                        test.source);
+                ++failures;
+            }
+        }
+    }
+    {
+        ProgramPair pair;
+        ExpressionContext fixed;
+        ExpressionReferenceOrbitResult reference;
+        ExpressionTaylorJetRequest request;
+        ExpressionTaylorJetResult jet;
+        if (!compilePair(
+                "abs(real(c))", FormulaParameter::C,
+                fixed, pair) ||
+            !buildReference(
+                pair, fixed, FormulaParameter::C,
+                "0", "0", 8, 512, reference)) {
+            printf("  absolute-value fold Taylor setup failed\n");
+            ++failures;
+        } else {
+            request.program = &pair.runtime;
+            request.reference = &reference;
+            request.pixelParameter = FormulaParameter::C;
+            request.parameterScale = makeScale(-4);
+            request.minimumOrder = 8;
+            request.preferredOrder = 8;
+            request.maximumOrder = 8;
+            request.minimumLanding = 1;
+            request.maximumCandidateIteration = 4;
+            request.bailout = 4.0;
+            request.accuracyBudget = 0x1p-40;
+            if (ExpressionTaylorJetBuilder::build(
+                    request, jet) ||
+                jet.status !=
+                    ExpressionTaylorJetStatus::
+                        BranchRejected ||
+                !jet.foldRejected ||
+                jet.foldRejectionIteration != 0 ||
+                jet.foldRejectionReason.empty()) {
+                printf("  absolute-value fold Taylor rejection failed status=%s iteration=%d reason=%s\n",
+                       formula::expressionTaylorJetStatusName(
+                           jet.status),
+                       jet.foldRejectionIteration,
+                       jet.foldRejectionReason.c_str());
                 ++failures;
             }
         }
@@ -8030,7 +8295,10 @@ static int runExpressionDeepRenderCase() {
                     CertifiedBranchCandidate ||
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
-                    CertifiedRealCandidate;
+                    CertifiedRealCandidate ||
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    CertifiedPiecewiseCandidate;
         const bool meromorphicCandidate =
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
@@ -8043,13 +8311,18 @@ static int runExpressionDeepRenderCase() {
             pair.runtime.scaledResidualCapability() ==
                 formula::ExpressionScaledResidualCapability::
                     CertifiedRealCandidate;
+        const bool piecewiseCandidate =
+            pair.runtime.scaledResidualCapability() ==
+                formula::ExpressionScaledResidualCapability::
+                    CertifiedPiecewiseCandidate;
         const bool allMpfrTaylorCandidate =
             (pair.runtime.scaledResidualCapability() ==
                  formula::ExpressionScaledResidualCapability::
                      CertifiedEntireCandidate ||
              meromorphicCandidate ||
              branchCandidate ||
-             realCandidate) &&
+             realCandidate ||
+             piecewiseCandidate) &&
             expectedFallback == pixelCount;
         const bool uncertainReason =
             expectedReason ==
@@ -8106,11 +8379,16 @@ static int runExpressionDeepRenderCase() {
                          isZero() ||
                      result.taylorMinimumBranchZeroClearance.
                          isZero()
-                   : realCandidate
+                   : realCandidate || piecewiseCandidate
                    ? result.taylorLayout !=
                            formula::ExpressionTaylorJetLayout::
                                RealBivariate ||
-                     result.taylorMonomialCount == 0
+                     result.taylorMonomialCount == 0 ||
+                     (piecewiseCandidate &&
+                      (result.taylorAbsBranchCount == 0 ||
+                       result.
+                           taylorMinimumFoldClearance.
+                               isZero()))
                    : result.taylorFunctionSeriesCount == 0 ||
                      result.taylorFunctionSeriesOperationCount == 0 ||
                      result.taylorMaximumFunctionSeriesOrder < 1))) ||
@@ -8350,6 +8628,354 @@ static int runExpressionDeepRenderCase() {
         "0", "0", 7, 5, 12, 0,
         ExpressionDeepFallbackReason::InvalidTape,
         true);
+
+    {
+        auto runPiecewiseParity = [&](
+                const char* name,
+                const char* source,
+                FormulaParameter pixel,
+                const ExpressionContext& fixed,
+                const char* centerReal,
+                const char* centerImaginary,
+                const char* scale,
+                bool requireTaylor,
+                bool requireMixedFold) {
+            ProgramPair pair;
+            if (!compilePair(
+                    source, pixel, fixed, pair) ||
+                pair.runtime.scaledResidualCapability() !=
+                    formula::ExpressionScaledResidualCapability::
+                        CertifiedPiecewiseCandidate) {
+                printf("  piecewise setup failed [%s]\n",
+                       name);
+                ++failures;
+                return;
+            }
+
+            std::vector<float> accelerated;
+            ExpressionDeepRenderRequest request =
+                makeRequest(
+                    pair, fixed, pixel,
+                    centerReal, centerImaginary,
+                    9, 5, 8, accelerated);
+            request.scale.decimal = scale;
+            request.taylor.minimumLanding = 1;
+            request.taylor.requirePredictedBenefit = false;
+            request.threading.threads = 1;
+            ExpressionDeepRenderResult acceleratedResult;
+            bool okay =
+                formula::renderExpressionDeepFrame(
+                    request, acceleratedResult);
+
+            std::vector<float> noTaylor(
+                accelerated.size(),
+                formula::ExpressionDeepEmptyPixel);
+            ExpressionDeepRenderRequest noTaylorRequest =
+                request;
+            noTaylorRequest.taylor.enableTaylor = false;
+            noTaylorRequest.output = noTaylor.data();
+            noTaylorRequest.outputCount = noTaylor.size();
+            ExpressionDeepRenderResult noTaylorResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    noTaylorRequest, noTaylorResult);
+
+            std::vector<float> allMpfr(
+                accelerated.size(),
+                formula::ExpressionDeepEmptyPixel);
+            ExpressionDeepRenderRequest allMpfrRequest =
+                noTaylorRequest;
+            allMpfrRequest.forceMpfrFallbackForVerification =
+                true;
+            allMpfrRequest.output = allMpfr.data();
+            allMpfrRequest.outputCount = allMpfr.size();
+            ExpressionDeepRenderResult allMpfrResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    allMpfrRequest, allMpfrResult);
+
+            std::vector<float> threaded(
+                accelerated.size(),
+                formula::ExpressionDeepEmptyPixel);
+            ExpressionDeepRenderRequest threadedRequest =
+                request;
+            threadedRequest.threading.threads = 4;
+            threadedRequest.output = threaded.data();
+            threadedRequest.outputCount = threaded.size();
+            ExpressionDeepRenderResult threadedResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    threadedRequest, threadedResult);
+
+            const uint64_t pixels =
+                static_cast<uint64_t>(accelerated.size());
+            okay = okay &&
+                accelerated == noTaylor &&
+                accelerated == allMpfr &&
+                accelerated == threaded &&
+                noTaylorResult.fastPixelCount > 0 &&
+                allMpfrResult.fastPixelCount == 0 &&
+                allMpfrResult.fallbackPixelCount == pixels &&
+                acceleratedResult.fastPixelCount ==
+                    threadedResult.fastPixelCount &&
+                acceleratedResult.fallbackPixelCount ==
+                    threadedResult.fallbackPixelCount;
+            if (requireTaylor) {
+                okay = okay &&
+                    acceleratedResult.taylorAccepted &&
+                    acceleratedResult.
+                        taylorAcceptedPixelCount > 0 &&
+                    acceleratedResult.
+                        taylorAbsBranchCount > 0 &&
+                    !acceleratedResult.
+                        taylorMinimumFoldClearance.
+                            isZero();
+            }
+            if (requireMixedFold) {
+                okay = okay &&
+                    acceleratedResult.taylorAttempted &&
+                    !acceleratedResult.taylorAccepted &&
+                    acceleratedResult.taylorFoldRejected &&
+                    acceleratedResult.
+                        taylorFoldRejectionIteration == 0 &&
+                    acceleratedResult.fastPixelCount > 0 &&
+                    acceleratedResult.fallbackPixelCount > 0 &&
+                    acceleratedResult.fallbackPixelCount <
+                        pixels &&
+                    reasonCount(
+                        acceleratedResult,
+                        ExpressionDeepFallbackReason::
+                            BranchSensitive) > 0;
+            }
+            if (!okay) {
+                printf("  piecewise parity failed [%s] fast/fallback=%llu/%llu noTaylor=%llu/%llu Taylor=%d/%s fold=%d@%d abs=%llu +/-=%llu/%llu\n",
+                       name,
+                       (unsigned long long)
+                           acceleratedResult.fastPixelCount,
+                       (unsigned long long)
+                           acceleratedResult.fallbackPixelCount,
+                       (unsigned long long)
+                           noTaylorResult.fastPixelCount,
+                       (unsigned long long)
+                           noTaylorResult.fallbackPixelCount,
+                       acceleratedResult.taylorAccepted ? 1 : 0,
+                       formula::expressionTaylorJetStatusName(
+                           acceleratedResult.taylorStatus),
+                       acceleratedResult.taylorFoldRejected
+                           ? 1 : 0,
+                       acceleratedResult.
+                           taylorFoldRejectionIteration,
+                       (unsigned long long)
+                           acceleratedResult.
+                               taylorAbsBranchCount,
+                       (unsigned long long)
+                           acceleratedResult.
+                               taylorAbsPositiveCellCount,
+                       (unsigned long long)
+                           acceleratedResult.
+                               taylorAbsNegativeCellCount);
+                ++failures;
+            } else {
+                ++exactFrames;
+            }
+        };
+
+        ExpressionContext piecewiseC;
+        piecewiseC.z0 = { 0.75, 0.5 };
+        ExpressionContext piecewiseZ0;
+        piecewiseZ0.c = { -0.2, 0.1 };
+        const struct {
+            const char* name;
+            const char* source;
+        } formulas[] = {
+            { "burning",
+              "sqr(complex(abs(real(z)),abs(imag(z))))+c" },
+            { "celtic",
+              "complex(abs(real(z*z)),imag(z*z))+c" },
+            { "buffalo",
+              "complex(abs(real(z*z)),-abs(imag(z*z)))+c" }
+        };
+        for (const auto& formula : formulas) {
+            std::string name =
+                std::string(formula.name) + "-c-moderate";
+            runPiecewiseParity(
+                name.c_str(), formula.source,
+                FormulaParameter::C, piecewiseC,
+                "-0.2", "0.1", "64", false, false);
+            name = std::string(formula.name) + "-c-e500";
+            runPiecewiseParity(
+                name.c_str(), formula.source,
+                FormulaParameter::C, piecewiseC,
+                "-0.2", "0.1", "1e500",
+                false, false);
+            name =
+                std::string(formula.name) + "-z0-moderate";
+            runPiecewiseParity(
+                name.c_str(), formula.source,
+                FormulaParameter::InitialZ, piecewiseZ0,
+                "0.75", "0.5", "64", false, false);
+            name = std::string(formula.name) + "-z0-e500";
+            runPiecewiseParity(
+                name.c_str(), formula.source,
+                FormulaParameter::InitialZ, piecewiseZ0,
+                "0.75", "0.5", "1e500",
+                false, false);
+        }
+        runPiecewiseParity(
+            "abs-real-safe-taylor",
+            "abs(real(c))",
+            FormulaParameter::C, transcendentalFixed,
+            "2", "0", "1e500", true, false);
+        runPiecewiseParity(
+            "burning-exact-fold",
+            "sqr(complex(abs(real(z)),abs(imag(z))))+c",
+            FormulaParameter::InitialZ, z0Fixed,
+            "0.125", "1", "4", false, true);
+
+        ProgramPair benchmarkPair;
+        if (!compilePair(
+                "abs(real(c))",
+                FormulaParameter::C,
+                transcendentalFixed,
+                benchmarkPair)) {
+            printf("  piecewise benchmark setup failed\n");
+            ++failures;
+        } else {
+            std::array<double, 2> acceleratedSeconds{};
+            std::array<double, 2> mpfrSeconds{};
+            ExpressionDeepRenderResult telemetry;
+            ExpressionDeepRenderResult perStepTelemetry;
+            bool benchmarkOkay = true;
+            for (size_t repeat = 0;
+                 repeat < acceleratedSeconds.size();
+                 ++repeat) {
+                std::vector<float> accelerated;
+                ExpressionDeepRenderRequest acceleratedRequest =
+                    makeRequest(
+                        benchmarkPair,
+                        transcendentalFixed,
+                        FormulaParameter::C,
+                        "2", "0",
+                        64, 40, 360, accelerated);
+                acceleratedRequest.scale.decimal = "1e500";
+                acceleratedRequest.taylor.minimumLanding = 1;
+                const Clock::time_point acceleratedStart =
+                    Clock::now();
+                ExpressionDeepRenderResult acceleratedResult;
+                benchmarkOkay = benchmarkOkay &&
+                    formula::renderExpressionDeepFrame(
+                        acceleratedRequest,
+                        acceleratedResult);
+                acceleratedSeconds[repeat] =
+                    std::chrono::duration<double>(
+                        Clock::now() -
+                        acceleratedStart).count();
+
+                std::vector<float> perStep(
+                    accelerated.size(),
+                    formula::ExpressionDeepEmptyPixel);
+                ExpressionDeepRenderRequest perStepRequest =
+                    acceleratedRequest;
+                perStepRequest.taylor.enableTaylor = false;
+                perStepRequest.output = perStep.data();
+                perStepRequest.outputCount =
+                    perStep.size();
+                ExpressionDeepRenderResult perStepResult;
+                benchmarkOkay = benchmarkOkay &&
+                    formula::renderExpressionDeepFrame(
+                        perStepRequest,
+                        perStepResult);
+
+                std::vector<float> allMpfr(
+                    accelerated.size(),
+                    formula::ExpressionDeepEmptyPixel);
+                ExpressionDeepRenderRequest mpfrRequest =
+                    perStepRequest;
+                mpfrRequest.
+                    forceMpfrFallbackForVerification = true;
+                mpfrRequest.output = allMpfr.data();
+                mpfrRequest.outputCount = allMpfr.size();
+                const Clock::time_point mpfrStart =
+                    Clock::now();
+                ExpressionDeepRenderResult mpfrResult;
+                benchmarkOkay = benchmarkOkay &&
+                    formula::renderExpressionDeepFrame(
+                        mpfrRequest, mpfrResult);
+                mpfrSeconds[repeat] =
+                    std::chrono::duration<double>(
+                        Clock::now() - mpfrStart).count();
+                benchmarkOkay = benchmarkOkay &&
+                    accelerated == perStep &&
+                    accelerated == allMpfr;
+                if (repeat == 0) {
+                    telemetry = acceleratedResult;
+                    perStepTelemetry = perStepResult;
+                }
+            }
+            const double minimumAccelerated =
+                *std::min_element(
+                    acceleratedSeconds.begin(),
+                    acceleratedSeconds.end());
+            const double maximumAccelerated =
+                *std::max_element(
+                    acceleratedSeconds.begin(),
+                    acceleratedSeconds.end());
+            const double minimumMpfr =
+                *std::min_element(
+                    mpfrSeconds.begin(),
+                    mpfrSeconds.end());
+            const double maximumMpfr =
+                *std::max_element(
+                    mpfrSeconds.begin(),
+                    mpfrSeconds.end());
+            const bool stableTiming =
+                minimumAccelerated > 0.0 &&
+                minimumMpfr > 0.0 &&
+                maximumAccelerated /
+                        minimumAccelerated <=
+                    1.5 &&
+                maximumMpfr / minimumMpfr <= 1.5;
+            const double minimumSpeedup =
+                maximumAccelerated > 0.0
+                ? minimumMpfr / maximumAccelerated
+                : 0.0;
+            if (!benchmarkOkay || !stableTiming ||
+                !(minimumSpeedup > 1.0)) {
+                printf("  repeated piecewise e500 benchmark failed stable=%d speedup=%.2fx\n",
+                       stableTiming ? 1 : 0,
+                       minimumSpeedup);
+                ++failures;
+            }
+            const uint64_t perStepPixels =
+                perStepTelemetry.fastPixelCount +
+                perStepTelemetry.fallbackPixelCount;
+            const double foldRate =
+                perStepPixels
+                ? static_cast<double>(
+                      perStepTelemetry.
+                          fallbackReasonCounts[
+                              static_cast<size_t>(
+                                  ExpressionDeepFallbackReason::
+                                      BranchSensitive)]) /
+                      static_cast<double>(perStepPixels)
+                : 0.0;
+            printf("  piecewise e500 repeated Taylor/MPFR %.3f/%.3f and %.3f/%.3f s speedup %.2fx stable=%d coverage=%d accepted=%llu per-step fast/fallback=%llu/%llu fold=%.3f%%\n",
+                   acceleratedSeconds[0],
+                   mpfrSeconds[0],
+                   acceleratedSeconds[1],
+                   mpfrSeconds[1],
+                   minimumSpeedup,
+                   stableTiming ? 1 : 0,
+                   telemetry.taylorCoveredIterations,
+                   (unsigned long long)
+                       telemetry.taylorAcceptedPixelCount,
+                   (unsigned long long)
+                       perStepTelemetry.fastPixelCount,
+                   (unsigned long long)
+                       perStepTelemetry.fallbackPixelCount,
+                   100.0 * foldRate);
+        }
+    }
 
     // Pole clearance is a whole-frame proof, not point-only tape metadata.
     // A frame whose denominator neighborhood crosses zero must release the
@@ -10227,7 +10853,7 @@ static int runExpressionDeepRenderCase() {
     }
 
     printf("=== expression deep frame renderer e500\n");
-    printf("  exact frames=%d certified entire/meromorphic/branch/real jets plus MPFR fallback\n",
+    printf("  exact frames=%d certified entire/meromorphic/branch/real/piecewise jets plus MPFR fallback\n",
            exactFrames);
     printf("  64x40 reference/scaled/all-MPFR %.3f/%.3f/%.3f s speedup %.2fx\n",
            benchmarkReference, benchmarkScaled,

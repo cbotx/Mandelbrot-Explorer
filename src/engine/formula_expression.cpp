@@ -533,32 +533,103 @@ ExpressionProgram::scaledResidualCapability() const {
     if (!_valid)
         return ExpressionScaledResidualCapability::Unsupported;
 
+    struct ValueKind {
+        bool real = false;
+        bool zero = false;
+    };
     bool hasSeries = false;
     bool hasMeromorphic = false;
     bool hasCertifiedBranch = false;
     bool hasUncertifiedBranch = false;
     bool hasBranchIncompatible = false;
     bool hasRealSmooth = false;
+    bool hasPiecewise = false;
     bool hasUnsupported = false;
-    for (const Instruction& instruction : _code) {
+    std::vector<ValueKind> kinds(_code.size());
+    std::vector<size_t> stack;
+    stack.reserve(_stackDepth);
+    for (size_t index = 0; index < _code.size(); ++index) {
+        const Instruction& instruction = _code[index];
+        const int operands = operandCount(instruction.op);
+        size_t left = SIZE_MAX;
+        size_t right = SIZE_MAX;
+        if (operands == 1) {
+            left = stack.back();
+            stack.pop_back();
+        } else if (operands == 2) {
+            right = stack.back();
+            stack.pop_back();
+            left = stack.back();
+            stack.pop_back();
+        }
+        ValueKind kind;
         switch (instruction.op) {
         case Op::Constant:
+            kind.real = instruction.value.imag() == 0.0;
+            kind.zero =
+                instruction.value.real() == 0.0 &&
+                instruction.value.imag() == 0.0;
+            break;
         case Op::Z:
         case Op::C:
         case Op::Z0:
-        case Op::Iteration:
         case Op::Parameter:
+            break;
+        case Op::OrbitInvariant:
+            hasUnsupported = true;
+            hasBranchIncompatible = true;
+            break;
+        case Op::Iteration:
+            kind.real = true;
+            break;
         case Op::Negate:
+            kind = kinds[left];
+            break;
         case Op::Add:
         case Op::Subtract:
+            kind.real =
+                kinds[left].real && kinds[right].real;
+            kind.zero =
+                kinds[left].zero && kinds[right].zero;
+            break;
         case Op::Multiply:
+            kind.real =
+                kinds[left].real && kinds[right].real;
+            kind.zero =
+                kinds[left].zero || kinds[right].zero;
+            break;
         case Op::Square:
+            kind.real = kinds[left].real;
+            kind.zero = kinds[left].zero;
             break;
         case Op::Conjugate:
+            kind.real = kinds[left].real;
+            kind.zero = kinds[left].zero;
+            hasBranchIncompatible = true;
+            hasRealSmooth = true;
+            break;
         case Op::Real:
+            kind.real = true;
+            kind.zero = kinds[left].zero;
+            hasBranchIncompatible = true;
+            hasRealSmooth = true;
+            break;
         case Op::Imaginary:
+            kind.real = true;
+            kind.zero = kinds[left].real || kinds[left].zero;
+            hasBranchIncompatible = true;
+            hasRealSmooth = true;
+            break;
         case Op::MakeComplex:
+            kind.real = kinds[right].zero;
+            kind.zero =
+                kinds[left].zero && kinds[right].zero;
+            hasBranchIncompatible = true;
+            hasRealSmooth = true;
+            break;
         case Op::Norm:
+            kind.real = true;
+            kind.zero = kinds[left].zero;
             hasBranchIncompatible = true;
             hasRealSmooth = true;
             break;
@@ -570,6 +641,11 @@ ExpressionProgram::scaledResidualCapability() const {
             hasSeries = true;
             break;
         case Op::Divide:
+            kind.real =
+                kinds[left].real && kinds[right].real;
+            kind.zero = kinds[left].zero;
+            hasMeromorphic = true;
+            break;
         case Op::Tan:
         case Op::Tanh:
             hasMeromorphic = true;
@@ -581,24 +657,41 @@ ExpressionProgram::scaledResidualCapability() const {
             hasCertifiedBranch = true;
             break;
         case Op::Arg:
+            kind.real = true;
             hasUncertifiedBranch = true;
             break;
         case Op::Abs:
+            kind.real = true;
+            kind.zero = kinds[left].zero;
+            hasBranchIncompatible = true;
+            if (kinds[left].real)
+                hasPiecewise = true;
+            else
+                hasUnsupported = true;
+            break;
         case Op::Polar:
-        case Op::OrbitInvariant:
             hasUnsupported = true;
             hasBranchIncompatible = true;
             break;
         }
+        kinds[index] = kind;
+        stack.push_back(index);
     }
     if (hasUncertifiedBranch ||
-        (hasCertifiedBranch && hasBranchIncompatible))
+        (hasCertifiedBranch &&
+         (hasBranchIncompatible || hasPiecewise)))
         return ExpressionScaledResidualCapability::BranchSensitive;
     if (hasCertifiedBranch)
         return ExpressionScaledResidualCapability::
             CertifiedBranchCandidate;
     if (hasUnsupported)
         return ExpressionScaledResidualCapability::Unsupported;
+    if (hasPiecewise) {
+        if (hasSeries || hasMeromorphic)
+            return ExpressionScaledResidualCapability::Unsupported;
+        return ExpressionScaledResidualCapability::
+            CertifiedPiecewiseCandidate;
+    }
     if (hasRealSmooth) {
         if (hasSeries || hasMeromorphic)
             return ExpressionScaledResidualCapability::Unsupported;

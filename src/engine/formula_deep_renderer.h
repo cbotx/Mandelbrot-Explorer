@@ -182,6 +182,13 @@ struct ExpressionDeepRenderResult {
     ScaledRealValue taylorMinimumBranchCutClearance;
     ScaledRealValue taylorMinimumBranchZeroClearance;
     bool taylorBranchRejected = false;
+    uint64_t taylorAbsBranchCount = 0;
+    uint64_t taylorAbsPositiveCellCount = 0;
+    uint64_t taylorAbsNegativeCellCount = 0;
+    ScaledRealValue taylorMinimumFoldClearance;
+    bool taylorFoldRejected = false;
+    int taylorFoldRejectionIteration = -1;
+    std::string taylorFoldRejectionReason;
     double taylorBuildSeconds = 0.0;
     // Aggregate worker time; it may exceed fastSeconds under parallelism.
     double taylorEvaluationSeconds = 0.0;

@@ -55,6 +55,7 @@ enum class ExpressionScaledResidualCapability : uint8_t {
     CertifiedMeromorphicCandidate,
     CertifiedBranchCandidate,
     CertifiedRealCandidate,
+    CertifiedPiecewiseCandidate,
     UncertifiedSeries,
     BranchSensitive,
     Unsupported

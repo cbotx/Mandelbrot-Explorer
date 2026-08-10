@@ -212,11 +212,6 @@ ScaledArithmeticStatus multiplyRoundoff(
         magnitude, unitRoundoff, output);
 }
 
-struct ScaledRealBall {
-    ScaledRealValue value;
-    ScaledRealValue radius;
-};
-
 ScaledArithmeticStatus certifiedRealAdd(
         const ScaledRealBall& left,
         const ScaledRealBall& right,
@@ -1262,6 +1257,98 @@ const char* expressionScaledResidualStatusName(
     return "invalid-tape";
 }
 
+ExpressionScaledResidualStatus certifiedScaledDiffAbsReal(
+        const ScaledRealBall& reference,
+        const ScaledRealBall& residual,
+        ScaledRealBall& output) {
+    output = {};
+    auto validateBall = [](
+            const ScaledRealBall& ball) {
+        ScaledArithmeticStatus status =
+            validate(ball.value);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        if (!validRadius(ball.radius))
+            return ScaledArithmeticStatus::ExponentRange;
+        status = certifyScaledMpfrExponentRange(
+            ball.value);
+        if (status != ScaledArithmeticStatus::Success)
+            return status;
+        return certifyScaledMpfrExponentRange(
+            ball.radius);
+    };
+    ScaledArithmeticStatus arithmetic =
+        validateBall(reference);
+    if (arithmetic != ScaledArithmeticStatus::Success)
+        return residualStatus(arithmetic);
+    arithmetic = validateBall(residual);
+    if (arithmetic != ScaledArithmeticStatus::Success)
+        return residualStatus(arithmetic);
+
+    ScaledRealBall endpoint;
+    arithmetic = certifiedRealAdd(
+        reference, residual, endpoint);
+    if (arithmetic != ScaledArithmeticStatus::Success)
+        return residualStatus(arithmetic);
+    arithmetic = validateBall(endpoint);
+    if (arithmetic != ScaledArithmeticStatus::Success)
+        return residualStatus(arithmetic);
+
+    auto strictSign = [](
+            const ScaledRealBall& ball) {
+        if (ball.value.mantissa > 0.0 &&
+            compareScaledNonnegative(
+                absoluteValue(ball.value),
+                ball.radius) > 0)
+            return 1;
+        if (ball.value.mantissa < 0.0 &&
+            compareScaledNonnegative(
+                absoluteValue(ball.value),
+                ball.radius) > 0)
+            return -1;
+        return 0;
+    };
+    const int referenceSign = strictSign(reference);
+    const int endpointSign = strictSign(endpoint);
+    if (referenceSign == 0 || endpointSign == 0)
+        return ExpressionScaledResidualStatus::
+            BranchUncertain;
+
+    if (referenceSign == endpointSign) {
+        output = residual;
+        if (referenceSign < 0) {
+            arithmetic = scaledNegate(
+                output.value, output.value);
+            if (arithmetic !=
+                    ScaledArithmeticStatus::Success)
+                return residualStatus(arithmetic);
+        }
+    } else {
+        ScaledRealBall twiceReference;
+        arithmetic = certifiedRealAdd(
+            reference, reference, twiceReference);
+        if (arithmetic ==
+                ScaledArithmeticStatus::Success)
+            arithmetic = certifiedRealAdd(
+                twiceReference, residual, output);
+        if (arithmetic != ScaledArithmeticStatus::Success)
+            return residualStatus(arithmetic);
+        if (referenceSign > 0) {
+            arithmetic = scaledNegate(
+                output.value, output.value);
+            if (arithmetic !=
+                    ScaledArithmeticStatus::Success)
+                return residualStatus(arithmetic);
+        }
+    }
+    if (output.value.isZero())
+        output.value.mantissa = 0.0;
+    arithmetic = validateBall(output);
+    return arithmetic == ScaledArithmeticStatus::Success
+        ? ExpressionScaledResidualStatus::Success
+        : residualStatus(arithmetic);
+}
+
 void ExpressionScaledResidualEvaluator::reset() {
     _program = nullptr;
     _reference = nullptr;
@@ -1870,6 +1957,9 @@ ExpressionScaledResidualEvaluator::evaluate(
                 leftMagnitude, leftMagnitude,
                 operationMagnitude);
             break;
+        case ExpressionOracleOperation::Abs:
+            operationMagnitude = leftMagnitude;
+            break;
         default:
             return ScaledArithmeticStatus::Success;
         }
@@ -2083,6 +2173,12 @@ ExpressionScaledResidualEvaluator::evaluate(
             _states[local].radius;
         output = {};
         outputRadius = {};
+        bool& outputRealValued =
+            _states[local].realValued;
+        outputRealValued = false;
+        bool& outputZeroValued =
+            _states[local].zeroValued;
+        outputZeroValued = false;
         const ScaledComplexValue* left =
             node.leftNode == UINT16_MAX
                 ? nullptr
@@ -2099,7 +2195,14 @@ ExpressionScaledResidualEvaluator::evaluate(
         };
         switch (node.operation) {
         case ExpressionOracleOperation::Constant:
+            outputRealValued =
+                _program->_code[local].value.imag() == 0.0;
+            outputZeroValued =
+                _program->_code[local].value.real() == 0.0 &&
+                _program->_code[local].value.imag() == 0.0;
+            break;
         case ExpressionOracleOperation::Iteration:
+            outputRealValued = true;
             break;
         case ExpressionOracleOperation::Z:
             output = input.z;
@@ -2127,6 +2230,10 @@ ExpressionScaledResidualEvaluator::evaluate(
             status = scaledNegate(*left, output);
             outputRadius =
                 _states[node.leftNode].radius;
+            outputRealValued =
+                _states[node.leftNode].realValued;
+            outputZeroValued =
+                _states[node.leftNode].zeroValued;
             break;
         case ExpressionOracleOperation::Add: {
             ScaledComplexBall sum;
@@ -2137,6 +2244,12 @@ ExpressionScaledResidualEvaluator::evaluate(
                 output = sum.value;
                 outputRadius = sum.radius;
             }
+            outputRealValued =
+                _states[node.leftNode].realValued &&
+                _states[node.rightNode].realValued;
+            outputZeroValued =
+                _states[node.leftNode].zeroValued &&
+                _states[node.rightNode].zeroValued;
             break;
         }
         case ExpressionOracleOperation::Subtract: {
@@ -2149,6 +2262,12 @@ ExpressionScaledResidualEvaluator::evaluate(
                 output = differenceBall.value;
                 outputRadius = differenceBall.radius;
             }
+            outputRealValued =
+                _states[node.leftNode].realValued &&
+                _states[node.rightNode].realValued;
+            outputZeroValued =
+                _states[node.leftNode].zeroValued &&
+                _states[node.rightNode].zeroValued;
             break;
         }
         case ExpressionOracleOperation::Multiply: {
@@ -2191,6 +2310,12 @@ ExpressionScaledResidualEvaluator::evaluate(
                 output = sum.value;
                 outputRadius = sum.radius;
             }
+            outputRealValued =
+                _states[node.leftNode].realValued &&
+                _states[node.rightNode].realValued;
+            outputZeroValued =
+                _states[node.leftNode].zeroValued ||
+                _states[node.rightNode].zeroValued;
             break;
         }
         case ExpressionOracleOperation::Square: {
@@ -2223,6 +2348,10 @@ ExpressionScaledResidualEvaluator::evaluate(
                 output = linearBall.value;
                 outputRadius = linearBall.radius;
             }
+            outputRealValued =
+                _states[node.leftNode].realValued;
+            outputZeroValued =
+                _states[node.leftNode].zeroValued;
             break;
         }
         case ExpressionOracleOperation::Exp:
@@ -2246,18 +2375,29 @@ ExpressionScaledResidualEvaluator::evaluate(
                 left->im, output.im);
             outputRadius =
                 _states[node.leftNode].radius;
+            outputRealValued =
+                _states[node.leftNode].realValued;
+            outputZeroValued =
+                _states[node.leftNode].zeroValued;
             break;
         case ExpressionOracleOperation::Real:
             output.re = left->re;
             output.im = {};
             outputRadius =
                 _states[node.leftNode].radius;
+            outputRealValued = true;
+            outputZeroValued =
+                _states[node.leftNode].zeroValued;
             break;
         case ExpressionOracleOperation::Imaginary:
             output.re = left->im;
             output.im = {};
             outputRadius =
                 _states[node.leftNode].radius;
+            outputRealValued = true;
+            outputZeroValued =
+                _states[node.leftNode].realValued ||
+                _states[node.leftNode].zeroValued;
             break;
         case ExpressionOracleOperation::MakeComplex:
             output.re = left->re;
@@ -2268,6 +2408,11 @@ ExpressionScaledResidualEvaluator::evaluate(
                     _states[node.rightNode].radius) >= 0
                 ? _states[node.leftNode].radius
                 : _states[node.rightNode].radius;
+            outputRealValued =
+                _states[node.rightNode].zeroValued;
+            outputZeroValued =
+                _states[node.leftNode].zeroValued &&
+                _states[node.rightNode].zeroValued;
             break;
         case ExpressionOracleOperation::Norm: {
             ScaledComplexValue base;
@@ -2327,6 +2472,9 @@ ExpressionScaledResidualEvaluator::evaluate(
                 output.im = {};
                 outputRadius = normResult.radius;
             }
+            outputRealValued = true;
+            outputZeroValued =
+                _states[node.leftNode].zeroValued;
             break;
         }
         case ExpressionOracleOperation::Divide:
@@ -2352,7 +2500,72 @@ ExpressionScaledResidualEvaluator::evaluate(
                     ? ExpressionScaledResidualStatus::Singular
                     : ExpressionScaledResidualStatus::BranchUncertain;
             return result;
-        case ExpressionOracleOperation::Abs:
+        case ExpressionOracleOperation::Abs: {
+            if (!_states[node.leftNode].realValued) {
+                result.status =
+                    ExpressionScaledResidualStatus::
+                        Unsupported;
+                return result;
+            }
+            const ExpressionReferenceTapeNode& inputNode =
+                _reference->tape[
+                    offset + node.leftNode];
+            ScaledComplexBall primary;
+            ScaledComplexBall defect;
+            ScaledComplexBall base;
+            status = makeScaledComplexValue(
+                inputNode.output, primary.value);
+            if (status ==
+                    ScaledArithmeticStatus::Success)
+                status = makeScaledComplexValue(
+                    inputNode.outputDefect,
+                    defect.value);
+            if (status ==
+                    ScaledArithmeticStatus::Success)
+                status = guardedAdd(
+                    primary, defect, base);
+            if (status ==
+                    ScaledArithmeticStatus::Success)
+                status = scaledAddUp(
+                    base.radius,
+                    inputNode.outputError,
+                    base.radius);
+            if (status != ScaledArithmeticStatus::Success)
+                break;
+            if (!base.value.im.isZero() ||
+                !left->im.isZero()) {
+                result.status =
+                    ExpressionScaledResidualStatus::
+                        InvalidTape;
+                return result;
+            }
+            ScaledRealBall referenceBall{
+                base.value.re, base.radius
+            };
+            ScaledRealBall residualBall{
+                left->re,
+                _states[node.leftNode].radius
+            };
+            ScaledRealBall differenceBall;
+            const ExpressionScaledResidualStatus
+                diffStatus =
+                    certifiedScaledDiffAbsReal(
+                        referenceBall, residualBall,
+                        differenceBall);
+            if (diffStatus !=
+                    ExpressionScaledResidualStatus::
+                        Success) {
+                result.status = diffStatus;
+                return result;
+            }
+            output.re = differenceBall.value;
+            output.im = {};
+            outputRadius = differenceBall.radius;
+            outputRealValued = true;
+            outputZeroValued =
+                _states[node.leftNode].zeroValued;
+            break;
+        }
         case ExpressionOracleOperation::Polar:
         case ExpressionOracleOperation::OrbitInvariant:
             result.status =

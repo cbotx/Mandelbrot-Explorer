@@ -1029,6 +1029,14 @@ struct Candidate {
     bool hasBranchCutClearance = false;
     bool hasBranchZeroClearance = false;
     bool branchRejected = false;
+    uint64_t absBranchCount = 0;
+    uint64_t absPositiveCellCount = 0;
+    uint64_t absNegativeCellCount = 0;
+    ScaledRealValue minimumFoldClearance;
+    bool hasFoldClearance = false;
+    bool foldRejected = false;
+    int foldRejectionIteration = -1;
+    std::string foldRejectionReason;
     bool landingUsesSampleOutput = false;
     size_t memoryBytes = 0;
 };
@@ -1281,9 +1289,12 @@ public:
                 ExpressionReferenceBuildStatus::Success ||
             !request.reference->
                 certifiedAgainstHigherPrecision ||
-            request.program->scaledResidualCapability() !=
-                ExpressionScaledResidualCapability::
-                    CertifiedRealCandidate ||
+            (request.program->scaledResidualCapability() !=
+                 ExpressionScaledResidualCapability::
+                     CertifiedRealCandidate &&
+             request.program->scaledResidualCapability() !=
+                 ExpressionScaledResidualCapability::
+                     CertifiedPiecewiseCandidate) ||
             (request.pixelParameter != FormulaParameter::C &&
              request.pixelParameter !=
                  FormulaParameter::InitialZ) ||
@@ -1348,6 +1359,7 @@ public:
             case Op::Real:
             case Op::Imaginary:
             case Op::MakeComplex:
+            case Op::Abs:
                 break;
             default:
                 return finish(
@@ -1498,6 +1510,12 @@ public:
                     candidateBytes, nodeCount,
                     sizeof(ScaledRealValue)) ||
                 !checkedAddSize(
+                    candidateBytes, nodeCount,
+                    sizeof(uint8_t)) ||
+                !checkedAddSize(
+                    candidateBytes, nodeCount,
+                    sizeof(uint8_t)) ||
+                !checkedAddSize(
                     candidateBytes, monomialCount * 2,
                     sizeof(ScaledComplexBall)) ||
                 !checkedAddSize(
@@ -1569,6 +1587,10 @@ public:
                     nodeEntries);
                 std::vector<ScaledRealValue> remainders(
                     nodeCount);
+                std::vector<uint8_t> exactReal(
+                    nodeCount);
+                std::vector<uint8_t> exactZero(
+                    nodeCount);
                 std::vector<ScaledComplexBall> state(
                     monomialCount);
                 std::vector<ScaledComplexBall> nextState(
@@ -1594,6 +1616,14 @@ public:
                         actualCandidateBytes,
                         remainders.capacity(),
                         sizeof(ScaledRealValue)) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        exactReal.capacity(),
+                        sizeof(uint8_t)) ||
+                    !checkedAddSize(
+                        actualCandidateBytes,
+                        exactZero.capacity(),
+                        sizeof(uint8_t)) ||
                     !checkedAddSize(
                         actualCandidateBytes,
                         state.capacity(),
@@ -1812,6 +1842,106 @@ public:
                             return status;
                     }
                     return ScaledArithmeticStatus::Success;
+                };
+                auto certifyAbsBranch = [&](
+                        size_t sampleOffset,
+                        uint16_t source,
+                        int& sign,
+                        ScaledRealValue& clearance) {
+                    sign = 0;
+                    clearance = {};
+                    if (!exactReal[source])
+                        return ScaledArithmeticStatus::Singular;
+                    const ExpressionReferenceTapeNode& tape =
+                        request.reference->tape[
+                            sampleOffset + source];
+                    ScaledComplexBall primary;
+                    ScaledComplexBall defect;
+                    ScaledComplexBall center;
+                    ScaledArithmeticStatus status =
+                        makeScaledComplexValue(
+                            tape.output, primary.value);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = makeScaledComplexValue(
+                            tape.outputDefect,
+                            defect.value);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addBall(
+                            primary, defect, center);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        status = addRemainder(
+                            center.radius,
+                            tape.outputError);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                    if (!center.value.im.isZero())
+                        return ScaledArithmeticStatus::Singular;
+
+                    status = addBall(
+                        center, coefficient(source, 0),
+                        center);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                    if (!center.value.im.isZero())
+                        return ScaledArithmeticStatus::Singular;
+
+                    ScaledRealValue radius =
+                        remainders[source];
+                    status = addRemainder(
+                        radius, center.radius);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                    for (size_t index = 1;
+                         index < monomialCount; ++index) {
+                        ScaledRealValue magnitude;
+                        status = upperMagnitude(
+                            coefficient(source, index),
+                            magnitude);
+                        count(candidate.operations);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return status;
+                        status = addRemainder(
+                            radius, magnitude);
+                        if (status !=
+                                ScaledArithmeticStatus::Success)
+                            return status;
+                    }
+
+                    const ScaledRealValue magnitude =
+                        absoluteValue(center.value.re);
+                    if (center.value.re.mantissa > 0.0 &&
+                        compareScaledNonnegative(
+                            magnitude, radius) > 0)
+                        sign = 1;
+                    else if (
+                        center.value.re.mantissa < 0.0 &&
+                        compareScaledNonnegative(
+                            magnitude, radius) > 0)
+                        sign = -1;
+                    else
+                        return ScaledArithmeticStatus::Success;
+
+                    status = scaledSubtract(
+                        magnitude, radius, clearance);
+                    count(candidate.operations);
+                    if (status !=
+                            ScaledArithmeticStatus::Success)
+                        return status;
+                    ScaledRealValue conservative;
+                    status = scaledDivideByDouble(
+                        clearance, 2.0, conservative);
+                    count(candidate.operations);
+                    if (status ==
+                            ScaledArithmeticStatus::Success)
+                        clearance = conservative;
+                    return status;
                 };
                 auto multiplyPolynomials = [&](
                         size_t sampleOffset,
@@ -2107,7 +2237,9 @@ public:
                             ExpressionOracleOperation::
                                 Square ||
                         node.operation ==
-                            ExpressionOracleOperation::Norm;
+                            ExpressionOracleOperation::Norm ||
+                        node.operation ==
+                            ExpressionOracleOperation::Abs;
                     if (!arithmeticOperation)
                         return
                             ScaledArithmeticStatus::Success;
@@ -2171,6 +2303,10 @@ public:
                         status = multiplyBound(
                             left, left,
                             operationMagnitude);
+                    } else if (
+                        node.operation ==
+                            ExpressionOracleOperation::Abs) {
+                        operationMagnitude = left;
                     } else {
                         status = fullBound(
                             node.rightNode, right);
@@ -2300,6 +2436,12 @@ public:
                         remainders.begin(),
                         remainders.end(),
                         ScaledRealValue{});
+                    std::fill(
+                        exactReal.begin(),
+                        exactReal.end(), uint8_t{ 0 });
+                    std::fill(
+                        exactZero.begin(),
+                        exactZero.end(), uint8_t{ 0 });
                     ScaledArithmeticStatus arithmetic =
                         ScaledArithmeticStatus::Success;
 
@@ -2327,7 +2469,18 @@ public:
 
                         switch (op) {
                         case Op::Constant:
+                            exactReal[local] =
+                                request.program->_code[local].
+                                    value.imag() == 0.0;
+                            exactZero[local] =
+                                request.program->_code[local].
+                                    value.real() == 0.0 &&
+                                request.program->_code[local].
+                                    value.imag() == 0.0;
+                            break;
                         case Op::Iteration:
+                            exactReal[local] = 1;
+                            break;
                         case Op::Parameter:
                             break;
                         case Op::Z:
@@ -2362,6 +2515,10 @@ public:
                             break;
                         case Op::Negate:
                             copyNode(node.leftNode);
+                            exactReal[local] =
+                                exactReal[node.leftNode];
+                            exactZero[local] =
+                                exactZero[node.leftNode];
                             for (size_t index = 0;
                                  index < monomialCount;
                                  ++index) {
@@ -2381,6 +2538,12 @@ public:
                             break;
                         case Op::Add:
                         case Op::Subtract:
+                            exactReal[local] =
+                                exactReal[node.leftNode] &&
+                                exactReal[node.rightNode];
+                            exactZero[local] =
+                                exactZero[node.leftNode] &&
+                                exactZero[node.rightNode];
                             for (size_t index = 0;
                                  index < monomialCount;
                                  ++index) {
@@ -2422,6 +2585,12 @@ public:
                             }
                             break;
                         case Op::Multiply:
+                            exactReal[local] =
+                                exactReal[node.leftNode] &&
+                                exactReal[node.rightNode];
+                            exactZero[local] =
+                                exactZero[node.leftNode] ||
+                                exactZero[node.rightNode];
                             arithmetic =
                                 multiplyPolynomials(
                                     sampleOffset,
@@ -2431,6 +2600,10 @@ public:
                                         local));
                             break;
                         case Op::Square:
+                            exactReal[local] =
+                                exactReal[node.leftNode];
+                            exactZero[local] =
+                                exactZero[node.leftNode];
                             arithmetic =
                                 multiplyPolynomials(
                                     sampleOffset,
@@ -2440,6 +2613,10 @@ public:
                                         local));
                             break;
                         case Op::Conjugate:
+                            exactReal[local] =
+                                exactReal[node.leftNode];
+                            exactZero[local] =
+                                exactZero[node.leftNode];
                             for (size_t index = 0;
                                  index < monomialCount;
                                  ++index) {
@@ -2460,6 +2637,9 @@ public:
                                 remainders[node.leftNode];
                             break;
                         case Op::Real:
+                            exactReal[local] = 1;
+                            exactZero[local] =
+                                exactZero[node.leftNode];
                             for (size_t index = 0;
                                  index < monomialCount;
                                  ++index) {
@@ -2478,6 +2658,10 @@ public:
                                 remainders[node.leftNode];
                             break;
                         case Op::Imaginary:
+                            exactReal[local] = 1;
+                            exactZero[local] =
+                                exactReal[node.leftNode] ||
+                                exactZero[node.leftNode];
                             for (size_t index = 0;
                                  index < monomialCount;
                                  ++index) {
@@ -2496,6 +2680,11 @@ public:
                                 remainders[node.leftNode];
                             break;
                         case Op::MakeComplex:
+                            exactReal[local] =
+                                exactZero[node.rightNode];
+                            exactZero[local] =
+                                exactZero[node.leftNode] &&
+                                exactZero[node.rightNode];
                             for (size_t index = 0;
                                  index < monomialCount;
                                  ++index) {
@@ -2545,6 +2734,9 @@ public:
                                         node.rightNode]);
                             break;
                         case Op::Norm:
+                            exactReal[local] = 1;
+                            exactZero[local] =
+                                exactZero[node.leftNode];
                             arithmetic =
                                 multiplyPolynomials(
                                     sampleOffset,
@@ -2553,12 +2745,102 @@ public:
                                     static_cast<uint16_t>(
                                         local));
                             break;
+                        case Op::Abs: {
+                            ++candidate.absBranchCount;
+                            int sign = 0;
+                            ScaledRealValue clearance;
+                            arithmetic = certifyAbsBranch(
+                                sampleOffset,
+                                node.leftNode, sign,
+                                clearance);
+                            if (arithmetic !=
+                                    ScaledArithmeticStatus::
+                                        Success)
+                                break;
+                            if (sign == 0) {
+                                candidate.status =
+                                    ExpressionTaylorJetStatus::
+                                        BranchRejected;
+                                candidate.reason =
+                                    "absolute-value input enclosure touches or crosses zero";
+                                candidate.foldRejected = true;
+                                candidate.
+                                    foldRejectionIteration =
+                                        landing;
+                                candidate.
+                                    foldRejectionReason =
+                                        candidate.reason;
+                                break;
+                            }
+                            if (!candidate.
+                                    hasFoldClearance ||
+                                compareScaledNonnegative(
+                                    clearance,
+                                    candidate.
+                                        minimumFoldClearance) <
+                                    0) {
+                                candidate.
+                                    minimumFoldClearance =
+                                        clearance;
+                                candidate.
+                                    hasFoldClearance = true;
+                            }
+                            copyNode(node.leftNode);
+                            exactReal[local] = 1;
+                            exactZero[local] =
+                                exactZero[node.leftNode];
+                            if (sign > 0) {
+                                ++candidate.
+                                    absPositiveCellCount;
+                            } else {
+                                ++candidate.
+                                    absNegativeCellCount;
+                                for (size_t index = 0;
+                                     index <
+                                         monomialCount;
+                                     ++index) {
+                                    arithmetic =
+                                        scaledNegate(
+                                            coefficient(
+                                                local,
+                                                index).
+                                                value,
+                                            coefficient(
+                                                local,
+                                                index).
+                                                value);
+                                    count(
+                                        candidate.operations);
+                                    if (arithmetic !=
+                                            ScaledArithmeticStatus::
+                                                Success)
+                                        break;
+                                    if (coefficient(
+                                            local, index).
+                                            value.isZero()) {
+                                        coefficient(
+                                            local, index).
+                                            value.re.
+                                                mantissa =
+                                                    0.0;
+                                        coefficient(
+                                            local, index).
+                                            value.im.
+                                                mantissa =
+                                                    0.0;
+                                    }
+                                }
+                            }
+                            break;
+                        }
                         default:
                             arithmetic =
                                 ScaledArithmeticStatus::
                                     Singular;
                             break;
                         }
+                        if (!candidate.reason.empty())
+                            break;
                         if (arithmetic !=
                                 ScaledArithmeticStatus::
                                     Success)
@@ -2604,6 +2886,8 @@ public:
                         }
                     }
 
+                    if (!candidate.reason.empty())
+                        break;
                     if (arithmetic !=
                             ScaledArithmeticStatus::Success) {
                         candidate.status =
@@ -2853,6 +3137,20 @@ public:
             : static_cast<size_t>(best.landing);
         result.landingUsesSampleOutput =
             best.landingUsesSampleOutput;
+        result.absBranchCount =
+            best.absBranchCount;
+        result.absPositiveCellCount =
+            best.absPositiveCellCount;
+        result.absNegativeCellCount =
+            best.absNegativeCellCount;
+        result.minimumFoldClearance =
+            best.minimumFoldClearance;
+        result.foldRejected =
+            best.foldRejected;
+        result.foldRejectionIteration =
+            best.foldRejectionIteration;
+        result.foldRejectionReason =
+            best.foldRejectionReason;
         result.remainderRadius = best.remainder;
         result.intermediateEscapeMargins =
             std::move(best.margins);
@@ -2888,9 +3186,12 @@ bool ExpressionTaylorJetBuilder::build(
     const Clock::time_point start = Clock::now();
     result = {};
     if (request.program && request.program->valid() &&
-        request.program->scaledResidualCapability() ==
-            ExpressionScaledResidualCapability::
-                CertifiedRealCandidate)
+        (request.program->scaledResidualCapability() ==
+             ExpressionScaledResidualCapability::
+                 CertifiedRealCandidate ||
+         request.program->scaledResidualCapability() ==
+             ExpressionScaledResidualCapability::
+                 CertifiedPiecewiseCandidate))
         return ExpressionRealTaylorJetBuilder::build(
             request, result);
     auto finish = [&](ExpressionTaylorJetStatus status,
