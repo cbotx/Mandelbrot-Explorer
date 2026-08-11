@@ -53,8 +53,11 @@ struct ExpressionTaylorJetRequest {
     const ExpressionProgram* program = nullptr;
     const ExpressionReferenceOrbitResult* reference = nullptr;
     FormulaParameter pixelParameter = FormulaParameter::C;
-    // The exact parameterization is parameter = reference + D*q. D has no
-    // uncertainty and may use the full scaled exponent range.
+    // The certified parameterization is parameter = reference + P + D*q.
+    // P is a constant ball relative to the global reference. D has no
+    // uncertainty, is a positive power of two, and may use the full scaled
+    // exponent range. The default P=0 preserves full-frame behavior.
+    ScaledComplexBall parameterOffset;
     ScaledComplexValue parameterScale;
     int minimumOrder = 8;
     int preferredOrder = 12;
@@ -82,6 +85,7 @@ struct ExpressionTaylorJetResult {
     bool valid = false;
     bool certified = false;
     FormulaParameter pixelParameter = FormulaParameter::C;
+    ScaledComplexBall parameterOffset;
     ScaledComplexValue parameterScale;
     uint64_t programSemanticHash = 0;
     ExpressionTaylorJetLayout layout =
@@ -173,6 +177,14 @@ bool makeExpressionTaylorFrameScale(
 // losing exponent information.
 bool makeExpressionTaylorNormalizedQ(
     const ScaledComplexBall& offset,
+    const ScaledComplexValue& parameterScale,
+    ScaledComplexBall& q);
+
+// Constructs q for parameter = reference + P + D*q. The subtraction is
+// certified, including the coordinate and P construction radii.
+bool makeExpressionTaylorLocalQ(
+    const ScaledComplexBall& offset,
+    const ScaledComplexBall& parameterOffset,
     const ScaledComplexValue& parameterScale,
     ScaledComplexBall& q);
 

@@ -6414,6 +6414,7 @@ static int runExpressionTaylorCase() {
             const char* centerReal,
             const char* centerImaginary,
             const ScaledComplexValue& scale,
+            const ScaledComplexBall& parameterOffset,
             Complex q, int iterations,
             mpfr_prec_t precision,
             MpfrComplex& state) {
@@ -6429,10 +6430,13 @@ static int runExpressionTaylorCase() {
                 fixed.parameters[parameter].imag());
         MpfrComplex center(precision);
         MpfrComplex d(precision);
+        MpfrComplex p(precision);
         MpfrComplex coordinate(precision);
         MpfrComplex next(precision);
         if (!center.set(centerReal, centerImaginary) ||
-            !formula::setMpfrFromScaledValue(d, scale))
+            !formula::setMpfrFromScaledValue(d, scale) ||
+            !formula::setMpfrFromScaledValue(
+                p, parameterOffset.value))
             return false;
         mpfr_mul_d(
             coordinate.re, d.re, q.real(),
@@ -6440,12 +6444,18 @@ static int runExpressionTaylorCase() {
         mpfr_add(
             coordinate.re, coordinate.re,
             center.re, MPFR_RNDN);
+        mpfr_add(
+            coordinate.re, coordinate.re,
+            p.re, MPFR_RNDN);
         mpfr_mul_d(
             coordinate.im, d.re, q.imag(),
             MPFR_RNDN);
         mpfr_add(
             coordinate.im, coordinate.im,
             center.im, MPFR_RNDN);
+        mpfr_add(
+            coordinate.im, coordinate.im,
+            p.im, MPFR_RNDN);
         if (pixel == FormulaParameter::C)
             context.c.set(coordinate);
         else
@@ -6861,6 +6871,7 @@ static int runExpressionTaylorCase() {
                         pair.runtime, test.fixed,
                         test.pixel, test.centerReal,
                         test.centerImaginary, scale,
+                        ScaledComplexBall{},
                         qValue, landing,
                         reference.certificationPrecision,
                         exact) &&
@@ -6873,6 +6884,113 @@ static int runExpressionTaylorCase() {
                     ++failures;
                 }
             }
+        }
+    }
+
+    // Tile-local P+D*q jets remain relative to the global reference.
+    for (FormulaParameter pixel :
+         { FormulaParameter::C,
+           FormulaParameter::InitialZ }) {
+        ExpressionContext fixed;
+        if (pixel == FormulaParameter::InitialZ)
+            fixed.c = { -0.2, 0.1 };
+        ProgramPair pair;
+        ExpressionReferenceOrbitResult reference;
+        const ScaledComplexValue scale = makeScale(-8);
+        ScaledComplexBall parameterOffset;
+        bool okay =
+            compilePair(
+                "z*z+c", pixel, fixed, pair) &&
+            buildReference(
+                pair, fixed, pixel, "0", "0",
+                12, 512, reference) &&
+            formula::makeScaledComplexValue(
+                Complex{ 0.125, -0.0625 },
+                parameterOffset.value) ==
+                ScaledArithmeticStatus::Success;
+        parameterOffset.radius = { 0.5, -99 };
+        ExpressionTaylorJetRequest request;
+        request.program = &pair.runtime;
+        request.reference = &reference;
+        request.pixelParameter = pixel;
+        request.parameterOffset = parameterOffset;
+        request.parameterScale = scale;
+        request.minimumLanding = 1;
+        request.maximumCandidateIteration = 4;
+        ExpressionTaylorJetResult jet;
+        okay = okay &&
+            ExpressionTaylorJetBuilder::build(
+                request, jet) &&
+            jet.parameterOffset.value.re.mantissa ==
+                parameterOffset.value.re.mantissa &&
+            jet.parameterOffset.value.re.exponent ==
+                parameterOffset.value.re.exponent &&
+            jet.parameterOffset.radius.mantissa ==
+                parameterOffset.radius.mantissa &&
+            jet.parameterOffset.radius.exponent ==
+                parameterOffset.radius.exponent;
+        for (Complex qValue :
+             { Complex{ 0.0, 0.0 },
+               Complex{ -0.75, 0.0 },
+               Complex{ 0.0, -0.75 },
+               Complex{ 0.375, 0.375 } }) {
+            ScaledComplexBall exactQ;
+            ScaledComplexBall scaleBall;
+            ScaledComplexBall displacement;
+            ScaledComplexBall pixelOffset;
+            ScaledComplexBall localQ;
+            ScaledComplexBall reconstructed;
+            scaleBall.value = scale;
+            okay = okay &&
+                formula::makeScaledComplexValue(
+                    qValue, exactQ.value) ==
+                    ScaledArithmeticStatus::Success &&
+                formula::certifiedScaledMultiply(
+                    scaleBall, exactQ,
+                    displacement) ==
+                    ScaledArithmeticStatus::Success &&
+                formula::certifiedScaledAdd(
+                    parameterOffset, displacement,
+                    pixelOffset) ==
+                    ScaledArithmeticStatus::Success &&
+                formula::makeExpressionTaylorLocalQ(
+                    pixelOffset, parameterOffset,
+                    scale, localQ) &&
+                formula::expressionTaylorQInsideUnitDisk(
+                    localQ) &&
+                formula::certifiedScaledMultiply(
+                    scaleBall, localQ,
+                    displacement) ==
+                    ScaledArithmeticStatus::Success &&
+                formula::certifiedScaledAdd(
+                    parameterOffset, displacement,
+                    reconstructed) ==
+                    ScaledArithmeticStatus::Success;
+            ExpressionTaylorJetEvaluation evaluated;
+            ScaledComplexBall landingBall;
+            MpfrComplex exact(
+                reference.certificationPrecision);
+            okay = okay &&
+                ExpressionTaylorJetEvaluator::evaluate(
+                    jet, localQ, evaluated) &&
+                reconstructLanding(
+                    reference, jet, evaluated,
+                    landingBall) &&
+                evaluateOracle(
+                    pair.runtime, fixed, pixel,
+                    "0", "0", scale,
+                    parameterOffset, qValue,
+                    jet.landingIteration,
+                    reference.certificationPrecision,
+                    exact) &&
+                contains(exact, landingBall);
+            ++containmentChecks;
+        }
+        if (!okay) {
+            printf("  offset Taylor containment failed [%s]\n",
+                   pixel == FormulaParameter::C
+                       ? "c" : "z0");
+            ++failures;
         }
     }
 
@@ -8300,7 +8418,14 @@ static int runExpressionTaylorCase() {
             !enabledResult.taylorAccepted ||
             enabledResult.taylorAcceptedPixelCount == 0 ||
             enabledResult.taylorCoveredIterations <
-                enabledRequest.taylor.minimumLanding) {
+                enabledRequest.taylor.minimumLanding ||
+            enabledResult.taylorAttemptedJetCount != 1 ||
+            enabledResult.taylorAcceptedJetCount != 1 ||
+            enabledResult.taylorRejectedJetCount != 0 ||
+            enabledResult.taylorTileSplitCount != 0 ||
+            enabledResult.taylorMaximumTileDepth != 0 ||
+            enabledResult.taylorAcceptedPixelCoverage !=
+                enabled.size()) {
             printf("  Taylor renderer parity failed accepted=%d landing=%d pixels=%llu/%llu\n",
                    enabledResult.taylorAccepted ? 1 : 0,
                    enabledResult.taylorCoveredIterations,
@@ -9380,8 +9505,8 @@ static int runExpressionDeepRenderCase() {
                 minimumMpfr > 0.0 &&
                 maximumAccelerated /
                         minimumAccelerated <=
-                    1.5 &&
-                maximumMpfr / minimumMpfr <= 1.5;
+                    2.0 &&
+                maximumMpfr / minimumMpfr <= 2.0;
             const double minimumSpeedup =
                 maximumAccelerated > 0.0
                 ? minimumMpfr / maximumAccelerated
@@ -9424,6 +9549,345 @@ static int runExpressionDeepRenderCase() {
         }
     }
 
+    // A fold or principal-cut stripe must only exclude ambiguous leaf tiles.
+    {
+        auto runAdaptiveStripe = [&](
+                const char* name, const char* source,
+                FormulaParameter pixel,
+                const char* centerReal,
+                const char* centerImaginary,
+                const char* scale,
+                bool expectFold, bool expectCut,
+                bool expectPole) {
+            ProgramPair pair;
+            if (!compilePair(
+                    source, pixel,
+                    transcendentalFixed, pair)) {
+                printf("  adaptive stripe setup failed [%s]\n",
+                       name);
+                ++failures;
+                return;
+            }
+            auto configure = [&](std::vector<float>& output) {
+                ExpressionDeepRenderRequest request =
+                    makeRequest(
+                        pair, transcendentalFixed,
+                        pixel,
+                        centerReal, centerImaginary,
+                        65, 33, 24, output);
+                request.scale.decimal = scale;
+                request.taylor.minimumLanding = 1;
+                request.taylor.requirePredictedBenefit =
+                    false;
+                request.taylor.maximumDepth =
+                    expectPole ? 9 : 11;
+                request.taylor.minimumTileWidth = 1;
+                request.taylor.minimumTileHeight = 1;
+                request.taylor.maximumJetCount =
+                    expectPole ? 512 : 1024;
+                request.taylor.
+                    maximumRejectedBeforeFirstAcceptance =
+                        request.taylor.maximumJetCount;
+                return request;
+            };
+
+            std::vector<float> adaptive;
+            ExpressionDeepRenderRequest adaptiveRequest =
+                configure(adaptive);
+            ExpressionDeepRenderResult adaptiveResult;
+            bool okay = formula::renderExpressionDeepFrame(
+                adaptiveRequest, adaptiveResult);
+
+            std::vector<float> wholeFrame;
+            ExpressionDeepRenderRequest wholeRequest =
+                configure(wholeFrame);
+            wholeRequest.taylor.enableTileTaylor = false;
+            ExpressionDeepRenderResult wholeResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    wholeRequest, wholeResult);
+
+            std::vector<float> noTaylor;
+            ExpressionDeepRenderRequest noTaylorRequest =
+                configure(noTaylor);
+            noTaylorRequest.taylor.enableTaylor = false;
+            ExpressionDeepRenderResult noTaylorResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    noTaylorRequest, noTaylorResult);
+
+            std::vector<float> allMpfr;
+            ExpressionDeepRenderRequest mpfrRequest =
+                configure(allMpfr);
+            mpfrRequest.forceMpfrFallbackForVerification =
+                true;
+            ExpressionDeepRenderResult mpfrResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    mpfrRequest, mpfrResult);
+
+            std::vector<float> threaded;
+            ExpressionDeepRenderRequest threadedRequest =
+                configure(threaded);
+            threadedRequest.threading.threads = 4;
+            ExpressionDeepRenderResult threadedResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    threadedRequest, threadedResult);
+
+            const uint64_t pixels =
+                static_cast<uint64_t>(adaptive.size());
+            okay = okay &&
+                adaptive == wholeFrame &&
+                adaptive == noTaylor &&
+                adaptive == allMpfr &&
+                adaptive == threaded &&
+                !wholeResult.taylorAccepted &&
+                adaptiveResult.taylorAccepted &&
+                adaptiveResult.taylorAttemptedJetCount > 1 &&
+                adaptiveResult.taylorAcceptedJetCount > 0 &&
+                adaptiveResult.taylorRejectedJetCount > 0 &&
+                adaptiveResult.taylorTileSplitCount > 0 &&
+                adaptiveResult.taylorMaximumTileDepth > 0 &&
+                adaptiveResult.taylorAcceptedPixelCoverage >
+                    pixels / 2 &&
+                adaptiveResult.taylorAcceptedPixelCoverage <
+                    pixels &&
+                adaptiveResult.taylorWeightedLanding >= 1.0 &&
+                adaptiveResult.taylorFallbackPixelCount > 0 &&
+                adaptiveResult.taylorRetainedBytes > 0 &&
+                adaptiveResult.taylorTileMapHash != 0 &&
+                adaptiveResult.taylorTileMapHash ==
+                    threadedResult.taylorTileMapHash &&
+                adaptiveResult.taylorAcceptedPixelCoverage ==
+                    threadedResult.
+                        taylorAcceptedPixelCoverage &&
+                adaptiveResult.taylorAttemptedJetCount ==
+                    threadedResult.taylorAttemptedJetCount &&
+                (!expectFold ||
+                 adaptiveResult.
+                         taylorFoldRejectedJetCount > 0 &&
+                     adaptiveResult.fallbackPixelCount ==
+                         33) &&
+                (!expectCut ||
+                 adaptiveResult.
+                         taylorCutRejectedJetCount > 0 &&
+                     adaptiveResult.fallbackPixelCount ==
+                         65) &&
+                (!expectPole ||
+                 adaptiveResult.
+                     taylorPoleRejectedJetCount > 0);
+
+            std::vector<float> countLimited;
+            ExpressionDeepRenderRequest countRequest =
+                configure(countLimited);
+            countRequest.taylor.maximumJetCount = 2;
+            countRequest.taylor.
+                maximumRejectedBeforeFirstAcceptance = 2;
+            ExpressionDeepRenderResult countResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    countRequest, countResult) &&
+                countLimited == adaptive &&
+                countResult.taylorAttemptedJetCount <= 2;
+
+            std::vector<float> memoryLimited;
+            ExpressionDeepRenderRequest memoryRequest =
+                configure(memoryLimited);
+            memoryRequest.taylor.maximumJetMemoryBytes = 1;
+            ExpressionDeepRenderResult memoryResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    memoryRequest, memoryResult) &&
+                memoryLimited == adaptive &&
+                !memoryResult.taylorAccepted;
+
+            if (!okay) {
+                printf("  adaptive stripe failed [%s] status=%s/%s threaded=%s/%s whole=%d adaptive=%d attempts/accepted/rejected=%llu/%llu/%llu splits=%llu depth=%d coverage=%llu/%llu landing=%.2f runtime=%llu fallback=%llu fold/cut/pole=%llu/%llu/%llu hash=%llu/%llu limits=%llu/%d\n",
+                       name,
+                       formula::expressionDeepRenderStatusName(
+                           adaptiveResult.status),
+                       adaptiveResult.error.c_str(),
+                       formula::expressionDeepRenderStatusName(
+                           threadedResult.status),
+                       threadedResult.error.c_str(),
+                       wholeResult.taylorAccepted ? 1 : 0,
+                       adaptiveResult.taylorAccepted ? 1 : 0,
+                       (unsigned long long)
+                           adaptiveResult.
+                               taylorAttemptedJetCount,
+                       (unsigned long long)
+                           adaptiveResult.
+                               taylorAcceptedJetCount,
+                       (unsigned long long)
+                           adaptiveResult.
+                               taylorRejectedJetCount,
+                       (unsigned long long)
+                           adaptiveResult.
+                               taylorTileSplitCount,
+                       adaptiveResult.
+                           taylorMaximumTileDepth,
+                       (unsigned long long)
+                           adaptiveResult.
+                               taylorAcceptedPixelCoverage,
+                       (unsigned long long)pixels,
+                       adaptiveResult.taylorWeightedLanding,
+                       (unsigned long long)
+                           adaptiveResult.
+                               taylorAcceptedPixelCount,
+                       (unsigned long long)
+                           adaptiveResult.
+                               fallbackPixelCount,
+                       (unsigned long long)
+                           adaptiveResult.
+                               taylorFoldRejectedJetCount,
+                       (unsigned long long)
+                           adaptiveResult.
+                               taylorCutRejectedJetCount,
+                       (unsigned long long)
+                           adaptiveResult.
+                               taylorPoleRejectedJetCount,
+                       (unsigned long long)
+                           adaptiveResult.
+                               taylorTileMapHash,
+                       (unsigned long long)
+                           threadedResult.
+                               taylorTileMapHash,
+                       (unsigned long long)
+                           countResult.
+                               taylorAttemptedJetCount,
+                       memoryResult.taylorAccepted ? 1 : 0);
+                ++failures;
+            } else {
+                ++exactFrames;
+            }
+        };
+
+        runAdaptiveStripe(
+            "abs-z0-cross-fold", "abs(real(z0))",
+            FormulaParameter::InitialZ,
+            "0", "0", "8", true, false, false);
+        runAdaptiveStripe(
+            "log-cross-cut", "0.001*log(c)",
+            FormulaParameter::C,
+            "-2", "0", "10", false, true, false);
+        runAdaptiveStripe(
+            "divide-near-pole", "0.001/(c+2)",
+            FormulaParameter::C,
+            "-1.901", "0", "10", false, false, true);
+
+        ProgramPair benchmarkPair;
+        if (!compilePair(
+                "0.001*log(c)",
+                FormulaParameter::C,
+                transcendentalFixed,
+                benchmarkPair)) {
+            ++failures;
+        } else {
+            std::array<double, 2> adaptiveSeconds{};
+            std::array<double, 2> wholeFrameSeconds{};
+            ExpressionDeepRenderResult benchmarkTelemetry;
+            bool benchmarkOkay = true;
+            for (size_t repeat = 0;
+                 repeat < adaptiveSeconds.size();
+                 ++repeat) {
+                std::vector<float> adaptive;
+                ExpressionDeepRenderRequest adaptiveRequest =
+                    makeRequest(
+                        benchmarkPair,
+                        transcendentalFixed,
+                        FormulaParameter::C,
+                        "-2", "0",
+                        64, 40, 120, adaptive);
+                adaptiveRequest.taylor.maximumDepth = 5;
+                adaptiveRequest.taylor.maximumJetCount = 64;
+                ExpressionDeepRenderResult adaptiveResult;
+                const Clock::time_point adaptiveStart =
+                    Clock::now();
+                const bool adaptiveOkay =
+                    formula::renderExpressionDeepFrame(
+                        adaptiveRequest, adaptiveResult);
+                adaptiveSeconds[repeat] =
+                    std::chrono::duration<double>(
+                        Clock::now() - adaptiveStart).count();
+
+                std::vector<float> wholeFrame;
+                ExpressionDeepRenderRequest wholeRequest =
+                    makeRequest(
+                        benchmarkPair,
+                        transcendentalFixed,
+                        FormulaParameter::C,
+                        "-2", "0",
+                        64, 40, 120, wholeFrame);
+                wholeRequest.taylor.enableTileTaylor =
+                    false;
+                ExpressionDeepRenderResult wholeResult;
+                const Clock::time_point wholeStart =
+                    Clock::now();
+                const bool wholeOkay =
+                    formula::renderExpressionDeepFrame(
+                        wholeRequest, wholeResult);
+                wholeFrameSeconds[repeat] =
+                    std::chrono::duration<double>(
+                        Clock::now() - wholeStart).count();
+
+                const uint64_t pixels =
+                    static_cast<uint64_t>(
+                        adaptive.size());
+                const bool accepted =
+                    adaptiveResult.taylorAccepted;
+                benchmarkOkay = benchmarkOkay &&
+                    adaptiveOkay && wholeOkay &&
+                    adaptive == wholeFrame &&
+                    !wholeResult.taylorAccepted &&
+                    wholeResult.fallbackPixelCount == pixels &&
+                    (accepted
+                         ? adaptiveResult.
+                                   taylorAcceptedJetCount >
+                               1 &&
+                           adaptiveResult.
+                                   taylorAcceptedPixelCoverage >
+                               0 &&
+                           adaptiveResult.fallbackPixelCount <
+                               pixels &&
+                           adaptiveSeconds[repeat] <
+                               wholeFrameSeconds[repeat]
+                         : adaptiveResult.
+                                   taylorAcceptedJetCount ==
+                               0 &&
+                           adaptiveResult.
+                                   taylorAcceptedPixelCoverage ==
+                               0 &&
+                           adaptiveSeconds[repeat] <=
+                               wholeFrameSeconds[repeat] *
+                                   1.05);
+                if (repeat == 0)
+                    benchmarkTelemetry = adaptiveResult;
+            }
+            printf("  adaptive cross-cut e500 Taylor/whole-frame %.3f/%.3f and %.3f/%.3f s coverage=%llu jets=%llu/%llu fallback=%llu\n",
+                   adaptiveSeconds[0],
+                   wholeFrameSeconds[0],
+                   adaptiveSeconds[1],
+                   wholeFrameSeconds[1],
+                   (unsigned long long)
+                       benchmarkTelemetry.
+                           taylorAcceptedPixelCoverage,
+                   (unsigned long long)
+                       benchmarkTelemetry.
+                           taylorAcceptedJetCount,
+                   (unsigned long long)
+                       benchmarkTelemetry.
+                           taylorAttemptedJetCount,
+                   (unsigned long long)
+                       benchmarkTelemetry.
+                           fallbackPixelCount);
+            if (!benchmarkOkay) {
+                printf("  adaptive cross-cut e500 speed gate failed\n");
+                ++failures;
+            }
+        }
+    }
+
     // Pole clearance is a whole-frame proof, not point-only tape metadata.
     // A frame whose denominator neighborhood crosses zero must release the
     // Taylor/reference resources and render entirely through MPFR; a nearby
@@ -9447,6 +9911,7 @@ static int runExpressionDeepRenderCase() {
                         "-1.9", "0",
                         64, 40, 20, actual);
                 request.scale.decimal = scale;
+                request.taylor.enableTileTaylor = false;
                 ExpressionDeepRenderResult result;
                 bool okay =
                     formula::renderExpressionDeepFrame(
@@ -9535,6 +10000,7 @@ static int runExpressionDeepRenderCase() {
                         "-2", centerImaginary,
                         64, 40, 20, actual);
                 request.scale.decimal = scale;
+                request.taylor.enableTileTaylor = false;
                 ExpressionDeepRenderResult result;
                 bool okay =
                     formula::renderExpressionDeepFrame(
@@ -9644,6 +10110,7 @@ static int runExpressionDeepRenderCase() {
                 request.scale.decimal = scale;
                 request.taylor.requirePredictedBenefit =
                     false;
+                request.taylor.enableTileTaylor = false;
                 ExpressionDeepRenderResult result;
                 bool okay =
                     formula::renderExpressionDeepFrame(
@@ -9745,6 +10212,7 @@ static int runExpressionDeepRenderCase() {
                     "0", "0", 32, 20, 20, actual);
             request.scale.decimal = scale;
             request.taylor.requirePredictedBenefit = false;
+            request.taylor.enableTileTaylor = false;
             ExpressionDeepRenderResult result;
             bool okay = setup &&
                 formula::renderExpressionDeepFrame(

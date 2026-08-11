@@ -41,6 +41,7 @@ struct ExpressionDeepMemoryPolicy {
 
 struct ExpressionDeepTaylorPolicy {
     bool enableTaylor = true;
+    bool enableTileTaylor = true;
     int minimumLanding = 8;
     int order = 12;
     int minimumOrder = 8;
@@ -50,8 +51,15 @@ struct ExpressionDeepTaylorPolicy {
     int maximumCompositionOrder = 24;
     int maximumCandidateIteration = 0;
     double accuracyBudget = 0x1p-40;
+    int maximumDepth = 5;
+    int minimumTileWidth = 4;
+    int minimumTileHeight = 4;
+    size_t maximumJetCount = 256;
+    size_t maximumRejectedBeforeFirstAcceptance = 8;
+    // Zero uses the remaining renderer memory budget.
+    size_t maximumJetMemoryBytes = 0;
     // Reject a built jet when its certified work estimate cannot amortize
-    // across the frame.
+    // across the frame or tile.
     bool requirePredictedBenefit = true;
 };
 
@@ -201,7 +209,19 @@ struct ExpressionDeepRenderResult {
     double taylorResidualSeconds = 0.0;
     uint64_t taylorAcceptedPixelCount = 0;
     uint64_t taylorFallbackPixelCount = 0;
+    uint64_t taylorAttemptedJetCount = 0;
+    uint64_t taylorAcceptedJetCount = 0;
+    uint64_t taylorRejectedJetCount = 0;
+    uint64_t taylorTileSplitCount = 0;
+    int taylorMaximumTileDepth = 0;
+    uint64_t taylorAcceptedPixelCoverage = 0;
+    double taylorWeightedLanding = 0.0;
+    uint64_t taylorFoldRejectedJetCount = 0;
+    uint64_t taylorCutRejectedJetCount = 0;
+    uint64_t taylorPoleRejectedJetCount = 0;
+    uint64_t taylorTileMapHash = 0;
     size_t taylorMemoryBytes = 0;
+    size_t taylorRetainedBytes = 0;
     ExpressionTaylorJetStatus taylorStatus =
         ExpressionTaylorJetStatus::NoCoverage;
     std::string taylorFailureReason;
@@ -216,20 +236,14 @@ const char* expressionDeepFallbackReasonName(
 
 // Renders finite-iteration escape classifications. The arithmetic fast path is
 // certified relative to an independently iterated higher-precision MPFR oracle;
-// ambiguous bailout intervals fall back per pixel. Exp/sin/cos/sinh/cosh may
-// use a certified whole-prefix Taylor jet; if that jet cannot cover the full
-// requested horizon profitably, the formula remains all-MPFR. Divide/tan/tanh
-// use a distinct certified-meromorphic Taylor tier and reject any full-frame
-// denominator neighborhood that is not proven pole-free. Log/log10/sqrt/power
-// use a certified principal-branch tier and reject any full-frame input
-// neighborhood that is not proven clear of zero and the negative-real cut.
-// Arg uses the same whole-frame principal-cut proof as Log, then projects a
-// certified log1p composition onto its real-valued imaginary component.
-// Polar proves real inputs and nonnegative radius over the whole frame, then
-// composes certified sine/cosine bivariate polynomials. Conjugate/real/
-// imaginary/norm/complex formulas share that real-bivariate q/conjugate(q)
-// tier. Unsupported mixed transcendental real formulas release fast resources
-// and render through MPFR.
+// ambiguous bailout intervals fall back per pixel. Taylor first attempts one
+// full-frame jet. When enabled, a rejected fold/cut/pole neighborhood is then
+// subdivided deterministically into certified tile-local P+D*q jets, all
+// relative to the same higher-precision reference tape. Accepted immutable
+// jets land into the existing certified residual tail; uncovered leaves retain
+// the per-step scaled path when supported and otherwise use MPFR. Existing
+// entire, meromorphic, principal-branch, Arg, Polar, real-bivariate, bailout,
+// first-escape, and profitability gates remain in force for every tile.
 // Interior output means only that no escape was observed before maxIterations,
 // not mathematical membership.
 bool renderExpressionDeepFrame(

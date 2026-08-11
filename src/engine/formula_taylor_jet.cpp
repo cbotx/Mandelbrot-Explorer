@@ -1273,6 +1273,28 @@ bool makeExpressionTaylorNormalizedQ(
            ScaledArithmeticStatus::Success;
 }
 
+bool makeExpressionTaylorLocalQ(
+        const ScaledComplexBall& offset,
+        const ScaledComplexBall& parameterOffset,
+        const ScaledComplexValue& parameterScale,
+        ScaledComplexBall& q) {
+    if (!validRadius(parameterOffset.radius) ||
+        certifyScaledMpfrExponentRange(parameterOffset) !=
+            ScaledArithmeticStatus::Success)
+        return false;
+    if (parameterOffset.value.isZero() &&
+        parameterOffset.radius.isZero())
+        return makeExpressionTaylorNormalizedQ(
+            offset, parameterScale, q);
+    ScaledComplexBall localOffset;
+    if (certifiedScaledSubtract(
+            offset, parameterOffset, localOffset) !=
+            ScaledArithmeticStatus::Success)
+        return false;
+    return makeExpressionTaylorNormalizedQ(
+        localOffset, parameterScale, q);
+}
+
 bool expressionTaylorQInsideUnitDisk(
         const ScaledComplexBall& q) {
     if (certifyScaledMpfrExponentRange(q) !=
@@ -1346,8 +1368,10 @@ public:
             !std::isfinite(request.bailout) ||
             !(request.accuracyBudget > 0.0) ||
             !std::isfinite(request.accuracyBudget) ||
-            !request.parameterScale.isNormalized() ||
-            request.parameterScale.isZero())
+            !validRadius(request.parameterOffset.radius) ||
+            request.parameterScale.re.mantissa != 0.5 ||
+            !request.parameterScale.im.isZero() ||
+            !request.parameterScale.re.isNormalized())
             return finish(
                 ExpressionTaylorJetStatus::InvalidRequest,
                 "real-bivariate Taylor jet request is invalid",
@@ -1367,10 +1391,13 @@ public:
                 false);
         if (certifyScaledMpfrExponentRange(
                 request.parameterScale) !=
+                ScaledArithmeticStatus::Success ||
+            certifyScaledMpfrExponentRange(
+                request.parameterOffset) !=
                 ScaledArithmeticStatus::Success)
             return finish(
                 ExpressionTaylorJetStatus::ExponentRange,
-                "real-bivariate Taylor parameter scale is outside MPFR guards",
+                "real-bivariate Taylor parameterization is outside MPFR guards",
                 false);
 
         using Op = ExpressionProgram::Op;
@@ -3304,6 +3331,8 @@ public:
                         "real-bivariate q index is unavailable";
                 } else if (request.pixelParameter ==
                                FormulaParameter::InitialZ) {
+                    state[0] =
+                        request.parameterOffset;
                     state[qIndex].value =
                         request.parameterScale;
                 }
@@ -3439,22 +3468,28 @@ public:
                             break;
                         case Op::C:
                             if (request.pixelParameter ==
-                                    FormulaParameter::C)
+                                    FormulaParameter::C) {
+                                coefficient(local, 0) =
+                                    request.parameterOffset;
                                 coefficient(
                                     local, qIndex).value =
                                         request.
                                             parameterScale;
+                            }
                             remainders[local] =
                                 request.reference->cError;
                             break;
                         case Op::Z0:
                             if (request.pixelParameter ==
                                     FormulaParameter::
-                                        InitialZ)
+                                        InitialZ) {
+                                coefficient(local, 0) =
+                                    request.parameterOffset;
                                 coefficient(
                                     local, qIndex).value =
                                         request.
                                             parameterScale;
+                            }
                             remainders[local] =
                                 request.reference->z0Error;
                             break;
@@ -4373,6 +4408,7 @@ public:
             totalConvolutionOperations;
         result.memoryBytes = peakMemory;
         result.pixelParameter = request.pixelParameter;
+        result.parameterOffset = request.parameterOffset;
         result.parameterScale = request.parameterScale;
         result.programSemanticHash =
             request.program->semanticHash();
@@ -4573,8 +4609,10 @@ bool ExpressionTaylorJetBuilder::build(
         !std::isfinite(request.bailout) ||
         !(request.accuracyBudget > 0.0) ||
         !std::isfinite(request.accuracyBudget) ||
-        !request.parameterScale.isNormalized() ||
-        request.parameterScale.isZero())
+        !validRadius(request.parameterOffset.radius) ||
+        request.parameterScale.re.mantissa != 0.5 ||
+        !request.parameterScale.im.isZero() ||
+        !request.parameterScale.re.isNormalized())
         return finish(
             ExpressionTaylorJetStatus::InvalidRequest,
             "Taylor jet request is invalid", false);
@@ -4593,10 +4631,13 @@ bool ExpressionTaylorJetBuilder::build(
             false);
     if (certifyScaledMpfrExponentRange(
             request.parameterScale) !=
+            ScaledArithmeticStatus::Success ||
+        certifyScaledMpfrExponentRange(
+            request.parameterOffset) !=
             ScaledArithmeticStatus::Success)
         return finish(
             ExpressionTaylorJetStatus::ExponentRange,
-            "Taylor parameter scale is outside MPFR guards",
+            "Taylor parameterization is outside MPFR guards",
             false);
 
     using Op = ExpressionProgram::Op;
@@ -6595,6 +6636,8 @@ bool ExpressionTaylorJetBuilder::build(
                     candidate.reason =
                         "Taylor order cannot represent the parameter";
                 } else {
+                    state[0] =
+                        request.parameterOffset;
                     state[1].value =
                         request.parameterScale;
                 }
@@ -6700,18 +6743,24 @@ bool ExpressionTaylorJetBuilder::build(
                         break;
                     case Op::C:
                         if (request.pixelParameter ==
-                                FormulaParameter::C)
+                                FormulaParameter::C) {
+                            coefficient(local, 0) =
+                                request.parameterOffset;
                             coefficient(local, 1).value =
                                 request.parameterScale;
+                        }
                         remainders[local] =
                             request.reference->cError;
                         break;
                     case Op::Z0:
                         if (request.pixelParameter ==
                                 FormulaParameter::
-                                    InitialZ)
+                                    InitialZ) {
+                            coefficient(local, 0) =
+                                request.parameterOffset;
                             coefficient(local, 1).value =
                                 request.parameterScale;
+                        }
                         remainders[local] =
                             request.reference->z0Error;
                         break;
@@ -7849,6 +7898,7 @@ bool ExpressionTaylorJetBuilder::build(
     result.operationCount = totalOperations;
     result.memoryBytes = peakMemory;
     result.pixelParameter = request.pixelParameter;
+    result.parameterOffset = request.parameterOffset;
     result.parameterScale = request.parameterScale;
     result.programSemanticHash =
         request.program->semanticHash();

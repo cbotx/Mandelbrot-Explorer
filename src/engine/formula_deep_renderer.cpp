@@ -1,6 +1,7 @@
 #include "formula_deep_renderer.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -576,9 +577,291 @@ struct ScaledOffset {
     ScaledRealValue error;
 };
 
+struct TaylorTileJet {
+    int xBegin = 0;
+    int yBegin = 0;
+    int xEnd = 0;
+    int yEnd = 0;
+    int depth = 0;
+    ExpressionTaylorJetResult jet;
+};
+
+struct PendingTaylorTile {
+    int xBegin = 0;
+    int yBegin = 0;
+    int xEnd = 0;
+    int yEnd = 0;
+    int depth = 0;
+};
+
 ScaledRealValue absoluteScaled(ScaledRealValue value) {
     value.mantissa = std::abs(value.mantissa);
     return value;
+}
+
+uint64_t saturatingAdd(
+        uint64_t left, uint64_t right) {
+    return right >
+            std::numeric_limits<uint64_t>::max() - left
+        ? std::numeric_limits<uint64_t>::max()
+        : left + right;
+}
+
+void mergeMaximum(
+        ScaledRealValue& target,
+        const ScaledRealValue& value) {
+    if (compareScaledNonnegative(value, target) > 0)
+        target = value;
+}
+
+void mergeMinimumNonzero(
+        ScaledRealValue& target,
+        const ScaledRealValue& value) {
+    if (value.isZero()) return;
+    if (target.isZero() ||
+        compareScaledNonnegative(value, target) < 0)
+        target = value;
+}
+
+bool taylorPersistentBytes(
+        const ExpressionTaylorJetResult& jet,
+        size_t& bytes) {
+    bytes = 0;
+    return checkedAddSize(
+               bytes, jet.coefficients.capacity(),
+               sizeof(ScaledComplexValue)) &&
+           checkedAddSize(
+               bytes, jet.coefficientRadii.capacity(),
+               sizeof(ScaledRealValue)) &&
+           checkedAddSize(
+               bytes,
+               jet.intermediateEscapeMargins.capacity(),
+               sizeof(ScaledRealValue));
+}
+
+bool makePixelOffsetBall(
+        const std::vector<ScaledOffset>& xOffsets,
+        const std::vector<ScaledOffset>& yOffsets,
+        int x, int y, ScaledComplexBall& offset) {
+    if (x < 0 || y < 0 ||
+        static_cast<size_t>(x) >= xOffsets.size() ||
+        static_cast<size_t>(y) >= yOffsets.size())
+        return false;
+    const ScaledOffset& xOffset =
+        xOffsets[static_cast<size_t>(x)];
+    const ScaledOffset& yOffset =
+        yOffsets[static_cast<size_t>(y)];
+    offset.value.re = xOffset.value;
+    offset.value.im = yOffset.value;
+    offset.radius =
+        compareScaledNonnegative(
+            xOffset.error, yOffset.error) >= 0
+        ? xOffset.error : yOffset.error;
+    return certifyScaledMpfrExponentRange(offset) ==
+           ScaledArithmeticStatus::Success;
+}
+
+bool makeTaylorTileParameterization(
+        const std::vector<ScaledOffset>& xOffsets,
+        const std::vector<ScaledOffset>& yOffsets,
+        const PendingTaylorTile& tile,
+        const ScaledComplexValue& frameScale,
+        ScaledComplexBall& parameterOffset,
+        ScaledComplexValue& parameterScale) {
+    if (tile.xBegin < 0 || tile.yBegin < 0 ||
+        tile.xBegin >= tile.xEnd ||
+        tile.yBegin >= tile.yEnd ||
+        static_cast<size_t>(tile.xEnd) > xOffsets.size() ||
+        static_cast<size_t>(tile.yEnd) > yOffsets.size())
+        return false;
+    const int centerX =
+        tile.xBegin + (tile.xEnd - tile.xBegin - 1) / 2;
+    const int centerY =
+        tile.yBegin + (tile.yEnd - tile.yBegin - 1) / 2;
+    if (!makePixelOffsetBall(
+            xOffsets, yOffsets, centerX, centerY,
+            parameterOffset))
+        return false;
+
+    ScaledRealValue maximumRealMagnitude;
+    ScaledRealValue maximumImaginaryMagnitude;
+    ScaledRealValue maximumComponentError;
+    for (int y = tile.yBegin; y < tile.yEnd; ++y) {
+        for (int x = tile.xBegin; x < tile.xEnd; ++x) {
+            ScaledComplexBall pixelOffset;
+            ScaledComplexBall localOffset;
+            if (!makePixelOffsetBall(
+                    xOffsets, yOffsets, x, y,
+                    pixelOffset) ||
+                certifiedScaledSubtract(
+                    pixelOffset, parameterOffset,
+                    localOffset) !=
+                    ScaledArithmeticStatus::Success ||
+                certifyScaledMpfrExponentRange(
+                    localOffset) !=
+                    ScaledArithmeticStatus::Success)
+                return false;
+            mergeMaximum(
+                maximumRealMagnitude,
+                absoluteScaled(localOffset.value.re));
+            mergeMaximum(
+                maximumImaginaryMagnitude,
+                absoluteScaled(localOffset.value.im));
+            mergeMaximum(
+                maximumComponentError,
+                localOffset.radius);
+        }
+    }
+    const bool madeScale =
+        makeExpressionTaylorFrameScale(
+            maximumRealMagnitude,
+            maximumImaginaryMagnitude,
+            maximumComponentError,
+            parameterScale);
+    if (!madeScale) {
+        if (!maximumRealMagnitude.isZero() ||
+            !maximumImaginaryMagnitude.isZero() ||
+            !maximumComponentError.isZero() ||
+            frameScale.re.mantissa != 0.5 ||
+            !frameScale.im.isZero())
+            return false;
+        parameterScale = frameScale;
+        const int64_t shift =
+            static_cast<int64_t>(tile.depth) + 8;
+        if (parameterScale.re.exponent <
+                std::numeric_limits<int64_t>::min() + shift)
+            return false;
+        parameterScale.re.exponent -= shift;
+        if (certifyScaledMpfrExponentRange(
+                parameterScale) !=
+                ScaledArithmeticStatus::Success)
+            return false;
+    }
+    for (int y = tile.yBegin; y < tile.yEnd; ++y) {
+        for (int x = tile.xBegin; x < tile.xEnd; ++x) {
+            ScaledComplexBall pixelOffset;
+            ScaledComplexBall q;
+            if (!makePixelOffsetBall(
+                    xOffsets, yOffsets, x, y,
+                    pixelOffset) ||
+                !makeExpressionTaylorLocalQ(
+                    pixelOffset, parameterOffset,
+                    parameterScale, q) ||
+                !expressionTaylorQInsideUnitDisk(q))
+                return false;
+        }
+    }
+    return true;
+}
+
+uint64_t taylorTilePixels(
+        const PendingTaylorTile& tile) {
+    return static_cast<uint64_t>(
+               tile.xEnd - tile.xBegin) *
+           static_cast<uint64_t>(
+               tile.yEnd - tile.yBegin);
+}
+
+size_t splitTaylorTile(
+        const PendingTaylorTile& tile,
+        const ExpressionDeepTaylorPolicy& policy,
+        std::array<PendingTaylorTile, 4>& children) {
+    const int width = tile.xEnd - tile.xBegin;
+    const int height = tile.yEnd - tile.yBegin;
+    const bool canSplitX =
+        policy.minimumTileWidth <= width / 2;
+    const bool canSplitY =
+        policy.minimumTileHeight <= height / 2;
+    if (tile.depth >= policy.maximumDepth ||
+        (!canSplitX && !canSplitY))
+        return 0;
+    if (canSplitX && canSplitY) {
+        const int middleX =
+            tile.xBegin + width / 2;
+        const int middleY =
+            tile.yBegin + height / 2;
+        for (PendingTaylorTile& child : children) {
+            child = tile;
+            child.depth = tile.depth + 1;
+        }
+        children[0].xEnd = middleX;
+        children[0].yEnd = middleY;
+        children[1].xBegin = middleX;
+        children[1].yEnd = middleY;
+        children[2].xEnd = middleX;
+        children[2].yBegin = middleY;
+        children[3].xBegin = middleX;
+        children[3].yBegin = middleY;
+        return 4;
+    }
+    children[0] = tile;
+    children[1] = tile;
+    children[0].depth =
+        children[1].depth = tile.depth + 1;
+    if (canSplitX) {
+        const int middle =
+            tile.xBegin + width / 2;
+        children[0].xEnd = middle;
+        children[1].xBegin = middle;
+    } else {
+        const int middle =
+            tile.yBegin + height / 2;
+        children[0].yEnd = middle;
+        children[1].yBegin = middle;
+    }
+    return 2;
+}
+
+bool predictedTaylorBenefit(
+        const ExpressionTaylorJetResult& jet,
+        uint64_t pixelCount, int maximumIterations) {
+    const long double fullCost =
+        static_cast<long double>(pixelCount) *
+        static_cast<long double>(maximumIterations) * 16.0L;
+    const long double evaluation =
+        static_cast<long double>(pixelCount) *
+        (jet.layout ==
+                 ExpressionTaylorJetLayout::RealBivariate
+             ? 2.0L *
+                   static_cast<long double>(
+                       jet.monomialCount) +
+                   jet.order + 2.0L
+             : 2.0L * jet.order + 2.0L);
+    const long double tail =
+        static_cast<long double>(pixelCount) *
+        static_cast<long double>(
+            std::max(
+                0, maximumIterations -
+                       jet.landingIteration)) *
+        16.0L;
+    const long double acceleratedCost =
+        static_cast<long double>(jet.operationCount) +
+        evaluation + tail;
+    return acceleratedCost < fullCost;
+}
+
+uint64_t mixTaylorTileHash(
+        uint64_t hash, const TaylorTileJet& tile) {
+    auto mix = [&](uint64_t value) {
+        hash ^= value;
+        hash *= 1099511628211ULL;
+    };
+    mix(static_cast<uint64_t>(
+        static_cast<uint32_t>(tile.xBegin)));
+    mix(static_cast<uint64_t>(
+        static_cast<uint32_t>(tile.yBegin)));
+    mix(static_cast<uint64_t>(
+        static_cast<uint32_t>(tile.xEnd)));
+    mix(static_cast<uint64_t>(
+        static_cast<uint32_t>(tile.yEnd)));
+    mix(static_cast<uint64_t>(
+        static_cast<uint32_t>(tile.depth)));
+    mix(static_cast<uint64_t>(
+        static_cast<uint32_t>(
+            tile.jet.landingIteration)));
+    mix(static_cast<uint64_t>(
+        static_cast<uint32_t>(tile.jet.order)));
+    return hash;
 }
 
 bool componentDiscrepancy(
@@ -818,6 +1101,18 @@ bool renderExpressionDeepFrame(
             request.taylor.maximumCompositionOrder < 1 ||
             request.taylor.maximumCompositionOrder > 24 ||
             request.taylor.maximumCandidateIteration < 0 ||
+            request.taylor.maximumDepth < 0 ||
+            request.taylor.maximumDepth > 30 ||
+            request.taylor.minimumTileWidth < 1 ||
+            request.taylor.minimumTileHeight < 1 ||
+            request.taylor.maximumJetCount < 1 ||
+            request.taylor.maximumJetCount >
+                size_t{ 65536 } ||
+            request.taylor.
+                    maximumRejectedBeforeFirstAcceptance < 1 ||
+            request.taylor.
+                    maximumRejectedBeforeFirstAcceptance >
+                request.taylor.maximumJetCount ||
             !(request.taylor.accuracyBudget > 0.0) ||
             !std::isfinite(
                 request.taylor.accuracyBudget))
@@ -1253,7 +1548,10 @@ bool renderExpressionDeepFrame(
         std::unique_ptr<ExpressionScaledResidualEvaluator>
             validationEvaluator;
         ExpressionTaylorJetResult taylorJet;
+        std::vector<TaylorTileJet> taylorTileJets;
+        std::vector<int32_t> taylorPixelJet;
         bool useTaylor = false;
+        bool useGlobalTaylor = false;
         size_t retainedTaylorBytes = 0;
         if (runFast) {
             ExactGeometry geometry(reference.precision);
@@ -1453,6 +1751,407 @@ bool renderExpressionDeepFrame(
                 request.maxIterations >
                     request.taylor.minimumLanding) {
                 result.taylorAttempted = true;
+                long double weightedLandingTotal = 0.0L;
+                size_t taylorBuildPeakBytes = 0;
+                auto recordJet = [&](
+                        const ExpressionTaylorJetResult& jet,
+                        bool accepted, uint64_t pixels,
+                        int depth) {
+                    ++result.taylorAttemptedJetCount;
+                    if (accepted) {
+                        ++result.taylorAcceptedJetCount;
+                        result.taylorAcceptedPixelCoverage =
+                            saturatingAdd(
+                                result.
+                                    taylorAcceptedPixelCoverage,
+                                pixels);
+                        weightedLandingTotal +=
+                            static_cast<long double>(pixels) *
+                            static_cast<long double>(
+                                jet.landingIteration);
+                        result.taylorStatus =
+                            ExpressionTaylorJetStatus::Success;
+                    } else {
+                        ++result.taylorRejectedJetCount;
+                        if (result.taylorAcceptedJetCount == 0) {
+                            result.taylorStatus = jet.status;
+                            result.taylorFailureReason =
+                                jet.failureReason;
+                        }
+                    }
+                    result.taylorMaximumTileDepth =
+                        std::max(
+                            result.taylorMaximumTileDepth,
+                            depth);
+                    result.taylorOrder =
+                        std::max(
+                            result.taylorOrder, jet.order);
+                    result.taylorLayout = jet.layout;
+                    result.taylorMonomialCount =
+                        std::max(
+                            result.taylorMonomialCount,
+                            jet.monomialCount);
+                    result.
+                        taylorBivariateConvolutionOperationCount =
+                            saturatingAdd(
+                                result.
+                                    taylorBivariateConvolutionOperationCount,
+                                jet.
+                                    bivariateConvolutionOperationCount);
+                    result.taylorCoveredIterations =
+                        std::max(
+                            result.taylorCoveredIterations,
+                            jet.landingIteration);
+                    result.taylorMaximumFunctionSeriesOrder =
+                        std::max(
+                            result.
+                                taylorMaximumFunctionSeriesOrder,
+                            jet.maximumFunctionSeriesOrder);
+                    result.taylorFunctionSeriesCount =
+                        saturatingAdd(
+                            result.taylorFunctionSeriesCount,
+                            jet.functionSeriesCount);
+                    result.taylorFunctionSeriesOperationCount =
+                        saturatingAdd(
+                            result.
+                                taylorFunctionSeriesOperationCount,
+                            jet.functionSeriesOperationCount);
+                    mergeMaximum(
+                        result.taylorMaximumFunctionSeriesTail,
+                        jet.maximumFunctionSeriesTail);
+                    result.taylorMaximumReciprocalOrder =
+                        std::max(
+                            result.taylorMaximumReciprocalOrder,
+                            jet.maximumReciprocalOrder);
+                    result.taylorReciprocalCount =
+                        saturatingAdd(
+                            result.taylorReciprocalCount,
+                            jet.reciprocalCount);
+                    result.taylorReciprocalOperationCount =
+                        saturatingAdd(
+                            result.
+                                taylorReciprocalOperationCount,
+                            jet.reciprocalOperationCount);
+                    mergeMinimumNonzero(
+                        result.
+                            taylorMinimumDenominatorClearance,
+                        jet.minimumDenominatorClearance);
+                    mergeMaximum(
+                        result.taylorMaximumReciprocalTail,
+                        jet.maximumReciprocalTail);
+                    result.taylorMaximumBranchSeriesOrder =
+                        std::max(
+                            result.
+                                taylorMaximumBranchSeriesOrder,
+                            jet.maximumBranchSeriesOrder);
+                    result.taylorBranchCompositionCount =
+                        saturatingAdd(
+                            result.taylorBranchCompositionCount,
+                            jet.branchCompositionCount);
+                    result.
+                        taylorBranchCompositionOperationCount =
+                            saturatingAdd(
+                                result.
+                                    taylorBranchCompositionOperationCount,
+                                jet.
+                                    branchCompositionOperationCount);
+                    mergeMaximum(
+                        result.taylorMaximumBranchSeriesTail,
+                        jet.maximumBranchSeriesTail);
+                    mergeMinimumNonzero(
+                        result.taylorMinimumBranchCutClearance,
+                        jet.minimumBranchCutClearance);
+                    mergeMinimumNonzero(
+                        result.taylorMinimumBranchZeroClearance,
+                        jet.minimumBranchZeroClearance);
+                    result.taylorArgCompositionCount =
+                        saturatingAdd(
+                            result.taylorArgCompositionCount,
+                            jet.argCompositionCount);
+                    if (result.taylorArgRejectionReason.empty())
+                        result.taylorArgRejectionReason =
+                            jet.argRejectionReason;
+                    result.taylorPolarCompositionCount =
+                        saturatingAdd(
+                            result.taylorPolarCompositionCount,
+                            jet.polarCompositionCount);
+                    mergeMinimumNonzero(
+                        result.
+                            taylorMinimumPolarRadiusClearance,
+                        jet.minimumPolarRadiusClearance);
+                    if (result.
+                            taylorPolarRejectionReason.empty())
+                        result.taylorPolarRejectionReason =
+                            jet.polarRejectionReason;
+                    result.taylorAbsBranchCount =
+                        saturatingAdd(
+                            result.taylorAbsBranchCount,
+                            jet.absBranchCount);
+                    result.taylorAbsPositiveCellCount =
+                        saturatingAdd(
+                            result.taylorAbsPositiveCellCount,
+                            jet.absPositiveCellCount);
+                    result.taylorAbsNegativeCellCount =
+                        saturatingAdd(
+                            result.taylorAbsNegativeCellCount,
+                            jet.absNegativeCellCount);
+                    mergeMinimumNonzero(
+                        result.taylorMinimumFoldClearance,
+                        jet.minimumFoldClearance);
+                    if (jet.poleRejected ||
+                        jet.status ==
+                            ExpressionTaylorJetStatus::
+                                PoleRejected) {
+                        result.taylorPoleRejected = true;
+                        ++result.
+                            taylorPoleRejectedJetCount;
+                    }
+                    if (jet.branchRejected &&
+                        !jet.foldRejected) {
+                        result.taylorBranchRejected = true;
+                        ++result.
+                            taylorCutRejectedJetCount;
+                    }
+                    if (jet.polarRejected)
+                        result.taylorPolarRejected = true;
+                    if (jet.foldRejected) {
+                        result.taylorFoldRejected = true;
+                        ++result.
+                            taylorFoldRejectedJetCount;
+                        if (result.
+                                taylorFoldRejectionIteration <
+                                0)
+                            result.
+                                taylorFoldRejectionIteration =
+                                    jet.
+                                        foldRejectionIteration;
+                        if (result.
+                                taylorFoldRejectionReason.
+                                    empty())
+                            result.
+                                taylorFoldRejectionReason =
+                                    jet.
+                                        foldRejectionReason;
+                    }
+                };
+                auto makeJetRequest = [&](
+                        const ScaledComplexBall& parameterOffset,
+                        const ScaledComplexValue& parameterScale,
+                        size_t retainedBytes,
+                        ExpressionTaylorJetRequest& jetRequest) {
+                    jetRequest.program =
+                        request.runtimeProgram;
+                    jetRequest.reference = &reference;
+                    jetRequest.pixelParameter =
+                        request.pixelParameter;
+                    jetRequest.parameterOffset =
+                        parameterOffset;
+                    jetRequest.parameterScale =
+                        parameterScale;
+                    jetRequest.minimumOrder =
+                        request.taylor.minimumOrder;
+                    jetRequest.preferredOrder =
+                        request.taylor.order;
+                    jetRequest.maximumOrder =
+                        request.taylor.maximumOrder;
+                    jetRequest.maximumBivariateOrder =
+                        request.taylor.
+                            maximumBivariateOrder;
+                    jetRequest.maximumCompositionOrder =
+                        request.taylor.
+                            maximumCompositionOrder;
+                    jetRequest.minimumLanding =
+                        request.taylor.minimumLanding;
+                    jetRequest.maximumCandidateIteration =
+                        request.taylor.
+                            maximumCandidateIteration;
+                    jetRequest.bailout = request.bailout;
+                    jetRequest.accuracyBudget =
+                        request.taylor.accuracyBudget;
+                    jetRequest.shouldCancel =
+                        pollCancellation;
+
+                    size_t available =
+                        std::numeric_limits<size_t>::max();
+                    bool limited = false;
+                    if (request.memory.memoryLimitBytes != 0) {
+                        limited = true;
+                        size_t fixed =
+                            reference.memoryBytes;
+                        if (!checkedAddSize(
+                                fixed, 1,
+                                rendererBaseBytes))
+                            return false;
+                        if (fixed >
+                                request.memory.
+                                    memoryLimitBytes ||
+                            retainedBytes >
+                                request.memory.
+                                    memoryLimitBytes -
+                                    fixed)
+                            return false;
+                        available =
+                            request.memory.memoryLimitBytes -
+                            fixed - retainedBytes;
+                    }
+                    if (request.taylor.
+                            maximumJetMemoryBytes != 0) {
+                        limited = true;
+                        if (retainedBytes >
+                                request.taylor.
+                                    maximumJetMemoryBytes)
+                            return false;
+                        available = std::min(
+                            available,
+                            request.taylor.
+                                maximumJetMemoryBytes -
+                                retainedBytes);
+                    }
+                    if (limited && available == 0)
+                        return false;
+                    jetRequest.memoryLimitBytes =
+                        limited ? available : 0;
+                    return true;
+                };
+                auto attemptJet = [&](
+                        const ScaledComplexBall& parameterOffset,
+                        const ScaledComplexValue& parameterScale,
+                        uint64_t pixels, int depth,
+                        size_t retainedBytes,
+                        ExpressionTaylorJetResult& jet,
+                        size_t& persistentBytes) {
+                    persistentBytes = 0;
+                    ExpressionTaylorJetRequest jetRequest;
+                    bool built = false;
+                    if (!makeJetRequest(
+                            parameterOffset, parameterScale,
+                            retainedBytes, jetRequest)) {
+                        jet.status =
+                            ExpressionTaylorJetStatus::
+                                ResourceLimit;
+                        jet.failureReason =
+                            "Taylor planner memory budget is exhausted";
+                    } else {
+                        built =
+                            ExpressionTaylorJetBuilder::build(
+                                jetRequest, jet);
+                    }
+                    result.taylorBuildSeconds +=
+                        jet.buildSeconds;
+                    size_t combinedPeak = retainedBytes;
+                    if (!checkedAddSize(
+                            combinedPeak, 1,
+                            jet.memoryBytes))
+                        combinedPeak =
+                            std::numeric_limits<size_t>::max();
+                    taylorBuildPeakBytes =
+                        std::max(
+                            taylorBuildPeakBytes,
+                            combinedPeak);
+                    result.taylorMemoryBytes =
+                        std::max(
+                            result.taylorMemoryBytes,
+                            combinedPeak);
+
+                    bool accepted = built;
+                    if (accepted &&
+                        certifiedTaylorCapability(
+                            result.capability) &&
+                        (!certifiedPiecewiseCandidate ||
+                         jet.argCompositionCount > 0 ||
+                         jet.polarCompositionCount > 0) &&
+                        !request.
+                            allowUncertifiedForBenchmark &&
+                        jet.landingIteration <
+                            request.maxIterations) {
+                        accepted = false;
+                        jet.status =
+                            ExpressionTaylorJetStatus::
+                                NoCoverage;
+                        jet.failureReason =
+                            "certified Taylor jet does not cover the full iteration horizon";
+                    }
+                    if (accepted &&
+                        request.taylor.
+                            requirePredictedBenefit &&
+                        !predictedTaylorBenefit(
+                            jet, pixels,
+                            request.maxIterations)) {
+                        accepted = false;
+                        jet.status =
+                            ExpressionTaylorJetStatus::
+                                NoCoverage;
+                        jet.failureReason =
+                            "Taylor cost predicts no tile benefit";
+                    }
+                    if (accepted &&
+                        !taylorPersistentBytes(
+                            jet, persistentBytes)) {
+                        accepted = false;
+                        jet.status =
+                            ExpressionTaylorJetStatus::
+                                ResourceLimit;
+                        jet.failureReason =
+                            "Taylor coefficient memory calculation overflow";
+                    }
+                    size_t retainedAfter = retainedBytes;
+                    if (accepted &&
+                        !checkedAddSize(
+                            retainedAfter, 1,
+                            persistentBytes)) {
+                        accepted = false;
+                        jet.status =
+                            ExpressionTaylorJetStatus::
+                                ResourceLimit;
+                        jet.failureReason =
+                            "Taylor retained memory calculation overflow";
+                    }
+                    if (accepted &&
+                        request.taylor.
+                                maximumJetMemoryBytes != 0 &&
+                        retainedAfter >
+                            request.taylor.
+                                maximumJetMemoryBytes) {
+                        accepted = false;
+                        jet.status =
+                            ExpressionTaylorJetStatus::
+                                ResourceLimit;
+                        jet.failureReason =
+                            "Taylor retained coefficients exceed jet memory policy";
+                    }
+                    size_t fastPeak = rendererBytes;
+                    if (accepted &&
+                        !checkedAddSize(
+                            fastPeak, 1,
+                            retainedAfter)) {
+                        accepted = false;
+                        jet.status =
+                            ExpressionTaylorJetStatus::
+                                ResourceLimit;
+                        jet.failureReason =
+                            "Taylor renderer peak memory calculation overflow";
+                    }
+                    if (accepted &&
+                        request.memory.memoryLimitBytes != 0 &&
+                        (reference.memoryBytes >
+                             request.memory.
+                                 memoryLimitBytes ||
+                         fastPeak >
+                             request.memory.
+                                 memoryLimitBytes -
+                                 reference.memoryBytes)) {
+                        accepted = false;
+                        jet.status =
+                            ExpressionTaylorJetStatus::
+                                ResourceLimit;
+                        jet.failureReason =
+                            "Taylor coefficients exceed renderer memory policy";
+                    }
+                    recordJet(
+                        jet, accepted, pixels, depth);
+                    return accepted;
+                };
+
                 ScaledRealValue maximumRealMagnitude;
                 ScaledRealValue maximumImaginaryMagnitude;
                 ScaledRealValue maximumComponentError;
@@ -1482,144 +2181,30 @@ bool renderExpressionDeepFrame(
                         maximumComponentError =
                             offset.error;
                 }
-                ScaledComplexValue parameterScale;
-                if (makeExpressionTaylorFrameScale(
+                ScaledComplexValue frameScale;
+                const bool haveFrameScale =
+                    makeExpressionTaylorFrameScale(
                         maximumRealMagnitude,
                         maximumImaginaryMagnitude,
                         maximumComponentError,
-                        parameterScale)) {
-                    ExpressionTaylorJetRequest jetRequest;
-                    jetRequest.program =
-                        request.runtimeProgram;
-                    jetRequest.reference = &reference;
-                    jetRequest.pixelParameter =
-                        request.pixelParameter;
-                    jetRequest.parameterScale =
-                        parameterScale;
-                    jetRequest.minimumOrder =
-                        request.taylor.minimumOrder;
-                    jetRequest.preferredOrder =
-                        request.taylor.order;
-                    jetRequest.maximumOrder =
-                        request.taylor.maximumOrder;
-                    jetRequest.maximumBivariateOrder =
-                        request.taylor.
-                            maximumBivariateOrder;
-                    jetRequest.maximumCompositionOrder =
-                        request.taylor.
-                            maximumCompositionOrder;
-                    jetRequest.minimumLanding =
-                        request.taylor.minimumLanding;
-                    jetRequest.maximumCandidateIteration =
-                        request.taylor.
-                            maximumCandidateIteration;
-                    jetRequest.bailout = request.bailout;
-                    jetRequest.accuracyBudget =
-                        request.taylor.accuracyBudget;
-                    if (request.memory.memoryLimitBytes != 0 &&
-                        reference.memoryBytes <=
-                            request.memory.memoryLimitBytes &&
-                        rendererBaseBytes <=
-                            request.memory.memoryLimitBytes -
-                                reference.memoryBytes)
-                        jetRequest.memoryLimitBytes =
-                            request.memory.memoryLimitBytes -
-                            reference.memoryBytes -
-                            rendererBaseBytes;
-                    else
-                        jetRequest.memoryLimitBytes =
-                            request.memory.memoryLimitBytes;
-                    jetRequest.shouldCancel =
-                        pollCancellation;
-                    useTaylor =
-                        ExpressionTaylorJetBuilder::build(
-                            jetRequest, taylorJet);
+                        frameScale);
+                size_t rootPersistentBytes = 0;
+                if (haveFrameScale) {
+                    ScaledComplexBall zeroOffset;
+                    useTaylor = attemptJet(
+                        zeroOffset, frameScale,
+                        pixelCount64, 0, 0,
+                        taylorJet, rootPersistentBytes);
                 } else {
-                    taylorJet.status =
+                    ExpressionTaylorJetResult failed;
+                    failed.status =
                         ExpressionTaylorJetStatus::
-                            ExponentRange;
-                    taylorJet.failureReason =
+                        ExponentRange;
+                    failed.failureReason =
                         "Taylor frame normalization failed";
+                    recordJet(
+                        failed, false, pixelCount64, 0);
                 }
-                result.taylorBuildSeconds =
-                    taylorJet.buildSeconds;
-                result.taylorMemoryBytes =
-                    taylorJet.memoryBytes;
-                result.taylorStatus =
-                    taylorJet.status;
-                result.taylorFailureReason =
-                    taylorJet.failureReason;
-                result.taylorOrder = taylorJet.order;
-                result.taylorLayout =
-                    taylorJet.layout;
-                result.taylorMonomialCount =
-                    taylorJet.monomialCount;
-                result.
-                    taylorBivariateConvolutionOperationCount =
-                        taylorJet.
-                            bivariateConvolutionOperationCount;
-                result.taylorCoveredIterations =
-                    taylorJet.landingIteration;
-                result.taylorMaximumFunctionSeriesOrder =
-                    taylorJet.maximumFunctionSeriesOrder;
-                result.taylorFunctionSeriesCount =
-                    taylorJet.functionSeriesCount;
-                result.taylorFunctionSeriesOperationCount =
-                    taylorJet.functionSeriesOperationCount;
-                result.taylorMaximumFunctionSeriesTail =
-                    taylorJet.maximumFunctionSeriesTail;
-                result.taylorMaximumReciprocalOrder =
-                    taylorJet.maximumReciprocalOrder;
-                result.taylorReciprocalCount =
-                    taylorJet.reciprocalCount;
-                result.taylorReciprocalOperationCount =
-                    taylorJet.reciprocalOperationCount;
-                result.taylorMinimumDenominatorClearance =
-                    taylorJet.minimumDenominatorClearance;
-                result.taylorMaximumReciprocalTail =
-                    taylorJet.maximumReciprocalTail;
-                result.taylorPoleRejected =
-                    taylorJet.poleRejected;
-                result.taylorMaximumBranchSeriesOrder =
-                    taylorJet.maximumBranchSeriesOrder;
-                result.taylorBranchCompositionCount =
-                    taylorJet.branchCompositionCount;
-                result.taylorBranchCompositionOperationCount =
-                    taylorJet.branchCompositionOperationCount;
-                result.taylorMaximumBranchSeriesTail =
-                    taylorJet.maximumBranchSeriesTail;
-                result.taylorMinimumBranchCutClearance =
-                    taylorJet.minimumBranchCutClearance;
-                result.taylorMinimumBranchZeroClearance =
-                    taylorJet.minimumBranchZeroClearance;
-                result.taylorBranchRejected =
-                    taylorJet.branchRejected;
-                result.taylorArgCompositionCount =
-                    taylorJet.argCompositionCount;
-                result.taylorArgRejectionReason =
-                    taylorJet.argRejectionReason;
-                result.taylorPolarCompositionCount =
-                    taylorJet.polarCompositionCount;
-                result.taylorMinimumPolarRadiusClearance =
-                    taylorJet.minimumPolarRadiusClearance;
-                result.taylorPolarRejected =
-                    taylorJet.polarRejected;
-                result.taylorPolarRejectionReason =
-                    taylorJet.polarRejectionReason;
-                result.taylorAbsBranchCount =
-                    taylorJet.absBranchCount;
-                result.taylorAbsPositiveCellCount =
-                    taylorJet.absPositiveCellCount;
-                result.taylorAbsNegativeCellCount =
-                    taylorJet.absNegativeCellCount;
-                result.taylorMinimumFoldClearance =
-                    taylorJet.minimumFoldClearance;
-                result.taylorFoldRejected =
-                    taylorJet.foldRejected;
-                result.taylorFoldRejectionIteration =
-                    taylorJet.foldRejectionIteration;
-                result.taylorFoldRejectionReason =
-                    taylorJet.foldRejectionReason;
                 if (cancelled.load(
                         std::memory_order_acquire) ||
                     taylorJet.status ==
@@ -1629,79 +2214,360 @@ bool renderExpressionDeepFrame(
                         ExpressionDeepRenderStatus::
                             Cancelled,
                         "render cancelled while building Taylor jet");
-                if (useTaylor &&
-                    certifiedTaylorCapability(
-                        result.capability) &&
-                    (!certifiedPiecewiseCandidate ||
-                     taylorJet.argCompositionCount > 0 ||
-                     taylorJet.polarCompositionCount > 0) &&
-                    !request.allowUncertifiedForBenchmark &&
-                    taylorJet.landingIteration <
-                        request.maxIterations) {
-                    useTaylor = false;
-                    result.taylorFailureReason =
-                        "certified Taylor jet does not cover the full iteration horizon";
-                }
-                if (useTaylor &&
-                    request.taylor.
-                        requirePredictedBenefit) {
-                    const long double saved =
-                        static_cast<long double>(
-                            pixelCount64) *
-                        taylorJet.landingIteration * 16.0L;
-                    const long double evaluation =
-                        static_cast<long double>(
-                            pixelCount64) *
-                        (taylorJet.layout ==
-                                 ExpressionTaylorJetLayout::
-                                     RealBivariate
-                             ? 2.0L *
-                                   static_cast<long double>(
-                                       taylorJet.
-                                           monomialCount) +
-                                   taylorJet.order + 2.0L
-                             : 2.0L * taylorJet.order +
-                                   2.0L);
-                    const long double predictedCost =
-                        static_cast<long double>(
-                            taylorJet.operationCount) +
-                        evaluation;
-                    if (saved <= predictedCost) {
-                        useTaylor = false;
-                        result.taylorFailureReason =
-                            "Taylor cost predicts no frame benefit";
-                    }
-                }
                 if (useTaylor) {
-                    size_t persistentTaylorBytes = 0;
+                    useGlobalTaylor = true;
+                    retainedTaylorBytes =
+                        rootPersistentBytes;
+                    TaylorTileJet rootTile;
+                    rootTile.xEnd = request.width;
+                    rootTile.yEnd = request.height;
+                    rootTile.jet.landingIteration =
+                        taylorJet.landingIteration;
+                    rootTile.jet.order =
+                        taylorJet.order;
+                    result.taylorTileMapHash =
+                        mixTaylorTileHash(
+                            1469598103934665603ULL,
+                            rootTile);
+                } else if (
+                    request.taylor.enableTileTaylor &&
+                    request.taylor.maximumDepth > 0 &&
+                    taylorJet.failureReason !=
+                        "Taylor cost predicts no tile benefit" &&
+                    result.taylorAttemptedJetCount <
+                        request.taylor.maximumJetCount) {
+                    std::vector<ScaledComplexValue>().swap(
+                        taylorJet.coefficients);
+                    std::vector<ScaledRealValue>().swap(
+                        taylorJet.coefficientRadii);
+                    std::vector<ScaledRealValue>().swap(
+                        taylorJet.intermediateEscapeMargins);
+                    rootPersistentBytes = 0;
+                    std::vector<PendingTaylorTile> pending;
+                    bool plannerReady = true;
+                    size_t plannerMetadataBytes = 0;
                     if (!checkedAddSize(
-                            persistentTaylorBytes,
-                            taylorJet.coefficients.capacity(),
-                            sizeof(ScaledComplexValue)) ||
+                            plannerMetadataBytes,
+                            pixelCount, sizeof(int32_t)) ||
                         !checkedAddSize(
-                            persistentTaylorBytes,
-                            taylorJet.coefficientRadii.capacity(),
-                            sizeof(ScaledRealValue)) ||
+                            plannerMetadataBytes,
+                            request.taylor.maximumJetCount,
+                            sizeof(TaylorTileJet)) ||
                         !checkedAddSize(
-                            persistentTaylorBytes,
-                            taylorJet.
-                                intermediateEscapeMargins.
-                                    capacity(),
-                            sizeof(ScaledRealValue))) {
-                        useTaylor = false;
-                        result.taylorFailureReason =
-                            "Taylor coefficient memory calculation overflow";
+                            plannerMetadataBytes,
+                            request.taylor.maximumJetCount,
+                            sizeof(PendingTaylorTile)))
+                        plannerReady = false;
+                    if (plannerReady &&
+                        request.taylor.
+                                maximumJetMemoryBytes != 0 &&
+                        plannerMetadataBytes >
+                            request.taylor.
+                                maximumJetMemoryBytes)
+                        plannerReady = false;
+                    if (plannerReady &&
+                        request.memory.memoryLimitBytes != 0) {
+                        size_t fixed =
+                            reference.memoryBytes;
+                        if (!checkedAddSize(
+                                fixed, 1,
+                                rendererBytes)) {
+                            plannerReady = false;
+                        }
+                        if (plannerReady &&
+                            (fixed >
+                                request.memory.
+                                    memoryLimitBytes ||
+                            plannerMetadataBytes >
+                                request.memory.
+                                    memoryLimitBytes -
+                                    fixed))
+                            plannerReady = false;
                     }
+                    if (plannerReady) {
+                        try {
+                            taylorPixelJet.assign(
+                                pixelCount, int32_t{ -1 });
+                            taylorTileJets.reserve(
+                                request.taylor.
+                                    maximumJetCount);
+                            pending.reserve(
+                                request.taylor.
+                                    maximumJetCount);
+                        } catch (const std::bad_alloc&) {
+                            plannerReady = false;
+                        } catch (
+                                const std::length_error&) {
+                            plannerReady = false;
+                        }
+                    }
+                    if (plannerReady) {
+                        size_t actualMetadataBytes = 0;
+                        if (!checkedAddSize(
+                                actualMetadataBytes,
+                                taylorPixelJet.capacity(),
+                                sizeof(int32_t)) ||
+                            !checkedAddSize(
+                                actualMetadataBytes,
+                                taylorTileJets.capacity(),
+                                sizeof(TaylorTileJet)) ||
+                            !checkedAddSize(
+                                actualMetadataBytes,
+                                pending.capacity(),
+                                sizeof(PendingTaylorTile))) {
+                            plannerReady = false;
+                        } else {
+                            plannerMetadataBytes =
+                                actualMetadataBytes;
+                        }
+                        if (plannerReady &&
+                            request.taylor.
+                                    maximumJetMemoryBytes !=
+                                0 &&
+                            plannerMetadataBytes >
+                                request.taylor.
+                                    maximumJetMemoryBytes)
+                            plannerReady = false;
+                        if (plannerReady &&
+                            request.memory.
+                                    memoryLimitBytes != 0) {
+                            size_t fixed =
+                                reference.memoryBytes;
+                            if (!checkedAddSize(
+                                    fixed, 1,
+                                    rendererBytes) ||
+                                fixed >
+                                    request.memory.
+                                        memoryLimitBytes ||
+                                plannerMetadataBytes >
+                                    request.memory.
+                                        memoryLimitBytes -
+                                        fixed)
+                                plannerReady = false;
+                        }
+                    }
+                    if (plannerReady) {
+                        retainedTaylorBytes =
+                            plannerMetadataBytes;
+                        PendingTaylorTile root;
+                        root.xEnd = request.width;
+                        root.yEnd = request.height;
+                        std::array<
+                            PendingTaylorTile, 4>
+                            children;
+                        const size_t childCount =
+                            splitTaylorTile(
+                                root, request.taylor,
+                                children);
+                        if (childCount != 0) {
+                            ++result.
+                                taylorTileSplitCount;
+                            const size_t available =
+                                request.taylor.
+                                    maximumJetCount -
+                                result.
+                                    taylorAttemptedJetCount;
+                            const size_t retainedChildren =
+                                std::min(
+                                    childCount, available);
+                            for (size_t child =
+                                     retainedChildren;
+                                 child > 0; --child)
+                                pending.push_back(
+                                    children[child - 1]);
+                        }
+                        bool stopForBudget = false;
+                        uint64_t tileMapHash =
+                            1469598103934665603ULL;
+                        while (!pending.empty() &&
+                               !stopForBudget &&
+                               result.
+                                   taylorAttemptedJetCount <
+                                   request.taylor.
+                                       maximumJetCount) {
+                            if (pollCancellation())
+                                break;
+                            const PendingTaylorTile tile =
+                                pending.back();
+                            pending.pop_back();
+                            ScaledComplexBall
+                                parameterOffset;
+                            ScaledComplexValue
+                                parameterScale;
+                            ExpressionTaylorJetResult jet;
+                            size_t persistentBytes = 0;
+                            bool accepted = false;
+                            if (makeTaylorTileParameterization(
+                                    xOffsets, yOffsets,
+                                    tile, frameScale,
+                                    parameterOffset,
+                                    parameterScale)) {
+                                accepted = attemptJet(
+                                    parameterOffset,
+                                    parameterScale,
+                                    taylorTilePixels(tile),
+                                    tile.depth,
+                                    retainedTaylorBytes,
+                                    jet,
+                                    persistentBytes);
+                            } else {
+                                jet.status =
+                                    ExpressionTaylorJetStatus::
+                                        ExponentRange;
+                                jet.failureReason =
+                                    "Taylor tile normalization failed";
+                                recordJet(
+                                    jet, false,
+                                    taylorTilePixels(tile),
+                                    tile.depth);
+                            }
+                            if (cancelled.load(
+                                    std::memory_order_acquire) ||
+                                jet.status ==
+                                    ExpressionTaylorJetStatus::
+                                        Cancelled)
+                                break;
+                            if (accepted) {
+                                TaylorTileJet acceptedTile;
+                                acceptedTile.xBegin =
+                                    tile.xBegin;
+                                acceptedTile.yBegin =
+                                    tile.yBegin;
+                                acceptedTile.xEnd =
+                                    tile.xEnd;
+                                acceptedTile.yEnd =
+                                    tile.yEnd;
+                                acceptedTile.depth =
+                                    tile.depth;
+                                acceptedTile.jet =
+                                    std::move(jet);
+                                const int32_t jetIndex =
+                                    static_cast<int32_t>(
+                                        taylorTileJets.
+                                            size());
+                                taylorTileJets.push_back(
+                                    std::move(
+                                        acceptedTile));
+                                retainedTaylorBytes +=
+                                    persistentBytes;
+                                const TaylorTileJet&
+                                    retained =
+                                        taylorTileJets.back();
+                                tileMapHash =
+                                    mixTaylorTileHash(
+                                        tileMapHash,
+                                        retained);
+                                for (int y =
+                                         tile.yBegin;
+                                     y < tile.yEnd; ++y)
+                                    for (int x =
+                                             tile.xBegin;
+                                         x < tile.xEnd;
+                                         ++x)
+                                        taylorPixelJet[
+                                            static_cast<
+                                                size_t>(y) *
+                                                request.
+                                                    width +
+                                            x] = jetIndex;
+                            } else {
+                                if (result.
+                                            taylorAcceptedJetCount ==
+                                        0 &&
+                                    result.
+                                            taylorRejectedJetCount >=
+                                        request.taylor.
+                                            maximumRejectedBeforeFirstAcceptance) {
+                                    pending.clear();
+                                    continue;
+                                }
+                                if (jet.status ==
+                                        ExpressionTaylorJetStatus::
+                                            ResourceLimit) {
+                                    stopForBudget = true;
+                                    continue;
+                                }
+                                if (jet.failureReason ==
+                                        "Taylor cost predicts no tile benefit")
+                                    continue;
+                                std::array<
+                                    PendingTaylorTile, 4>
+                                    children;
+                                const size_t childCount =
+                                    splitTaylorTile(
+                                        tile,
+                                        request.taylor,
+                                        children);
+                                if (childCount != 0 &&
+                                    result.
+                                            taylorAttemptedJetCount +
+                                        pending.size() <
+                                        request.taylor.
+                                            maximumJetCount) {
+                                    ++result.
+                                        taylorTileSplitCount;
+                                    const size_t available =
+                                        request.taylor.
+                                            maximumJetCount -
+                                        result.
+                                            taylorAttemptedJetCount -
+                                        pending.size();
+                                    const size_t
+                                        retainedChildren =
+                                            std::min(
+                                                childCount,
+                                                available);
+                                    for (size_t child =
+                                             retainedChildren;
+                                         child > 0; --child)
+                                        pending.push_back(
+                                            children[
+                                                child - 1]);
+                                }
+                            }
+                        }
+                        if (cancelled.load(
+                                std::memory_order_acquire))
+                            return fail(
+                                ExpressionDeepRenderStatus::
+                                    Cancelled,
+                                "render cancelled while planning Taylor tiles");
+                        useTaylor =
+                            !taylorTileJets.empty();
+                        if (useTaylor)
+                            result.taylorTileMapHash =
+                                tileMapHash;
+                    }
+                    if (!plannerReady ||
+                        taylorTileJets.empty()) {
+                        std::vector<TaylorTileJet>().swap(
+                            taylorTileJets);
+                        std::vector<int32_t>().swap(
+                            taylorPixelJet);
+                        retainedTaylorBytes = 0;
+                    }
+                }
+                if (result.taylorAcceptedPixelCoverage !=
+                        0)
+                    result.taylorWeightedLanding =
+                        static_cast<double>(
+                            weightedLandingTotal /
+                            static_cast<long double>(
+                                result.
+                                    taylorAcceptedPixelCoverage));
+                result.taylorAccepted = useTaylor;
+                result.taylorRetainedBytes =
+                    retainedTaylorBytes;
+                if (useTaylor) {
                     size_t fastWithTaylor = rendererBytes;
                     size_t buildWithTaylor =
                         rendererBaseBytes;
-                    if (useTaylor &&
-                        (!checkedAddSize(
-                             fastWithTaylor, 1,
-                             persistentTaylorBytes) ||
-                         !checkedAddSize(
-                             buildWithTaylor, 1,
-                             taylorJet.memoryBytes))) {
+                    if (!checkedAddSize(
+                            fastWithTaylor, 1,
+                            retainedTaylorBytes) ||
+                        !checkedAddSize(
+                            buildWithTaylor, 1,
+                            taylorBuildPeakBytes)) {
                         useTaylor = false;
                         result.taylorFailureReason =
                             "Taylor peak memory calculation overflow";
@@ -1709,18 +2575,16 @@ bool renderExpressionDeepFrame(
                     const size_t withTaylor = std::max(
                         fastWithTaylor, buildWithTaylor);
                     if (useTaylor &&
-                        (request.memory.memoryLimitBytes != 0 &&
+                        request.memory.memoryLimitBytes != 0 &&
                          (reference.memoryBytes >
                               request.memory.memoryLimitBytes ||
                           withTaylor >
                               request.memory.memoryLimitBytes -
-                                  reference.memoryBytes))) {
+                                  reference.memoryBytes)) {
                         useTaylor = false;
                         result.taylorFailureReason =
                             "Taylor coefficients exceed renderer memory policy";
                     } else if (useTaylor) {
-                        retainedTaylorBytes =
-                            persistentTaylorBytes;
                         rendererBytes = withTaylor;
                         result.rendererBytes = rendererBytes;
                     }
@@ -1732,8 +2596,16 @@ bool renderExpressionDeepFrame(
                         taylorJet.coefficientRadii);
                     std::vector<ScaledRealValue>().swap(
                         taylorJet.intermediateEscapeMargins);
+                    std::vector<TaylorTileJet>().swap(
+                        taylorTileJets);
+                    std::vector<int32_t>().swap(
+                        taylorPixelJet);
+                    retainedTaylorBytes = 0;
+                    useGlobalTaylor = false;
                 }
                 result.taylorAccepted = useTaylor;
+                result.taylorRetainedBytes =
+                    retainedTaylorBytes;
             }
             if (runFast &&
                 certifiedTaylorCapability(
@@ -1975,7 +2847,33 @@ bool renderExpressionDeepFrame(
                                         pixel.output = 0.0f;
                                     } else {
                                         int firstIteration = 0;
-                                        if (useTaylor) {
+                                        const ExpressionTaylorJetResult*
+                                            pixelTaylorJet =
+                                                nullptr;
+                                        if (useGlobalTaylor) {
+                                            pixelTaylorJet =
+                                                &taylorJet;
+                                        } else if (
+                                            !taylorPixelJet.
+                                                empty()) {
+                                            const int32_t
+                                                mappedJet =
+                                                    taylorPixelJet[
+                                                        index];
+                                            if (mappedJet >= 0 &&
+                                                static_cast<
+                                                    size_t>(
+                                                    mappedJet) <
+                                                    taylorTileJets.
+                                                        size())
+                                                pixelTaylorJet =
+                                                    &taylorTileJets[
+                                                        static_cast<
+                                                            size_t>(
+                                                            mappedJet)].
+                                                        jet;
+                                        }
+                                        if (pixelTaylorJet) {
                                             const Clock::time_point
                                                 evaluationStart =
                                                     Clock::now();
@@ -1983,9 +2881,11 @@ bool renderExpressionDeepFrame(
                                             ScaledComplexBall
                                                 landingDelta;
                                             bool landed = false;
-                                            if (makeExpressionTaylorNormalizedQ(
+                                            if (makeExpressionTaylorLocalQ(
                                                     offset,
-                                                    taylorJet.
+                                                    pixelTaylorJet->
+                                                        parameterOffset,
+                                                    pixelTaylorJet->
                                                         parameterScale,
                                                     q) &&
                                                 expressionTaylorQInsideUnitDisk(
@@ -1994,7 +2894,7 @@ bool renderExpressionDeepFrame(
                                                     landing;
                                                 if (ExpressionTaylorJetEvaluator::
                                                         evaluate(
-                                                            taylorJet,
+                                                            *pixelTaylorJet,
                                                             q,
                                                             landing)) {
                                                     landingDelta =
@@ -2002,7 +2902,7 @@ bool renderExpressionDeepFrame(
                                                     const ExpressionReferenceSample&
                                                         landingSample =
                                                             reference.samples[
-                                                                taylorJet.
+                                                                pixelTaylorJet->
                                                                     landingSample];
                                                     ScaledComplexBall
                                                         landingBase;
@@ -2010,11 +2910,11 @@ bool renderExpressionDeepFrame(
                                                         landingValue;
                                                     arithmetic =
                                                         makeScaledComplexValue(
-                                                            taylorJet.
+                                                            pixelTaylorJet->
                                                                 landingUsesSampleOutput
                                                             ? landingSample.next
                                                             : landingSample.z,
-                                                            taylorJet.
+                                                            pixelTaylorJet->
                                                                 landingUsesSampleOutput
                                                             ? landingSample.
                                                                   rootDefect
@@ -2068,7 +2968,7 @@ bool renderExpressionDeepFrame(
                                                 stateDelta =
                                                     landingDelta;
                                                 firstIteration =
-                                                    taylorJet.
+                                                    pixelTaylorJet->
                                                         landingIteration;
                                                 taylorAcceptedPixels.
                                                     fetch_add(
@@ -2097,6 +2997,22 @@ bool renderExpressionDeepFrame(
                                                     firstIteration =
                                                         request.maxIterations;
                                                 }
+                                            }
+                                        } else if (useTaylor) {
+                                            taylorFallbackPixels.
+                                                fetch_add(
+                                                    1,
+                                                    std::memory_order_relaxed);
+                                            if (certifiedTaylorCapability(
+                                                    result.capability) &&
+                                                !piecewisePerStepEligible &&
+                                                !request.
+                                                    allowUncertifiedForBenchmark) {
+                                                pixel.reason =
+                                                    ExpressionDeepFallbackReason::
+                                                        CertificationFailure;
+                                                firstIteration =
+                                                    request.maxIterations;
                                             }
                                         }
                                         const Clock::time_point
@@ -2283,7 +3199,7 @@ bool renderExpressionDeepFrame(
                                                 break;
                                             }
                                         }
-                                        if (useTaylor)
+                                        if (pixelTaylorJet)
                                             taylorResidualNanoseconds.
                                                 fetch_add(
                                                     static_cast<uint64_t>(
