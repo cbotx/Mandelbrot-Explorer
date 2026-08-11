@@ -55,7 +55,7 @@ struct ExpressionDeepTaylorPolicy {
     int minimumTileWidth = 4;
     int minimumTileHeight = 4;
     size_t maximumJetCount = 256;
-    size_t maximumRejectedBeforeFirstAcceptance = 8;
+    size_t maximumRejectedBeforeFirstAcceptance = 2;
     // Zero uses the remaining renderer memory budget.
     size_t maximumJetMemoryBytes = 0;
     // Reject a built jet when its certified work estimate cannot amortize

@@ -3698,7 +3698,8 @@ inline int Mandel::getIndex(int i, int j, int u, int v) const {
 }
 
 void Mandel::SetHalt(bool flag) {
-    _flag_halt = flag;
+    _haltRequested.store(flag, std::memory_order_release);
+    _flag_halt.store(flag, std::memory_order_release);
 }
 
 void Mandel::SetProgress(std::atomic<float>* progress, float offset, float scale) {

@@ -137,6 +137,9 @@ public:
     uint8_t* getImage() const;
 
     void SetHalt(bool flag);
+    bool HaltRequested() const {
+        return _haltRequested.load(std::memory_order_acquire);
+    }
     void SetProgress(std::atomic<float>* progress, float offset = 0.0f, float scale = 1.0f);
     double escapeRadius() const {
         return _customEscapeRadiusActive
@@ -329,7 +332,8 @@ private:
     bool attractor(double z_in_re, double z_in_im, const double c_re, const double c_im, int period) const;
 
 private:
-    volatile bool _flag_halt = false;
+    std::atomic_bool _flag_halt{false};
+    std::atomic_bool _haltRequested{false};
     std::atomic<float>* _progress = nullptr;
     std::atomic<int> _progress_done{0};
     std::atomic<long long> _deepGmpFallbackPixels{0};

@@ -12916,7 +12916,7 @@ static int runGenericFormulaProfile() {
             formula::ExpressionJit4 jit;
             formula::ExpressionContext contexts[4]{};
             float results[4]{};
-            volatile bool halt = true;
+            std::atomic_bool halt{true};
             bool cancelled =
                 identity.compile("z", &error) &&
                 jit.compile(identity) &&
@@ -14272,7 +14272,13 @@ static int runCustomDeepZoomCase() {
     expect(!plan(quadratic, FormulaParameter::C, bailout,
                  ExpressionColoring::Raw, above)
                 .canZoomBeyondDirectLimit(),
-           "raw rejected");
+           "quadratic specialized raw adapter remains unavailable");
+    expect(formula::makeExpressionProductionPlan(
+               quadratic.source, quadratic.runtime, quadratic.fixed,
+               FormulaParameter::C, bailout, ExpressionColoring::Raw,
+               above, capabilityCenterRe, capabilityCenterIm, 48, 32)
+               .usesGenericCertifiedDeep(),
+           "raw quadratic receives generic certified deep fallback");
     auto featherPlan =
         plan(quadratic, FormulaParameter::C, bailout,
              ExpressionColoring::Feather, above);
@@ -14398,11 +14404,30 @@ static int runCustomDeepZoomCase() {
         expect(nav.SetExpressionFormula(
                    "z*z+c+0", FormulaParameter::C, {}, {}, parameters,
                    bailout, &error),
-               "incompatible formula apply succeeds");
+               "generic raw formula apply succeeds");
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(scale, 1e15) == 0,
+               "generic raw apply preserves deep view");
+        expect(!nav.GetCustomDeepZoomPlan()
+                    .usesQuadraticPerturbation() &&
+               nav.GetExpressionAccelerationText().find(
+                   "generic deep") != std::string::npos,
+               "navigator reports generic deep dispatch");
+        nav.ZoomIn(8, 6);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        nav.Update();
+        nav.UpdateCoords();
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(
+                   scale, 1e15) > 0,
+               "generic raw interactive zoom crosses cap");
+        nav.JumpReset();
+
+        nav.SetCMethod(ColoringMethod::STRIPE_AVERAGE);
         nav.GetView(re, im, scale);
         expect(mpf_cmp_d(
                    scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0,
-               "incompatible apply clamps transactionally");
+               "generic Feather switch clamps transactionally");
         nav.ZoomIn(8, 6);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         nav.Update();
@@ -14410,7 +14435,21 @@ static int runCustomDeepZoomCase() {
         nav.GetView(re, im, scale);
         expect(mpf_cmp_d(
                    scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0,
-               "incompatible interactive zoom remains capped");
+               "generic Feather interactive zoom remains capped");
+        nav.JumpReset();
+        nav.SetCMethod(0);
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(
+                   scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0,
+               "returning to raw does not restore lost depth");
+        nav.ZoomIn(8, 6);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        nav.Update();
+        nav.UpdateCoords();
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(
+                   scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) > 0,
+               "returning to raw permits further zoom");
         nav.JumpReset();
 
         expect(nav.SetExpressionFormula(
@@ -14474,6 +14513,111 @@ static int runCustomDeepZoomCase() {
         mpf_clears(re, im, scale, (mpf_ptr)0);
     }
     {
+        MandelNavigator nav(16, 12, 1, 200, 1.0, 1.0);
+        std::array<Complex, 8> parameters{};
+        ExpressionError error;
+        const std::string deepScale = "1e500";
+        const std::string deepCenter =
+            "-0.75" + std::string(497, '0') + "1";
+        expect(nav.SetLocation(deepCenter, "0", deepScale),
+               "generic e500 Mandel setup");
+        expect(nav.SetExpressionFormula(
+                   "z*z+c+0", FormulaParameter::C, {}, {}, parameters,
+                   bailout, &error),
+               "generic c-plane raw apply");
+        mpf_t re, im, scale;
+        mpf_inits(re, im, scale, (mpf_ptr)0);
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(scale, 1e100) > 0 &&
+               nav.GetExpressionAccelerationText().find(
+                   "generic deep") != std::string::npos,
+               "generic c-plane e500 accepted");
+        const std::string exactText = nav.GetLocationText(true);
+        auto lineValue = [&](const char* key) {
+            const size_t begin = exactText.find(key);
+            if (begin == std::string::npos)
+                return std::string();
+            const size_t valueBegin = begin + strlen(key);
+            const size_t end =
+                exactText.find_first_of("\r\n", valueBegin);
+            return exactText.substr(
+                valueBegin,
+                end == std::string::npos
+                    ? std::string::npos : end - valueBegin);
+        };
+        const std::string copiedX = lineValue("x: ");
+        const std::string copiedY = lineValue("y: ");
+        const std::string copiedScale = lineValue("zoom: ");
+        MandelNavigator roundTrip(
+            16, 12, 1, 200, 1.0, 1.0);
+        expect(roundTrip.SetLocation(
+                   copiedX, copiedY, copiedScale,
+                   nav.GetViewPrecision()),
+               "exact e500 location text reparses");
+        mpf_t copiedRe, copiedIm, copiedZoom;
+        mpf_inits(
+            copiedRe, copiedIm, copiedZoom, (mpf_ptr)0);
+        roundTrip.GetView(copiedRe, copiedIm, copiedZoom);
+        const std::string recopied =
+            roundTrip.GetLocationText(true);
+        expect(copiedX.rfind(deepCenter, 0) == 0 &&
+               recopied.find("x: " + deepCenter) !=
+                   std::string::npos &&
+               copiedScale.find("e+500") !=
+                   std::string::npos &&
+               recopied.find("e+500") != std::string::npos,
+               "exact e500 coordinate digits roundtrip");
+
+        expect(nav.SetExpressionFormula(
+                   "z*z+c+0", FormulaParameter::InitialZ,
+                   {}, { -0.2, 0.1 }, parameters,
+                   bailout, &error),
+               "generic z0-plane raw apply");
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(scale, 1e100) > 0,
+               "generic z0-plane preserves e500 view");
+        nav.SetCMethod(ColoringMethod::ORBIT_TRAP);
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(
+                   scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0,
+               "generic OrbitTrap clamps at direct limit");
+        nav.SetCMethod(0);
+        expect(nav.SetLocation("8", "0", deepScale),
+               "generic raw accepts arbitrary e500 center");
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(scale, 1e100) > 0 &&
+               mpf_cmp_ui(re, 8) == 0,
+               "generic raw tentative center is not quadratic-gated");
+        nav.ZoomIn(0, 0);
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(10));
+        nav.Update();
+        nav.UpdateCoords();
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(scale, 1e100) > 0,
+               "generic raw wheel tentative view remains e500-capable");
+        nav.JumpReset();
+        expect(nav.SetExpressionFormula(
+                   "z*z*z+c", FormulaParameter::C,
+                   {}, {}, parameters, bailout, &error),
+               "unsupported smooth generic formula applies");
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(
+                   scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0,
+               "unsupported deep formula switch clamps transactionally");
+        const std::string unsupportedScale =
+            "1" + std::string(20000, '0');
+        expect(nav.SetLocation("0", "0", unsupportedScale),
+               "over-limit generic location parses");
+        nav.GetView(re, im, scale);
+        expect(mpf_cmp_d(
+                   scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0,
+               "generic precision cap prevents an unrenderable view");
+        mpf_clears(
+            copiedRe, copiedIm, copiedZoom,
+            re, im, scale, (mpf_ptr)0);
+    }
+    {
         MandelNavigator julia(16, 12, 1, 1000, 1.0, 1.0);
         julia.SetJuliaMode(true);
         expect(julia.SetLocation("0", "0", "1000000000000001"),
@@ -14484,7 +14628,70 @@ static int runCustomDeepZoomCase() {
         expect(mpf_cmp_d(
                    scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) == 0,
                "Julia remains capped");
+        expect(julia.SetJuliaC("0.3", "-0.2"),
+               "legacy Julia constants without a precision hint remain valid");
+        const std::string juliaConstant =
+            "0." + std::string(80, '0') + "1";
+        expect(julia.SetJuliaC(
+                   juliaConstant, "-0", 256),
+               "Julia precision hint accepted");
+        mpf_t cRe, cIm;
+        mpf_inits(cRe, cIm, (mpf_ptr)0);
+        julia.GetJuliaC(cRe, cIm);
+        expect(mpf_get_prec(cRe) == 256 &&
+               mpf_get_prec(cIm) == 256,
+               "Julia precision hint applied exactly");
+        const std::string juliaCopy =
+            julia.GetLocationText(true);
+        const size_t hintAt =
+            juliaCopy.find("precision: ");
+        expect(hintAt != std::string::npos &&
+               juliaCopy.find("precision: 256", hintAt) !=
+                   std::string::npos,
+               "Julia copy preserves bounded precision hint");
+        mpf_clears(cRe, cIm, (mpf_ptr)0);
         mpf_clears(re, im, scale, (mpf_ptr)0);
+    }
+    {
+        MandelNavigator nav(
+            9, 7, 1, 1000000, 1.0, 1.0);
+        std::array<Complex, 8> parameters{};
+        ExpressionError error;
+        expect(nav.SetLocation("0", "0", "1e500") &&
+               nav.SetExpressionFormula(
+                   "z*z+c+0", FormulaParameter::C,
+                   {}, {}, parameters, bailout, &error),
+               "generic lifetime setup");
+        nav.StartCompute();
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(2));
+        const auto swapStart =
+            std::chrono::steady_clock::now();
+        const bool swapped = nav.SetExpressionFormula(
+            "sin(z)+c", FormulaParameter::C,
+            {}, {}, parameters, bailout, &error);
+        const double swapSeconds =
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() -
+                swapStart).count();
+        expect(swapped && swapSeconds < 3.0 &&
+               !nav.IsComputing(),
+               "formula reapply interrupts before pointer swap");
+        nav.SetMxit(32);
+        nav.StartCompute();
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::seconds(5);
+        while (nav.IsComputing() &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(2));
+        const GenericDeepInfo info =
+            nav.GetLastGenericDeepInfo();
+        expect(!nav.IsComputing() &&
+               nav.LastComputeUsedGenericDeepPath() &&
+               info.success,
+               "reapplied formula owns stable async request state");
     }
     {
         MandelNavigator fromJulia(16, 12, 1, 1000, 1.0, 1.0);
@@ -15967,6 +16174,412 @@ static int runBackendCase() {
     return failures == 0 ? 0 : 1;
 }
 
+static int runGenericDeepBackendCase() {
+    using formula::ExpressionContext;
+    using formula::ExpressionDeepRenderRequest;
+    using formula::ExpressionDeepRenderResult;
+    using formula::ExpressionError;
+    using formula::ExpressionProgram;
+
+    struct Case {
+        const char* name;
+        const char* source;
+        FormulaParameter pixel;
+        formula::Complex fixedC;
+        double centerRe;
+        double centerIm;
+    };
+    const Case cases[] = {
+        { "arithmetic-c", "z*z+c+0", FormulaParameter::C,
+          {}, -0.75, 0.0 },
+        { "arithmetic-z0", "z*z+c+0", FormulaParameter::InitialZ,
+          { -0.1, 0.2 }, 0.0, 0.0 },
+        { "sin-exp-c", "0.1*sin(z)+0.01*exp(z)+c",
+          FormulaParameter::C, {}, 0.0, 0.0 },
+        { "division-tan-c", "0.1*z/(c+3)+0.01*tan(z)+c",
+          FormulaParameter::C, {}, 0.0, 0.0 },
+        { "branch-c",
+          "0.01*log(z+3)+0.01*sqrt(z+4)+"
+          "0.01*pow(z+2,complex(0.5,0))+c",
+          FormulaParameter::C, {}, 0.0, 0.0 },
+        { "branch-cut-fallback", "0.001*log(c)",
+          FormulaParameter::C, {}, -1.0, 0.0 },
+        { "real-conj-norm-c",
+          "0.1*conj(z)+0.01*norm(z)+"
+          "complex(0.1*real(c),0.1*imag(c))",
+          FormulaParameter::C, {}, 0.0, 0.0 },
+        { "burning-ship-c",
+          "0.2*sqr(complex(abs(real(z)),abs(imag(z))))+c",
+          FormulaParameter::C, {}, -0.4, -0.2 },
+        { "arg-polar-c",
+          "0.1*arg(z+2)+"
+          "0.1*polar(abs(real(c))+1,arg(c+2))",
+          FormulaParameter::C, {}, 0.0, 0.0 },
+        { "sin-z0", "sin(z)+c+0",
+          FormulaParameter::InitialZ, { -0.2, 0.1 }, 0.0, 0.0 }
+    };
+
+    constexpr int W = 7;
+    constexpr int H = 5;
+    constexpr int MXIT = 24;
+    int failures = 0;
+    mpf_t centerRe, centerIm, scale;
+    mpf_init2(centerRe, 2048);
+    mpf_init2(centerIm, 2048);
+    mpf_init2(scale, 2048);
+    mpf_set_str(scale, "1e500", 10);
+    GenericDeepInfo arithmeticInfo;
+    GenericDeepInfo fallbackInfo;
+
+    for (const Case& test : cases) {
+        ExpressionProgram canonical;
+        ExpressionProgram runtime;
+        ExpressionContext fixed;
+        fixed.c = test.fixedC;
+        ExpressionError error;
+        bool okay =
+            canonical.compile(test.source, &error) &&
+            canonical.specialize(
+                fixed, test.pixel, runtime, &error);
+        mpf_set_d(centerRe, test.centerRe);
+        mpf_set_d(centerIm, test.centerIm);
+        std::vector<float> backendOutput(
+            (size_t)W * H, EMPTYPIXEL);
+        std::vector<float> directOutput(
+            backendOutput.size(), EMPTYPIXEL);
+        std::vector<float> mpfrOutput(
+            backendOutput.size(), EMPTYPIXEL);
+        Mandel engine(W, H, MXIT, 1, backendOutput.data());
+        engine.setPrecision(2048);
+        std::atomic<float> progress{0.0f};
+        std::unique_ptr<IComputeBackend> backend =
+            createComputeBackend("cpu");
+        ComputeRequest request;
+        request.mode = ComputeMode::Expression;
+        request.cpuEngine = &engine;
+        request.centerRe = centerRe;
+        request.centerIm = centerIm;
+        request.scale = scale;
+        request.width = W;
+        request.height = H;
+        request.sub = 1;
+        request.maxIterations = MXIT;
+        request.iterations = backendOutput.data();
+        request.progress = &progress;
+        request.expressionSource = &canonical;
+        request.expression = &runtime;
+        request.expressionFixed = &fixed;
+        request.expressionPixel = test.pixel;
+        request.expressionBailout = 4.0;
+        request.expressionColoring =
+            formula::ExpressionColoring::Raw;
+        backend->resetCancellation();
+        okay = okay && backend->compute(request);
+
+        ExpressionDeepRenderRequest directRequest;
+        directRequest.canonicalProgram = &canonical;
+        directRequest.runtimeProgram = &runtime;
+        directRequest.center.realMpf = centerRe;
+        directRequest.center.imaginaryMpf = centerIm;
+        directRequest.scale.mpf = scale;
+        directRequest.fixed = fixed;
+        directRequest.pixelParameter = test.pixel;
+        directRequest.width = W;
+        directRequest.height = H;
+        directRequest.maxIterations = MXIT;
+        directRequest.bailout = 4.0;
+        directRequest.output = directOutput.data();
+        directRequest.outputCount = directOutput.size();
+        directRequest.precision.viewBits = 2048;
+        ExpressionDeepRenderResult directResult;
+        okay = okay &&
+            formula::renderExpressionDeepFrame(
+                directRequest, directResult);
+
+        ExpressionDeepRenderRequest mpfrRequest = directRequest;
+        mpfrRequest.output = mpfrOutput.data();
+        mpfrRequest.forceMpfrFallbackForVerification = true;
+        ExpressionDeepRenderResult mpfrResult;
+        okay = okay &&
+            formula::renderExpressionDeepFrame(
+                mpfrRequest, mpfrResult);
+
+        const GenericDeepInfo info =
+            backend->lastGenericDeepInfo();
+        const bool exact =
+            backendOutput == directOutput &&
+            backendOutput == mpfrOutput;
+        const bool telemetry =
+            backend->lastComputeUsedGenericDeepPath() &&
+            !backend->lastComputeUsedCustomDeepPath() &&
+            info.used && info.settled && info.success &&
+            info.pixelCount == backendOutput.size() &&
+            progress.load(std::memory_order_relaxed) == 1.0f &&
+            info.fastPixelCount ==
+                directResult.fastPixelCount &&
+            info.fallbackPixelCount ==
+                directResult.fallbackPixelCount;
+        if (!okay || !exact || !telemetry) {
+            ++failures;
+            printf(
+                "  generic backend failed [%s] okay=%d exact=%d "
+                "used/success=%d/%d fast/fallback=%llu/%llu "
+                "status=%s error=%s\n",
+                test.name, okay ? 1 : 0, exact ? 1 : 0,
+                info.used ? 1 : 0, info.success ? 1 : 0,
+                (unsigned long long)info.fastPixelCount,
+                (unsigned long long)info.fallbackPixelCount,
+                info.status.c_str(), info.error.c_str());
+        }
+        if (strcmp(test.name, "arithmetic-c") == 0)
+            arithmeticInfo = info;
+        if (strcmp(test.name, "branch-cut-fallback") == 0)
+            fallbackInfo = info;
+    }
+
+    ExpressionProgram genericCanonical;
+    ExpressionProgram genericRuntime;
+    ExpressionContext genericFixed;
+    ExpressionError genericError;
+    bool genericReady =
+        genericCanonical.compile("z*z+c+0", &genericError) &&
+        genericCanonical.specialize(
+            genericFixed, FormulaParameter::C,
+            genericRuntime, &genericError);
+    mpf_set_ui(centerRe, 0);
+    mpf_set_ui(centerIm, 0);
+    std::vector<float> unsupported(
+        (size_t)W * H, EMPTYPIXEL);
+    Mandel unsupportedEngine(
+        W, H, MXIT, 1, unsupported.data());
+    std::unique_ptr<IComputeBackend> backend =
+        createComputeBackend("cpu");
+    ComputeRequest request;
+    request.mode = ComputeMode::Expression;
+    request.cpuEngine = &unsupportedEngine;
+    request.centerRe = centerRe;
+    request.centerIm = centerIm;
+    request.scale = scale;
+    request.width = W;
+    request.height = H;
+    request.sub = 1;
+    request.maxIterations = MXIT;
+    request.iterations = unsupported.data();
+    request.expressionSource = &genericCanonical;
+    request.expression = &genericRuntime;
+    request.expressionFixed = &genericFixed;
+    request.expressionPixel = FormulaParameter::C;
+    request.expressionBailout = 4.0;
+    request.expressionColoring =
+        formula::ExpressionColoring::Feather;
+    backend->resetCancellation();
+    if (!genericReady || backend->compute(request) ||
+        backend->lastComputeUsedGenericDeepPath() ||
+        std::count(
+            unsupported.begin(), unsupported.end(),
+            EMPTYPIXEL) != (ptrdiff_t)unsupported.size()) {
+        ++failures;
+        printf("  unsupported deep coloring did not fail empty\n");
+    }
+
+    std::vector<float> shallow(
+        (size_t)W * H, EMPTYPIXEL);
+    std::vector<float> shallowExpected(
+        shallow.size(), EMPTYPIXEL);
+    Mandel shallowEngine(W, H, MXIT, 1, shallow.data());
+    Mandel shallowOracle(
+        W, H, MXIT, 1, shallowExpected.data());
+    mpf_set_d(scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT);
+    request.cpuEngine = &shallowEngine;
+    request.iterations = shallow.data();
+    request.expressionColoring =
+        formula::ExpressionColoring::Raw;
+    const bool shallowExpectedOkay =
+        shallowOracle.ComputeExpression(
+            centerRe, centerIm, scale, genericRuntime,
+            genericFixed, FormulaParameter::C, MXIT, 4.0,
+            formula::ExpressionColoring::Raw);
+    backend->resetCancellation();
+    if (!shallowExpectedOkay || !backend->compute(request) ||
+        backend->lastComputeUsedGenericDeepPath() ||
+        shallow != shallowExpected) {
+        ++failures;
+        printf("  scale<=1e12 direct dispatch changed\n");
+    }
+
+    ExpressionProgram undefinedCanonical;
+    ExpressionProgram undefinedRuntime;
+    ExpressionContext undefinedFixed;
+    bool undefinedReady =
+        undefinedCanonical.compile(
+            "1/(z-z)", &genericError) &&
+        undefinedCanonical.specialize(
+            undefinedFixed, FormulaParameter::InitialZ,
+            undefinedRuntime, &genericError);
+    mpf_set_str(scale, "1e500", 10);
+    std::fill(
+        unsupported.begin(), unsupported.end(), EMPTYPIXEL);
+    request.cpuEngine = &unsupportedEngine;
+    request.iterations = unsupported.data();
+    request.expressionSource = &undefinedCanonical;
+    request.expression = &undefinedRuntime;
+    request.expressionFixed = &undefinedFixed;
+    request.expressionPixel = FormulaParameter::InitialZ;
+    backend->resetCancellation();
+    const bool undefinedResult = backend->compute(request);
+    const GenericDeepInfo undefinedInfo =
+        backend->lastGenericDeepInfo();
+    if (!undefinedReady || undefinedResult ||
+        !backend->lastComputeUsedGenericDeepPath() ||
+        undefinedInfo.success ||
+        undefinedInfo.status != "undefined-pixel" ||
+        std::count(
+            unsupported.begin(), unsupported.end(),
+            EMPTYPIXEL) != (ptrdiff_t)unsupported.size()) {
+        ++failures;
+        printf(
+            "  undefined generic frame was success-shaped "
+            "status=%s error=%s\n",
+            undefinedInfo.status.c_str(),
+            undefinedInfo.error.c_str());
+    }
+
+    std::unique_ptr<IComputeBackend> warp =
+        createComputeBackend("warp");
+    if (!warp || warp->info().fallback) {
+        ++failures;
+    } else {
+        std::fill(
+            unsupported.begin(), unsupported.end(), EMPTYPIXEL);
+        request.cpuEngine = &unsupportedEngine;
+        request.iterations = unsupported.data();
+        request.expressionSource = &genericCanonical;
+        request.expression = &genericRuntime;
+        request.expressionFixed = &genericFixed;
+        request.expressionPixel = FormulaParameter::C;
+        warp->resetCancellation();
+        const bool warpOkay = warp->compute(request);
+        const GenericDeepInfo warpInfo =
+            warp->lastGenericDeepInfo();
+        if (!warpOkay || warp->lastComputeUsedGpuPath() ||
+            !warp->lastComputeUsedGenericDeepPath() ||
+            !warpInfo.used || !warpInfo.success) {
+            ++failures;
+            printf("  D3D generic deep CPU delegation failed\n");
+        }
+    }
+
+    ExpressionProgram cancelCanonical;
+    ExpressionProgram cancelRuntime;
+    ExpressionContext cancelFixed;
+    const bool cancelReady =
+        cancelCanonical.compile("z*z+c+0", &genericError) &&
+        cancelCanonical.specialize(
+            cancelFixed, FormulaParameter::C,
+            cancelRuntime, &genericError);
+    constexpr int CW = 9;
+    constexpr int CH = 7;
+    constexpr int CMAX = 1000000;
+    std::vector<float> cancelled(
+        (size_t)CW * CH, EMPTYPIXEL);
+    Mandel cancelEngine(
+        CW, CH, CMAX, 1, cancelled.data());
+    ComputeRequest cancelRequest;
+    cancelRequest.mode = ComputeMode::Expression;
+    cancelRequest.cpuEngine = &cancelEngine;
+    cancelRequest.centerRe = centerRe;
+    cancelRequest.centerIm = centerIm;
+    cancelRequest.scale = scale;
+    cancelRequest.width = CW;
+    cancelRequest.height = CH;
+    cancelRequest.sub = 1;
+    cancelRequest.maxIterations = CMAX;
+    cancelRequest.iterations = cancelled.data();
+    cancelRequest.expressionSource = &cancelCanonical;
+    cancelRequest.expression = &cancelRuntime;
+    cancelRequest.expressionFixed = &cancelFixed;
+    cancelRequest.expressionPixel = FormulaParameter::C;
+    cancelRequest.expressionBailout = 1e100;
+    cancelRequest.expressionColoring =
+        formula::ExpressionColoring::Raw;
+    backend->resetCancellation();
+    auto future = std::async(std::launch::async, [&] {
+        return backend->compute(cancelRequest);
+    });
+    for (int wait = 0; wait < 200; ++wait) {
+        const GenericDeepInfo info =
+            backend->lastGenericDeepInfo();
+        if (info.used && !info.settled) break;
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(1));
+    }
+    const auto cancelStart =
+        std::chrono::steady_clock::now();
+    backend->cancel();
+    const bool bounded =
+        future.wait_for(std::chrono::seconds(3)) ==
+        std::future_status::ready;
+    const bool cancelResult = bounded ? future.get() : true;
+    const double cancelSeconds =
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() -
+            cancelStart).count();
+    const GenericDeepInfo cancelInfo =
+        backend->lastGenericDeepInfo();
+    backend->resetCancellation();
+    const size_t empty = std::count(
+        cancelled.begin(), cancelled.end(), EMPTYPIXEL);
+    if (!cancelReady || !bounded || cancelResult ||
+        cancelSeconds >= 3.0 || !cancelInfo.cancelled ||
+        cancelInfo.status != "cancelled" || empty == 0) {
+        ++failures;
+        printf(
+            "  generic cancellation failed bounded/result/time/"
+            "empty/status=%d/%d/%.3f/%zu/%s\n",
+            bounded ? 1 : 0, cancelResult ? 1 : 0,
+            cancelSeconds, empty, cancelInfo.status.c_str());
+    }
+
+    const double fallbackRate = arithmeticInfo.pixelCount
+        ? 100.0 * arithmeticInfo.fallbackPixelCount /
+            arithmeticInfo.pixelCount
+        : 100.0;
+    if (!arithmeticInfo.success ||
+        arithmeticInfo.fastPixelCount == 0 ||
+        arithmeticInfo.fallbackPixelCount ==
+            arithmeticInfo.pixelCount)
+        ++failures;
+    if (!fallbackInfo.success ||
+        fallbackInfo.fallbackPixelCount == 0)
+        ++failures;
+    printf("=== generic certified deep production backend\n");
+    printf(
+        "  e500 c/z0 arithmetic, entire, meromorphic, branch, "
+        "real/piecewise, Arg/Polar exact MPFR parity\n");
+    printf(
+        "  arithmetic total/reference/Taylor/fallback "
+        "%.6f/%.6f/%.6f/%.6f s; fallback=%llu/%llu (%.2f%%)\n",
+        arithmeticInfo.totalSeconds,
+        arithmeticInfo.referenceSeconds,
+        arithmeticInfo.taylorSeconds,
+        arithmeticInfo.fallbackSeconds,
+        (unsigned long long)
+            arithmeticInfo.fallbackPixelCount,
+        (unsigned long long)arithmeticInfo.pixelCount,
+        fallbackRate);
+    printf("  branch-cut fallback=%llu/%llu\n",
+           (unsigned long long)
+               fallbackInfo.fallbackPixelCount,
+           (unsigned long long)fallbackInfo.pixelCount);
+    printf("  cancellation %.3f s empty=%zu/%zu\n",
+           cancelSeconds, empty, cancelled.size());
+    printf("  => %s\n\n",
+           failures == 0 ? "PASS"
+                         : "CHECK (generic deep integration failure)");
+    mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+    return failures == 0 ? 0 : 1;
+}
+
 static int runGpuBenchmarkCase(int width, int height) {
     std::unique_ptr<IComputeBackend> gpu = createComputeBackend("gpu");
     printf("=== D3D11 hardware GPU benchmark\n");
@@ -16218,6 +16831,7 @@ int main(int argc, char** argv) {
     if (which == "formula-bench")              rc |= runGenericFormulaProfile();
     if (which == "multibrot")                  rc |= runMultibrotCase();
     if (which == "backend")                    rc |= runBackendCase();
+    if (which == "generic-deep")               rc |= runGenericDeepBackendCase();
     if (which == "gpu")
         rc |= runGpuBenchmarkCase(
             argc > 2 ? W : 1920, argc > 3 ? H : 1080);

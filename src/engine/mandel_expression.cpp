@@ -51,7 +51,7 @@ int cubicSeriesOrder(
 CubicSeries buildCubicSeries(
         const std::vector<formula::Complex>& orbit,
         FormulaParameter pixelParameter, formula::Complex scale,
-        int mxit, double bailout, volatile bool* halt) {
+        int mxit, double bailout, const std::atomic_bool* halt) {
     CubicSeries best;
     best.scale = scale;
     if (scale == formula::Complex{} ||
@@ -182,7 +182,7 @@ bool solveIntegerPowerSimdRow(
         int power, FormulaParameter pixelParameter,
         const formula::ExpressionContext& fixed, int mxit,
         double bailout, formula::ExpressionColoring coloring,
-        float* output, volatile bool* halt) {
+        float* output, const std::atomic_bool* halt) {
     const bool distance = coloring == formula::ExpressionColoring::Distance;
     const double bailoutSquared = bailout * bailout;
     const double logPower = std::log((double)power);
@@ -405,7 +405,7 @@ bool solveExpressionHybridRow(
         const formula::ExpressionContext& fixed,
         FormulaParameter pixelParameter, int mxit, double bailout,
         formula::ExpressionColoring coloring, int integerPower,
-        float* output, volatile bool* halt) {
+        float* output, const std::atomic_bool* halt) {
     formula::ExpressionContext contexts[4] = {
         fixed, fixed, fixed, fixed
     };
@@ -530,7 +530,7 @@ bool solveExpressionJitRow(
         const formula::ExpressionContext& fixed,
         FormulaParameter pixelParameter, int mxit, double bailout,
         formula::ExpressionColoring coloring, int integerPower,
-        float* output, volatile bool* halt) {
+        float* output, const std::atomic_bool* halt) {
     if (plan ? !jit.supports(*plan) : !jit.valid()) return false;
     formula::ExpressionContext contexts[4] = {
         fixed, fixed, fixed, fixed
@@ -657,7 +657,7 @@ bool solveExpressionColoredFixedBatchRow(
         const formula::ExpressionContext& fixed,
         FormulaParameter pixelParameter, int mxit, double bailout,
         formula::ExpressionColoring coloring,
-        float* output, volatile bool* halt) {
+        float* output, const std::atomic_bool* halt) {
     std::unique_ptr<formula::ExpressionOrbitPlan::Prepared[]> prepared =
         plan
             ? std::make_unique<
@@ -760,7 +760,7 @@ bool solveExpressionColoredScalarRow(
         const formula::ExpressionContext& fixed,
         FormulaParameter pixelParameter, int mxit, double bailout,
         formula::ExpressionColoring coloring, int integerPower,
-        float* output, volatile bool* halt) {
+        float* output, const std::atomic_bool* halt) {
     std::unique_ptr<formula::ExpressionOrbitPlan::Prepared> prepared =
         plan
             ? std::make_unique<

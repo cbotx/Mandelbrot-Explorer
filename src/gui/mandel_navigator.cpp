@@ -3,6 +3,8 @@
 #include <cmath>
 #include <future>
 #include <limits>
+#include <iomanip>
+#include <sstream>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -61,6 +63,7 @@ MandelNavigator::~MandelNavigator() {
 }
 
 void MandelNavigator::Reset() {
+    InterruptCompute();
     mpf_set_d(_z_re, IsJulia() ? 0.0 : -0.5);
     mpf_set_d(_z_im, 0.0);
     mpf_set_d(_scale, 1.0);
@@ -118,6 +121,7 @@ void MandelNavigator::ConfigureSampling() {
 void MandelNavigator::StartCompute() {
     InterruptCompute();
     _backend->resetCancellation();
+    _computeProgress.store(0.0f, std::memory_order_relaxed);
     ConfigureSampling();
     _cache_valid = false;                       // fractal changing -> phase cache stale
     // Clear BOTH buffers. _iter marks pixels unresolved; _normal (the DE / normal-map
@@ -144,6 +148,7 @@ void MandelNavigator::StartCompute() {
         request.coloringMethod = method;
         request.iterations = this->_iter;
         request.normal = this->_normal;
+        request.progress = &this->_computeProgress;
         if (this->IsExpression()) {
             request.mode = ComputeMode::Expression;
             request.expressionSource = &this->_expressionProgram;
@@ -166,7 +171,9 @@ void MandelNavigator::StartCompute() {
             request.coloringMethod =
                 method & ColoringMethod::EXTERIOR_DIST_EST;
         }
+        this->_mandel->SetProgress(&this->_computeProgress);
         this->_backend->compute(request);
+        this->_mandel->SetProgress(nullptr);
         this->_require_update = true;
     };
     // _task = std::async(&Mandel::Compute, _mandel, _z_re, _z_im, _scale, _mxit, _c_method);
@@ -188,34 +195,77 @@ bool MandelNavigator::IsComputing() {
     return true;
 }
 
-std::string MandelNavigator::GetLocationText() const {
+std::string MandelNavigator::GetLocationText(bool exactScale) const {
     int precision = (int)mpf_get_prec(_z_re);
     if (IsJulia())
         precision = std::max(precision, (int)std::max(mpf_get_prec(_julia_c_re),
                                                        mpf_get_prec(_julia_c_im)));
-    int digits = std::max(18, (int)(precision * log(2.0) / log(10.0)));
-    std::vector<char> buf((size_t)digits * 5 + 512);
+    int digits = std::max(
+        18, (int)std::ceil(
+            precision * log(2.0) / log(10.0)) + 3);
+    const int exactDigits = precision + 3;
+    std::vector<char> buf(
+        (size_t)(exactScale ? exactDigits : digits) * 6 + 1024);
     if (IsExpression()) {
-        gmp_snprintf(buf.data(), buf.size(),
-                     "mode: expression\r\nx: %.*Ff\r\ny: %.*Ff\r\nzoom: %.6Fe",
-                     digits, _z_re, digits, _z_im, _scale);
+        if (exactScale)
+            gmp_snprintf(
+                buf.data(), buf.size(),
+                "mode: expression\r\nx: %.*Ff\r\ny: %.*Ff\r\n"
+                "zoom: %.*Fe\r\nprecision: %llu",
+                exactDigits, _z_re, exactDigits, _z_im,
+                exactDigits, _scale,
+                (unsigned long long)mpf_get_prec(_scale));
+        else
+            gmp_snprintf(
+                buf.data(), buf.size(),
+                "mode: expression\r\nx: %.*Ff\r\ny: %.*Ff\r\nzoom: %.6Fe",
+                digits, _z_re, digits, _z_im, _scale);
         return std::string(buf.data()) + "\r\nformula: " + _expressionProgram.source();
-    } else if (IsJulia())
-        gmp_snprintf(buf.data(), buf.size(),
-                     "mode: julia\r\nx: %.*Ff\r\ny: %.*Ff\r\nzoom: %.6Fe\r\n"
-                     "c_re: %.*Ff\r\nc_im: %.*Ff",
-                     digits, _z_re, digits, _z_im, _scale,
-                     digits, _julia_c_re, digits, _julia_c_im);
+    } else if (IsJulia()) {
+        if (exactScale)
+            gmp_snprintf(
+                buf.data(), buf.size(),
+                "mode: julia\r\nx: %.*Ff\r\ny: %.*Ff\r\n"
+                "zoom: %.*Fe\r\nprecision: %llu\r\n"
+                "c_re: %.*Ff\r\nc_im: %.*Ff",
+                exactDigits, _z_re, exactDigits, _z_im,
+                exactDigits, _scale,
+                (unsigned long long)precision,
+                exactDigits, _julia_c_re,
+                exactDigits, _julia_c_im);
+        else
+            gmp_snprintf(
+                buf.data(), buf.size(),
+                "mode: julia\r\nx: %.*Ff\r\ny: %.*Ff\r\nzoom: %.6Fe\r\n"
+                "c_re: %.*Ff\r\nc_im: %.*Ff",
+                digits, _z_re, digits, _z_im, _scale,
+                digits, _julia_c_re, digits, _julia_c_im);
+    } else if (exactScale)
+        gmp_snprintf(
+            buf.data(), buf.size(),
+            "x: %.*Ff\r\ny: %.*Ff\r\nzoom: %.*Fe\r\nprecision: %llu",
+            exactDigits, _z_re, exactDigits, _z_im,
+            exactDigits, _scale,
+            (unsigned long long)mpf_get_prec(_scale));
     else
-        gmp_snprintf(buf.data(), buf.size(), "x: %.*Ff\r\ny: %.*Ff\r\nzoom: %.6Fe",
-                     digits, _z_re, digits, _z_im, _scale);
+        gmp_snprintf(
+            buf.data(), buf.size(),
+            "x: %.*Ff\r\ny: %.*Ff\r\nzoom: %.6Fe",
+            digits, _z_re, digits, _z_im, _scale);
     return std::string(buf.data());
 }
 
-bool MandelNavigator::SetLocation(const std::string& xs, const std::string& ys, const std::string& ss) {
-    int prec = (int)(std::max({ xs.size(), ys.size(), ss.size() }) *
-                     3.3219) + 40;
+bool MandelNavigator::SetLocation(
+        const std::string& xs, const std::string& ys,
+        const std::string& ss, mp_bitcnt_t precisionHint) {
+    mp_bitcnt_t prec = precisionHint;
+    if (prec == 0) {
+        prec = (mp_bitcnt_t)(
+            std::max({ xs.size(), ys.size(), ss.size() }) *
+            3.3219) + 40;
+    }
     if (prec < 64) prec = 64;
+    if (prec > (mp_bitcnt_t)(1 << 20)) return false;
     mpf_t newScale, newRe, newIm;
     mpf_init2(newScale, prec); mpf_init2(newRe, prec); mpf_init2(newIm, prec);
     bool ok = mpf_set_str(newScale, ss.c_str(), 10) == 0 && mpf_sgn(newScale) > 0 &&
@@ -228,13 +278,14 @@ bool MandelNavigator::SetLocation(const std::string& xs, const std::string& ys, 
     const bool unrestricted =
         IsMandelbrot() ||
         (IsExpression() &&
-         BuildCustomDeepZoomPlan(
+         BuildExpressionProductionPlan(
              newScale, _c_method, newRe, newIm)
              .canZoomBeyondDirectLimit());
     if (!unrestricted &&
         mpf_cmp_d(newScale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) > 0) {
         mpf_set_d(newScale, formula::CUSTOM_DIRECT_ZOOM_LIMIT);
     }
+    InterruptCompute();
     mpf_set_prec(_scale, prec); mpf_set(_scale, newScale);
     mpf_set_prec(_z_re, prec); mpf_set(_z_re, newRe);
     mpf_set_prec(_z_im, prec); mpf_set(_z_im, newIm);
@@ -246,6 +297,7 @@ bool MandelNavigator::SetLocation(const std::string& xs, const std::string& ys, 
 }
 
 void MandelNavigator::UpdateCoords() {
+    InterruptCompute();
     double effectiveK = _k;
     double effectiveDisplayDx = _display_dx, effectiveDisplayDy = _display_dy;
     mpf_t candidateScale, candidateRe, candidateIm, candidateT;
@@ -318,7 +370,7 @@ void MandelNavigator::UpdateCoords() {
             return true;
         }
         return IsExpression() &&
-               BuildCustomDeepZoomPlan(
+               BuildExpressionProductionPlan(
                    candidateScale, _c_method,
                    candidateRe, candidateIm)
                    .canZoomBeyondDirectLimit();
@@ -629,6 +681,8 @@ void MandelNavigator::applyDEOverlay(uint8_t* bitmap) {
 }
 
 void MandelNavigator::SetMxit(int mxit) {
+    if (_mxit == mxit) return;
+    InterruptCompute();
     _mxit = mxit;
 }
 
@@ -643,14 +697,30 @@ void MandelNavigator::GetJuliaC(mpf_t re, mpf_t im) const {
     mpf_set_prec(im, mpf_get_prec(_julia_c_im)); mpf_set(im, _julia_c_im);
 }
 
-bool MandelNavigator::SetJuliaC(const std::string& re, const std::string& im) {
-    int precision = (int)(std::max(re.size(), im.size()) * 3.3219) + 40;
-    precision = std::max(64, precision);
+bool MandelNavigator::SetJuliaC(
+        const std::string& re, const std::string& im,
+        mp_bitcnt_t precisionHint) {
+    constexpr mp_bitcnt_t maximumPrecision =
+        formula::ExpressionReferencePrecisionPolicy::
+            ApplicationMaximumBits;
+    uint64_t inferred =
+        static_cast<uint64_t>(
+            std::max(re.size(), im.size()) * 3.3219) + 40;
+    if (precisionHint != 0) {
+        inferred = precisionHint;
+    } else {
+        inferred = std::max<uint64_t>(64, inferred);
+    }
+    if (inferred < 64 || inferred > maximumPrecision)
+        return false;
+    const mp_bitcnt_t precision =
+        static_cast<mp_bitcnt_t>(inferred);
     mpf_t parsedRe, parsedIm;
     mpf_init2(parsedRe, precision); mpf_init2(parsedIm, precision);
     bool ok = mpf_set_str(parsedRe, re.c_str(), 10) == 0 &&
               mpf_set_str(parsedIm, im.c_str(), 10) == 0;
     if (ok) {
+        InterruptCompute();
         mpf_set_prec(_julia_c_re, precision); mpf_set(_julia_c_re, parsedRe);
         mpf_set_prec(_julia_c_im, precision); mpf_set(_julia_c_im, parsedIm);
     }
@@ -781,8 +851,8 @@ bool MandelNavigator::SetExpressionFormula(
 
     InterruptCompute();
     if (IsJulia() && !IsExpression()) RestoreMandelbrotMode();
-    formula::CustomDeepZoomPlan candidateDeepZoom =
-        formula::makeCustomDeepZoomPlan(
+    formula::ExpressionProductionPlan candidateProduction =
+        formula::makeExpressionProductionPlan(
             compiled, runtime, fixed, pixel, bailout,
             candidateColoring, _scale, _z_re, _z_im, _w, _h);
     if (!IsExpression()) SaveMandelbrotState();
@@ -804,11 +874,14 @@ bool MandelNavigator::SetExpressionFormula(
         ? (previousMethod &
            expressionColoringMethodMask(supportsDistance))
         : 0;
-    if (planeChanged || pixel == FormulaParameter::InitialZ) {
+    const bool currentlyDeep =
+        mpf_cmp_d(
+            _scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) > 0;
+    if ((planeChanged || pixel == FormulaParameter::InitialZ) &&
+        !currentlyDeep) {
         mpf_set_ui(_z_re, 0); mpf_set_ui(_z_im, 0); mpf_set_ui(_scale, 1);
-    } else if (mpf_cmp_d(
-                   _scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) > 0 &&
-               !candidateDeepZoom.canZoomBeyondDirectLimit()) {
+    } else if (currentlyDeep &&
+               !candidateProduction.canZoomBeyondDirectLimit()) {
         mpf_set_d(_scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT);
     }
     JumpReset();
@@ -820,10 +893,47 @@ bool MandelNavigator::SetExpressionFormula(
 
 std::string MandelNavigator::GetExpressionAccelerationText() const {
     if (!IsExpression()) return {};
-    if (BuildCustomDeepZoomPlan(_scale, _c_method)
-            .usesQuadraticPerturbation()) {
+    const formula::ExpressionProductionPlan production =
+        BuildExpressionProductionPlan(_scale, _c_method);
+    if (production.usesQuadraticPerturbation()) {
         return "deep quadratic perturbation / SA / BLA";
     }
+    if (production.usesGenericCertifiedDeep()) {
+        const GenericDeepInfo info = _backend->lastGenericDeepInfo();
+        if (!info.used || !info.settled)
+            return "generic deep Taylor";
+        if (!info.success) {
+            return "generic deep failed (" +
+                (info.status.empty() ? std::string("unknown")
+                                     : info.status) + ")";
+        }
+        std::string path;
+        if (info.pixelCount != 0 &&
+            info.fallbackPixelCount == info.pixelCount &&
+            info.fastPixelCount == 0) {
+            path = "generic deep MPFR";
+        } else if (info.fallbackPixelCount != 0) {
+            path = "generic deep Taylor + MPFR fallback";
+        } else {
+            path = "generic deep Taylor";
+        }
+        const double fallbackRate = info.pixelCount
+            ? 100.0 * info.fallbackPixelCount / info.pixelCount
+            : 0.0;
+        const double taylorCoverage = info.pixelCount
+            ? 100.0 * info.taylorPixelCoverage / info.pixelCount
+            : 0.0;
+        std::ostringstream text;
+        text << path << "  fallback "
+             << info.fallbackPixelCount << "/" << info.pixelCount
+             << " (" << std::fixed << std::setprecision(1)
+             << fallbackRate << "%), Taylor coverage "
+             << taylorCoverage << "%";
+        return text.str();
+    }
+    if (production.path ==
+        formula::ExpressionProductionPath::UnsupportedDeep)
+        return "deep view unsupported for current coloring";
     if (_expressionProgram.fastPath() !=
         formula::ExpressionProgram::FastPath::None) {
         int power = _expressionProgram.fastIntegerPower();
@@ -887,9 +997,10 @@ void MandelNavigator::SetCMethod(int c_method) {
     const bool clamp =
         IsExpression() &&
         mpf_cmp_d(_scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) > 0 &&
-        !BuildCustomDeepZoomPlan(_scale, candidate)
+        !BuildExpressionProductionPlan(_scale, candidate)
              .canZoomBeyondDirectLimit();
-    if (clamp) InterruptCompute();
+    if (candidate != _c_method || clamp)
+        InterruptCompute();
     _c_method = candidate;
     if (clamp) {
         mpf_set_d(_scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT);
@@ -904,6 +1015,21 @@ formula::CustomDeepZoomPlan MandelNavigator::BuildCustomDeepZoomPlan(
     if (!centerRe) centerRe = _z_re;
     if (!centerIm) centerIm = _z_im;
     return formula::makeCustomDeepZoomPlan(
+        _expressionProgram, _expressionRuntimeProgram,
+        _expressionFixed, _expressionPixel, _expressionBailout,
+        expressionColoringFromMethod(
+            method, ExpressionSupportsDistance()),
+        scale, centerRe, centerIm, _w, _h);
+}
+
+formula::ExpressionProductionPlan
+MandelNavigator::BuildExpressionProductionPlan(
+        mpf_srcptr scale, int method,
+        mpf_srcptr centerRe, mpf_srcptr centerIm) const {
+    if (!IsExpression()) return {};
+    if (!centerRe) centerRe = _z_re;
+    if (!centerIm) centerIm = _z_im;
+    return formula::makeExpressionProductionPlan(
         _expressionProgram, _expressionRuntimeProgram,
         _expressionFixed, _expressionPixel, _expressionBailout,
         expressionColoringFromMethod(

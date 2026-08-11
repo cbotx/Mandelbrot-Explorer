@@ -95,7 +95,7 @@ bool ExpressionJit4::evaluate(
 }
 bool ExpressionJit4::evaluateOrbit(
         const ExpressionContext*, int, int, double,
-        float*, const volatile bool*,
+        float*, const std::atomic_bool*,
         const ExpressionOrbitPlan*) const {
     return false;
 }

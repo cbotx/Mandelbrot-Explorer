@@ -50,6 +50,7 @@ private:
     int _c_method = ColoringMethod::EXTERIOR_DIST_EST;
     int _shift_idx;
     std::atomic_bool _require_update{true};
+    std::atomic<float> _computeProgress{0.0f};
     bool _need_settle = false;   // a computing frame was point-sampled; force one AA pass once settled
 
     // ---- palette-phase animation cache -------------------------------------
@@ -110,6 +111,15 @@ public:
     bool LastComputeUsedCustomDeepPath() const {
         return _backend->lastComputeUsedCustomDeepPath();
     }
+    bool LastComputeUsedGenericDeepPath() const {
+        return _backend->lastComputeUsedGenericDeepPath();
+    }
+    GenericDeepInfo GetLastGenericDeepInfo() const {
+        return _backend->lastGenericDeepInfo();
+    }
+    float GetComputeProgress() const {
+        return _computeProgress.load(std::memory_order_relaxed);
+    }
     // Copy the current view: center (re/im) and scale into caller-owned mpf_t.
     void GetView(mpf_t re, mpf_t im, mpf_t scale) const;
     mp_bitcnt_t GetViewPrecision() const { return mpf_get_prec(_scale); }
@@ -135,7 +145,8 @@ public:
                               const std::array<std::complex<double>, 8>& parameters,
                               double bailout, formula::ExpressionError* error = nullptr);
     void RestoreMandelbrotMode();
-    bool SetJuliaC(const std::string& re, const std::string& im);
+    bool SetJuliaC(const std::string& re, const std::string& im,
+                   mp_bitcnt_t precisionHint = 0);
     void GetJuliaC(mpf_t re, mpf_t im) const;
     
     int GetCMethod();
@@ -146,16 +157,23 @@ public:
 
     bool IsComputing();
 
-    std::string GetLocationText() const;
+    std::string GetLocationText(bool exactScale = false) const;
 
     // Jump to an absolute location: x/y as decimal strings, scale as a plain
     // decimal string (scientific already expanded). Sets precision from the digit
     // count, resets the preview transform. Returns false on a parse error.
-    bool SetLocation(const std::string& x, const std::string& y, const std::string& scale);
+    bool SetLocation(
+        const std::string& x, const std::string& y,
+        const std::string& scale,
+        mp_bitcnt_t precisionHint = 0);
 
 private:
     void SaveMandelbrotState();
     formula::CustomDeepZoomPlan BuildCustomDeepZoomPlan(
+        mpf_srcptr scale, int method,
+        mpf_srcptr centerRe = nullptr,
+        mpf_srcptr centerIm = nullptr) const;
+    formula::ExpressionProductionPlan BuildExpressionProductionPlan(
         mpf_srcptr scale, int method,
         mpf_srcptr centerRe = nullptr,
         mpf_srcptr centerIm = nullptr) const;

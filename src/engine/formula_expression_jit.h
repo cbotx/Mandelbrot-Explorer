@@ -2,6 +2,7 @@
 #define MANDEL_FORMULA_EXPRESSION_JIT_H
 
 #include <array>
+#include <atomic>
 #include <complex>
 #include <memory>
 #include <string>
@@ -63,7 +64,7 @@ public:
     bool evaluate(const ExpressionContext* contexts, Complex* outputs) const;
     bool evaluateOrbit(const ExpressionContext* contexts, int lanes,
                        int mxit, double bailout, float* results,
-                       const volatile bool* halt = nullptr,
+                       const std::atomic_bool* halt = nullptr,
                        const ExpressionOrbitPlan* plan = nullptr) const;
 
 private:

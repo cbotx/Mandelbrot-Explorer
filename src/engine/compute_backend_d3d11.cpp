@@ -20,6 +20,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -314,6 +315,14 @@ public:
         return _lastComputeUsedCustomDeepPath.load(
             std::memory_order_acquire);
     }
+    bool lastComputeUsedGenericDeepPath() const override {
+        return _lastComputeUsedGenericDeepPath.load(
+            std::memory_order_acquire);
+    }
+    GenericDeepInfo lastGenericDeepInfo() const override {
+        std::lock_guard<std::mutex> lock(_genericMutex);
+        return _genericInfo;
+    }
 
     bool compute(const ComputeRequest& request) override {
         bool expected = false;
@@ -323,6 +332,12 @@ public:
         _lastComputeUsedGpuPath.store(false, std::memory_order_release);
         _lastComputeUsedCustomDeepPath.store(
             false, std::memory_order_release);
+        _lastComputeUsedGenericDeepPath.store(
+            false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(_genericMutex);
+            _genericInfo = {};
+        }
         if (_cancelRequested.load(std::memory_order_acquire))
             return false;
 
@@ -331,7 +346,12 @@ public:
 
         if (computeGpu(request)) {
             _lastComputeUsedGpuPath.store(true, std::memory_order_release);
-            return !_cancelRequested.load(std::memory_order_acquire);
+            const bool success =
+                !_cancelRequested.load(std::memory_order_acquire);
+            if (success && request.progress)
+                request.progress->store(
+                    1.0f, std::memory_order_release);
+            return success;
         }
         if (_cancelRequested.load(std::memory_order_acquire))
             return false;
@@ -366,6 +386,9 @@ private:
     std::atomic_bool _cancelRequested{false};
     std::atomic_bool _lastComputeUsedGpuPath{false};
     std::atomic_bool _lastComputeUsedCustomDeepPath{false};
+    std::atomic_bool _lastComputeUsedGenericDeepPath{false};
+    mutable std::mutex _genericMutex;
+    GenericDeepInfo _genericInfo;
 
     D3D_FEATURE_LEVEL _featureLevel = D3D_FEATURE_LEVEL_9_1;
     ComPtr<ID3D11Device> _device;
@@ -384,14 +407,26 @@ private:
     std::vector<float> _refineOutput;
 
     bool computeCpu(const ComputeRequest& request) {
-        if (_cancelRequested.load(std::memory_order_acquire))
+        if (_cancelRequested.load(std::memory_order_acquire)) {
             _cpu->cancel();
-        else
+        } else {
             _cpu->resetCancellation();
+            if (_cancelRequested.load(std::memory_order_acquire)) {
+                _cpu->cancel();
+                return false;
+            }
+        }
         bool result = _cpu->compute(request);
         _lastComputeUsedCustomDeepPath.store(
             _cpu->lastComputeUsedCustomDeepPath(),
             std::memory_order_release);
+        _lastComputeUsedGenericDeepPath.store(
+            _cpu->lastComputeUsedGenericDeepPath(),
+            std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(_genericMutex);
+            _genericInfo = _cpu->lastGenericDeepInfo();
+        }
         return result;
     }
 
@@ -450,6 +485,17 @@ private:
         using ProfileClock = std::chrono::steady_clock;
         const auto totalStart = ProfileClock::now();
         const bool profile = getenv("MANDEL_GPU_PROFILE") != nullptr;
+        auto publishProgress = [&](float value) {
+            if (!request.progress) return;
+            float current =
+                request.progress->load(std::memory_order_relaxed);
+            while (current < value &&
+                   !request.progress->compare_exchange_weak(
+                       current, value,
+                       std::memory_order_release,
+                       std::memory_order_relaxed)) {}
+        };
+        publishProgress(0.02f);
         const uint64_t count64 =
             static_cast<uint64_t>(request.width) * request.height;
         if (count64 == 0 ||
@@ -556,6 +602,10 @@ private:
                 unbind();
                 return false;
             }
+            publishProgress(
+                0.05f + 0.45f *
+                    static_cast<float>(base + params.pixelCount) /
+                    static_cast<float>(count));
         }
         const auto dispatchEnd = ProfileClock::now();
         unbind();
@@ -570,6 +620,7 @@ private:
         std::memcpy(_readback.data(), mapped.pData, count * sizeof(float));
         _context->Unmap(_stagingBuffer.Get(), 0);
         if (_cancelRequested.load(std::memory_order_acquire)) return false;
+        publishProgress(0.55f);
         const auto readbackEnd = ProfileClock::now();
 
         // The GPU resolves robust short escapes only. Long or bounded trajectories
@@ -601,6 +652,7 @@ private:
             _refinePixels[slot] = pixel;
         }
         const int refined = refineCount.load(std::memory_order_relaxed);
+        publishProgress(0.60f);
         _refineRe.resize(refined);
         _refineIm.resize(refined);
         _refineOutput.resize(refined);
@@ -614,6 +666,7 @@ private:
         }
         const int refineBlocks =
             (refined + kCpuRefineBlock - 1) / kCpuRefineBlock;
+        std::atomic<int> refinedBlocks{0};
 #pragma omp parallel for schedule(dynamic, 1)
         for (int block = 0; block < refineBlocks; ++block) {
             if (_cancelRequested.load(std::memory_order_relaxed)) continue;
@@ -623,12 +676,21 @@ private:
                 _refineRe.data() + base, _refineIm.data() + base,
                 blockCount, _refineOutput.data() + base,
                 request.maxIterations);
+            const int completed =
+                refinedBlocks.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+            publishProgress(
+                0.60f + 0.35f *
+                    static_cast<float>(completed) /
+                    static_cast<float>(
+                        std::max(1, refineBlocks)));
         }
 #pragma omp parallel for schedule(static)
         for (int slot = 0; slot < refined; ++slot) {
             _readback[_refinePixels[slot]] = _refineOutput[slot];
         }
         if (_cancelRequested.load(std::memory_order_acquire)) return false;
+        publishProgress(0.98f);
         const auto refineEnd = ProfileClock::now();
 
         if (request.sub == 1) {

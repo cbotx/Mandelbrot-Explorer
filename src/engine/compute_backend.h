@@ -4,6 +4,7 @@
 #include <gmp.h>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -35,6 +36,7 @@ struct ComputeRequest {
     int coloringMethod = 0;
     float* iterations = nullptr;
     float* normal = nullptr;
+    std::atomic<float>* progress = nullptr;
 
     const formula::ExpressionProgram* expressionSource = nullptr;
     const formula::ExpressionProgram* expression = nullptr;
@@ -54,12 +56,35 @@ struct ComputeBackendInfo {
     bool fallback = false;
 };
 
+struct GenericDeepInfo {
+    bool used = false;
+    bool settled = false;
+    bool success = false;
+    bool cancelled = false;
+    bool taylorAccepted = false;
+    std::string status;
+    std::string error;
+    std::string phase;
+    float progress = 0.0f;
+    uint64_t pixelCount = 0;
+    uint64_t fastPixelCount = 0;
+    uint64_t fallbackPixelCount = 0;
+    uint64_t taylorPixelCoverage = 0;
+    double totalSeconds = 0.0;
+    double referenceSeconds = 0.0;
+    double taylorSeconds = 0.0;
+    double fastSeconds = 0.0;
+    double fallbackSeconds = 0.0;
+};
+
 class IComputeBackend {
 public:
     virtual ~IComputeBackend() = default;
     virtual const ComputeBackendInfo& info() const = 0;
     virtual bool lastComputeUsedGpuPath() const = 0;
     virtual bool lastComputeUsedCustomDeepPath() const { return false; }
+    virtual bool lastComputeUsedGenericDeepPath() const { return false; }
+    virtual GenericDeepInfo lastGenericDeepInfo() const { return {}; }
     virtual bool compute(const ComputeRequest& request) = 0;
     virtual void cancel() = 0;
     virtual void resetCancellation() = 0;

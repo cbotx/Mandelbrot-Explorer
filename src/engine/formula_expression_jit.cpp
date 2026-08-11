@@ -346,7 +346,7 @@ bool ExpressionJit4::evaluate(const ExpressionContext* contexts,
 bool ExpressionJit4::evaluateOrbit(
         const ExpressionContext* contexts, int lanes,
         int mxit, double bailout, float* results,
-        const volatile bool* halt,
+        const std::atomic_bool* halt,
         const ExpressionOrbitPlan* plan) const {
     if (!valid() || !contexts || !results ||
         lanes < 1 || lanes > 4 || mxit < 1 ||

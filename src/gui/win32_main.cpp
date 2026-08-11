@@ -269,6 +269,10 @@ public:
     uint64_t orbitThumbnailSmokeFirstGeneration = 0;
     uint64_t orbitThumbnailSmokeExpectedGeneration = 0;
     std::chrono::steady_clock::time_point orbitThumbnailSmokeDeadline{};
+    bool genericDeepSmoke = false;
+    int genericDeepSmokeStage = 0;
+    bool genericDeepSmokeObservedRunning = false;
+    std::chrono::steady_clock::time_point genericDeepSmokeDeadline{};
     std::chrono::steady_clock::time_point lastOrbitRequest{};
     int lastOrbitX = -10000, lastOrbitY = -10000;
     bool paletteOpen = false;              // dropdown expanded
@@ -509,6 +513,94 @@ public:
         }
         orbitThumbnailSmoke = false;
         PostQuitMessage(passed ? 0 : 1);
+    }
+
+    void finishGenericDeepSmoke(bool passed, const char* detail) {
+        FILE* file = nullptr;
+        fopen_s(
+            &file, "build\\generic_deep_gui_smoke.txt", "a");
+        if (file) {
+            fprintf(
+                file, "%s: %s\n",
+                passed ? "PASS" : "FAIL", detail);
+            fclose(file);
+        }
+        genericDeepSmoke = false;
+        PostQuitMessage(passed ? 0 : 1);
+    }
+
+    bool startGenericDeepSmokeStage(int stage) {
+        FormulaDialogConfig candidate;
+        candidate.source = stage == 0
+            ? "z*z+c+0" : "sin(z)+c";
+        candidate.pixelParameter = FormulaParameter::C;
+        candidate.bailout = 4.0;
+        if (!applyFormulaConfig(candidate, false))
+            return false;
+        maxIter = 32;
+        nav->SetMxit(maxIter);
+        if (!nav->SetLocation("0", "0", "1e500"))
+            return false;
+        genericDeepSmokeStage = stage;
+        genericDeepSmokeDeadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::seconds(45);
+        startRender();
+        genericDeepSmokeObservedRunning = nav->IsComputing();
+        return true;
+    }
+
+    void checkGenericDeepSmoke() {
+        if (!genericDeepSmoke) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now > genericDeepSmokeDeadline) {
+            finishGenericDeepSmoke(false, "render timed out");
+            return;
+        }
+        if (nav->IsComputing()) {
+            genericDeepSmokeObservedRunning = true;
+            return;
+        }
+        if (!genericDeepSmokeObservedRunning) return;
+        const GenericDeepInfo info =
+            nav->GetLastGenericDeepInfo();
+        FILE* file = nullptr;
+        fopen_s(
+            &file, "build\\generic_deep_gui_smoke.txt", "a");
+        if (file) {
+            fprintf(
+                file,
+                "stage=%s used=%d success=%d status=%s "
+                "pixels=%llu fast=%llu fallback=%llu "
+                "total=%.6f reference=%.6f Taylor=%.6f "
+                "fallback_time=%.6f path=%s\n",
+                genericDeepSmokeStage == 0
+                    ? "arithmetic" : "transcendental",
+                info.used ? 1 : 0, info.success ? 1 : 0,
+                info.status.c_str(),
+                (unsigned long long)info.pixelCount,
+                (unsigned long long)info.fastPixelCount,
+                (unsigned long long)info.fallbackPixelCount,
+                info.totalSeconds, info.referenceSeconds,
+                info.taylorSeconds, info.fallbackSeconds,
+                nav->GetExpressionAccelerationText().c_str());
+            fclose(file);
+        }
+        if (!info.used || !info.settled || !info.success ||
+            !nav->LastComputeUsedGenericDeepPath()) {
+            finishGenericDeepSmoke(
+                false, "generic-deep path/status mismatch");
+            return;
+        }
+        if (genericDeepSmokeStage == 0) {
+            if (!startGenericDeepSmokeStage(1))
+                finishGenericDeepSmoke(
+                    false, "transcendental setup failed");
+            return;
+        }
+        finishGenericDeepSmoke(
+            true,
+            "arithmetic and transcendental e500 renders completed");
     }
 
     void startOrbitThumbnailSmoke() {
@@ -1189,9 +1281,13 @@ public:
     }
 
     void copyLocation() {
-        std::string location = nav->GetLocationText();
+        std::string location = nav->GetLocationText(true);
         if (nav->IsExpression()) {
             char line[160];
+            snprintf(
+                line, sizeof(line), "\r\ncoloring: %d",
+                coloringIdx);
+            location += line;
             location += "\r\npixel: ";
             location += formulaConfig.pixelParameter == FormulaParameter::InitialZ ? "z0" : "c";
             snprintf(line, sizeof(line),
@@ -1258,6 +1354,17 @@ public:
             return ok;
         };
         if (!validNumbers({ xs, ys, scale }, 2)) return;
+        mp_bitcnt_t precisionHint = 0;
+        const std::string precisionText = val("precision:");
+        if (!precisionText.empty()) {
+            char* end = nullptr;
+            unsigned long long parsed =
+                strtoull(precisionText.c_str(), &end, 10);
+            if (!end || *end || parsed < 64 ||
+                parsed > (1u << 20))
+                return;
+            precisionHint = (mp_bitcnt_t)parsed;
+        }
         if (mode == "expression") {
             FormulaDialogConfig candidate;
             candidate.source = val("formula:");
@@ -1287,6 +1394,15 @@ public:
                     atof(values[6 + 2 * i].c_str())
                 };
             if (!applyFormulaConfig(candidate, false)) return;
+            std::string coloring = val("coloring:");
+            if (!coloring.empty()) {
+                char* end = nullptr;
+                long index = strtol(
+                    coloring.c_str(), &end, 10);
+                if (!end || *end || index < 0 || index > 6 ||
+                    !setColoringState((int)index, false))
+                    return;
+            }
         } else if (mode == "julia") {
             if (!juliaUiEnabled) return;
             std::string cr = val("c_re:"), ci = val("c_im:");
@@ -1294,14 +1410,16 @@ public:
             if (!validNumbers({ cr, ci })) return;
             bool wasJulia = nav->IsJulia();
             switchJuliaMode(true, false);
-            if (!nav->SetJuliaC(cr, ci)) {
+            if (!nav->SetJuliaC(
+                    cr, ci, precisionHint)) {
                 if (!wasJulia) switchJuliaMode(false, false);
                 return;
             }
         } else if (!nav->IsMandelbrot()) {
             restoreMandelbrotUi(false);
         }
-        if (nav->SetLocation(xs, ys, scale)) {
+        if (nav->SetLocation(
+                xs, ys, scale, precisionHint)) {
             needFull = true;
             startRender();
         }
@@ -1536,13 +1654,14 @@ public:
                      DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
     }
-    void selectColoring(int idx) {
-        if (idx < 0 || idx > 6) return;
-        if (nav->IsJulia() && !nav->IsExpression() && idx > 1) return;
+    bool setColoringState(int idx, bool render) {
+        if (idx < 0 || idx > 6) return false;
+        if (nav->IsJulia() && !nav->IsExpression() && idx > 1)
+            return false;
         if (nav->IsExpression() &&
             !expressionColoringIndexSupported(
                 idx, nav->ExpressionSupportsDistance()))
-            return;
+            return false;
         coloringIdx = idx;
         relief_on = (idx == 3) ? 1 : 0;
         normal_light_on = (idx == 4) ? 1 : 0;
@@ -1560,7 +1679,11 @@ public:
         // idx 6 (DE + smooth) draws the distance-estimate B&W layer over the smooth base.
         nav->SetCMethod(m);
         layout();   // light/strength slider appears/disappears -> reflow the panel
-        startRender();
+        if (render) startRender();
+        return true;
+    }
+    void selectColoring(int idx) {
+        setColoringState(idx, true);
     }
 
     // ---- gallery (demo presets) ----
@@ -1867,8 +1990,11 @@ public:
             panelRight() - S(PANEL_W), rc.bottom
         };
         fillRect(dc, status, CLR_PANEL);
-        std::wstring st = nav->IsComputing()
-            ? L"  Rendering..."
+        const bool computing = nav->IsComputing();
+        std::wstring st = computing
+            ? L"  Rendering " +
+                std::to_wstring((int)std::lround(
+                    100.0f * nav->GetComputeProgress())) + L"%..."
             : L"  Ready   last render " + std::to_wstring((int)lastRenderMs) + L" ms";
         st += L"   present " + std::to_wstring((int)(lastPresentMs + 0.5)) + L" ms";
         {
@@ -2081,6 +2207,10 @@ public:
             }
         }
         bool computing = nav->IsComputing();
+        checkGenericDeepSmoke();
+        if (!genericDeepSmoke &&
+            getenv("MANDEL_GUI_GENERIC_DEEP_SMOKE"))
+            return;
         if (benchMode && !fpsLogMode && !computing) { runRecolorBench(); return; }
         bool anim = std::fabs(animSpeed) > 1e-4f;
         bool active = computing || wasComputing || navDragging || palette.dragging ||
@@ -2216,13 +2346,18 @@ public:
                 std::make_unique<OrbitThumbnailWorker>();
             orbitThumbnailSmoke =
                 getenv("MANDEL_GUI_ORBIT_THUMBNAIL_SMOKE") != nullptr;
+            genericDeepSmoke =
+                getenv("MANDEL_GUI_GENERIC_DEEP_SMOKE") != nullptr;
+            if (genericDeepSmoke)
+                DeleteFileW(L"build\\generic_deep_gui_smoke.txt");
             if (const char* e = getenv("MANDEL_GUI_ORBIT")) orbitOn = atoi(e) != 0;
             orbitBench = getenv("MANDEL_GUI_ORBIT_BENCH") != nullptr;
             if (orbitBench || orbitThumbnailSmoke) orbitOn = true;
             if (orbitOn) rebuildOrbitThumbnail();
             const bool anyBench =
                 getenv("MANDEL_GUI_BENCH") ||
-                orbitBench || orbitThumbnailSmoke;
+                orbitBench || orbitThumbnailSmoke ||
+                genericDeepSmoke;
             if (anyBench) {
                 const char* gx = getenv("MANDEL_GUI_CX"), *gy = getenv("MANDEL_GUI_CY");
                 const char* gz = getenv("MANDEL_GUI_ZOOM");
@@ -2252,8 +2387,8 @@ public:
                 if (const char* value = getenv("MANDEL_GUI_FIXED_C_IM")) config.fixedC.imag(atof(value));
                 if (const char* value = getenv("MANDEL_GUI_FORMULA_BAILOUT")) config.bailout = atof(value);
                 applyFormulaConfig(config, false);
-                // z0-plane activation intentionally resets its view; apply the
-                // requested benchmark location after selecting the binding.
+                // Apply the requested benchmark location after selecting the
+                // binding; shallow z0 activation still starts from its default.
                 if (anyBench) {
                     const char* gx = getenv("MANDEL_GUI_CX"), *gy = getenv("MANDEL_GUI_CY");
                     const char* gz = getenv("MANDEL_GUI_ZOOM");
@@ -2296,7 +2431,18 @@ public:
                 }
             }
             layout();
-            if (orbitBench || orbitThumbnailSmoke) {
+            if (genericDeepSmoke) {
+                renderW = 48;
+                renderH = 32;
+                bitmap.assign(
+                    (size_t)renderW * renderH * 3, 0);
+                display.assign(
+                    (size_t)renderW * renderH * 3, 0);
+                nav->Resize(renderW, renderH);
+                if (!startGenericDeepSmokeStage(0))
+                    finishGenericDeepSmoke(
+                        false, "arithmetic setup failed");
+            } else if (orbitBench || orbitThumbnailSmoke) {
                 // Worker smoke/bench runs must not compete with a full frame render.
             } else if (benchMode) {
                 // A hidden benchmark window receives no initial WM_SIZE, so size the
@@ -2663,7 +2809,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     const bool benchHeadless =
         (getenv("MANDEL_GUI_BENCH") ||
          getenv("MANDEL_GUI_ORBIT_BENCH") ||
-         getenv("MANDEL_GUI_ORBIT_THUMBNAIL_SMOKE")) &&
+         getenv("MANDEL_GUI_ORBIT_THUMBNAIL_SMOKE") ||
+         getenv("MANDEL_GUI_GENERIC_DEEP_SMOKE")) &&
         !getenv("MANDEL_GUI_SHOW");
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"Mandelbrot Explorer",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | (benchHeadless ? 0 : WS_VISIBLE),
