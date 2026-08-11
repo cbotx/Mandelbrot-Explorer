@@ -163,6 +163,14 @@ public:
         const ExpressionTaylorJetResult& jet,
         const ScaledComplexBall& q,
         ExpressionTaylorJetEvaluation& result);
+    // Evaluates up to four pixels against one immutable accepted jet. The
+    // coefficient traversal is shared while every lane retains its own
+    // scaled exponents, signed zeros, and outward certification radius.
+    static bool evaluateBatch(
+        const ExpressionTaylorJetResult& jet,
+        const ScaledComplexBall* q,
+        size_t count,
+        ExpressionTaylorJetEvaluation* results);
 };
 
 // Chooses an exact positive power-of-two D that encloses

@@ -1,6 +1,7 @@
 #include "formula_taylor_jet.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -8015,7 +8016,84 @@ bool ExpressionTaylorJetEvaluator::evaluate(
         const ExpressionTaylorJetResult& jet,
         const ScaledComplexBall& q,
         ExpressionTaylorJetEvaluation& result) {
+    if (jet.layout ==
+            ExpressionTaylorJetLayout::RealBivariate)
+        return evaluateBatch(jet, &q, 1, &result);
     result = {};
+    const size_t expectedCoefficientCount =
+        jet.order >= 0
+        ? static_cast<size_t>(jet.order) + 1
+        : 0;
+    if (!jet.valid || !jet.certified ||
+        jet.order < 1 ||
+        jet.coefficients.size() !=
+            expectedCoefficientCount ||
+        jet.monomialCount != expectedCoefficientCount ||
+        jet.coefficientRadii.size() !=
+            jet.coefficients.size() ||
+        !validRadius(jet.remainderRadius) ||
+        !expressionTaylorQInsideUnitDisk(q)) {
+        result.status =
+            ExpressionTaylorJetStatus::InvalidRequest;
+        return false;
+    }
+    ScaledComplexBall value;
+    value.value = jet.coefficients.back();
+    value.radius = jet.coefficientRadii.back();
+    for (int degree = jet.order - 1;
+         degree >= 0; --degree) {
+        ScaledComplexBall product;
+        ScaledArithmeticStatus arithmetic =
+            certifiedScaledMultiply(
+                value, q, product);
+        ++result.operationCount;
+        if (arithmetic !=
+                ScaledArithmeticStatus::Success) {
+            result.status =
+                statusForArithmetic(arithmetic);
+            return false;
+        }
+        ScaledComplexBall coefficient;
+        coefficient.value =
+            jet.coefficients[
+                static_cast<size_t>(degree)];
+        coefficient.radius =
+            jet.coefficientRadii[
+                static_cast<size_t>(degree)];
+        arithmetic = certifiedScaledAdd(
+            product, coefficient, value);
+        ++result.operationCount;
+        if (arithmetic !=
+                ScaledArithmeticStatus::Success) {
+            result.status =
+                statusForArithmetic(arithmetic);
+            return false;
+        }
+    }
+    if (addUp(
+            value.radius, jet.remainderRadius) !=
+            ScaledArithmeticStatus::Success ||
+        certifyScaledMpfrExponentRange(value) !=
+            ScaledArithmeticStatus::Success) {
+        result.status =
+            ExpressionTaylorJetStatus::ExponentRange;
+        return false;
+    }
+    result.residual = value;
+    result.valid = true;
+    result.status = ExpressionTaylorJetStatus::Success;
+    return true;
+}
+
+bool ExpressionTaylorJetEvaluator::evaluateBatch(
+        const ExpressionTaylorJetResult& jet,
+        const ScaledComplexBall* q,
+        size_t count,
+        ExpressionTaylorJetEvaluation* results) {
+    if (!q || !results || count == 0 || count > 4)
+        return false;
+    for (size_t lane = 0; lane < count; ++lane)
+        results[lane] = {};
     size_t expectedCoefficientCount = 0;
     if (jet.layout ==
             ExpressionTaylorJetLayout::RealBivariate) {
@@ -8033,24 +8111,39 @@ bool ExpressionTaylorJetEvaluator::evaluate(
         jet.monomialCount != expectedCoefficientCount ||
         jet.coefficientRadii.size() !=
             jet.coefficients.size() ||
-        !validRadius(jet.remainderRadius) ||
-        !expressionTaylorQInsideUnitDisk(q)) {
-        result.status =
-            ExpressionTaylorJetStatus::InvalidRequest;
+        !validRadius(jet.remainderRadius)) {
+        for (size_t lane = 0; lane < count; ++lane)
+            results[lane].status =
+                ExpressionTaylorJetStatus::InvalidRequest;
         return false;
     }
-    ScaledComplexBall value;
+    for (size_t lane = 0; lane < count; ++lane) {
+        if (!expressionTaylorQInsideUnitDisk(q[lane])) {
+            results[lane].status =
+                ExpressionTaylorJetStatus::InvalidRequest;
+            return false;
+        }
+    }
+    if (jet.layout ==
+            ExpressionTaylorJetLayout::RealBivariate &&
+        count > 1) {
+        for (size_t lane = 0; lane < count; ++lane)
+            if (!evaluate(jet, q[lane], results[lane]))
+                return false;
+        return true;
+    }
+    std::array<ScaledComplexBall, 4> values{};
     if (jet.layout ==
             ExpressionTaylorJetLayout::RealBivariate) {
-        ScaledComplexBall conjugateQ = q;
+        ScaledComplexBall conjugateQ = q[0];
         ScaledArithmeticStatus arithmetic =
             scaledNegate(
-                q.value.im,
+                q[0].value.im,
                 conjugateQ.value.im);
-        ++result.operationCount;
+        ++results[0].operationCount;
         if (arithmetic !=
                 ScaledArithmeticStatus::Success) {
-            result.status =
+            results[0].status =
                 statusForArithmetic(arithmetic);
             return false;
         }
@@ -8060,16 +8153,11 @@ bool ExpressionTaylorJetEvaluator::evaluate(
              --conjugateDegree) {
             const int maximumQDegree =
                 jet.order - conjugateDegree;
-            size_t coefficientIndex = 0;
-            if (!expressionTaylorBivariateIndex(
-                    jet.order, maximumQDegree,
-                    conjugateDegree,
-                    coefficientIndex)) {
-                result.status =
-                    ExpressionTaylorJetStatus::
-                        InvalidRequest;
-                return false;
-            }
+            const size_t order =
+                static_cast<size_t>(jet.order);
+            size_t coefficientIndex =
+                order * (order + 1) / 2 +
+                static_cast<size_t>(conjugateDegree);
             ScaledComplexBall row;
             row.value =
                 jet.coefficients[coefficientIndex];
@@ -8077,33 +8165,27 @@ bool ExpressionTaylorJetEvaluator::evaluate(
                 jet.coefficientRadii[coefficientIndex];
             for (int qDegree = maximumQDegree - 1;
                  qDegree >= 0; --qDegree) {
+                const size_t degree =
+                    static_cast<size_t>(
+                        qDegree + conjugateDegree);
+                coefficientIndex =
+                    degree * (degree + 1) / 2 +
+                    static_cast<size_t>(conjugateDegree);
+                ScaledComplexBall coefficient;
+                coefficient.value =
+                    jet.coefficients[coefficientIndex];
+                coefficient.radius =
+                    jet.coefficientRadii[coefficientIndex];
                 ScaledComplexBall product;
                 arithmetic = certifiedScaledMultiply(
-                    row, q, product);
-                ++result.operationCount;
+                    row, q[0], product);
+                ++results[0].operationCount;
                 if (arithmetic !=
-                        ScaledArithmeticStatus::
-                            Success) {
-                    result.status =
+                        ScaledArithmeticStatus::Success) {
+                    results[0].status =
                         statusForArithmetic(arithmetic);
                     return false;
                 }
-                if (!expressionTaylorBivariateIndex(
-                        jet.order, qDegree,
-                        conjugateDegree,
-                        coefficientIndex)) {
-                    result.status =
-                        ExpressionTaylorJetStatus::
-                            InvalidRequest;
-                    return false;
-                }
-                ScaledComplexBall coefficient;
-                coefficient.value =
-                    jet.coefficients[
-                        coefficientIndex];
-                coefficient.radius =
-                    jet.coefficientRadii[
-                        coefficientIndex];
                 const bool productZero =
                     product.value.isZero() &&
                     product.radius.isZero();
@@ -8113,12 +8195,16 @@ bool ExpressionTaylorJetEvaluator::evaluate(
                 if (productZero && coefficientZero) {
                     row = product;
                     row.value.re.mantissa =
-                        std::signbit(product.value.re.mantissa) ||
-                        std::signbit(coefficient.value.re.mantissa)
+                        std::signbit(
+                            product.value.re.mantissa) ||
+                        std::signbit(
+                            coefficient.value.re.mantissa)
                         ? -0.0 : 0.0;
                     row.value.im.mantissa =
-                        std::signbit(product.value.im.mantissa) ||
-                        std::signbit(coefficient.value.im.mantissa)
+                        std::signbit(
+                            product.value.im.mantissa) ||
+                        std::signbit(
+                            coefficient.value.im.mantissa)
                         ? -0.0 : 0.0;
                 } else if (productZero) {
                     row = coefficient;
@@ -8127,28 +8213,26 @@ bool ExpressionTaylorJetEvaluator::evaluate(
                 } else {
                     arithmetic = certifiedScaledAdd(
                         product, coefficient, row);
-                    ++result.operationCount;
+                    ++results[0].operationCount;
                     if (arithmetic !=
-                            ScaledArithmeticStatus::
-                                Success) {
-                        result.status =
+                            ScaledArithmeticStatus::Success) {
+                        results[0].status =
                             statusForArithmetic(arithmetic);
                         return false;
                     }
                 }
             }
             if (!haveValue) {
-                value = row;
+                values[0] = row;
                 haveValue = true;
             } else {
                 ScaledComplexBall product;
                 arithmetic = certifiedScaledMultiply(
-                    value, conjugateQ, product);
-                ++result.operationCount;
+                    values[0], conjugateQ, product);
+                ++results[0].operationCount;
                 if (arithmetic !=
-                        ScaledArithmeticStatus::
-                            Success) {
-                    result.status =
+                        ScaledArithmeticStatus::Success) {
+                    results[0].status =
                         statusForArithmetic(arithmetic);
                     return false;
                 }
@@ -8159,27 +8243,28 @@ bool ExpressionTaylorJetEvaluator::evaluate(
                     row.value.isZero() &&
                     row.radius.isZero();
                 if (productZero && rowZero) {
-                    value = product;
-                    value.value.re.mantissa =
-                        std::signbit(product.value.re.mantissa) ||
+                    values[0] = product;
+                    values[0].value.re.mantissa =
+                        std::signbit(
+                            product.value.re.mantissa) ||
                         std::signbit(row.value.re.mantissa)
                         ? -0.0 : 0.0;
-                    value.value.im.mantissa =
-                        std::signbit(product.value.im.mantissa) ||
+                    values[0].value.im.mantissa =
+                        std::signbit(
+                            product.value.im.mantissa) ||
                         std::signbit(row.value.im.mantissa)
                         ? -0.0 : 0.0;
                 } else if (productZero) {
-                    value = row;
+                    values[0] = row;
                 } else if (rowZero) {
-                    value = product;
+                    values[0] = product;
                 } else {
                     arithmetic = certifiedScaledAdd(
-                        product, row, value);
-                    ++result.operationCount;
+                        product, row, values[0]);
+                    ++results[0].operationCount;
                     if (arithmetic !=
-                            ScaledArithmeticStatus::
-                                Success) {
-                        result.status =
+                            ScaledArithmeticStatus::Success) {
+                        results[0].status =
                             statusForArithmetic(arithmetic);
                         return false;
                     }
@@ -8187,21 +8272,14 @@ bool ExpressionTaylorJetEvaluator::evaluate(
             }
         }
     } else {
-        value.value = jet.coefficients.back();
-        value.radius = jet.coefficientRadii.back();
+        for (size_t lane = 0; lane < count; ++lane) {
+            values[lane].value =
+                jet.coefficients.back();
+            values[lane].radius =
+                jet.coefficientRadii.back();
+        }
         for (int degree = jet.order - 1;
              degree >= 0; --degree) {
-            ScaledComplexBall product;
-            ScaledArithmeticStatus arithmetic =
-                certifiedScaledMultiply(
-                    value, q, product);
-            ++result.operationCount;
-            if (arithmetic !=
-                    ScaledArithmeticStatus::Success) {
-                result.status =
-                    statusForArithmetic(arithmetic);
-                return false;
-            }
             ScaledComplexBall coefficient;
             coefficient.value =
                 jet.coefficients[
@@ -8209,29 +8287,49 @@ bool ExpressionTaylorJetEvaluator::evaluate(
             coefficient.radius =
                 jet.coefficientRadii[
                     static_cast<size_t>(degree)];
-            arithmetic = certifiedScaledAdd(
-                product, coefficient, value);
-            ++result.operationCount;
-            if (arithmetic !=
-                    ScaledArithmeticStatus::Success) {
-                result.status =
-                    statusForArithmetic(arithmetic);
-                return false;
+            for (size_t lane = 0;
+                 lane < count; ++lane) {
+                ScaledComplexBall product;
+                ScaledArithmeticStatus arithmetic =
+                    certifiedScaledMultiply(
+                        values[lane], q[lane], product);
+                ++results[lane].operationCount;
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success) {
+                    results[lane].status =
+                        statusForArithmetic(arithmetic);
+                    return false;
+                }
+                arithmetic = certifiedScaledAdd(
+                    product, coefficient,
+                    values[lane]);
+                ++results[lane].operationCount;
+                if (arithmetic !=
+                        ScaledArithmeticStatus::Success) {
+                    results[lane].status =
+                        statusForArithmetic(arithmetic);
+                    return false;
+                }
             }
         }
     }
-    if (addUp(
-            value.radius, jet.remainderRadius) !=
-            ScaledArithmeticStatus::Success ||
-        certifyScaledMpfrExponentRange(value) !=
-            ScaledArithmeticStatus::Success) {
-        result.status =
-            ExpressionTaylorJetStatus::ExponentRange;
-        return false;
+    for (size_t lane = 0; lane < count; ++lane) {
+        if (addUp(
+                values[lane].radius,
+                jet.remainderRadius) !=
+                ScaledArithmeticStatus::Success ||
+            certifyScaledMpfrExponentRange(
+                values[lane]) !=
+                ScaledArithmeticStatus::Success) {
+            results[lane].status =
+                ExpressionTaylorJetStatus::ExponentRange;
+            return false;
+        }
+        results[lane].residual = values[lane];
+        results[lane].valid = true;
+        results[lane].status =
+            ExpressionTaylorJetStatus::Success;
     }
-    result.residual = value;
-    result.valid = true;
-    result.status = ExpressionTaylorJetStatus::Success;
     return true;
 }
 

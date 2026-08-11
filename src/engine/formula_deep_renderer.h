@@ -42,6 +42,9 @@ struct ExpressionDeepMemoryPolicy {
 struct ExpressionDeepTaylorPolicy {
     bool enableTaylor = true;
     bool enableTileTaylor = true;
+    // Coherently traverses one accepted univariate jet for up to four pixels.
+    // Unsupported layouts or failed lane preparation use scalar evaluation.
+    bool enableBatchEvaluation = true;
     int minimumLanding = 8;
     int order = 12;
     int minimumOrder = 8;
@@ -204,6 +207,8 @@ struct ExpressionDeepRenderResult {
     int taylorFoldRejectionIteration = -1;
     std::string taylorFoldRejectionReason;
     double taylorBuildSeconds = 0.0;
+    // Planner/setup time excluding time reported by Taylor builders.
+    double taylorPlanningSeconds = 0.0;
     // Aggregate worker time; it may exceed fastSeconds under parallelism.
     double taylorEvaluationSeconds = 0.0;
     double taylorResidualSeconds = 0.0;

@@ -6505,7 +6505,8 @@ static int runExpressionTaylorCase() {
     int failures = 0;
     int containmentChecks = 0;
     std::vector<Complex> qValues = {
-        { 0.0, 0.0 },
+        { 0.0, -0.0 },
+        { -0.0, 0.0 },
         { 0.25, -0.5 },
         { -0.6, 0.2 },
         { 0.45, 0.45 },
@@ -6525,6 +6526,60 @@ static int runExpressionTaylorCase() {
         { -0.499, 0.499 },
         { 0.499, -0.499 },
         { -0.499, -0.499 }
+    };
+    auto sameScaled = [](
+            const ScaledRealValue& left,
+            const ScaledRealValue& right) {
+        return left.mantissa == right.mantissa &&
+               left.exponent == right.exponent &&
+               (left.mantissa != 0.0 ||
+                std::signbit(left.mantissa) ==
+                    std::signbit(right.mantissa));
+    };
+    auto sameEvaluation = [&](
+            const ExpressionTaylorJetEvaluation& left,
+            const ExpressionTaylorJetEvaluation& right) {
+        return left.status == right.status &&
+               left.valid == right.valid &&
+               left.operationCount == right.operationCount &&
+               sameScaled(
+                   left.residual.value.re,
+                   right.residual.value.re) &&
+               sameScaled(
+                   left.residual.value.im,
+                   right.residual.value.im) &&
+               sameScaled(
+                   left.residual.radius,
+                   right.residual.radius);
+    };
+    auto verifyBatch = [&](
+            const char* name, int landing,
+            const ExpressionTaylorJetResult& jet,
+            const std::array<ScaledComplexBall, 4>& q) {
+        std::array<
+            ExpressionTaylorJetEvaluation, 4> scalar{};
+        std::array<
+            ExpressionTaylorJetEvaluation, 4> batch{};
+        bool okay = true;
+        for (size_t lane = 0; lane < q.size(); ++lane)
+            okay =
+                ExpressionTaylorJetEvaluator::evaluate(
+                    jet, q[lane], scalar[lane]) &&
+                okay;
+        okay =
+            ExpressionTaylorJetEvaluator::evaluateBatch(
+                jet, q.data(), q.size(), batch.data()) &&
+            okay;
+        for (size_t lane = 0; lane < q.size(); ++lane)
+            okay =
+                sameEvaluation(
+                    scalar[lane], batch[lane]) &&
+                okay;
+        if (!okay) {
+            printf("  Taylor batch/scalar mismatch [%s/%d]\n",
+                   name, landing);
+            ++failures;
+        }
     };
     uint64_t randomState = 0x9e3779b97f4a7c15ULL;
     while (qValues.size() < 32) {
@@ -6884,6 +6939,32 @@ static int runExpressionTaylorCase() {
                     ++failures;
                 }
             }
+            std::array<ScaledComplexBall, 4> batchQ{};
+            bool batchQOkay = true;
+            for (size_t lane = 0;
+                 lane < batchQ.size(); ++lane)
+                batchQOkay =
+                    formula::makeScaledComplexValue(
+                        qValues[lane], batchQ[lane].value) ==
+                        ScaledArithmeticStatus::Success &&
+                    batchQOkay;
+            if (batchQOkay)
+                verifyBatch(
+                    test.name, landing, prefix, batchQ);
+            else
+                ++failures;
+
+            batchQ = {};
+            batchQ[0].value.re = { 0.5, -1800 };
+            batchQ[0].value.im.mantissa = -0.0;
+            batchQ[1].value.re.mantissa = -0.0;
+            batchQ[1].value.im = { -0.5, -3600 };
+            batchQ[2].value.re = { -0.5, -1024 };
+            batchQ[2].value.im = { 0.5, -2048 };
+            batchQ[3].value.re.mantissa = 0.0;
+            batchQ[3].value.im.mantissa = -0.0;
+            verifyBatch(
+                test.name, landing, prefix, batchQ);
         }
     }
 
@@ -8361,7 +8442,7 @@ static int runExpressionTaylorCase() {
     ProgramPair renderPair;
     ExpressionContext renderFixed;
     if (!compilePair(
-            "z*z+c", FormulaParameter::C,
+            "sin(z)+c", FormulaParameter::C,
             renderFixed, renderPair)) {
         ++failures;
     } else {
@@ -8393,12 +8474,20 @@ static int runExpressionTaylorCase() {
             request.threading.tileHeight = 5;
             return request;
         };
-        std::vector<float> enabled, disabled, single;
+        std::vector<float> enabled, scalarBatch, disabled, single;
         ExpressionDeepRenderRequest enabledRequest =
             makeRenderRequest(41, 25, 240, enabled);
         ExpressionDeepRenderResult enabledResult;
         bool okay = formula::renderExpressionDeepFrame(
             enabledRequest, enabledResult);
+        ExpressionDeepRenderRequest scalarBatchRequest =
+            makeRenderRequest(41, 25, 240, scalarBatch);
+        scalarBatchRequest.taylor.enableBatchEvaluation =
+            false;
+        ExpressionDeepRenderResult scalarBatchResult;
+        okay = okay &&
+            formula::renderExpressionDeepFrame(
+                scalarBatchRequest, scalarBatchResult);
         ExpressionDeepRenderRequest disabledRequest =
             makeRenderRequest(41, 25, 240, disabled);
         disabledRequest.taylor.enableTaylor = false;
@@ -8413,9 +8502,11 @@ static int runExpressionTaylorCase() {
         okay = okay &&
             formula::renderExpressionDeepFrame(
                 singleRequest, singleResult);
-        if (!okay || enabled != disabled ||
+        if (!okay || enabled != scalarBatch ||
+            enabled != disabled ||
             enabled != single ||
             !enabledResult.taylorAccepted ||
+            !scalarBatchResult.taylorAccepted ||
             enabledResult.taylorAcceptedPixelCount == 0 ||
             enabledResult.taylorCoveredIterations <
                 enabledRequest.taylor.minimumLanding ||

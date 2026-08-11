@@ -661,6 +661,82 @@ bool makePixelOffsetBall(
            ScaledArithmeticStatus::Success;
 }
 
+#if defined(_MSC_VER)
+__declspec(noinline)
+#endif
+bool evaluateTaylorBatch(
+        const std::vector<ScaledOffset>& xOffsets,
+        const ScaledOffset& yOffset,
+        int x, int xEnd,
+        const ExpressionTaylorJetResult& jet,
+        size_t& count,
+        std::array<
+            ExpressionTaylorJetEvaluation, 4>& landing) {
+    count = static_cast<size_t>(
+        std::min(4, xEnd - x));
+    std::array<ScaledComplexBall, 4> q{};
+    for (size_t lane = 0; lane < count; ++lane) {
+        const ScaledOffset& xOffset =
+            xOffsets[static_cast<size_t>(x) + lane];
+        ScaledComplexBall offset;
+        offset.value.re = xOffset.value;
+        offset.value.im = yOffset.value;
+        offset.radius =
+            compareScaledNonnegative(
+                xOffset.error, yOffset.error) >= 0
+            ? xOffset.error : yOffset.error;
+        if (!makeExpressionTaylorLocalQ(
+                offset, jet.parameterOffset,
+                jet.parameterScale, q[lane]))
+            return false;
+    }
+    return ExpressionTaylorJetEvaluator::evaluateBatch(
+        jet, q.data(), count, landing.data());
+}
+
+struct TaylorBatchCache {
+    int y = -1;
+    int xBegin = 0;
+    size_t count = 0;
+    bool valid = false;
+    std::array<
+        ExpressionTaylorJetEvaluation, 4> landing{};
+};
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#endif
+bool getTaylorBatchLanding(
+        TaylorBatchCache& cache,
+        const std::vector<ScaledOffset>& xOffsets,
+        const ScaledOffset& yOffset,
+        int x, int y, int xEnd,
+        const ExpressionTaylorJetResult& jet,
+        ExpressionTaylorJetEvaluation& landing,
+        uint64_t& evaluationNanoseconds) {
+    if (cache.y != y ||
+        x < cache.xBegin ||
+        static_cast<size_t>(x - cache.xBegin) >=
+            cache.count) {
+        const Clock::time_point start = Clock::now();
+        cache.y = y;
+        cache.xBegin = x;
+        cache.valid = evaluateTaylorBatch(
+            xOffsets, yOffset, x, xEnd, jet,
+            cache.count, cache.landing);
+        evaluationNanoseconds +=
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                    Clock::now() - start).count());
+    }
+    if (!cache.valid)
+        return false;
+    landing = cache.landing[
+        static_cast<size_t>(x - cache.xBegin)];
+    return landing.valid;
+}
+
 bool makeTaylorTileParameterization(
         const std::vector<ScaledOffset>& xOffsets,
         const std::vector<ScaledOffset>& yOffsets,
@@ -1750,6 +1826,10 @@ bool renderExpressionDeepFrame(
                     result.capability) &&
                 request.maxIterations >
                     request.taylor.minimumLanding) {
+                const Clock::time_point taylorPlanningStart =
+                    Clock::now();
+                const double taylorBuildSecondsBefore =
+                    result.taylorBuildSeconds;
                 result.taylorAttempted = true;
                 long double weightedLandingTotal = 0.0L;
                 size_t taylorBuildPeakBytes = 0;
@@ -2606,6 +2686,12 @@ bool renderExpressionDeepFrame(
                 result.taylorAccepted = useTaylor;
                 result.taylorRetainedBytes =
                     retainedTaylorBytes;
+                result.taylorPlanningSeconds =
+                    std::max(
+                        0.0,
+                        secondsSince(taylorPlanningStart) -
+                        (result.taylorBuildSeconds -
+                         taylorBuildSecondsBefore));
             }
             if (runFast &&
                 certifiedTaylorCapability(
@@ -2657,6 +2743,15 @@ bool renderExpressionDeepFrame(
             ExpressionDeepRenderPhase::Fast,
             0, pixelCount64);
         const Clock::time_point fastStart = Clock::now();
+        const bool useBatchTaylor =
+            useGlobalTaylor &&
+            request.taylor.enableBatchEvaluation &&
+            result.capability !=
+                ExpressionScaledResidualCapability::
+                    ExactCenteredArithmetic &&
+            taylorJet.layout ==
+                ExpressionTaylorJetLayout::
+                    ComplexUnivariate;
         std::atomic<uint64_t> fastPixels{ 0 };
         std::atomic<uint64_t> totalIterations{ 0 };
         std::atomic<uint64_t> taylorAcceptedPixels{ 0 };
@@ -2694,6 +2789,12 @@ bool renderExpressionDeepFrame(
                     workerReady = false;
                 }
                 uint64_t localIterations = 0;
+                uint64_t localFastPixels = 0;
+                uint64_t localTaylorAcceptedPixels = 0;
+                uint64_t localTaylorFallbackPixels = 0;
+                uint64_t localTaylorEvaluationNanoseconds = 0;
+                uint64_t localTaylorResidualNanoseconds = 0;
+                TaylorBatchCache batchCache;
 #pragma omp for schedule(dynamic, 1)
                 for (long long tile = 0;
                      tile < static_cast<long long>(tileCount);
@@ -2874,29 +2975,51 @@ bool renderExpressionDeepFrame(
                                                         jet;
                                         }
                                         if (pixelTaylorJet) {
-                                            const Clock::time_point
-                                                evaluationStart =
-                                                    Clock::now();
                                             ScaledComplexBall q;
                                             ScaledComplexBall
                                                 landingDelta;
                                             bool landed = false;
-                                            if (makeExpressionTaylorLocalQ(
+                                            ExpressionTaylorJetEvaluation
+                                                landing;
+                                            bool evaluatedLanding =
+                                                false;
+                                            bool batchedLanding =
+                                                false;
+                                            if (useBatchTaylor) {
+                                                batchedLanding =
+                                                    getTaylorBatchLanding(
+                                                        batchCache,
+                                                        xOffsets,
+                                                        yOffset,
+                                                        x, y, xEnd,
+                                                        *pixelTaylorJet,
+                                                        landing,
+                                                        localTaylorEvaluationNanoseconds);
+                                                evaluatedLanding =
+                                                    batchedLanding;
+                                            }
+                                            Clock::time_point
+                                                evaluationStart;
+                                            if (!batchedLanding) {
+                                                evaluationStart =
+                                                    Clock::now();
+                                            }
+                                            if (!evaluatedLanding &&
+                                                makeExpressionTaylorLocalQ(
                                                     offset,
                                                     pixelTaylorJet->
                                                         parameterOffset,
                                                     pixelTaylorJet->
                                                         parameterScale,
-                                                    q) &&
-                                                expressionTaylorQInsideUnitDisk(
                                                     q)) {
-                                                ExpressionTaylorJetEvaluation
-                                                    landing;
-                                                if (ExpressionTaylorJetEvaluator::
+                                                evaluatedLanding =
+                                                    ExpressionTaylorJetEvaluator::
                                                         evaluate(
                                                             *pixelTaylorJet,
                                                             q,
-                                                            landing)) {
+                                                            landing);
+                                            }
+                                            if (evaluatedLanding) {
                                                     landingDelta =
                                                         landing.residual;
                                                     const ExpressionReferenceSample&
@@ -2951,10 +3074,9 @@ bool renderExpressionDeepFrame(
                                                                 BailoutDecision::
                                                                     Inside;
                                                     }
-                                                }
                                             }
-                                            taylorEvaluationNanoseconds.
-                                                fetch_add(
+                                            if (!batchedLanding)
+                                                localTaylorEvaluationNanoseconds +=
                                                     static_cast<uint64_t>(
                                                         std::chrono::
                                                             duration_cast<
@@ -2962,18 +3084,14 @@ bool renderExpressionDeepFrame(
                                                                     nanoseconds>(
                                                                 Clock::now() -
                                                                 evaluationStart).
-                                                            count()),
-                                                    std::memory_order_relaxed);
+                                                            count());
                                             if (landed) {
                                                 stateDelta =
                                                     landingDelta;
                                                 firstIteration =
                                                     pixelTaylorJet->
                                                         landingIteration;
-                                                taylorAcceptedPixels.
-                                                    fetch_add(
-                                                        1,
-                                                        std::memory_order_relaxed);
+                                                ++localTaylorAcceptedPixels;
                                                 if (firstIteration ==
                                                         request.
                                                             maxIterations) {
@@ -2982,10 +3100,7 @@ bool renderExpressionDeepFrame(
                                                         ExpressionDeepInteriorPixel;
                                                 }
                                             } else {
-                                                taylorFallbackPixels.
-                                                    fetch_add(
-                                                        1,
-                                                        std::memory_order_relaxed);
+                                                ++localTaylorFallbackPixels;
                                                 if (certifiedTaylorCapability(
                                                         result.capability) &&
                                                     !certifiedPiecewiseCandidate &&
@@ -2999,10 +3114,7 @@ bool renderExpressionDeepFrame(
                                                 }
                                             }
                                         } else if (useTaylor) {
-                                            taylorFallbackPixels.
-                                                fetch_add(
-                                                    1,
-                                                    std::memory_order_relaxed);
+                                            ++localTaylorFallbackPixels;
                                             if (certifiedTaylorCapability(
                                                     result.capability) &&
                                                 !piecewisePerStepEligible &&
@@ -3015,7 +3127,13 @@ bool renderExpressionDeepFrame(
                                                     request.maxIterations;
                                             }
                                         }
-                                        const Clock::time_point
+                                        const bool timeTaylorResidual =
+                                            pixelTaylorJet &&
+                                            firstIteration <
+                                                request.maxIterations;
+                                        Clock::time_point
+                                            residualStart;
+                                        if (timeTaylorResidual)
                                             residualStart =
                                                 Clock::now();
                                         for (int iteration =
@@ -3199,18 +3317,16 @@ bool renderExpressionDeepFrame(
                                                 break;
                                             }
                                         }
-                                        if (pixelTaylorJet)
-                                            taylorResidualNanoseconds.
-                                                fetch_add(
-                                                    static_cast<uint64_t>(
-                                                        std::chrono::
-                                                            duration_cast<
-                                                                std::chrono::
-                                                                    nanoseconds>(
-                                                                Clock::now() -
-                                                                residualStart).
-                                                            count()),
-                                                    std::memory_order_relaxed);
+                                        if (timeTaylorResidual)
+                                            localTaylorResidualNanoseconds +=
+                                                static_cast<uint64_t>(
+                                                    std::chrono::
+                                                        duration_cast<
+                                                            std::chrono::
+                                                                nanoseconds>(
+                                                            Clock::now() -
+                                                            residualStart).
+                                                        count());
                                     }
                                 }
                             }
@@ -3226,9 +3342,7 @@ bool renderExpressionDeepFrame(
                                         request.output[index] =
                                             ExpressionDeepEmptyPixel;
                                     } else {
-                                        fastPixels.fetch_add(
-                                            1,
-                                            std::memory_order_relaxed);
+                                        ++localFastPixels;
                                     }
                                 }
                             } else {
@@ -3263,6 +3377,21 @@ bool renderExpressionDeepFrame(
                 }
                 totalIterations.fetch_add(
                     localIterations,
+                    std::memory_order_relaxed);
+                fastPixels.fetch_add(
+                    localFastPixels,
+                    std::memory_order_relaxed);
+                taylorAcceptedPixels.fetch_add(
+                    localTaylorAcceptedPixels,
+                    std::memory_order_relaxed);
+                taylorFallbackPixels.fetch_add(
+                    localTaylorFallbackPixels,
+                    std::memory_order_relaxed);
+                taylorEvaluationNanoseconds.fetch_add(
+                    localTaylorEvaluationNanoseconds,
+                    std::memory_order_relaxed);
+                taylorResidualNanoseconds.fetch_add(
+                    localTaylorResidualNanoseconds,
                     std::memory_order_relaxed);
             }
         }
