@@ -46,26 +46,25 @@ bool choosePrecision(
 
     uint64_t inputBits = 0;
     if (request.center.usesMpf()) {
-        const uint64_t limbBits =
-            static_cast<uint64_t>(GMP_NUMB_BITS);
-        const uint64_t realLimbs =
-            static_cast<uint64_t>(
-                mpf_size(request.center.realMpf));
-        const uint64_t imaginaryLimbs =
-            static_cast<uint64_t>(
-                mpf_size(request.center.imaginaryMpf));
-        const uint64_t usedLimbs =
-            std::max(realLimbs, imaginaryLimbs);
-        if (usedLimbs >
-            std::numeric_limits<uint64_t>::max() /
-                limbBits) {
-            error = "GMP input precision calculation overflow";
-            return false;
-        }
-        // mpf can retain a carry limb beyond mpf_get_prec(), and
-        // mpf_set_prec_raw() can make the nominal precision smaller than the
-        // live significand. Cover every used limb so mpfr_set_f is exact.
-        inputBits = usedLimbs * limbBits;
+        auto significantBits = [](mpf_srcptr value) {
+            const mp_size_t limbCount = mpf_size(value);
+            if (limbCount == 0) return uint64_t{ 0 };
+            const size_t highBit =
+                mpn_sizeinbase(value->_mp_d, limbCount, 2);
+            const mp_bitcnt_t lowBit =
+                mpn_scan1(value->_mp_d, 0);
+            return highBit > lowBit
+                ? static_cast<uint64_t>(
+                    highBit - lowBit)
+                : uint64_t{ 1 };
+        };
+        // GMP may retain a carry limb beyond mpf_get_prec(), while
+        // mpf_set_prec_raw() may leave more live bits than the nominal
+        // precision. Count the actual nonzero significand span so mpfr_set_f
+        // remains exact without charging zero padding as precision.
+        inputBits = std::max(
+            significantBits(request.center.realMpf),
+            significantBits(request.center.imaginaryMpf));
     } else {
         size_t digits = std::max(
             decimalDigits(request.center.realDecimal),

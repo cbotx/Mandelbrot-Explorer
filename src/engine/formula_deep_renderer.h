@@ -222,6 +222,7 @@ struct ExpressionDeepRenderResult {
     bool usedSpecializedPiecewiseMpfr = false;
     uint64_t specializedPiecewiseMpfrPixelCount = 0;
     uint64_t specializedPiecewiseMpfrIterationCount = 0;
+    uint64_t specializedPiecewiseMpfrPeriodicPixelCount = 0;
     bool taylorAttempted = false;
     bool taylorAccepted = false;
     int taylorOrder = 0;

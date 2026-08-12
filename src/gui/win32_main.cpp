@@ -2174,7 +2174,7 @@ public:
             if (deep.used) {
                 fprintf(
                     f,
-                    "generic status=%s pixels=%llu fast=%llu fallback=%llu Taylor=%llu preflight=%llu/%llu predicted=%s avoided=%llu specialized_mpfr=%d total=%.6f reference=%.6f preflight_time=%.6f build+eval=%.6f fast_time=%.6f fallback_time=%.6f preflight_iter=%llu preflight_ops=%llu preflight_folds=%llu first_uncertain=",
+                    "generic status=%s pixels=%llu fast=%llu fallback=%llu Taylor=%llu preflight=%llu/%llu predicted=%s avoided=%llu specialized_mpfr=%d mpfr_pixels=%llu mpfr_iter=%llu periodic=%llu precision=%llu/%llu total=%.6f reference=%.6f preflight_time=%.6f build+eval=%.6f fast_time=%.6f fallback_time=%.6f preflight_iter=%llu preflight_ops=%llu preflight_folds=%llu first_uncertain=",
                     deep.status.c_str(),
                     (unsigned long long)deep.pixelCount,
                     (unsigned long long)deep.fastPixelCount,
@@ -2188,6 +2188,16 @@ public:
                     (unsigned long long)
                         deep.preflightAvoidedFastPixelCount,
                     deep.specializedPiecewiseMpfr ? 1 : 0,
+                    (unsigned long long)
+                        deep.specializedPiecewiseMpfrPixelCount,
+                    (unsigned long long)
+                        deep.specializedPiecewiseMpfrIterationCount,
+                    (unsigned long long)
+                        deep.specializedPiecewiseMpfrPeriodicPixelCount,
+                    (unsigned long long)
+                        deep.selectedPrecision,
+                    (unsigned long long)
+                        deep.fallbackPrecision,
                     deep.totalSeconds, deep.referenceSeconds,
                     deep.preflightSeconds, deep.taylorSeconds,
                     deep.fastSeconds, deep.fallbackSeconds,
@@ -2416,7 +2426,14 @@ public:
                 const char* gz = getenv("MANDEL_GUI_ZOOM");
                 if (gx && gy && gz) {
                     std::string sc = expandSci(gz);
-                    if (!sc.empty()) nav->SetLocation(gx, gy, sc);
+                    mp_bitcnt_t precision = 0;
+                    if (const char* value =
+                            getenv("MANDEL_GUI_PRECISION"))
+                        precision = static_cast<mp_bitcnt_t>(
+                            strtoull(value, nullptr, 10));
+                    if (!sc.empty())
+                        nav->SetLocation(
+                            gx, gy, sc, precision);
                 }
                 if (const char* ww = getenv("MANDEL_GUI_WINW")) {
                     int winw = atoi(ww); const char* wh = getenv("MANDEL_GUI_WINH");
@@ -2447,7 +2464,16 @@ public:
                     const char* gz = getenv("MANDEL_GUI_ZOOM");
                     if (gx && gy && gz) {
                         std::string sc = expandSci(gz);
-                        if (!sc.empty()) nav->SetLocation(gx, gy, sc);
+                        mp_bitcnt_t precision = 0;
+                        if (const char* value =
+                                getenv("MANDEL_GUI_PRECISION"))
+                            precision =
+                                static_cast<mp_bitcnt_t>(
+                                    strtoull(
+                                        value, nullptr, 10));
+                        if (!sc.empty())
+                            nav->SetLocation(
+                                gx, gy, sc, precision);
                     }
                 }
                 if (getenv("MANDEL_GUI_FORMULA_RESTORE"))
@@ -2500,9 +2526,33 @@ public:
             } else if (benchMode) {
                 // A hidden benchmark window receives no initial WM_SIZE, so size the
                 // navigator explicitly instead of silently rendering at 900x600.
-                int oldW = renderW, oldH = renderH;
-                retargetToView();
-                if (renderW == oldW && renderH == oldH) startRender();
+                const char* requestedWidth =
+                    getenv("MANDEL_GUI_RENDERW");
+                const char* requestedHeight =
+                    getenv("MANDEL_GUI_RENDERH");
+                const int explicitWidth =
+                    requestedWidth ? atoi(requestedWidth) : 0;
+                const int explicitHeight =
+                    requestedHeight ? atoi(requestedHeight) : 0;
+                if (explicitWidth > 1 && explicitHeight > 1) {
+                    renderW = explicitWidth;
+                    renderH = explicitHeight;
+                    bitmap.assign(
+                        static_cast<size_t>(renderW) *
+                            renderH * 3,
+                        0);
+                    display.assign(
+                        static_cast<size_t>(renderW) *
+                            renderH * 3,
+                        0);
+                    nav->Resize(renderW, renderH);
+                    startRender();
+                } else {
+                    int oldW = renderW, oldH = renderH;
+                    retargetToView();
+                    if (renderW == oldW && renderH == oldH)
+                        startRender();
+                }
             } else {
                 startRender();
             }

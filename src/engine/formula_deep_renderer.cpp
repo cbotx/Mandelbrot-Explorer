@@ -62,13 +62,15 @@ uint64_t decimalBits(const std::string& text) {
 
 uint64_t mpfBits(mpf_srcptr value) {
     if (!value) return 0;
-    const uint64_t limbs =
-        static_cast<uint64_t>(mpf_size(value));
-    if (limbs >
-            std::numeric_limits<uint64_t>::max() /
-                static_cast<uint64_t>(GMP_NUMB_BITS))
-        return std::numeric_limits<uint64_t>::max();
-    return limbs * static_cast<uint64_t>(GMP_NUMB_BITS);
+    const mp_size_t limbCount = mpf_size(value);
+    if (limbCount == 0) return 0;
+    const size_t highBit =
+        mpn_sizeinbase(value->_mp_d, limbCount, 2);
+    const mp_bitcnt_t lowBit =
+        mpn_scan1(value->_mp_d, 0);
+    return highBit > lowBit
+        ? static_cast<uint64_t>(highBit - lowBit)
+        : 1;
 }
 
 bool validCenterRepresentation(
@@ -245,6 +247,8 @@ struct FallbackWorkerWorkspace {
           context(precision),
           pixel(precision),
           next(precision),
+          periodicState(precision),
+          piecewiseSquares(precision),
           magnitudeStorage(precision) {
         for (mpfr_ptr value : piecewiseScratch)
             mpfr_init2(value, precision);
@@ -254,7 +258,9 @@ struct FallbackWorkerWorkspace {
             request.bailout, RND);
         mpfr_sqr(
             piecewiseBailoutSquared,
-            piecewiseBailoutSquared, RND);
+            piecewiseBailoutSquared, MPFR_RNDD);
+        piecewiseInsideSquareExponent =
+            mpfr_get_exp(piecewiseBailoutSquared) - 2;
     }
 
     ~FallbackWorkerWorkspace() {
@@ -268,14 +274,18 @@ struct FallbackWorkerWorkspace {
     ExpressionOracleContext context;
     MpfrComplex pixel;
     MpfrComplex next;
+    MpfrComplex periodicState;
+    MpfrComplex piecewiseSquares;
     MpfrComplex magnitudeStorage;
     mpfr_t piecewiseScratch[5];
     mpfr_t piecewiseBailoutSquared;
+    mpfr_exp_t piecewiseInsideSquareExponent = 0;
 };
 
 bool evaluatePiecewiseQuadraticMpfr(
         ExpressionPiecewiseQuadraticKind kind,
         const ExpressionOracleContext& context,
+        const MpfrComplex& componentSquares,
         MpfrComplex& output, mpfr_t (&scratch)[5]) {
     if (kind !=
             ExpressionPiecewiseQuadraticKind::BurningShip)
@@ -283,15 +293,12 @@ bool evaluatePiecewiseQuadraticMpfr(
     // The generic oracle computes hypot(component, +0) after real()/imag().
     // Its exact mathematical result is representable, so abs is identical and
     // avoids two general square-root calls.
-    mpfr_abs(scratch[1], context.z.re, RND);
-    mpfr_abs(scratch[2], context.z.im, RND);
+    mpfr_sub(
+        output.re, componentSquares.re,
+        componentSquares.im, RND);
     mpfr_mul(
-        scratch[3], scratch[1], scratch[1], RND);
-    mpfr_mul(
-        scratch[4], scratch[2], scratch[2], RND);
-    mpfr_sub(output.re, scratch[3], scratch[4], RND);
-    mpfr_mul(
-        scratch[3], scratch[1], scratch[2], RND);
+        scratch[3], context.z.re, context.z.im, RND);
+    mpfr_abs(scratch[3], scratch[3], RND);
     // The generic complex square adds two identical rounded products.
     mpfr_mul_2ui(output.im, scratch[3], 1, RND);
     mpfr_add(output.re, output.re, context.c.re, RND);
@@ -303,14 +310,35 @@ bool piecewiseOutsideBailout(
         const MpfrComplex& value,
         mpfr_srcptr bailoutSquared,
         double bailout,
-        mpfr_ptr magnitude,
+        mpfr_ptr magnitude, MpfrComplex& componentSquares,
+        mpfr_exp_t insideSquareExponent,
         mpfr_t (&scratch)[5],
         bool& outside) {
-    mpfr_sqr(scratch[0], value.re, MPFR_RNDU);
-    mpfr_sqr(scratch[1], value.im, MPFR_RNDU);
+    const int reRounded = mpfr_sqr(
+        componentSquares.re, value.re, RND);
+    const int imRounded = mpfr_sqr(
+        componentSquares.im, value.im, RND);
+    const bool realClearlyInside =
+        mpfr_zero_p(componentSquares.re) ||
+        mpfr_get_exp(componentSquares.re) <=
+            insideSquareExponent;
+    const bool imaginaryClearlyInside =
+        mpfr_zero_p(componentSquares.im) ||
+        mpfr_get_exp(componentSquares.im) <=
+            insideSquareExponent;
+    if (realClearlyInside && imaginaryClearlyInside) {
+        outside = false;
+        return true;
+    }
     mpfr_add(
-        scratch[2], scratch[0], scratch[1],
+        scratch[2], componentSquares.re,
+        componentSquares.im,
         MPFR_RNDU);
+    // Each nearest-rounded square can undershoot by at most half an
+    // ulp. Since the nonnegative sum has an ulp at least as large as
+    // either operand, one upward step covers both possible errors.
+    if (reRounded < 0 || imRounded < 0)
+        mpfr_nextabove(scratch[2]);
     if (mpfr_cmp(scratch[2], bailoutSquared) <= 0) {
         outside = false;
         return true;
@@ -4331,6 +4359,7 @@ bool renderExpressionDeepFrame(
         std::atomic<uint64_t> undefinedPixels{ 0 };
         std::atomic<uint64_t> specializedPiecewisePixels{ 0 };
         std::atomic<uint64_t> specializedPiecewiseIterations{ 0 };
+        std::atomic<uint64_t> specializedPiecewisePeriodicPixels{ 0 };
         std::atomic_bool fallbackResourceError{ false };
         std::atomic_bool fallbackInternalError{ false };
         std::atomic_bool fallbackIterationFaultInjected{
@@ -4375,6 +4404,7 @@ bool renderExpressionDeepFrame(
                 uint64_t localIterations = 0;
                 uint64_t localSpecializedPixels = 0;
                 uint64_t localSpecializedIterations = 0;
+                uint64_t localSpecializedPeriodicPixels = 0;
 #pragma omp for schedule(dynamic, 8)
                 for (long long queueIndex = 0;
                      queueIndex <
@@ -4435,6 +4465,9 @@ bool renderExpressionDeepFrame(
                     float output =
                         ExpressionDeepInteriorPixel;
                     bool decided = false;
+                    uint64_t periodicPower = 1;
+                    uint64_t periodicLength = 0;
+                    bool periodicReady = false;
                     if (!undefined) {
                         if (mpfr_nan_p(context.z.re) ||
                             mpfr_nan_p(context.z.im)) {
@@ -4452,6 +4485,9 @@ bool renderExpressionDeepFrame(
                                         piecewiseBailoutSquared,
                                     request.bailout,
                                     magnitude,
+                                    workspace->piecewiseSquares,
+                                    workspace->
+                                        piecewiseInsideSquareExponent,
                                     workspace->
                                         piecewiseScratch,
                                     outside)) {
@@ -4477,23 +4513,37 @@ bool renderExpressionDeepFrame(
                             }
                         }
                     }
+                    if (!undefined && !decided &&
+                        specializedPiecewise &&
+                        request.maxIterations >= 4096) {
+                        workspace->periodicState.set(context.z);
+                        periodicReady = true;
+                    }
                     for (int iteration = 0;
                          !undefined && !decided &&
                          iteration < request.maxIterations;
                          ++iteration) {
-                        if (pollCancellation()) break;
+                        if ((iteration & 15) == 0 &&
+                            pollCancellation())
+                            break;
                         context.iteration = iteration;
-                        std::string oracleError;
-                        const bool oracleDefined =
-                            specializedPiecewise
-                            ? evaluatePiecewiseQuadraticMpfr(
+                        bool oracleDefined = true;
+                        if (specializedPiecewise) {
+                            oracleDefined =
+                                evaluatePiecewiseQuadraticMpfr(
                                 piecewiseQuadraticKind,
-                                context, next,
-                                workspace->piecewiseScratch)
-                            : ExpressionOracle::evaluate(
+                                context,
+                                workspace->piecewiseSquares,
+                                next,
+                                workspace->piecewiseScratch);
+                        } else {
+                            std::string oracleError;
+                            oracleDefined =
+                                ExpressionOracle::evaluate(
                                 *request.runtimeProgram,
                                 context, next,
                                 &oracleError);
+                        }
                         ++localIterations;
                         if (specializedPiecewise)
                             ++localSpecializedIterations;
@@ -4515,7 +4565,8 @@ bool renderExpressionDeepFrame(
                             undefined = true;
                             break;
                         }
-                        context.z.set(next);
+                        mpfr_swap(context.z.re, next.re);
+                        mpfr_swap(context.z.im, next.im);
                         bool outside = false;
                         if (specializedPiecewise) {
                             if (!piecewiseOutsideBailout(
@@ -4524,6 +4575,9 @@ bool renderExpressionDeepFrame(
                                         piecewiseBailoutSquared,
                                     request.bailout,
                                     magnitude,
+                                    workspace->piecewiseSquares,
+                                    workspace->
+                                        piecewiseInsideSquareExponent,
                                     workspace->
                                         piecewiseScratch,
                                     outside)) {
@@ -4549,11 +4603,37 @@ bool renderExpressionDeepFrame(
                             output = static_cast<float>(
                                 iteration + 1);
                             decided = true;
-                        } else if (iteration + 1 ==
-                                       request.maxIterations) {
-                            output =
-                                ExpressionDeepInteriorPixel;
-                            decided = true;
+                        } else {
+                            if (periodicReady) {
+                                ++periodicLength;
+                                if (mpfr_equal_p(
+                                        context.z.re,
+                                        workspace->
+                                            periodicState.re) &&
+                                    mpfr_equal_p(
+                                        context.z.im,
+                                        workspace->
+                                            periodicState.im)) {
+                                    output =
+                                        ExpressionDeepInteriorPixel;
+                                    decided = true;
+                                    ++localSpecializedPeriodicPixels;
+                                } else if (
+                                    periodicLength ==
+                                        periodicPower) {
+                                    workspace->periodicState.set(
+                                        context.z);
+                                    periodicLength = 0;
+                                    periodicPower *= 2;
+                                }
+                            }
+                            if (!decided &&
+                                iteration + 1 ==
+                                    request.maxIterations) {
+                                output =
+                                    ExpressionDeepInteriorPixel;
+                                decided = true;
+                            }
                         }
                     }
                     if (cancelled.load(
@@ -4604,6 +4684,9 @@ bool renderExpressionDeepFrame(
                 specializedPiecewiseIterations.fetch_add(
                     localSpecializedIterations,
                     std::memory_order_relaxed);
+                specializedPiecewisePeriodicPixels.fetch_add(
+                    localSpecializedPeriodicPixels,
+                    std::memory_order_relaxed);
             }
         }
         result.fallbackSeconds =
@@ -4617,6 +4700,9 @@ bool renderExpressionDeepFrame(
                 std::memory_order_relaxed);
         result.specializedPiecewiseMpfrIterationCount =
             specializedPiecewiseIterations.load(
+                std::memory_order_relaxed);
+        result.specializedPiecewiseMpfrPeriodicPixelCount =
+            specializedPiecewisePeriodicPixels.load(
                 std::memory_order_relaxed);
         result.usedSpecializedPiecewiseMpfr =
             result.specializedPiecewiseMpfrPixelCount != 0;

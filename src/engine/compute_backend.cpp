@@ -392,6 +392,21 @@ private:
                 deepResult.fallbackPixelCount;
             _genericInfo.taylorPixelCoverage =
                 deepResult.taylorAcceptedPixelCoverage;
+            _genericInfo.totalIterationCount =
+                deepResult.totalIterations;
+            _genericInfo.specializedPiecewiseMpfrPixelCount =
+                deepResult.specializedPiecewiseMpfrPixelCount;
+            _genericInfo.specializedPiecewiseMpfrIterationCount =
+                deepResult.specializedPiecewiseMpfrIterationCount;
+            _genericInfo.specializedPiecewiseMpfrPeriodicPixelCount =
+                deepResult.
+                    specializedPiecewiseMpfrPeriodicPixelCount;
+            _genericInfo.selectedPrecision =
+                static_cast<uint64_t>(
+                    deepResult.selectedPrecision);
+            _genericInfo.fallbackPrecision =
+                static_cast<uint64_t>(
+                    deepResult.fallbackPrecision);
             _genericInfo.totalSeconds = totalSeconds;
             _genericInfo.referenceSeconds =
                 deepResult.referenceSeconds;

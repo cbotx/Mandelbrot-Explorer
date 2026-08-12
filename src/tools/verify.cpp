@@ -3528,9 +3528,23 @@ static int runExpressionReferenceCase() {
         auto checkMpfInput = [&](const char* label,
                                  mpf_srcptr real,
                                  mpf_srcptr imaginary) {
+            auto significantBits = [](mpf_srcptr value) {
+                const mp_size_t limbCount = mpf_size(value);
+                if (limbCount == 0)
+                    return mpfr_prec_t{ 0 };
+                const size_t highBit =
+                    mpn_sizeinbase(
+                        value->_mp_d, limbCount, 2);
+                const mp_bitcnt_t lowBit =
+                    mpn_scan1(value->_mp_d, 0);
+                return static_cast<mpfr_prec_t>(
+                    std::max<size_t>(
+                        1, highBit - lowBit));
+            };
             const mpfr_prec_t required = static_cast<mpfr_prec_t>(
-                std::max(mpf_size(real), mpf_size(imaginary)) *
-                GMP_NUMB_BITS);
+                std::max(
+                    significantBits(real),
+                    significantBits(imaginary)));
             ExpressionReferenceBuildRequest request;
             request.canonicalProgram = &coordinateCanonical;
             request.runtimeProgram = &coordinateRuntimeC;
@@ -3552,7 +3566,7 @@ static int runExpressionReferenceCase() {
                     result.pixelDefect) ||
                 mpfr_cmp_f(reconstructed.re, real) != 0 ||
                 mpfr_cmp_f(reconstructed.im, imaginary) != 0) {
-                printf("  exact used-limb mpf transfer failed [%s]\n",
+                printf("  exact-significand mpf transfer failed [%s]\n",
                        label);
                 ++failures;
             }
@@ -3563,7 +3577,7 @@ static int runExpressionReferenceCase() {
                 rejected.status !=
                     ExpressionReferenceBuildStatus::
                         PrecisionOutOfRange) {
-                printf("  used-limb precision policy failed [%s]\n",
+                printf("  significand precision policy failed [%s]\n",
                        label);
                 ++failures;
             }
@@ -9826,7 +9840,11 @@ static int runExpressionDeepRenderCase() {
                   "1.001e12", 500, 100.0 },
                 { "-1.0139510022135",
                   "-0.7988691125650",
-                  scale, 900, 4.0 }
+                  scale, 900, 4.0 },
+                { "-0.9057323612582908890917025099695845505893",
+                  "-0.8657625017293160215313785051941801184211",
+                  "3.270573007328246235696425358963614125045e12",
+                  2000, 100.0 }
             };
             for (const auto& view : nearby) {
                 std::vector<float> actual, expected;
@@ -11832,7 +11850,14 @@ static int runExpressionDeepRenderCase() {
                 std::count(
                     output.begin(), output.end(), 1.0f) !=
                     static_cast<ptrdiff_t>(output.size())) {
-                printf("  MPFR infinity escape policy failed\n");
+                printf("  MPFR infinity escape policy failed status=%s undefined=%llu ones=%td first=%.9g\n",
+                       formula::expressionDeepRenderStatusName(
+                           result.status),
+                       (unsigned long long)
+                           result.undefinedPixelCount,
+                       std::count(
+                           output.begin(), output.end(), 1.0f),
+                       output.empty() ? 0.0 : output.front());
                 ++failures;
             }
         }
@@ -17073,7 +17098,7 @@ static int runCustomSlowdownCase(int width, int height) {
             formula::renderExpressionDeepFrame(
                 request, result);
         seconds = since(start);
-        printf("  %-20s %.3f s fast/fallback=%llu/%llu preflight=%llu/%llu %s Taylor=%llu/%llu preflight iter/ops/folds=%llu/%llu/%llu fast iter/ops/folds=%llu/%llu/%llu specialized=%d\n",
+        printf("  %-20s %.3f s fast/fallback=%llu/%llu preflight=%llu/%llu %s Taylor=%llu/%llu preflight iter/ops/folds=%llu/%llu/%llu fast iter/ops/folds=%llu/%llu/%llu specialized=%d mpfr pixels/iter/periodic=%llu/%llu/%llu\n",
                name, seconds,
                (unsigned long long)result.fastPixelCount,
                (unsigned long long)
@@ -17100,7 +17125,14 @@ static int runCustomSlowdownCase(int width, int height) {
                    result.fastOperationCount,
                (unsigned long long)
                    result.fastFoldOperationCount,
-               result.usedSpecializedPiecewiseMpfr ? 1 : 0);
+               result.usedSpecializedPiecewiseMpfr ? 1 : 0,
+               (unsigned long long)
+                   result.specializedPiecewiseMpfrPixelCount,
+               (unsigned long long)
+                   result.specializedPiecewiseMpfrIterationCount,
+               (unsigned long long)
+                   result.
+                       specializedPiecewiseMpfrPeriodicPixelCount);
         printf("    first uncertain preflight:");
         for (size_t bin = 0;
              bin <

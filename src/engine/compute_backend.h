@@ -83,6 +83,12 @@ struct GenericDeepInfo {
     uint64_t fastPixelCount = 0;
     uint64_t fallbackPixelCount = 0;
     uint64_t taylorPixelCoverage = 0;
+    uint64_t totalIterationCount = 0;
+    uint64_t specializedPiecewiseMpfrPixelCount = 0;
+    uint64_t specializedPiecewiseMpfrIterationCount = 0;
+    uint64_t specializedPiecewiseMpfrPeriodicPixelCount = 0;
+    uint64_t selectedPrecision = 0;
+    uint64_t fallbackPrecision = 0;
     double totalSeconds = 0.0;
     double referenceSeconds = 0.0;
     double preflightSeconds = 0.0;
