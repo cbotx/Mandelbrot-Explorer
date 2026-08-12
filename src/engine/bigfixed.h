@@ -105,7 +105,7 @@ static inline void bf_mag_mulhigh(uint64_t* hbuf, const uint64_t* a, const uint6
 // faster.
 static inline void bf_mag_mulshift(uint64_t* r, const uint64_t* a, const uint64_t* b, int L, uint64_t* tmp) {
     constexpr int GUARD = 3;
-    if (L >= 16) {
+    if (L >= 16 && L < 72) {
         bf_mag_mulhigh(tmp, a, b, L, GUARD);               // tmp[t] = column (L-1-GUARD+t)
         for (int i = 0; i < L; ++i) r[i] = tmp[i + GUARD]; // result limb i = column L-1+i
         if (tmp[GUARD - 1] >> 63) {                        // round-nearest from column L-2

@@ -3844,7 +3844,11 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
     }
     // Auto (env unset): use BigFixed on the deep floatexp path, where its high-half
     // short product beats mpf; env forces on (>=1) or off (0). mpf elsewhere.
-    _use_bigfixed = (g_bigfixed == -1) ? _use_floatexp : (g_bigfixed > 0);
+    const bool bigFixedRequested = (g_bigfixed == -1) ? _use_floatexp : (g_bigfixed > 0);
+    // BigFixed has one integer limb. Keep |z|^2 + |c| and the a+/-b intermediates
+    // well below 2^64; larger Custom bailout radii must retain the unbounded mpf path.
+    const bool bigFixedRangeSafe = !_customEscapeRadiusActive || _customEscapeRadius <= 0x1p31;
+    _use_bigfixed = bigFixedRequested && bigFixedRangeSafe;
     if (_use_bigfixed) {
         // Fixed-point orbit: L limbs = precision/64 + guard for near-zero passes
         // (fixed-point loses relative precision as |Z|->0; the extra guard limbs

@@ -301,7 +301,7 @@ int main() {
     printf("== high-half correctness ==\n");
     for (int L : {6, 10, 16, 24, 48}) checkHigh(L);
     printf("\n== multiply variants (ns each; speedup vs mpf, higher=faster) ==\n");
-    for (int L : {6, 8, 10, 12, 16, 20, 24, 32, 48, 64, 96, 128}) study(L, 1000000);
+    for (int L : {6, 8, 10, 12, 16, 20, 24, 32, 48, 56, 60, 64, 68, 72, 80, 88, 96, 128}) study(L, 1000000);
     printf("\n== complex-square: 2 high-half muls vs 3 high-half squares ==\n");
     for (int L : {16, 20, 24, 32, 48, 64}) complexStep(L, 1000000);
     return 0;
