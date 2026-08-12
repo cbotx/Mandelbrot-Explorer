@@ -78,6 +78,12 @@ public:
         IntegerPowerPlusC
     };
 
+    ExpressionProgram();
+    ExpressionProgram(const ExpressionProgram& other);
+    ExpressionProgram(ExpressionProgram&& other) noexcept;
+    ExpressionProgram& operator=(const ExpressionProgram& other);
+    ExpressionProgram& operator=(ExpressionProgram&& other) noexcept;
+
     bool compile(const std::string& source, ExpressionError* error = nullptr);
     bool specialize(const ExpressionContext& fixed,
                     FormulaParameter pixelParameter,
@@ -140,6 +146,8 @@ private:
     bool _batchCompatible = false;
     bool _derivativeCompatible = false;
     bool _valid = false;
+    uint64_t _identity = 0;
+    uint64_t _revision = 1;
 
     bool analyze(ExpressionError* error);
     static int operandCount(Op op);

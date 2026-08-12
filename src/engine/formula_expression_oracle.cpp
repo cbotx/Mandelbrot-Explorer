@@ -34,12 +34,29 @@ struct EvaluationWorkspace {
         stack.reserve(stackDepth);
         for (size_t i = 0; i < stackDepth; ++i)
             stack.emplace_back(valuePrecision);
+        origins.resize(stackDepth);
+        values.resize(stackDepth, nullptr);
     }
 
     mpfr_prec_t precision = 0;
     std::vector<MpfrComplex> stack;
+    std::vector<const MpfrComplex*> values;
+    enum class Origin : uint8_t {
+        Other,
+        ZComponents,
+        ZReal,
+        ZImaginary,
+        AbsZReal,
+        AbsZImaginary
+    };
+    std::vector<Origin> origins;
     MpfrComplex unaryInput;
     Scratch scratch;
+    const ExpressionProgram* program = nullptr;
+    uint64_t programIdentity = 0;
+    uint64_t programRevision = 0;
+    bool hasOrbitInvariant = false;
+    std::vector<uint8_t> superOps;
 };
 
 thread_local std::unique_ptr<EvaluationWorkspace>
@@ -131,6 +148,29 @@ void square(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
     mpfr_mul(s.values[2], a.re, a.im, RND);
     mpfr_sub(out.re, s.values[0], s.values[1], RND);
     mpfr_mul_2ui(out.im, s.values[2], 1, RND);
+}
+
+void squareWithComponentSquares(
+        MpfrComplex& out, const MpfrComplex& a,
+        const MpfrComplex& componentSquares,
+        Scratch& s) {
+    mpfr_mul(s.values[0], a.re, a.im, RND);
+    mpfr_sub(
+        out.re, componentSquares.re,
+        componentSquares.im, RND);
+    mpfr_mul_2ui(out.im, s.values[0], 1, RND);
+}
+
+void squareAbsWithComponentSquares(
+        MpfrComplex& out, const MpfrComplex& a,
+        const MpfrComplex& componentSquares,
+        Scratch& s) {
+    mpfr_mul(s.values[0], a.re, a.im, RND);
+    mpfr_abs(s.values[0], s.values[0], RND);
+    mpfr_sub(
+        out.re, componentSquares.re,
+        componentSquares.im, RND);
+    mpfr_mul_2ui(out.im, s.values[0], 1, RND);
 }
 
 bool divide(MpfrComplex& out, const MpfrComplex& a, const MpfrComplex& b, Scratch& s) {
@@ -495,7 +535,19 @@ bool ExpressionOracle::evaluate(const ExpressionProgram& program,
                                 MpfrComplex& output,
                                 std::string* error) {
     return evaluateInternal(
-        program, context, output, nullptr, error);
+        program, context, output, nullptr, false,
+        nullptr, error);
+}
+
+bool ExpressionOracle::evaluateOrbitStep(
+        const ExpressionProgram& program,
+        const ExpressionOracleContext& context,
+        MpfrComplex& output,
+        const MpfrComplex* currentZComponentSquares,
+        std::string* error) {
+    return evaluateInternal(
+        program, context, output, nullptr, true,
+        currentZComponentSquares, error);
 }
 
 bool ExpressionOracle::evaluateTrace(
@@ -504,7 +556,8 @@ bool ExpressionOracle::evaluateTrace(
         MpfrComplex& output, ExpressionOracleTrace& trace,
         std::string* error) {
     return evaluateInternal(
-        program, context, output, &trace, error);
+        program, context, output, &trace, false,
+        nullptr, error);
 }
 
 void ExpressionOracle::releaseThreadWorkspace() {
@@ -515,6 +568,8 @@ bool ExpressionOracle::evaluateInternal(
         const ExpressionProgram& program,
         const ExpressionOracleContext& context,
         MpfrComplex& output, ExpressionOracleTrace* trace,
+        bool moveOutput,
+        const MpfrComplex* currentZComponentSquares,
         std::string* error) {
     if (error) error->clear();
     if (trace) {
@@ -527,17 +582,6 @@ bool ExpressionOracle::evaluateInternal(
         setNan(output);
         return false;
     }
-    for (const ExpressionProgram::Instruction& instruction :
-         program._code) {
-        if (instruction.op ==
-            ExpressionProgram::Op::OrbitInvariant) {
-            if (error)
-                *error =
-                    "orbit-plan bytecode is unsupported by the MPFR oracle";
-            setNan(output);
-            return false;
-        }
-    }
     const mpfr_prec_t precision = output.precision();
     if (!evaluationWorkspace ||
         evaluationWorkspace->precision != precision ||
@@ -548,6 +592,61 @@ bool ExpressionOracle::evaluateInternal(
             std::make_unique<EvaluationWorkspace>(
             precision, program.stackDepth());
     }
+    if (!moveOutput ||
+        evaluationWorkspace->program != &program ||
+        evaluationWorkspace->programIdentity !=
+            program._identity ||
+        evaluationWorkspace->programRevision !=
+            program._revision) {
+        evaluationWorkspace->program = &program;
+        evaluationWorkspace->programIdentity =
+            program._identity;
+        evaluationWorkspace->programRevision =
+            program._revision;
+        evaluationWorkspace->hasOrbitInvariant =
+            std::any_of(
+                program._code.begin(), program._code.end(),
+                [](const ExpressionProgram::Instruction&
+                       instruction) {
+                    return instruction.op ==
+                        ExpressionProgram::Op::
+                            OrbitInvariant;
+                });
+        evaluationWorkspace->superOps.assign(
+            program._code.size(), 0);
+        auto is = [&](size_t index,
+                      ExpressionProgram::Op op) {
+            return index < program._code.size() &&
+                   program._code[index].op == op;
+        };
+        for (size_t index = 0;
+             index + 7 < program._code.size();
+             ++index) {
+            if (is(index, ExpressionProgram::Op::Z) &&
+                is(index + 1,
+                   ExpressionProgram::Op::Real) &&
+                is(index + 2,
+                   ExpressionProgram::Op::Abs) &&
+                is(index + 3,
+                   ExpressionProgram::Op::Z) &&
+                is(index + 4,
+                   ExpressionProgram::Op::Imaginary) &&
+                is(index + 5,
+                   ExpressionProgram::Op::Abs) &&
+                is(index + 6,
+                   ExpressionProgram::Op::MakeComplex) &&
+                is(index + 7,
+                   ExpressionProgram::Op::Square))
+                evaluationWorkspace->superOps[index] = 1;
+        }
+    }
+    if (evaluationWorkspace->hasOrbitInvariant) {
+        if (error)
+            *error =
+                "orbit-plan bytecode is unsupported by the MPFR oracle";
+        setNan(output);
+        return false;
+    }
     std::vector<MpfrComplex>& stack =
         evaluationWorkspace->stack;
     std::vector<uint16_t> nodeStack;
@@ -556,21 +655,44 @@ bool ExpressionOracle::evaluateInternal(
         nodeStack.resize(program.stackDepth(), UINT16_MAX);
     }
     Scratch& scratch = evaluationWorkspace->scratch;
+    std::vector<EvaluationWorkspace::Origin>& origins =
+        evaluationWorkspace->origins;
+    std::vector<const MpfrComplex*>& values =
+        evaluationWorkspace->values;
     size_t top = 0;
     bool exactDomain = true;
-
     auto unary = [&](auto function) {
-        evaluationWorkspace->unaryInput.set(stack[top - 1]);
+        const MpfrComplex& input = *values[top - 1];
+        MpfrComplex& result = stack[top - 1];
+        const MpfrComplex* stableInput = &input;
+        if (&input == &result) {
+            evaluationWorkspace->unaryInput.set(input);
+            stableInput = &evaluationWorkspace->unaryInput;
+        }
         function(
-            stack[top - 1],
-            evaluationWorkspace->unaryInput, scratch);
+            result, *stableInput, scratch);
+        values[top - 1] = &result;
+        origins[top - 1] =
+            EvaluationWorkspace::Origin::Other;
+    };
+    auto aliasSafeUnary = [&](auto function) {
+        const MpfrComplex& input = *values[top - 1];
+        MpfrComplex& result = stack[top - 1];
+        function(result, input, scratch);
+        values[top - 1] = &result;
+        origins[top - 1] =
+            EvaluationWorkspace::Origin::Other;
     };
     auto binary = [&](auto function) {
-        const MpfrComplex& right = stack[top - 1];
+        const MpfrComplex& left = *values[top - 2];
+        const MpfrComplex& right = *values[top - 1];
         --top;
+        MpfrComplex& result = stack[top - 1];
         function(
-            stack[top - 1], stack[top - 1],
-            right, scratch);
+            result, left, right, scratch);
+        values[top - 1] = &result;
+        origins[top - 1] =
+            EvaluationWorkspace::Origin::Other;
     };
 
     auto operationOf = [](ExpressionProgram::Op op) {
@@ -647,6 +769,22 @@ bool ExpressionOracle::evaluateInternal(
     for (size_t instructionIndex = 0;
          instructionIndex < program._code.size();
          ++instructionIndex) {
+        if (!trace && currentZComponentSquares &&
+            instructionIndex <
+                evaluationWorkspace->superOps.size() &&
+            evaluationWorkspace->
+                superOps[instructionIndex] != 0) {
+            MpfrComplex& result = stack[top];
+            squareAbsWithComponentSquares(
+                result, context.z,
+                *currentZComponentSquares, scratch);
+            values[top] = &result;
+            origins[top] =
+                EvaluationWorkspace::Origin::Other;
+            ++top;
+            instructionIndex += 7;
+            continue;
+        }
         const ExpressionProgram::Instruction& instruction =
             program._code[instructionIndex];
         const int operands =
@@ -658,12 +796,13 @@ bool ExpressionOracle::evaluateInternal(
         if (trace && operands >= 1) {
             leftNode = nodeStack[top - (size_t)operands];
             leftInput.emplace(precision);
-            leftInput->set(stack[top - (size_t)operands]);
+            leftInput->set(
+                *values[top - (size_t)operands]);
         }
         if (trace && operands == 2) {
             rightNode = nodeStack[top - 1];
             rightInput.emplace(precision);
-            rightInput->set(stack[top - 1]);
+            rightInput->set(*values[top - 1]);
         }
         bool nodeDomain = true;
         auto domainResult = [&](bool valid) {
@@ -676,22 +815,57 @@ bool ExpressionOracle::evaluateInternal(
             stack[top].set(
                 instruction.value.real(),
                 instruction.value.imag());
+            values[top] = &stack[top];
             domainResult(
                 mpfr_number_p(stack[top].re) &&
                 mpfr_number_p(stack[top].im));
+            origins[top] =
+                EvaluationWorkspace::Origin::Other;
             ++top;
             break;
-        case ExpressionProgram::Op::Z: stack[top++].set(context.z); break;
-        case ExpressionProgram::Op::C: stack[top++].set(context.c); break;
-        case ExpressionProgram::Op::Z0: stack[top++].set(context.z0); break;
+        case ExpressionProgram::Op::Z:
+            values[top] = &context.z;
+            origins[top] =
+                EvaluationWorkspace::Origin::ZComponents;
+            ++top;
+            break;
+        case ExpressionProgram::Op::C:
+            values[top] = &context.c;
+            origins[top] =
+                EvaluationWorkspace::Origin::Other;
+            ++top;
+            break;
+        case ExpressionProgram::Op::Z0:
+            values[top] = &context.z0;
+            origins[top] =
+                EvaluationWorkspace::Origin::Other;
+            ++top;
+            break;
         case ExpressionProgram::Op::Iteration:
             mpfr_set_si(stack[top].re, context.iteration, RND);
-            mpfr_set_zero(stack[top].im, 0); ++top; break;
+            mpfr_set_zero(stack[top].im, 0);
+            values[top] = &stack[top];
+            origins[top] =
+                EvaluationWorkspace::Origin::Other;
+            ++top;
+            break;
         case ExpressionProgram::Op::Parameter:
-            stack[top++].set(context.parameters[instruction.argument]); break;
+            values[top] =
+                &context.parameters[instruction.argument];
+            origins[top] =
+                EvaluationWorkspace::Origin::Other;
+            ++top;
+            break;
         case ExpressionProgram::Op::Negate:
-            mpfr_neg(stack[top - 1].re, stack[top - 1].re, RND);
-            mpfr_neg(stack[top - 1].im, stack[top - 1].im, RND); break;
+            {
+                const MpfrComplex& input =
+                    *values[top - 1];
+                MpfrComplex& result = stack[top - 1];
+                mpfr_neg(result.re, input.re, RND);
+                mpfr_neg(result.im, input.im, RND);
+                values[top - 1] = &result;
+            }
+            break;
         case ExpressionProgram::Op::Add:
             binary([](MpfrComplex& o, const MpfrComplex& a, const MpfrComplex& b, Scratch&) { add(o, a, b); }); break;
         case ExpressionProgram::Op::Subtract:
@@ -707,44 +881,83 @@ bool ExpressionOracle::evaluateInternal(
                 domainResult(power(o, a, b, s));
             }); break;
         case ExpressionProgram::Op::Square:
-            square(stack[top - 1], stack[top - 1], scratch);
+            {
+            const MpfrComplex& input = *values[top - 1];
+            MpfrComplex& result = stack[top - 1];
+            if (currentZComponentSquares &&
+                origins[top - 1] ==
+                    EvaluationWorkspace::Origin::
+                        ZComponents)
+                squareWithComponentSquares(
+                    result, input,
+                    *currentZComponentSquares, scratch);
+            else
+                square(result, input, scratch);
+            values[top - 1] = &result;
+            origins[top - 1] =
+                EvaluationWorkspace::Origin::Other;
+            }
             break;
         case ExpressionProgram::Op::Sin:
-            sine(stack[top - 1], stack[top - 1], scratch);
+            aliasSafeUnary(
+                [](MpfrComplex& result,
+                   const MpfrComplex& input, Scratch& s) {
+                    sine(result, input, s);
+                });
             break;
         case ExpressionProgram::Op::Cos:
-            cosine(stack[top - 1], stack[top - 1], scratch);
+            aliasSafeUnary(
+                [](MpfrComplex& result,
+                   const MpfrComplex& input, Scratch& s) {
+                    cosine(result, input, s);
+                });
             break;
         case ExpressionProgram::Op::Tan:
             unary([&](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
                 domainResult(tangent(o, a, s));
             }); break;
         case ExpressionProgram::Op::Sinh:
-            hyperbolicSine(
-                stack[top - 1], stack[top - 1], scratch);
+            aliasSafeUnary(
+                [](MpfrComplex& result,
+                   const MpfrComplex& input, Scratch& s) {
+                    hyperbolicSine(result, input, s);
+                });
             break;
         case ExpressionProgram::Op::Cosh:
-            hyperbolicCosine(
-                stack[top - 1], stack[top - 1], scratch);
+            aliasSafeUnary(
+                [](MpfrComplex& result,
+                   const MpfrComplex& input, Scratch& s) {
+                    hyperbolicCosine(result, input, s);
+                });
             break;
         case ExpressionProgram::Op::Tanh:
             unary([&](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
                 domainResult(hyperbolicTangent(o, a, s));
             }); break;
         case ExpressionProgram::Op::Exp:
-            exponential(
-                stack[top - 1], stack[top - 1], scratch);
+            aliasSafeUnary(
+                [](MpfrComplex& result,
+                   const MpfrComplex& input, Scratch& s) {
+                    exponential(result, input, s);
+                });
             break;
         case ExpressionProgram::Op::Log:
-            domainResult(logarithm(
-                stack[top - 1], stack[top - 1],
-                scratch));
+            {
+            const MpfrComplex& input = *values[top - 1];
+            MpfrComplex& result = stack[top - 1];
+            domainResult(logarithm(result, input, scratch));
+            values[top - 1] = &result;
+            origins[top - 1] =
+                EvaluationWorkspace::Origin::Other;
+            }
             break;
         case ExpressionProgram::Op::Log10:
             {
+                const MpfrComplex& input =
+                    *values[top - 1];
                 MpfrComplex& value = stack[top - 1];
                 const bool valid =
-                    logarithm(value, value, scratch);
+                    logarithm(value, input, scratch);
                 domainResult(valid);
                 if (valid) {
                     mpfr_const_log2(
@@ -762,52 +975,147 @@ bool ExpressionOracle::evaluateInternal(
                         value.im, value.im,
                         scratch.values[0], RND);
                 }
+                values[top - 1] = &value;
             }
+            origins[top - 1] =
+                EvaluationWorkspace::Origin::Other;
             break;
         case ExpressionProgram::Op::Sqrt:
             unary([&](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
                 domainResult(squareRoot(o, a, s));
             }); break;
         case ExpressionProgram::Op::Abs:
-            absolute(stack[top - 1], stack[top - 1]);
+            {
+            const MpfrComplex& input = *values[top - 1];
+            MpfrComplex& result = stack[top - 1];
+            if (origins[top - 1] ==
+                    EvaluationWorkspace::Origin::ZReal)
+                origins[top - 1] =
+                    EvaluationWorkspace::Origin::AbsZReal;
+            else if (origins[top - 1] ==
+                         EvaluationWorkspace::Origin::
+                             ZImaginary)
+                origins[top - 1] =
+                    EvaluationWorkspace::Origin::
+                        AbsZImaginary;
+            else
+                origins[top - 1] =
+                    EvaluationWorkspace::Origin::Other;
+            absolute(result, input);
+            values[top - 1] = &result;
+            }
             break;
         case ExpressionProgram::Op::Norm:
-            norm(stack[top - 1], stack[top - 1], scratch);
+            aliasSafeUnary(
+                [](MpfrComplex& result,
+                   const MpfrComplex& input, Scratch& s) {
+                    norm(result, input, s);
+                });
             break;
         case ExpressionProgram::Op::Arg:
-            argument(stack[top - 1], stack[top - 1]);
+            aliasSafeUnary(
+                [](MpfrComplex& result,
+                   const MpfrComplex& input, Scratch&) {
+                    argument(result, input);
+                });
             break;
         case ExpressionProgram::Op::Conjugate:
-            mpfr_neg(stack[top - 1].im, stack[top - 1].im, RND); break;
+            {
+                const MpfrComplex& input =
+                    *values[top - 1];
+                MpfrComplex& result = stack[top - 1];
+                mpfr_set(result.re, input.re, RND);
+                mpfr_neg(result.im, input.im, RND);
+                values[top - 1] = &result;
+            }
+            if (origins[top - 1] !=
+                    EvaluationWorkspace::Origin::
+                        ZComponents)
+                origins[top - 1] =
+                    EvaluationWorkspace::Origin::Other;
+            break;
         case ExpressionProgram::Op::Real:
-            mpfr_set_zero(stack[top - 1].im, 0); break;
+            {
+            const MpfrComplex& input = *values[top - 1];
+            MpfrComplex& result = stack[top - 1];
+            const bool fromZ =
+                origins[top - 1] ==
+                    EvaluationWorkspace::Origin::
+                        ZComponents;
+            origins[top - 1] = fromZ
+                ? EvaluationWorkspace::Origin::ZReal
+                : EvaluationWorkspace::Origin::Other;
+            mpfr_set(result.re, input.re, RND);
+            mpfr_set_zero(result.im, 0);
+            values[top - 1] = &result;
+            }
+            break;
         case ExpressionProgram::Op::Imaginary:
-            mpfr_set(stack[top - 1].re, stack[top - 1].im, RND);
-            mpfr_set_zero(stack[top - 1].im, 0); break;
+            {
+            const MpfrComplex& input = *values[top - 1];
+            MpfrComplex& result = stack[top - 1];
+            const bool fromZ =
+                origins[top - 1] ==
+                    EvaluationWorkspace::Origin::
+                        ZComponents;
+            origins[top - 1] = fromZ
+                ? EvaluationWorkspace::Origin::ZImaginary
+                : EvaluationWorkspace::Origin::Other;
+            mpfr_set(result.re, input.im, RND);
+            mpfr_set_zero(result.im, 0);
+            values[top - 1] = &result;
+            }
+            break;
         case ExpressionProgram::Op::MakeComplex: {
-            const MpfrComplex& right = stack[top - 1];
+            const EvaluationWorkspace::Origin leftOrigin =
+                origins[top - 2];
+            const EvaluationWorkspace::Origin rightOrigin =
+                origins[top - 1];
+            const MpfrComplex& left = *values[top - 2];
+            const MpfrComplex& right = *values[top - 1];
             --top;
+            MpfrComplex& result = stack[top - 1];
+            mpfr_set(result.re, left.re, RND);
             mpfr_set(
-                stack[top - 1].im,
+                result.im,
                 right.re, RND);
+            values[top - 1] = &result;
+            origins[top - 1] =
+                leftOrigin ==
+                        EvaluationWorkspace::Origin::
+                            AbsZReal &&
+                    rightOrigin ==
+                        EvaluationWorkspace::Origin::
+                            AbsZImaginary
+                ? EvaluationWorkspace::Origin::
+                    ZComponents
+                : EvaluationWorkspace::Origin::Other;
             break;
         }
         case ExpressionProgram::Op::Polar: {
-            const MpfrComplex& angle = stack[top - 1];
+            const MpfrComplex& radius = *values[top - 2];
+            const MpfrComplex& angle = *values[top - 1];
             --top;
-            MpfrComplex& radius = stack[top - 1];
+            MpfrComplex& result = stack[top - 1];
             if (!mpfr_zero_p(radius.im) || !mpfr_zero_p(angle.im) ||
                 mpfr_nan_p(radius.re) || mpfr_inf_p(radius.re) ||
                 mpfr_sgn(radius.re) < 0 || mpfr_nan_p(angle.re) ||
                 mpfr_inf_p(angle.re)) {
-                setNan(radius);
+                setNan(result);
                 domainResult(false);
             } else {
                 mpfr_cos(scratch.values[0], angle.re, RND);
                 mpfr_sin(scratch.values[1], angle.re, RND);
-                mpfr_mul(radius.im, radius.re, scratch.values[1], RND);
-                mpfr_mul(radius.re, radius.re, scratch.values[0], RND);
+                mpfr_mul(
+                    result.im, radius.re,
+                    scratch.values[1], RND);
+                mpfr_mul(
+                    result.re, radius.re,
+                    scratch.values[0], RND);
             }
+            values[top - 1] = &result;
+            origins[top - 1] =
+                EvaluationWorkspace::Origin::Other;
             break;
         }
         case ExpressionProgram::Op::OrbitInvariant:
@@ -826,7 +1134,7 @@ bool ExpressionOracle::evaluateInternal(
             node.operation = operationOf(instruction.op);
             node.leftNode = leftNode;
             node.rightNode = rightNode;
-            node.output.set(stack[top - 1]);
+            node.output.set(*values[top - 1]);
             if (!nodeDomain)
                 node.flags |= OracleTraceUndefined;
 
@@ -967,7 +1275,13 @@ bool ExpressionOracle::evaluateInternal(
                 trace->nodes.size() - 1);
         }
     }
-    output.set(stack[0]);
+    const MpfrComplex& result = *values[0];
+    if (moveOutput && &result == &stack[0]) {
+        mpfr_swap(output.re, stack[0].re);
+        mpfr_swap(output.im, stack[0].im);
+    } else {
+        output.set(result);
+    }
     if (trace) trace->exactDomain = exactDomain;
     if (!exactDomain && error) *error = "expression evaluated outside a function domain";
     return exactDomain;

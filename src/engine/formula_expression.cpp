@@ -1,6 +1,7 @@
 #include "formula_expression.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
@@ -13,6 +14,22 @@
 #include <immintrin.h>
 
 namespace formula {
+
+namespace {
+
+std::atomic<uint64_t> nextProgramIdentity{ 1 };
+
+uint64_t allocateProgramIdentity() {
+    uint64_t identity =
+        nextProgramIdentity.fetch_add(
+            1, std::memory_order_relaxed);
+    if (identity == 0)
+        identity = nextProgramIdentity.fetch_add(
+            1, std::memory_order_relaxed);
+    return identity;
+}
+
+} // namespace
 
 class ExpressionParser {
 public:
@@ -824,7 +841,69 @@ bool ExpressionProgram::containsOrbitInvariant() const {
         });
 }
 
+ExpressionProgram::ExpressionProgram()
+    : _identity(allocateProgramIdentity()) {}
+
+ExpressionProgram::ExpressionProgram(
+        const ExpressionProgram& other)
+    : ExpressionProgram() {
+    *this = other;
+}
+
+ExpressionProgram::ExpressionProgram(
+        ExpressionProgram&& other) noexcept
+    : ExpressionProgram() {
+    *this = std::move(other);
+}
+
+ExpressionProgram& ExpressionProgram::operator=(
+        const ExpressionProgram& other) {
+    if (this == &other) return *this;
+    const uint64_t nextRevision = _revision + 1;
+    _code = other._code;
+    _source = other._source;
+    _stackDepth = other._stackDepth;
+    _fastPath = other._fastPath;
+    _fastIntegerPower = other._fastIntegerPower;
+    _avx2Compatible = other._avx2Compatible;
+    _batchCompatible = other._batchCompatible;
+    _derivativeCompatible = other._derivativeCompatible;
+    _valid = other._valid;
+    _revision = nextRevision ? nextRevision : 1;
+    return *this;
+}
+
+ExpressionProgram& ExpressionProgram::operator=(
+        ExpressionProgram&& other) noexcept {
+    if (this == &other) return *this;
+    const uint64_t nextRevision = _revision + 1;
+    _code = std::move(other._code);
+    _source = std::move(other._source);
+    _stackDepth = other._stackDepth;
+    _fastPath = other._fastPath;
+    _fastIntegerPower = other._fastIntegerPower;
+    _avx2Compatible = other._avx2Compatible;
+    _batchCompatible = other._batchCompatible;
+    _derivativeCompatible = other._derivativeCompatible;
+    _valid = other._valid;
+    _revision = nextRevision ? nextRevision : 1;
+    other._source.clear();
+    other._code.clear();
+    other._stackDepth = 0;
+    other._fastPath = FastPath::None;
+    other._fastIntegerPower = 0;
+    other._avx2Compatible = false;
+    other._batchCompatible = false;
+    other._derivativeCompatible = false;
+    other._valid = false;
+    ++other._revision;
+    if (other._revision == 0) other._revision = 1;
+    return *this;
+}
+
 bool ExpressionProgram::compile(const std::string& source, ExpressionError* error) {
+    ++_revision;
+    if (_revision == 0) _revision = 1;
     _valid = false;
     _source.clear();
     _code.clear();

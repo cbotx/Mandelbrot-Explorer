@@ -4559,9 +4559,12 @@ bool renderExpressionDeepFrame(
                                 workspace->piecewiseScratch);
                         } else {
                             oracleDefined =
-                                ExpressionOracle::evaluate(
+                                ExpressionOracle::
+                                    evaluateOrbitStep(
                                 *request.runtimeProgram,
-                                context, next, nullptr);
+                                context, next,
+                                &workspace->piecewiseSquares,
+                                nullptr);
                         }
                         ++localIterations;
                         if (specializedPiecewise)

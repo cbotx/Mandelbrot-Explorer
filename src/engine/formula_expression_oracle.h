@@ -129,6 +129,13 @@ public:
                          const ExpressionOracleContext& context,
                          MpfrComplex& output,
                          std::string* error = nullptr);
+    // Orbit hot path: output must not alias any context value.
+    static bool evaluateOrbitStep(
+        const ExpressionProgram& program,
+        const ExpressionOracleContext& context,
+        MpfrComplex& output,
+        const MpfrComplex* currentZComponentSquares = nullptr,
+        std::string* error = nullptr);
     static bool evaluateTrace(const ExpressionProgram& program,
                               const ExpressionOracleContext& context,
                               MpfrComplex& output,
@@ -142,6 +149,9 @@ private:
                                  const ExpressionOracleContext& context,
                                  MpfrComplex& output,
                                  ExpressionOracleTrace* trace,
+                                 bool moveOutput,
+                                 const MpfrComplex*
+                                     currentZComponentSquares,
                                  std::string* error);
 };
 
