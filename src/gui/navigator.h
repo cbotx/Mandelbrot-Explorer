@@ -7,28 +7,28 @@
 #include <array>
 
 class Navigator {
-protected:
+  protected:
     int _w, _h;
     double _dx, _dy;
     double _display_dx, _display_dy;
     double _k;
 
-private:
+  private:
     double _zoom_progress;
     double _zoom_start, _zoom_end;
     double _zoom_step;
-    double _zoom_time; // zoom animation time in ms
+    double _zoom_time;       // zoom animation time in ms
     double _zoom_x, _zoom_y; // zoom center
-    
+
     std::mutex _mu;
     int _drag_old_x, _drag_old_y, _drag_unprocessed_dx, _drag_unprocessed_dy;
     bool _dragging;
-    
+
     std::chrono::time_point<std::chrono::high_resolution_clock> _start_time;
 
     void (*_fix_image_cb)(void);
 
-public:
+  public:
     Navigator(int width, int height, double zoom_step, double zoom_time);
 
     virtual ~Navigator() = default;
@@ -55,7 +55,7 @@ public:
     // callback -- used to jump directly to an absolute pasted location.
     void JumpReset();
 
-private:
+  private:
     void init();
 };
 

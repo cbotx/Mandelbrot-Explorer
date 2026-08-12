@@ -30,15 +30,9 @@ struct ExpressionOrbitClassification {
     bool cancelled = false;
 };
 
-bool evaluateExpressionOrbit(
-    const ExpressionOrbitSnapshot& snapshot, Complex pixel,
-    int maxIterations, ExpressionOrbitEvaluation& result,
-    const std::function<bool()>& shouldCancel = {});
+bool evaluateExpressionOrbit(const ExpressionOrbitSnapshot& snapshot, Complex pixel, int maxIterations, ExpressionOrbitEvaluation& result, const std::function<bool()>& shouldCancel = {});
 
-bool classifyExpressionOrbit(
-    const ExpressionOrbitSnapshot& snapshot, Complex pixel,
-    int maxIterations, ExpressionOrbitClassification& result,
-    const std::function<bool()>& shouldCancel = {});
+bool classifyExpressionOrbit(const ExpressionOrbitSnapshot& snapshot, Complex pixel, int maxIterations, ExpressionOrbitClassification& result, const std::function<bool()>& shouldCancel = {});
 
 } // namespace formula
 

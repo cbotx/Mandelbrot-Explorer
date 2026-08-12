@@ -1,7 +1,6 @@
 #ifndef __MANDEL_NAVIGATOR_H__
 #define __MANDEL_NAVIGATOR_H__
 
-
 #include <gmp.h>
 #include <atomic>
 #include <future>
@@ -20,14 +19,13 @@
 #include "float_math.h"
 
 class MandelNavigator : public Navigator {
-private:
+  private:
     FormulaContext _formula = quadraticMandelbrot();
     std::unique_ptr<IComputeBackend> _backend;
     formula::ExpressionProgram _expressionProgram;
     formula::ExpressionProgram _expressionRuntimeProgram;
     formula::ExpressionOrbitPlan _expressionOrbitPlan;
-    std::shared_ptr<const formula::ExpressionOrbitSnapshot>
-        _expressionOrbitSnapshot;
+    std::shared_ptr<const formula::ExpressionOrbitSnapshot> _expressionOrbitSnapshot;
 #if defined(MANDEL_ENABLE_ASMJIT)
     formula::ExpressionJit4 _expressionJit;
     bool _expressionUseJit = false;
@@ -51,23 +49,23 @@ private:
     int _shift_idx;
     std::atomic_bool _require_update{true};
     std::atomic<float> _computeProgress{0.0f};
-    bool _need_settle = false;   // a computing frame was point-sampled; force one AA pass once settled
+    bool _need_settle = false; // a computing frame was point-sampled; force one AA pass once settled
 
     // ---- palette-phase animation cache -------------------------------------
     // Phase-independent per-pixel colouring analysis, rebuilt whenever the frame
     // settles. RecolorPhase re-shades these with the live color_phase each frame
     // without re-running colorFunction / the neighbourhood gradient.
-    std::vector<float> _baseU;      // AA path: palette-index centre (_w*_h)
-    std::vector<float> _widthC;     // AA path: palette footprint width (_w*_h)
-    std::vector<float> _baseUsub;   // Feather path: per-subpixel base index (sub grid)
+    std::vector<float> _baseU;    // AA path: palette-index centre (_w*_h)
+    std::vector<float> _widthC;   // AA path: palette footprint width (_w*_h)
+    std::vector<float> _baseUsub; // Feather path: per-subpixel base index (sub grid)
     bool _cache_valid = false;
-    float _cache_density = -1.0f;   // color_density the cache was built with
-    int _cache_method = -1;         // _c_method the cache was built with
+    float _cache_density = -1.0f; // color_density the cache was built with
+    int _cache_method = -1;       // _c_method the cache was built with
 
     // ---- relief (screen-space slope) height cache --------------------------
     // Per-pixel smooth height (centre subpixel), rebuilt on each settled frame;
     // applyRelief() re-shades from it each frame so the light stays animatable.
-    std::vector<float> _reliefHt;   // (_w*_h), NaN for interior/empty pixels
+    std::vector<float> _reliefHt; // (_w*_h), NaN for interior/empty pixels
     // Analytic normal-map: the engine fills _normal (sub-grid) with the per-pixel
     // surface-normal angle; _normalField is the per-output-pixel angle (centre
     // subpixel), NaN for interior/empty. applyNormalLight() shades from it.
@@ -76,7 +74,7 @@ private:
 
     std::future<void> _task;
 
-public:
+  public:
     MandelNavigator(int width, int height, int sub, int max_iteration, double zoom_step, double zoom_time);
 
     virtual ~MandelNavigator();
@@ -105,50 +103,29 @@ public:
     void SetMxit(int mxit);
     int GetMxit() const { return _mxit; }
     const ComputeBackendInfo& GetBackendInfo() const { return _backend->info(); }
-    bool LastComputeUsedGpuPath() const {
-        return _backend->lastComputeUsedGpuPath();
-    }
-    bool LastComputeUsedCustomDeepPath() const {
-        return _backend->lastComputeUsedCustomDeepPath();
-    }
-    bool LastComputeUsedGenericDeepPath() const {
-        return _backend->lastComputeUsedGenericDeepPath();
-    }
-    GenericDeepInfo GetLastGenericDeepInfo() const {
-        return _backend->lastGenericDeepInfo();
-    }
-    float GetComputeProgress() const {
-        return _computeProgress.load(std::memory_order_relaxed);
-    }
+    bool LastComputeUsedGpuPath() const { return _backend->lastComputeUsedGpuPath(); }
+    bool LastComputeUsedCustomDeepPath() const { return _backend->lastComputeUsedCustomDeepPath(); }
+    bool LastComputeUsedGenericDeepPath() const { return _backend->lastComputeUsedGenericDeepPath(); }
+    GenericDeepInfo GetLastGenericDeepInfo() const { return _backend->lastGenericDeepInfo(); }
+    float GetComputeProgress() const { return _computeProgress.load(std::memory_order_relaxed); }
     // Copy the current view: center (re/im) and scale into caller-owned mpf_t.
     void GetView(mpf_t re, mpf_t im, mpf_t scale) const;
     mp_bitcnt_t GetViewPrecision() const { return mpf_get_prec(_scale); }
     FormulaContext GetFormulaContext() const { return _formula; }
-    bool IsMandelbrot() const { return _formula.formula.id == FormulaId::PowerPlusC &&
-                                      _formula.slice.pixel == FormulaParameter::C; }
+    bool IsMandelbrot() const { return _formula.formula.id == FormulaId::PowerPlusC && _formula.slice.pixel == FormulaParameter::C; }
     bool IsJulia() const { return _formula.slice.pixel == FormulaParameter::InitialZ; }
     bool IsExpression() const { return _formula.formula.id == FormulaId::Expression; }
     bool SupportsOrbitOverlay() const { return IsMandelbrot() || IsExpression(); }
-    std::shared_ptr<const formula::ExpressionOrbitSnapshot>
-    GetExpressionOrbitSnapshot() const {
-        return IsExpression() ? _expressionOrbitSnapshot : nullptr;
-    }
-    bool ExpressionSupportsDistance() const {
-        return IsExpression() && _expressionProgram.fastIntegerPower() >= 2 &&
-               _expressionBailout >= 1.0;
-    }
+    std::shared_ptr<const formula::ExpressionOrbitSnapshot> GetExpressionOrbitSnapshot() const { return IsExpression() ? _expressionOrbitSnapshot : nullptr; }
+    bool ExpressionSupportsDistance() const { return IsExpression() && _expressionProgram.fastIntegerPower() >= 2 && _expressionBailout >= 1.0; }
     formula::CustomDeepZoomPlan GetCustomDeepZoomPlan() const;
     std::string GetExpressionAccelerationText() const;
     void SetJuliaMode(bool enabled);
-    bool SetExpressionFormula(const std::string& source, FormulaParameter pixel,
-                              std::complex<double> fixedZ0, std::complex<double> fixedC,
-                              const std::array<std::complex<double>, 8>& parameters,
-                              double bailout, formula::ExpressionError* error = nullptr);
+    bool SetExpressionFormula(const std::string& source, FormulaParameter pixel, std::complex<double> fixedZ0, std::complex<double> fixedC, const std::array<std::complex<double>, 8>& parameters, double bailout, formula::ExpressionError* error = nullptr);
     void RestoreMandelbrotMode();
-    bool SetJuliaC(const std::string& re, const std::string& im,
-                   mp_bitcnt_t precisionHint = 0);
+    bool SetJuliaC(const std::string& re, const std::string& im, mp_bitcnt_t precisionHint = 0);
     void GetJuliaC(mpf_t re, mpf_t im) const;
-    
+
     int GetCMethod();
 
     void SetCMethod(int c_method);
@@ -162,21 +139,12 @@ public:
     // Jump to an absolute location: x/y as decimal strings, scale as a plain
     // decimal string (scientific already expanded). Sets precision from the digit
     // count, resets the preview transform. Returns false on a parse error.
-    bool SetLocation(
-        const std::string& x, const std::string& y,
-        const std::string& scale,
-        mp_bitcnt_t precisionHint = 0);
+    bool SetLocation(const std::string& x, const std::string& y, const std::string& scale, mp_bitcnt_t precisionHint = 0);
 
-private:
+  private:
     void SaveMandelbrotState();
-    formula::CustomDeepZoomPlan BuildCustomDeepZoomPlan(
-        mpf_srcptr scale, int method,
-        mpf_srcptr centerRe = nullptr,
-        mpf_srcptr centerIm = nullptr) const;
-    formula::ExpressionProductionPlan BuildExpressionProductionPlan(
-        mpf_srcptr scale, int method,
-        mpf_srcptr centerRe = nullptr,
-        mpf_srcptr centerIm = nullptr) const;
+    formula::CustomDeepZoomPlan BuildCustomDeepZoomPlan(mpf_srcptr scale, int method, mpf_srcptr centerRe = nullptr, mpf_srcptr centerIm = nullptr) const;
+    formula::ExpressionProductionPlan BuildExpressionProductionPlan(mpf_srcptr scale, int method, mpf_srcptr centerRe = nullptr, mpf_srcptr centerIm = nullptr) const;
     void ConfigureSampling();
     void SmoothColor(uint8_t* bitmap_pixel, int idx, int _c_method);
     // SS phase cache: fill per-subpixel base palette indices for a SmoothColor
@@ -194,6 +162,5 @@ private:
     void applyNormalLight(uint8_t* bitmap);
     void applyDEOverlay(uint8_t* bitmap);
 };
-
 
 #endif

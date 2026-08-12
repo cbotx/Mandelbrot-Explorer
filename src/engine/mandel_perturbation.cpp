@@ -26,46 +26,37 @@
 // BLA profiling: per-thread padded counters (no false sharing / contention).
 // [tid][0]=iterations skipped, [1]=BLA applies, [2]=normal steps.
 static long long g_bla_stat[64][8];
-static int g_bla_noescape = -1;   // env MANDEL_BLA_NOESCAPE: force-skip the escape check (timing only)
-static long long g_fe_stat[64][3];   // [tid] 0=BLA skip-iters 1=BLA applies 2=normal steps (MANDEL_PROFILE)
-static long long g_blafe_safe[64] = { 0 };   // [tid] tryBLAfe overflow-safe floatexp fallbacks
-static int g_int_rep = -2;       // env MANDEL_INT_REP: exact state-repetition interior detection (default on; -2=unread)
-static int g_bigfixed = -2;      // env MANDEL_BIGFIXED: -2 unparsed, -1 auto (on for floatexp), 0 off, >=1 force on
+static int g_bla_noescape = -1;          // env MANDEL_BLA_NOESCAPE: force-skip the escape check (timing only)
+static long long g_fe_stat[64][3];       // [tid] 0=BLA skip-iters 1=BLA applies 2=normal steps (MANDEL_PROFILE)
+static long long g_blafe_safe[64] = {0}; // [tid] tryBLAfe overflow-safe floatexp fallbacks
+static int g_int_rep = -2;               // env MANDEL_INT_REP: exact state-repetition interior detection (default on; -2=unread)
+static int g_bigfixed = -2;              // env MANDEL_BIGFIXED: -2 unparsed, -1 auto (on for floatexp), 0 off, >=1 force on
 
 // Monotonic seconds, for the MANDEL_PROFILE phase timers.
 static inline double nowSec() {
-    return std::chrono::duration_cast<std::chrono::duration<double>>(
-        std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+    return std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::high_resolution_clock::now().time_since_epoch()).count();
 }
 
 using orbitcolor::SacAccum;
 using orbitcolor::TrapAccum;
-static inline int sacWindow() { return orbitcolor::stripeWindow(); }
-
-static inline bool customFeatherAdapter(
-        formula::CustomDeepZoomOutputAdapter adapter) {
-    return adapter ==
-        formula::CustomDeepZoomOutputAdapter::FeatherExpression;
+static inline int sacWindow() {
+    return orbitcolor::stripeWindow();
 }
 
-static inline bool customTrapAdapter(
-        formula::CustomDeepZoomOutputAdapter adapter) {
-    return adapter ==
-        formula::CustomDeepZoomOutputAdapter::OrbitTrapExpression;
+static inline bool customFeatherAdapter(formula::CustomDeepZoomOutputAdapter adapter) {
+    return adapter == formula::CustomDeepZoomOutputAdapter::FeatherExpression;
 }
 
-static inline float customFeatherEscapeValue(
-        const SacAccum& accumulator, double zr, double zi,
-        double radius) {
-    return orbitcolor::formulaPowerFeatherValue(
-        accumulator, std::hypot(zr, zi), radius, 2);
+static inline bool customTrapAdapter(formula::CustomDeepZoomOutputAdapter adapter) {
+    return adapter == formula::CustomDeepZoomOutputAdapter::OrbitTrapExpression;
 }
 
-static inline float customTrapEscapeValue(
-        const TrapAccum& accumulator, int iteration,
-        double zr, double zi) {
-    return orbitcolor::formulaPowerTrapValue(
-        accumulator, iteration, std::hypot(zr, zi), 2);
+static inline float customFeatherEscapeValue(const SacAccum& accumulator, double zr, double zi, double radius) {
+    return orbitcolor::formulaPowerFeatherValue(accumulator, std::hypot(zr, zi), radius, 2);
+}
+
+static inline float customTrapEscapeValue(const TrapAccum& accumulator, int iteration, double zr, double zi) {
+    return orbitcolor::formulaPowerTrapValue(accumulator, iteration, std::hypot(zr, zi), 2);
 }
 
 long long Mandel::lastDeepGmpFallbackPixels() const {
@@ -74,11 +65,11 @@ long long Mandel::lastDeepGmpFallbackPixels() const {
 
 // GMP mpf -> floatexp (m * 2^e, 0.5 <= |m| < 1), no underflow.
 static inline FloatExp mpf_to_fe(mpf_srcptr x) {
-    if (mpf_sgn(x) == 0) return FloatExp{ 0.0, 0 };
-    long ex; double d = mpf_get_d_2exp(&ex, x);
-    return FloatExp{ d, (int64_t)ex };
+    if (mpf_sgn(x) == 0) return FloatExp{0.0, 0};
+    long ex;
+    double d = mpf_get_d_2exp(&ex, x);
+    return FloatExp{d, (int64_t)ex};
 }
-
 
 // ---------------------------------------------------------------------------
 // GMP minibrot nucleus finder for the periodic-reference experiment. Ball
@@ -89,17 +80,32 @@ static inline FloatExp mpf_to_fe(mpf_srcptr x) {
 namespace {
 struct GScratch {
     mpf_t t1, t2, t3;
-    explicit GScratch(mp_bitcnt_t p) { mpf_init2(t1, p); mpf_init2(t2, p); mpf_init2(t3, p); }
-    ~GScratch() { mpf_clear(t1); mpf_clear(t2); mpf_clear(t3); }
+    explicit GScratch(mp_bitcnt_t p) {
+        mpf_init2(t1, p);
+        mpf_init2(t2, p);
+        mpf_init2(t3, p);
+    }
+    ~GScratch() {
+        mpf_clear(t1);
+        mpf_clear(t2);
+        mpf_clear(t3);
+    }
 };
 // z = z^2 + c (Karatsuba square: 2 muls)
 inline void g_sqadd(mpf_t zr, mpf_t zi, mpf_srcptr cr, mpf_srcptr ci, GScratch& s) {
-    mpf_add(s.t1, zr, zi); mpf_sub(s.t2, zr, zi); mpf_mul(s.t3, zr, zi);
-    mpf_mul(zr, s.t1, s.t2); mpf_add(zr, zr, cr);
-    mpf_mul_ui(zi, s.t3, 2); mpf_add(zi, zi, ci);
+    mpf_add(s.t1, zr, zi);
+    mpf_sub(s.t2, zr, zi);
+    mpf_mul(s.t3, zr, zi);
+    mpf_mul(zr, s.t1, s.t2);
+    mpf_add(zr, zr, cr);
+    mpf_mul_ui(zi, s.t3, 2);
+    mpf_add(zi, zi, ci);
 }
 inline void g_abs(mpf_t out, mpf_srcptr zr, mpf_srcptr zi, GScratch& s) {
-    mpf_mul(s.t1, zr, zr); mpf_mul(s.t2, zi, zi); mpf_add(s.t1, s.t1, s.t2); mpf_sqrt(out, s.t1);
+    mpf_mul(s.t1, zr, zr);
+    mpf_mul(s.t2, zi, zi);
+    mpf_add(s.t1, s.t1, s.t2);
+    mpf_sqrt(out, s.t1);
 }
 // Ball-arithmetic period: propagate the disk of c-values (centre, radius r) under
 // z->z^2+c as a disk (centre z_n, radius R_n): R' = (2|z|+R)R + r (+ a small
@@ -108,25 +114,44 @@ inline void g_abs(mpf_t out, mpf_srcptr zr, mpf_srcptr zi, GScratch& s) {
 static int g_ballPeriod(mpf_srcptr cr, mpf_srcptr ci, mpf_srcptr r, int maxp, mp_bitcnt_t prec) {
     GScratch s(prec);
     mpf_t zr, zi, R, R2m, zabs2, nb, ru, t;
-    mpf_init2(zr, prec); mpf_init2(zi, prec); mpf_init2(R, prec); mpf_init2(R2m, prec);
-    mpf_init2(zabs2, prec); mpf_init2(nb, prec); mpf_init2(ru, prec); mpf_init2(t, prec);
-    mpf_set_ui(zr, 0); mpf_set_ui(zi, 0); mpf_set_ui(R, 0);
-    const double cab = std::hypot(mpf_get_d(cr), mpf_get_d(ci));   // |c| ~ O(1)
-    mpf_set_ui(ru, 1); mpf_div_2exp(ru, ru, prec > 64 ? prec - 32 : prec / 2);
+    mpf_init2(zr, prec);
+    mpf_init2(zi, prec);
+    mpf_init2(R, prec);
+    mpf_init2(R2m, prec);
+    mpf_init2(zabs2, prec);
+    mpf_init2(nb, prec);
+    mpf_init2(ru, prec);
+    mpf_init2(t, prec);
+    mpf_set_ui(zr, 0);
+    mpf_set_ui(zi, 0);
+    mpf_set_ui(R, 0);
+    const double cab = std::hypot(mpf_get_d(cr), mpf_get_d(ci)); // |c| ~ O(1)
+    mpf_set_ui(ru, 1);
+    mpf_div_2exp(ru, ru, prec > 64 ? prec - 32 : prec / 2);
     int period = 0;
     for (int p = 1; p <= maxp; ++p) {
         // Orbit magnitudes are O(1), so |z| for the radius recurrence is taken in
         // double (no mpf_sqrt): R' = (2|z| + R) R + r + roundoff. R stays in GMP
         // because r (= 2/scale) can be far below double's underflow.
         double za = std::hypot(mpf_get_d(zr), mpf_get_d(zi));
-        mpf_set_d(t, 2.0 * za); mpf_add(nb, t, R); mpf_mul(nb, nb, R); mpf_add(nb, nb, r);
-        mpf_set_d(t, za * za + cab + 1.0); mpf_mul(t, t, ru); mpf_add(nb, nb, t);
+        mpf_set_d(t, 2.0 * za);
+        mpf_add(nb, t, R);
+        mpf_mul(nb, nb, R);
+        mpf_add(nb, nb, r);
+        mpf_set_d(t, za * za + cab + 1.0);
+        mpf_mul(t, t, ru);
+        mpf_add(nb, nb, t);
         mpf_set(R, nb);
         g_sqadd(zr, zi, cr, ci, s);
         // Exact disk-contains-0 test |z|^2 <= R^2 (GMP, no sqrt).
-        mpf_mul(s.t1, zr, zr); mpf_mul(s.t2, zi, zi); mpf_add(zabs2, s.t1, s.t2);
+        mpf_mul(s.t1, zr, zr);
+        mpf_mul(s.t2, zi, zi);
+        mpf_add(zabs2, s.t1, s.t2);
         mpf_mul(R2m, R, R);
-        if (mpf_cmp(zabs2, R2m) <= 0) { period = p; break; }
+        if (mpf_cmp(zabs2, R2m) <= 0) {
+            period = p;
+            break;
+        }
         // Escape: the whole disk left the bailout region. R, r are tiny; |c|+2 dominates.
         double zb = std::hypot(mpf_get_d(zr), mpf_get_d(zi));
         if (zb > cab + 2.0 + mpf_get_d(R)) break;
@@ -138,26 +163,58 @@ static int g_ballPeriod(mpf_srcptr cr, mpf_srcptr ci, mpf_srcptr r, int maxp, mp
 static bool g_newton(mpf_t cr, mpf_t ci, int period, mp_bitcnt_t prec, int maxit) {
     GScratch s(prec);
     mpf_t zr, zi, dr, di, den, nr, ni, tol, step2;
-    mpf_init2(zr, prec); mpf_init2(zi, prec); mpf_init2(dr, prec); mpf_init2(di, prec);
-    mpf_init2(den, prec); mpf_init2(nr, prec); mpf_init2(ni, prec); mpf_init2(tol, prec); mpf_init2(step2, prec);
-    mpf_set_ui(tol, 1); mpf_div_2exp(tol, tol, prec > 96 ? prec - 48 : prec / 2); mpf_mul(tol, tol, tol);
+    mpf_init2(zr, prec);
+    mpf_init2(zi, prec);
+    mpf_init2(dr, prec);
+    mpf_init2(di, prec);
+    mpf_init2(den, prec);
+    mpf_init2(nr, prec);
+    mpf_init2(ni, prec);
+    mpf_init2(tol, prec);
+    mpf_init2(step2, prec);
+    mpf_set_ui(tol, 1);
+    mpf_div_2exp(tol, tol, prec > 96 ? prec - 48 : prec / 2);
+    mpf_mul(tol, tol, tol);
     bool conv = false;
     for (int it = 0; it < maxit; ++it) {
-        mpf_set_ui(zr, 0); mpf_set_ui(zi, 0); mpf_set_ui(dr, 0); mpf_set_ui(di, 0);
-        for (int i = 0; i < period; ++i) {                      // z_p, dz_p from z0=0
-            mpf_mul(s.t1, zr, dr); mpf_mul(s.t2, zi, di); mpf_sub(s.t3, s.t1, s.t2);
-            mpf_mul_ui(s.t3, s.t3, 2); mpf_add_ui(s.t3, s.t3, 1);
-            mpf_mul(s.t1, zr, di); mpf_mul(s.t2, zi, dr); mpf_add(di, s.t1, s.t2); mpf_mul_ui(di, di, 2);
+        mpf_set_ui(zr, 0);
+        mpf_set_ui(zi, 0);
+        mpf_set_ui(dr, 0);
+        mpf_set_ui(di, 0);
+        for (int i = 0; i < period; ++i) { // z_p, dz_p from z0=0
+            mpf_mul(s.t1, zr, dr);
+            mpf_mul(s.t2, zi, di);
+            mpf_sub(s.t3, s.t1, s.t2);
+            mpf_mul_ui(s.t3, s.t3, 2);
+            mpf_add_ui(s.t3, s.t3, 1);
+            mpf_mul(s.t1, zr, di);
+            mpf_mul(s.t2, zi, dr);
+            mpf_add(di, s.t1, s.t2);
+            mpf_mul_ui(di, di, 2);
             mpf_set(dr, s.t3);
             g_sqadd(zr, zi, cr, ci, s);
         }
-        mpf_mul(s.t1, dr, dr); mpf_mul(s.t2, di, di); mpf_add(den, s.t1, s.t2);
+        mpf_mul(s.t1, dr, dr);
+        mpf_mul(s.t2, di, di);
+        mpf_add(den, s.t1, s.t2);
         if (mpf_sgn(den) == 0) break;
-        mpf_mul(s.t1, zr, dr); mpf_mul(s.t2, zi, di); mpf_add(s.t3, s.t1, s.t2); mpf_div(nr, s.t3, den);
-        mpf_mul(s.t1, zi, dr); mpf_mul(s.t2, zr, di); mpf_sub(s.t3, s.t1, s.t2); mpf_div(ni, s.t3, den);
-        mpf_sub(cr, cr, nr); mpf_sub(ci, ci, ni);
-        mpf_mul(s.t1, nr, nr); mpf_mul(s.t2, ni, ni); mpf_add(step2, s.t1, s.t2);
-        if (mpf_cmp(step2, tol) <= 0) { conv = true; break; }
+        mpf_mul(s.t1, zr, dr);
+        mpf_mul(s.t2, zi, di);
+        mpf_add(s.t3, s.t1, s.t2);
+        mpf_div(nr, s.t3, den);
+        mpf_mul(s.t1, zi, dr);
+        mpf_mul(s.t2, zr, di);
+        mpf_sub(s.t3, s.t1, s.t2);
+        mpf_div(ni, s.t3, den);
+        mpf_sub(cr, cr, nr);
+        mpf_sub(ci, ci, ni);
+        mpf_mul(s.t1, nr, nr);
+        mpf_mul(s.t2, ni, ni);
+        mpf_add(step2, s.t1, s.t2);
+        if (mpf_cmp(step2, tol) <= 0) {
+            conv = true;
+            break;
+        }
     }
     mpf_clears(zr, zi, dr, di, den, nr, ni, tol, step2, (mpf_ptr)0);
     return conv;
@@ -169,7 +226,10 @@ Mandel::Mandel(int width, int height, int max_iteration, int sub, float* iter) :
     assert(height > 0);
     assert(max_iteration > 0);
     assert(sub % 2);
-    { const char* e = getenv("MANDEL_BAILOUT"); if (e && atof(e) > 0) _ESCAPE_RADIUS = (float)atof(e); }
+    {
+        const char* e = getenv("MANDEL_BAILOUT");
+        if (e && atof(e) > 0) _ESCAPE_RADIUS = (float)atof(e);
+    }
     // The full-precision reference/derivative orbits are only ever read at the
     // current and previous index during the build (the delta loop uses the double
     // and floatexp shadows below), so two rotating buffers replace mxit+1 mpf_t
@@ -258,15 +318,12 @@ bool Mandel::attractor(double zz_re, double zz_im, const double c_re, const doub
         t2 = tmp * tmp + dz_im * dz_im;
         zz1_re = (z_re * tmp + z_im * dz_im) / t2;
         zz1_im = (z_im * tmp - z_re * dz_im) / t2;
-        if (zz1_re * zz1_re + zz1_im * zz1_im < epsilon) {
-            return (dz_re * dz_re + dz_im * dz_im <= 1);
-        }
+        if (zz1_re * zz1_re + zz1_im * zz1_im < epsilon) { return (dz_re * dz_re + dz_im * dz_im <= 1); }
         zz_re -= zz1_re;
         zz_im -= zz1_im;
     }
     return false;
 }
-
 
 double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method, double* normalOut) const {
     Float z_re = c_re;
@@ -279,15 +336,14 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method,
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
     const bool normal = (c_method & ColoringMethod::NORMAL_MAP) != 0;
     const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
-    const bool customFeather =
-        sac && customFeatherAdapter(_customOutputAdapter);
-    const bool customTrap =
-        trap && customTrapAdapter(_customOutputAdapter);
+    const bool customFeather = sac && customFeatherAdapter(_customOutputAdapter);
+    const bool customTrap = trap && customTrapAdapter(_customOutputAdapter);
     const bool de_ovl = (c_method & ColoringMethod::DE_OVERLAY) != 0;
     // The total derivative dz/dc is iterated for EDE (distance), the normal map
     // (its argument) and the DE overlay (distance); track it for any of them.
     const bool deriv = (c_method & ColoringMethod::EXTERIOR_DIST_EST) || normal || de_ovl;
-    SacAccum sacc; if (sac) sacc.init(sacWindow());
+    SacAccum sacc;
+    if (sac) sacc.init(sacWindow());
     TrapAccum trapc;
     if (customFeather) sacc.push((double)c_re, (double)c_im);
     if (customTrap) trapc.push((double)c_re, (double)c_im);
@@ -302,7 +358,7 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method,
             dc_im = 2.0 * (dc_re * z_im + dc_im * z_re);
             dc_re = tmp;
         }
-        
+
         tmp = z_re * z_re - z_im * z_im + c_re;
         z_im = 2.0 * z_re * z_im + c_im;
         z_re = tmp;
@@ -323,42 +379,28 @@ double Mandel::floatPointCompute(Float c_re, Float c_im, int mxit, int c_method,
                 if (normalOut) *normalOut = sqrt(tmp) * log(tmp) / sqrt(dc_re * dc_re + dc_im * dc_im);
                 return (i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
             } else if (trap) {
-                if (customTrap) {
-                    return customTrapEscapeValue(
-                        trapc, i + 1,
-                        (double)z_re, (double)z_im);
-                }
-                return trapc.value(
-                    i + 1 -
-                    log(log(tmp) / 2 / log(2)) / log(2));
+                if (customTrap) { return customTrapEscapeValue(trapc, i + 1, (double)z_re, (double)z_im); }
+                return trapc.value(i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
             } else if (sac) {
-                if (customFeather) {
-                    return customFeatherEscapeValue(
-                        sacc, (double)z_re, (double)z_im,
-                        escapeRadius());
-                }
-                return sacc.value(
-                    (double)tmp, escapeRadius());
+                if (customFeather) { return customFeatherEscapeValue(sacc, (double)z_re, (double)z_im, escapeRadius()); }
+                return sacc.value((double)tmp, escapeRadius());
             } else {
                 return (i + 1 - log(log(tmp) / 2 / log(2)) / log(2));
             }
         }
 
         tmp = d_re * d_re + d_im * d_im;
-        if (!customTrap && tmp < 0.000000001)
-            return trap ? trapc.value(0.0) : -2;   // interior: trap-colour or sentinel
+        if (!customTrap && tmp < 0.000000001) return trap ? trapc.value(0.0) : -2; // interior: trap-colour or sentinel
         ++i;
     }
-    return trap ? trapc.value(0.0) : -2;   // interior (hit mxit)
-
+    return trap ? trapc.value(0.0) : -2; // interior (hit mxit)
 }
 
 float Mandel::ComputeShallowPoint(double cRe, double cIm, int mxit) const {
     return static_cast<float>(floatPointCompute(cRe, cIm, mxit, 0));
 }
 
-void Mandel::ComputeShallowPoints(const double* cRe, const double* cIm,
-                                  int count, float* output, int mxit) const {
+void Mandel::ComputeShallowPoints(const double* cRe, const double* cIm, int count, float* output, int mxit) const {
     solveShallowSimdList(cRe, cIm, count, output, mxit, 0);
 }
 
@@ -369,8 +411,7 @@ void Mandel::ComputeShallowPoints(const double* cRe, const double* cIm,
 // slower than scalar). Writes floatPointCompute-equivalent values (raw EDE distance
 // / smooth iter / -2) into out[0..count). Used for both the base row and the
 // adaptive supersample sub-pixels.
-void Mandel::solveShallowSimdList(const double* cre, const double* cim, int count,
-                                  float* out, int mxit, int c_method) const {
+void Mandel::solveShallowSimdList(const double* cre, const double* cim, int count, float* out, int mxit, int c_method) const {
     const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
     const double ESC2 = escapeRadiusSquared();
     const double LG2 = log(2.0);
@@ -379,16 +420,27 @@ void Mandel::solveShallowSimdList(const double* cre, const double* cim, int coun
     const __m256d mxitv = _mm256_set1_pd((double)mxit);
 
     alignas(32) double cr_[4], ci_[4], zr_[4], zi_[4], dr_[4], di_[4], dcr_[4], dci_[4], jv_[4];
-    int lanePix[4]; int next = 0, activeCount = 0;
+    int lanePix[4];
+    int next = 0, activeCount = 0;
     auto loadLane = [&](int l) {
         if (next < count) {
-            cr_[l] = cre[next]; ci_[l] = cim[next];
-            zr_[l] = cr_[l]; zi_[l] = ci_[l];
-            dr_[l] = 2; di_[l] = 0; dcr_[l] = 1; dci_[l] = 0; jv_[l] = 1;
-            lanePix[l] = next++; ++activeCount;
+            cr_[l] = cre[next];
+            ci_[l] = cim[next];
+            zr_[l] = cr_[l];
+            zi_[l] = ci_[l];
+            dr_[l] = 2;
+            di_[l] = 0;
+            dcr_[l] = 1;
+            dci_[l] = 0;
+            jv_[l] = 1;
+            lanePix[l] = next++;
+            ++activeCount;
         } else {
             cr_[l] = ci_[l] = zr_[l] = zi_[l] = di_[l] = dci_[l] = 0;
-            dr_[l] = 2; dcr_[l] = 1; jv_[l] = 1; lanePix[l] = -1;
+            dr_[l] = 2;
+            dcr_[l] = 1;
+            jv_[l] = 1;
+            lanePix[l] = -1;
         }
     };
     for (int l = 0; l < 4; ++l) loadLane(l);
@@ -407,7 +459,12 @@ void Mandel::solveShallowSimdList(const double* cre, const double* cim, int coun
         __m256d ndci = _mm256_mul_pd(two, _mm256_add_pd(_mm256_mul_pd(dcr, zi), _mm256_mul_pd(dci, zr)));
         __m256d nzr = _mm256_add_pd(_mm256_sub_pd(_mm256_mul_pd(zr, zr), _mm256_mul_pd(zi, zi)), cr);
         __m256d nzi = _mm256_add_pd(_mm256_mul_pd(two, _mm256_mul_pd(zr, zi)), ci);
-        zr = nzr; zi = nzi; dr = ndr; di = ndi; dcr = ndcr; dci = ndci;
+        zr = nzr;
+        zi = nzi;
+        dr = ndr;
+        di = ndi;
+        dcr = ndcr;
+        dci = ndci;
 
         __m256d zrad = _mm256_add_pd(_mm256_mul_pd(zr, zr), _mm256_mul_pd(zi, zi));
         __m256d dmag = _mm256_add_pd(_mm256_mul_pd(dr, dr), _mm256_mul_pd(di, di));
@@ -417,39 +474,62 @@ void Mandel::solveShallowSimdList(const double* cre, const double* cim, int coun
         int jm = _mm256_movemask_pd(_mm256_cmp_pd(jnext, mxitv, _CMP_GE_OQ));
         int actmask = (lanePix[0] >= 0) | ((lanePix[1] >= 0) << 1) | ((lanePix[2] >= 0) << 2) | ((lanePix[3] >= 0) << 3);
         int need = (em | im | jm) & actmask;
-        if (need == 0) { jv = jnext; continue; }        // fast path: advance i, no scalar work
+        if (need == 0) {
+            jv = jnext;
+            continue;
+        } // fast path: advance i, no scalar work
 
         // slow path: finish + refill the lanes that ended this iteration.
         alignas(32) double zrad_[4], dcr2_[4], dci2_[4];
-        _mm256_store_pd(zrad_, zrad); _mm256_store_pd(dcr2_, dcr); _mm256_store_pd(dci2_, dci);
-        _mm256_store_pd(cr_, cr); _mm256_store_pd(ci_, ci);
-        _mm256_store_pd(zr_, zr); _mm256_store_pd(zi_, zi);
-        _mm256_store_pd(dr_, dr); _mm256_store_pd(di_, di);
-        _mm256_store_pd(dcr_, dcr); _mm256_store_pd(dci_, dci);
+        _mm256_store_pd(zrad_, zrad);
+        _mm256_store_pd(dcr2_, dcr);
+        _mm256_store_pd(dci2_, dci);
+        _mm256_store_pd(cr_, cr);
+        _mm256_store_pd(ci_, ci);
+        _mm256_store_pd(zr_, zr);
+        _mm256_store_pd(zi_, zi);
+        _mm256_store_pd(dr_, dr);
+        _mm256_store_pd(di_, di);
+        _mm256_store_pd(dcr_, dcr);
+        _mm256_store_pd(dci_, dci);
         _mm256_store_pd(jv_, jv);
         for (int l = 0; l < 4; ++l) {
             if (lanePix[l] < 0) continue;
-            bool fin = false; float res = -2.0f;
+            bool fin = false;
+            float res = -2.0f;
             if (em & (1 << l)) {
-                if (ede) res = (float)(sqrt(zrad_[l]) * log(zrad_[l]) / sqrt(dcr2_[l]*dcr2_[l] + dci2_[l]*dci2_[l]));
-                else     res = (float)(jv_[l] + 1 - log(log(zrad_[l]) / 2 / LG2) / LG2);
+                if (ede)
+                    res = (float)(sqrt(zrad_[l]) * log(zrad_[l]) / sqrt(dcr2_[l] * dcr2_[l] + dci2_[l] * dci2_[l]));
+                else
+                    res = (float)(jv_[l] + 1 - log(log(zrad_[l]) / 2 / LG2) / LG2);
                 fin = true;
-            } else if (im & (1 << l)) { res = -2.0f; fin = true; }
-            else if (jm & (1 << l)) { res = -2.0f; fin = true; }
-            if (fin) { out[lanePix[l]] = res; --activeCount; loadLane(l); }
-            else jv_[l] += 1;
+            } else if (im & (1 << l)) {
+                res = -2.0f;
+                fin = true;
+            } else if (jm & (1 << l)) {
+                res = -2.0f;
+                fin = true;
+            }
+            if (fin) {
+                out[lanePix[l]] = res;
+                --activeCount;
+                loadLane(l);
+            } else
+                jv_[l] += 1;
         }
-        cr = _mm256_load_pd(cr_); ci = _mm256_load_pd(ci_);
-        zr = _mm256_load_pd(zr_); zi = _mm256_load_pd(zi_);
-        dr = _mm256_load_pd(dr_); di = _mm256_load_pd(di_);
-        dcr = _mm256_load_pd(dcr_); dci = _mm256_load_pd(dci_);
+        cr = _mm256_load_pd(cr_);
+        ci = _mm256_load_pd(ci_);
+        zr = _mm256_load_pd(zr_);
+        zi = _mm256_load_pd(zi_);
+        dr = _mm256_load_pd(dr_);
+        di = _mm256_load_pd(di_);
+        dcr = _mm256_load_pd(dcr_);
+        dci = _mm256_load_pd(dci_);
         jv = _mm256_load_pd(jv_);
     }
 }
 
-void Mandel::solveJuliaShallowSimdList(const double* z0re, const double* z0im,
-                                       int count, double cre, double cim,
-                                       float* out, int mxit, bool ede) const {
+void Mandel::solveJuliaShallowSimdList(const double* z0re, const double* z0im, int count, double cre, double cim, float* out, int mxit, bool ede) const {
     const double ESC2 = escapeRadiusSquared();
     const double LG2 = log(2.0);
     const __m256d two = _mm256_set1_pd(2.0), one = _mm256_set1_pd(1.0);
@@ -458,7 +538,8 @@ void Mandel::solveJuliaShallowSimdList(const double* z0re, const double* z0im,
     const __m256d mxitv = _mm256_set1_pd((double)mxit);
 
     alignas(32) double zr_[4], zi_[4], dr_[4], di_[4], jv_[4];
-    int lanePix[4]; int next = 0, activeCount = 0;
+    int lanePix[4];
+    int next = 0, activeCount = 0;
     auto loadLane = [&](int l) {
         lanePix[l] = -1;
         while (next < count) {
@@ -466,14 +547,17 @@ void Mandel::solveJuliaShallowSimdList(const double* z0re, const double* z0im,
             double zr = z0re[pixel], zi = z0im[pixel];
             double zrad = zr * zr + zi * zi;
             if (zrad > ESC2) {
-                out[pixel] = ede
-                    ? (float)(sqrt(zrad) * log(zrad))   // D0=1
-                    : (float)(-log(log(zrad) / 2 / LG2) / LG2);
+                out[pixel] = ede ? (float)(sqrt(zrad) * log(zrad)) // D0=1
+                                 : (float)(-log(log(zrad) / 2 / LG2) / LG2);
                 continue;
             }
-            zr_[l] = zr; zi_[l] = zi;
-            dr_[l] = 1.0; di_[l] = 0.0; jv_[l] = 0.0;
-            lanePix[l] = pixel; ++activeCount;
+            zr_[l] = zr;
+            zi_[l] = zi;
+            dr_[l] = 1.0;
+            di_[l] = 0.0;
+            jv_[l] = 0.0;
+            lanePix[l] = pixel;
+            ++activeCount;
             return;
         }
         zr_[l] = zi_[l] = di_[l] = jv_[l] = 0.0;
@@ -493,21 +577,31 @@ void Mandel::solveJuliaShallowSimdList(const double* z0re, const double* z0im,
         }
         __m256d nzr = _mm256_add_pd(_mm256_sub_pd(_mm256_mul_pd(zr, zr), _mm256_mul_pd(zi, zi)), cr);
         __m256d nzi = _mm256_add_pd(_mm256_mul_pd(two, _mm256_mul_pd(zr, zi)), ci);
-        zr = nzr; zi = nzi; dr = ndr; di = ndi;
+        zr = nzr;
+        zi = nzi;
+        dr = ndr;
+        di = ndi;
 
         __m256d zrad = _mm256_add_pd(_mm256_mul_pd(zr, zr), _mm256_mul_pd(zi, zi));
         __m256d jnext = _mm256_add_pd(jv, one);
         int em = _mm256_movemask_pd(_mm256_cmp_pd(zrad, ESC2v, _CMP_GT_OQ));
         int jm = _mm256_movemask_pd(_mm256_cmp_pd(jnext, mxitv, _CMP_GE_OQ));
-        int actmask = (lanePix[0] >= 0) | ((lanePix[1] >= 0) << 1) |
-                      ((lanePix[2] >= 0) << 2) | ((lanePix[3] >= 0) << 3);
+        int actmask = (lanePix[0] >= 0) | ((lanePix[1] >= 0) << 1) | ((lanePix[2] >= 0) << 2) | ((lanePix[3] >= 0) << 3);
         int need = (em | jm) & actmask;
-        if (need == 0) { jv = jnext; continue; }
+        if (need == 0) {
+            jv = jnext;
+            continue;
+        }
 
         alignas(32) double zrad_[4], dr2_[4], di2_[4];
-        _mm256_store_pd(zrad_, zrad); _mm256_store_pd(dr2_, dr); _mm256_store_pd(di2_, di);
-        _mm256_store_pd(zr_, zr); _mm256_store_pd(zi_, zi);
-        _mm256_store_pd(dr_, dr); _mm256_store_pd(di_, di); _mm256_store_pd(jv_, jv);
+        _mm256_store_pd(zrad_, zrad);
+        _mm256_store_pd(dr2_, dr);
+        _mm256_store_pd(di2_, di);
+        _mm256_store_pd(zr_, zr);
+        _mm256_store_pd(zi_, zi);
+        _mm256_store_pd(dr_, dr);
+        _mm256_store_pd(di_, di);
+        _mm256_store_pd(jv_, jv);
         for (int l = 0; l < 4; ++l) {
             if (lanePix[l] < 0) continue;
             bool finished = false;
@@ -515,9 +609,7 @@ void Mandel::solveJuliaShallowSimdList(const double* z0re, const double* z0im,
             if (em & (1 << l)) {
                 if (ede) {
                     double denom = sqrt(dr2_[l] * dr2_[l] + di2_[l] * di2_[l]);
-                    result = denom > 0.0
-                        ? (float)(sqrt(zrad_[l]) * log(zrad_[l]) / denom)
-                        : 0.0f;
+                    result = denom > 0.0 ? (float)(sqrt(zrad_[l]) * log(zrad_[l]) / denom) : 0.0f;
                 } else {
                     result = (float)(jv_[l] + 1 - log(log(zrad_[l]) / 2 / LG2) / LG2);
                 }
@@ -533,28 +625,37 @@ void Mandel::solveJuliaShallowSimdList(const double* z0re, const double* z0im,
                 jv_[l] += 1.0;
             }
         }
-        zr = _mm256_load_pd(zr_); zi = _mm256_load_pd(zi_);
-        dr = _mm256_load_pd(dr_); di = _mm256_load_pd(di_);
+        zr = _mm256_load_pd(zr_);
+        zi = _mm256_load_pd(zi_);
+        dr = _mm256_load_pd(dr_);
+        di = _mm256_load_pd(di_);
         jv = _mm256_load_pd(jv_);
     }
 }
 
-float Mandel::accurateJuliaPoint(mpf_t z0_re, mpf_t z0_im, mpf_t c_re, mpf_t c_im,
-                                 int mxit, bool ede) const {
-    const mp_bitcnt_t precision = std::max({ mpf_get_prec(z0_re), mpf_get_prec(z0_im),
-                                             mpf_get_prec(c_re), mpf_get_prec(c_im) });
+float Mandel::accurateJuliaPoint(mpf_t z0_re, mpf_t z0_im, mpf_t c_re, mpf_t c_im, int mxit, bool ede) const {
+    const mp_bitcnt_t precision = std::max({mpf_get_prec(z0_re), mpf_get_prec(z0_im), mpf_get_prec(c_re), mpf_get_prec(c_im)});
     mpf_t zr, zi, dr, di, t1, t2, nzr, nzi, ndr, ndi, mag, dmag;
-    mpf_init2(zr, precision); mpf_set(zr, z0_re);
-    mpf_init2(zi, precision); mpf_set(zi, z0_im);
-    mpf_init2(dr, precision); mpf_set_ui(dr, 1);
+    mpf_init2(zr, precision);
+    mpf_set(zr, z0_re);
+    mpf_init2(zi, precision);
+    mpf_set(zi, z0_im);
+    mpf_init2(dr, precision);
+    mpf_set_ui(dr, 1);
     mpf_init2(di, precision);
-    mpf_init2(t1, precision); mpf_init2(t2, precision);
-    mpf_init2(nzr, precision); mpf_init2(nzi, precision);
-    mpf_init2(ndr, precision); mpf_init2(ndi, precision);
-    mpf_init2(mag, precision); mpf_init2(dmag, precision);
+    mpf_init2(t1, precision);
+    mpf_init2(t2, precision);
+    mpf_init2(nzr, precision);
+    mpf_init2(nzi, precision);
+    mpf_init2(ndr, precision);
+    mpf_init2(ndi, precision);
+    mpf_init2(mag, precision);
+    mpf_init2(dmag, precision);
 
     float result = -2.0f;
-    mpf_mul(t1, zr, zr); mpf_mul(t2, zi, zi); mpf_add(mag, t1, t2);
+    mpf_mul(t1, zr, zr);
+    mpf_mul(t2, zi, zi);
+    mpf_add(mag, t1, t2);
     // For c=0 the Julia set is exactly the closed unit disk. Besides being exact,
     // this avoids Windows GMP's 32-bit mp_exp_t wrapping after ~38 consecutive
     // squarings of a tiny interior value.
@@ -562,33 +663,46 @@ float Mandel::accurateJuliaPoint(mpf_t z0_re, mpf_t z0_im, mpf_t c_re, mpf_t c_i
         result = -2.0f;
     } else if (mpf_cmp_d(mag, escapeRadiusSquared()) > 0) {
         double zrad = mpf_get_d(mag);
-        result = ede
-            ? (float)(sqrt(zrad) * log(zrad))   // D0=1
-            : (float)(-log(log(zrad) / 2 / log(2.0)) / log(2.0));
+        result = ede ? (float)(sqrt(zrad) * log(zrad)) // D0=1
+                     : (float)(-log(log(zrad) / 2 / log(2.0)) / log(2.0));
     } else {
         for (int i = 0; i < mxit; ++i) {
             if (ede) {
-                mpf_mul(t1, dr, zr); mpf_mul(t2, di, zi);
-                mpf_sub(ndr, t1, t2); mpf_mul_ui(ndr, ndr, 2);
-                mpf_mul(t1, dr, zi); mpf_mul(t2, di, zr);
-                mpf_add(ndi, t1, t2); mpf_mul_ui(ndi, ndi, 2);
+                mpf_mul(t1, dr, zr);
+                mpf_mul(t2, di, zi);
+                mpf_sub(ndr, t1, t2);
+                mpf_mul_ui(ndr, ndr, 2);
+                mpf_mul(t1, dr, zi);
+                mpf_mul(t2, di, zr);
+                mpf_add(ndi, t1, t2);
+                mpf_mul_ui(ndi, ndi, 2);
             }
 
-            mpf_mul(t1, zr, zr); mpf_mul(t2, zi, zi);
-            mpf_sub(nzr, t1, t2); mpf_add(nzr, nzr, c_re);
-            mpf_mul(nzi, zr, zi); mpf_mul_ui(nzi, nzi, 2); mpf_add(nzi, nzi, c_im);
+            mpf_mul(t1, zr, zr);
+            mpf_mul(t2, zi, zi);
+            mpf_sub(nzr, t1, t2);
+            mpf_add(nzr, nzr, c_re);
+            mpf_mul(nzi, zr, zi);
+            mpf_mul_ui(nzi, nzi, 2);
+            mpf_add(nzi, nzi, c_im);
 
-            mpf_set(zr, nzr); mpf_set(zi, nzi);
-            if (ede) { mpf_set(dr, ndr); mpf_set(di, ndi); }
-            mpf_mul(t1, zr, zr); mpf_mul(t2, zi, zi); mpf_add(mag, t1, t2);
+            mpf_set(zr, nzr);
+            mpf_set(zi, nzi);
+            if (ede) {
+                mpf_set(dr, ndr);
+                mpf_set(di, ndi);
+            }
+            mpf_mul(t1, zr, zr);
+            mpf_mul(t2, zi, zi);
+            mpf_add(mag, t1, t2);
             if (mpf_cmp_d(mag, escapeRadiusSquared()) > 0) {
                 double zrad = mpf_get_d(mag);
                 if (ede) {
-                    mpf_mul(t1, dr, dr); mpf_mul(t2, di, di); mpf_add(dmag, t1, t2);
+                    mpf_mul(t1, dr, dr);
+                    mpf_mul(t2, di, di);
+                    mpf_add(dmag, t1, t2);
                     double denom = sqrt(mpf_get_d(dmag));
-                    result = denom > 0.0
-                        ? (float)(sqrt(zrad) * log(zrad) / denom)
-                        : 0.0f;
+                    result = denom > 0.0 ? (float)(sqrt(zrad) * log(zrad) / denom) : 0.0f;
                 } else {
                     result = (float)(i + 1 - log(log(zrad) / 2 / log(2.0)) / log(2.0));
                 }
@@ -596,14 +710,11 @@ float Mandel::accurateJuliaPoint(mpf_t z0_re, mpf_t z0_im, mpf_t c_re, mpf_t c_i
             }
         }
     }
-    mpf_clears(zr, zi, dr, di, t1, t2, nzr, nzi, ndr, ndi, mag, dmag,
-               (mpf_ptr)0);
+    mpf_clears(zr, zi, dr, di, t1, t2, nzr, nzi, ndr, ndi, mag, dmag, (mpf_ptr)0);
     return result;
 }
 
-float Mandel::accuratePointCompute(
-        mpf_t c_re, mpf_t c_im, int mxit, int c_method,
-        bool* cancelled) const {
+float Mandel::accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_method, bool* cancelled) const {
     if (cancelled) *cancelled = false;
     // Oracle WORKING precision. Brute-force iteration accumulates rounding error, so
     // near a boundary / a nucleus the ground truth needs MORE precision than the
@@ -611,8 +722,10 @@ float Mandel::accuratePointCompute(
     // ~960 digits but is truly interior). MANDEL_ORACLE_PREC=<decimal digits> raises
     // the internal orbit precision; default = the caller's (render) precision. Verify
     // by re-running at PREC and PREC+margin: the verdict must not change.
-    static const mp_bitcnt_t g_oprec = []{ const char* e = getenv("MANDEL_ORACLE_PREC");
-        return e ? (mp_bitcnt_t)(atol(e) * 3.3219281 + 64.0) : (mp_bitcnt_t)0; }();
+    static const mp_bitcnt_t g_oprec = [] {
+        const char* e = getenv("MANDEL_ORACLE_PREC");
+        return e ? (mp_bitcnt_t)(atol(e) * 3.3219281 + 64.0) : (mp_bitcnt_t)0;
+    }();
     const mp_bitcnt_t wp = g_oprec ? g_oprec : mpf_get_prec(c_re);
     mpf_t t1, t2;
     mpf_init2(t1, wp);
@@ -620,9 +733,11 @@ float Mandel::accuratePointCompute(
 
     // z = c;
     mpf_t z_re, z_im;
-    mpf_init2(z_re, wp); mpf_set(z_re, c_re);
-    mpf_init2(z_im, wp); mpf_set(z_im, c_im);
-    
+    mpf_init2(z_re, wp);
+    mpf_set(z_re, c_re);
+    mpf_init2(z_im, wp);
+    mpf_set(z_im, c_im);
+
     // d = 2.0;
     mpf_t d_re, d_im;
     mpf_init2(d_re, wp);
@@ -633,25 +748,30 @@ float Mandel::accuratePointCompute(
     const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
     const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
-    const bool customFeather =
-        sac && customFeatherAdapter(_customOutputAdapter);
-    const bool customTrap =
-        trap && customTrapAdapter(_customOutputAdapter);
+    const bool customFeather = sac && customFeatherAdapter(_customOutputAdapter);
+    const bool customTrap = trap && customTrapAdapter(_customOutputAdapter);
     // The `d` derivative only powers the |d|<1e-9 interior early-out. On exterior
     // pixels it is ~6 wasted GMP muls/iter, so MANDEL_ORACLE_NODERIV=1 skips it for
     // exterior-dominated frames: interior pixels then run to mxit (same -2 verdict),
     // exterior pixels are ~2.2x cheaper -- identical output, far faster oracle images.
-    static const bool g_noderiv = []{ const char* e = getenv("MANDEL_ORACLE_NODERIV"); return e && atoi(e) != 0; }();
+    static const bool g_noderiv = [] {
+        const char* e = getenv("MANDEL_ORACLE_NODERIV");
+        return e && atoi(e) != 0;
+    }();
     const bool track_d = !g_noderiv && !customTrap;
-    SacAccum sacc; if (sac) sacc.init(sacWindow());
+    SacAccum sacc;
+    if (sac) sacc.init(sacWindow());
     TrapAccum trapc;
     const double seedRe = mpf_get_d(c_re);
     const double seedIm = mpf_get_d(c_im);
     if (customFeather) sacc.push(seedRe, seedIm);
     if (customTrap) trapc.push(seedRe, seedIm);
     mpf_t dc_re, dc_im, e1, e2;
-    mpf_init2(dc_re, wp); mpf_set_ui(dc_re, 1);
-    mpf_init2(dc_im, wp); mpf_init2(e1, wp); mpf_init2(e2, wp);
+    mpf_init2(dc_re, wp);
+    mpf_set_ui(dc_re, 1);
+    mpf_init2(dc_im, wp);
+    mpf_init2(e1, wp);
+    mpf_init2(e2, wp);
     int i = 1;
     float res = -2;
     while (i < mxit) {
@@ -674,9 +794,14 @@ float Mandel::accuratePointCompute(
 
         // dc = 2.0 * dc * z + 1   (uses the pre-update z, like floatPointCompute)
         if (ede) {
-            mpf_mul(e1, dc_re, z_im); mpf_mul(e2, dc_im, z_re); mpf_add(e2, e1, e2);
-            mpf_mul(e1, dc_re, z_re); mpf_mul(t2, dc_im, z_im); mpf_sub(e1, e1, t2);
-            mpf_mul_ui(dc_re, e1, 2); mpf_add_ui(dc_re, dc_re, 1);
+            mpf_mul(e1, dc_re, z_im);
+            mpf_mul(e2, dc_im, z_re);
+            mpf_add(e2, e1, e2);
+            mpf_mul(e1, dc_re, z_re);
+            mpf_mul(t2, dc_im, z_im);
+            mpf_sub(e1, e1, t2);
+            mpf_mul_ui(dc_re, e1, 2);
+            mpf_add_ui(dc_re, dc_re, 1);
             mpf_mul_ui(dc_im, e2, 2);
         }
 
@@ -697,8 +822,7 @@ float Mandel::accuratePointCompute(
         mpf_mul(t1, z_re, z_re);
         mpf_mul(t2, z_im, z_im);
         mpf_add(t1, t1, t2);
-            
-        
+
         double rad = mpf_get_d(t1);
 
         if (rad > escapeRadiusSquared()) {
@@ -710,34 +834,30 @@ float Mandel::accuratePointCompute(
                 // Without the dx factor the result is ~dx (1e-737 deep) and mpf_get_d
                 // flushes it to a useless 0/NaN, and the black-star re-verify would
                 // write inconsistent EDE for the pixels it fixes.
-                mpf_mul(e1, dc_re, dc_re); mpf_mul(e2, dc_im, dc_im);
-                mpf_add(e1, e1, e2); mpf_sqrt(e1, e1);        // |dz/dc|
-                mpf_abs(t1, _dx); mpf_mul(e1, e1, t1);        // * pixel size -> pixel-normalised
-                double num =
-                    std::isfinite(rad) && rad > 0.0
-                        ? std::sqrt(rad) * std::log(rad)
-                        : 0.0;
+                mpf_mul(e1, dc_re, dc_re);
+                mpf_mul(e2, dc_im, dc_im);
+                mpf_add(e1, e1, e2);
+                mpf_sqrt(e1, e1); // |dz/dc|
+                mpf_abs(t1, _dx);
+                mpf_mul(e1, e1, t1); // * pixel size -> pixel-normalised
+                double num = std::isfinite(rad) && rad > 0.0 ? std::sqrt(rad) * std::log(rad) : 0.0;
                 mpf_set_d(e2, num);
-                if (mpf_sgn(e1) != 0) { mpf_div(e1, e2, e1); res = (float)mpf_get_d(e1); }
-                else res = 0.f;
+                if (mpf_sgn(e1) != 0) {
+                    mpf_div(e1, e2, e1);
+                    res = (float)mpf_get_d(e1);
+                } else
+                    res = 0.f;
             } else if (sac) {
                 if (customFeather) {
-                    res = customFeatherEscapeValue(
-                        sacc, mpf_get_d(z_re),
-                        mpf_get_d(z_im), escapeRadius());
+                    res = customFeatherEscapeValue(sacc, mpf_get_d(z_re), mpf_get_d(z_im), escapeRadius());
                 } else {
                     res = sacc.value(rad, escapeRadius());
                 }
             } else if (trap) {
                 if (customTrap) {
-                    res = customTrapEscapeValue(
-                        trapc, i + 1,
-                        mpf_get_d(z_re), mpf_get_d(z_im));
+                    res = customTrapEscapeValue(trapc, i + 1, mpf_get_d(z_re), mpf_get_d(z_im));
                 } else {
-                    res = trapc.value(
-                        (double)i + 1 -
-                        log(log(rad) / 2 / log(2)) /
-                            log(2));
+                    res = trapc.value((double)i + 1 - log(log(rad) / 2 / log(2)) / log(2));
                 }
             } else {
                 res = (i + 1 - log(log(rad) / 2 / log(2)) / log(2));
@@ -754,11 +874,10 @@ float Mandel::accuratePointCompute(
             rad = mpf_get_d(t1);
             if (rad < 0.000000001) break;
         }
-        
+
         ++i;
     }
-    if (trap && res == -2.0f)
-        res = trapc.value(0.0);
+    if (trap && res == -2.0f) res = trapc.value(0.0);
     mpf_clear(d_re);
     mpf_clear(d_im);
     mpf_clear(dc_re);
@@ -772,9 +891,7 @@ float Mandel::accuratePointCompute(
     return res;
 }
 
-float Mandel::accuratePixelCompute(
-        const std::array<int, 4>& pixel,
-        int mxit, int c_method, bool* cancelled) const {
+float Mandel::accuratePixelCompute(const std::array<int, 4>& pixel, int mxit, int c_method, bool* cancelled) const {
     mpf_t cre, cim, offset, signedOffset;
     mpf_init_set(cre, _c0_re);
     mpf_init_set(cim, _c0_im);
@@ -784,21 +901,17 @@ float Mandel::accuratePixelCompute(
     mpf_add(cre, cre, offset);
     mpf_mul_ui(offset, _dx, abs(pixel[3]));
     mpf_set(signedOffset, offset);
-    if (pixel[3] < 0)
-        mpf_neg(signedOffset, signedOffset);
+    if (pixel[3] < 0) mpf_neg(signedOffset, signedOffset);
     mpf_div_ui(signedOffset, signedOffset, _sub);
     mpf_add(cre, cre, signedOffset);
     mpf_mul_ui(offset, _dy, pixel[0]);
     mpf_add(cim, cim, offset);
     mpf_mul_ui(offset, _dy, abs(pixel[2]));
     mpf_set(signedOffset, offset);
-    if (pixel[2] < 0)
-        mpf_neg(signedOffset, signedOffset);
+    if (pixel[2] < 0) mpf_neg(signedOffset, signedOffset);
     mpf_div_ui(signedOffset, signedOffset, _sub);
     mpf_add(cim, cim, signedOffset);
-    float result =
-        accuratePointCompute(
-            cre, cim, mxit, c_method, cancelled);
+    float result = accuratePointCompute(cre, cim, mxit, c_method, cancelled);
     mpf_clears(cre, cim, offset, signedOffset, (mpf_ptr)0);
     return result;
 }
@@ -811,26 +924,35 @@ float Mandel::accuratePixelCompute(
 // reference's own representation: BigFixed tail when active, else the mpf tail).
 bool Mandel::refTailEscapes(int last, int extra) const {
     mpf_t zr, zi, t1, t2;
-    mpf_init(zr); mpf_init(zi); mpf_init(t1); mpf_init(t2);
-    if (_use_bigfixed) { bf_to_mpf(zr, _bz_re[last & 1]); bf_to_mpf(zi, _bz_im[last & 1]); }
-    else { mpf_set(zr, _z_re[last & 1]); mpf_set(zi, _z_im[last & 1]); }
+    mpf_init(zr);
+    mpf_init(zi);
+    mpf_init(t1);
+    mpf_init(t2);
+    if (_use_bigfixed) {
+        bf_to_mpf(zr, _bz_re[last & 1]);
+        bf_to_mpf(zi, _bz_im[last & 1]);
+    } else {
+        mpf_set(zr, _z_re[last & 1]);
+        mpf_set(zi, _z_im[last & 1]);
+    }
     const double R2 = escapeRadiusSquared();
     bool esc = false;
     for (int k = 0; k < extra && !esc; ++k) {
-        mpf_mul(t1, zr, zi);            // zr*zi
-        mpf_mul(zr, zr, zr);            // zr^2
-        mpf_mul(t2, zi, zi);            // zi^2
-        mpf_sub(zr, zr, t2);            // zr^2 - zi^2
-        mpf_add(zr, zr, _ref_z_re);     // + cr
-        mpf_mul_ui(zi, t1, 2);          // 2 zr zi
-        mpf_add(zi, zi, _ref_z_im);     // + ci
-        mpf_mul(t1, zr, zr); mpf_mul(t2, zi, zi); mpf_add(t1, t1, t2);
+        mpf_mul(t1, zr, zi);        // zr*zi
+        mpf_mul(zr, zr, zr);        // zr^2
+        mpf_mul(t2, zi, zi);        // zi^2
+        mpf_sub(zr, zr, t2);        // zr^2 - zi^2
+        mpf_add(zr, zr, _ref_z_re); // + cr
+        mpf_mul_ui(zi, t1, 2);      // 2 zr zi
+        mpf_add(zi, zi, _ref_z_im); // + ci
+        mpf_mul(t1, zr, zr);
+        mpf_mul(t2, zi, zi);
+        mpf_add(t1, t1, t2);
         if (mpf_get_d(t1) > R2) esc = true;
     }
     mpf_clears(zr, zi, t1, t2, (mpf_ptr)0);
     return esc;
 }
-
 
 void Mandel::ComputeDirect(int mxit, float* out, int step, int c_method) {
     // Brute-force ground truth: iterate every sampled pixel in full mpf_t
@@ -855,8 +977,7 @@ void Mandel::ComputeDirect(int mxit, float* out, int step, int c_method) {
             mpf_mul_ui(tmp, _dy, i);
             mpf_add(cim, _c0_im, tmp);
             bool cancelled = false;
-            float v = accuratePointCompute(
-                cre, cim, mxit, c_method, &cancelled);
+            float v = accuratePointCompute(cre, cim, mxit, c_method, &cancelled);
             if (cancelled) break;
             out[i * _w + j] = v;
         }
@@ -866,9 +987,7 @@ void Mandel::ComputeDirect(int mxit, float* out, int step, int c_method) {
     }
 }
 
-void Mandel::ComputeJulia(mpf_t z0_re, mpf_t z0_im, mpf_t scale,
-                          mpf_t fixed_c_re, mpf_t fixed_c_im,
-                          int mxit, int c_method) {
+void Mandel::ComputeJulia(mpf_t z0_re, mpf_t z0_im, mpf_t scale, mpf_t fixed_c_re, mpf_t fixed_c_im, int mxit, int c_method) {
     assert(_sub == 1);
     assert((c_method & ~ColoringMethod::EXTERIOR_DIST_EST) == 0);
     progressSet(0.0);
@@ -883,9 +1002,12 @@ void Mandel::ComputeJulia(mpf_t z0_re, mpf_t z0_im, mpf_t scale,
     mpf_div_ui(dh, dh, _w);
     mpf_sub(_c0_re, z0_re, dw);
     mpf_sub(_c0_im, z0_im, dh);
-    mpf_mul_ui(_dx, dw, 2); mpf_div_ui(_dx, _dx, _w - 1);
-    mpf_mul_ui(_dy, dh, 2); mpf_div_ui(_dy, _dy, _h - 1);
-    mpf_clear(dw); mpf_clear(dh);
+    mpf_mul_ui(_dx, dw, 2);
+    mpf_div_ui(_dx, _dx, _w - 1);
+    mpf_mul_ui(_dy, dh, 2);
+    mpf_div_ui(_dy, _dy, _h - 1);
+    mpf_clear(dw);
+    mpf_clear(dh);
 
     const double cRe = mpf_get_ld(fixed_c_re), cIm = mpf_get_ld(fixed_c_im);
     const double z0Re = mpf_get_ld(_c0_re), z0Im = mpf_get_ld(_c0_im);
@@ -902,8 +1024,7 @@ void Mandel::ComputeJulia(mpf_t z0_re, mpf_t z0_im, mpf_t scale,
             zr[j] = z0Re + dx * j;
             zi[j] = imag;
         }
-        solveJuliaShallowSimdList(zr.data(), zi.data(), _w, cRe, cIm,
-                                  row.data(), mxit, ede);
+        solveJuliaShallowSimdList(zr.data(), zi.data(), _w, cRe, cIm, row.data(), mxit, ede);
         for (int j = 0; j < _w; ++j) {
             float value = row[j];
             if (ede && value >= 0.0f) value /= (float)dx;
@@ -914,8 +1035,7 @@ void Mandel::ComputeJulia(mpf_t z0_re, mpf_t z0_im, mpf_t scale,
     progressSet(1.0);
 }
 
-void Mandel::ComputeJuliaDirect(mpf_t fixed_c_re, mpf_t fixed_c_im, int mxit,
-                                float* out, int step, int c_method) {
+void Mandel::ComputeJuliaDirect(mpf_t fixed_c_re, mpf_t fixed_c_im, int mxit, float* out, int step, int c_method) {
     assert(_sub == 1);
     assert((c_method & ~ColoringMethod::EXTERIOR_DIST_EST) == 0);
     if (step < 1) step = 1;
@@ -923,11 +1043,16 @@ void Mandel::ComputeJuliaDirect(mpf_t fixed_c_re, mpf_t fixed_c_im, int mxit,
 #pragma omp parallel for schedule(dynamic, 1)
     for (int i = 0; i < _h; i += step) {
         mpf_t z0r, z0i, cr, ci, tmp;
-        mpf_init(z0r); mpf_init(z0i); mpf_init_set(cr, fixed_c_re);
-        mpf_init_set(ci, fixed_c_im); mpf_init(tmp);
+        mpf_init(z0r);
+        mpf_init(z0i);
+        mpf_init_set(cr, fixed_c_re);
+        mpf_init_set(ci, fixed_c_im);
+        mpf_init(tmp);
         for (int j = 0; j < _w; j += step) {
-            mpf_mul_ui(tmp, _dx, j); mpf_add(z0r, _c0_re, tmp);
-            mpf_mul_ui(tmp, _dy, i); mpf_add(z0i, _c0_im, tmp);
+            mpf_mul_ui(tmp, _dx, j);
+            mpf_add(z0r, _c0_re, tmp);
+            mpf_mul_ui(tmp, _dy, i);
+            mpf_add(z0i, _c0_im, tmp);
             float value = accurateJuliaPoint(z0r, z0i, cr, ci, mxit, ede);
             if (ede && value >= 0.0f) value /= (float)mpf_get_d(_dx);
             out[i * _w + j] = value;
@@ -939,21 +1064,33 @@ void Mandel::ComputeJuliaDirect(mpf_t fixed_c_re, mpf_t fixed_c_im, int mxit,
 int Mandel::findNucleus(mpf_t nuc_re, mpf_t nuc_im, int maxp) {
     const mp_bitcnt_t prec = mpf_get_prec(_c0_re);
     mpf_t cre, cim, r, dh, dist, dr, di;
-    mpf_init2(cre, prec); mpf_init2(cim, prec); mpf_init2(r, prec); mpf_init2(dh, prec);
-    mpf_init2(dist, prec); mpf_init2(dr, prec); mpf_init2(di, prec);
+    mpf_init2(cre, prec);
+    mpf_init2(cim, prec);
+    mpf_init2(r, prec);
+    mpf_init2(dh, prec);
+    mpf_init2(dist, prec);
+    mpf_init2(dr, prec);
+    mpf_init2(di, prec);
     // View centre = c0 + (halfwidth, halfheight); search radius = halfwidth = 2/scale.
-    mpf_set_ui(r, 2); mpf_div(r, r, _scale);
+    mpf_set_ui(r, 2);
+    mpf_div(r, r, _scale);
     mpf_add(cre, _c0_re, r);
-    mpf_mul_ui(dh, r, _h); mpf_div_ui(dh, dh, _w);
+    mpf_mul_ui(dh, r, _h);
+    mpf_div_ui(dh, dh, _w);
     mpf_add(cim, _c0_im, dh);
     int period = g_ballPeriod(cre, cim, r, maxp, prec);
     int result = 0;
     if (period > 0) {
-        mpf_set(nuc_re, cre); mpf_set(nuc_im, cim);
+        mpf_set(nuc_re, cre);
+        mpf_set(nuc_im, cim);
         if (g_newton(nuc_re, nuc_im, period, prec, 200)) {
             // Accept only if the refined nucleus is inside the search disk.
-            mpf_sub(dr, nuc_re, cre); mpf_sub(di, nuc_im, cim);
-            mpf_mul(dr, dr, dr); mpf_mul(di, di, di); mpf_add(dist, dr, di); mpf_sqrt(dist, dist);
+            mpf_sub(dr, nuc_re, cre);
+            mpf_sub(di, nuc_im, cim);
+            mpf_mul(dr, dr, dr);
+            mpf_mul(di, di, di);
+            mpf_add(dist, dr, di);
+            mpf_sqrt(dist, dist);
             if (mpf_cmp(dist, r) <= 0) result = period;
         }
     }
@@ -969,32 +1106,47 @@ int Mandel::createPeriodicRef(int period, int mxit, int c_method) {
     (void)mxit;
     _ref_escaped = false;
     _ref_escape_iteration = 0;
-    _ref_z_f = Comp{ mpf_get_ld(_ref_z_re), mpf_get_ld(_ref_z_im) };
-    _ref_virtual = true;   // the nucleus is not a rendered pixel (skip centre-pixel erase; every pixel is computed)
+    _ref_z_f = Comp{mpf_get_ld(_ref_z_re), mpf_get_ld(_ref_z_im)};
+    _ref_virtual = true; // the nucleus is not a rendered pixel (skip centre-pixel erase; every pixel is computed)
     // Fractional pixel coordinate of the nucleus. The floatexp dc = _dxfe*(px-_ref_x)
     // uses it directly; the double path uses the nearest pixel _ref plus the
     // sub-pixel remainder _ref_frac so its integer-pixel dc equals c_pixel - nucleus.
-    mpf_sub(_t1, _ref_z_re, _c0_re); mpf_div(_t1, _t1, _dx); _ref_x = mpf_get_d(_t1);
-    mpf_sub(_t1, _ref_z_im, _c0_im); mpf_div(_t1, _t1, _dy); _ref_y = mpf_get_d(_t1);
+    mpf_sub(_t1, _ref_z_re, _c0_re);
+    mpf_div(_t1, _t1, _dx);
+    _ref_x = mpf_get_d(_t1);
+    mpf_sub(_t1, _ref_z_im, _c0_im);
+    mpf_div(_t1, _t1, _dy);
+    _ref_y = mpf_get_d(_t1);
     int px = (int)std::lround(_ref_x), py = (int)std::lround(_ref_y);
-    _ref = { py, px, 0, 0 };
-    _ref_frac_re = (Float)((_ref_x - px) * mpf_get_ld(_dx));   // nucleus - pixel_c(_ref)
+    _ref = {py, px, 0, 0};
+    _ref_frac_re = (Float)((_ref_x - px) * mpf_get_ld(_dx)); // nucleus - pixel_c(_ref)
     _ref_frac_im = (Float)((_ref_y - py) * mpf_get_ld(_dy));
 
     // Z_0 = nucleus (mirror createRef's index-0 setup).
-    mpf_set(_z_re[0], _ref_z_re); mpf_set(_z_im[0], _ref_z_im);
-    _use_bigfixed = false;   // periodic nucleus orbit is short (one period) and does not init BigFixed state; use mpf
-    _zf[0] = _ref_z_f; _zfr[0] = _ref_z_f.real(); _zfi[0] = _ref_z_f.imag();
-    _zfr_fe[0] = mpf_to_fe(_ref_z_re); _zfi_fe[0] = mpf_to_fe(_ref_z_im);
+    mpf_set(_z_re[0], _ref_z_re);
+    mpf_set(_z_im[0], _ref_z_im);
+    _use_bigfixed = false; // periodic nucleus orbit is short (one period) and does not init BigFixed state; use mpf
+    _zf[0] = _ref_z_f;
+    _zfr[0] = _ref_z_f.real();
+    _zfi[0] = _ref_z_f.imag();
+    _zfr_fe[0] = mpf_to_fe(_ref_z_re);
+    _zfi_fe[0] = mpf_to_fe(_ref_z_im);
     _z_m3[0] = (_zfr[0] * _zfr[0] + _zfi[0] * _zfi[0]) / 1000000;
-    _df[0] = Comp{ 1 }; _dfr[0] = 1.0; _dfi[0] = 0.0;
-    _dfe_r = FloatExp{ 1.0, 0 }; _dfe_i = FloatExp{ 0.0, 0 };
+    _df[0] = Comp{1};
+    _dfr[0] = 1.0;
+    _dfi[0] = 0.0;
+    _dfe_r = FloatExp{1.0, 0};
+    _dfe_i = FloatExp{0.0, 0};
     // No series approximation: the double path's SA-init loop (order 0, Adf[0]=SA_delta)
     // then produces dz = dc, and each pixel starts at reference index 1 (_SA_it = 0).
-    mpf_mul_ui(_t1, _dx, _w); mpf_div_ui(_t1, _t1, 2);
-    mpf_mul_ui(_t2, _dy, _h); mpf_div_ui(_t2, _t2, 2);
-    _SA_delta = { mpf_get_ld(_t1), mpf_get_ld(_t2) };
-    _SA_flag = false; _SA_it = 0; _SA_order = 0;
+    mpf_mul_ui(_t1, _dx, _w);
+    mpf_div_ui(_t1, _t1, 2);
+    mpf_mul_ui(_t2, _dy, _h);
+    mpf_div_ui(_t2, _t2, 2);
+    _SA_delta = {mpf_get_ld(_t1), mpf_get_ld(_t2)};
+    _SA_flag = false;
+    _SA_it = 0;
+    _SA_order = 0;
     for (int i = 0; i < _SA_N; ++i) _Adf_old[i] = _Bdf_old[i] = 0;
     _Adf_old[0] = _SA_delta;
 
@@ -1002,7 +1154,8 @@ int Mandel::createPeriodicRef(int period, int mxit, int c_method) {
     // series-approximation work). The nucleus orbit is bounded (never escapes).
     // Force the floatexp shadow fill so Compute can escalate double->floatexp after
     // inspecting the reference (the double path itself ignores _zfr_fe).
-    bool save_fe = _use_floatexp; _use_floatexp = true;
+    bool save_fe = _use_floatexp;
+    _use_floatexp = true;
     for (int i = 1; i < period; ++i) calCoefficient(i, 0, c_method);
     _use_floatexp = save_fe;
 
@@ -1014,8 +1167,7 @@ void Mandel::disableCustomHistorySeriesApproximation() {
     _SA_flag = false;
     _SA_it = 0;
     _SA_order = 0;
-    for (int i = 0; i < _SA_N; ++i)
-        _Adf_old[i] = _Bdf_old[i] = Comp{ 0 };
+    for (int i = 0; i < _SA_N; ++i) _Adf_old[i] = _Bdf_old[i] = Comp{0};
     _Adf_old[0] = _SA_delta;
 }
 
@@ -1034,18 +1186,19 @@ void Mandel::disableCustomHistorySeriesApproximation() {
 // over the already-built orbit, i.e. negligible next to the GMP orbit itself.
 FloatExp Mandel::nucleusSizeMag() const {
     const int p = _ref_period;
-    if (p < 2) return FloatExp{ 1.0, 1000000 };     // no periodic orbit -> "huge" (resolved)
-    FloatExp lr{ 1.0, 0 }, li{ 0.0, 0 };            // l (complex)
-    FloatExp br{ 1.0, 0 }, bi{ 0.0, 0 };            // b (complex)
+    if (p < 2) return FloatExp{1.0, 1000000}; // no periodic orbit -> "huge" (resolved)
+    FloatExp lr{1.0, 0}, li{0.0, 0};          // l (complex)
+    FloatExp br{1.0, 0}, bi{0.0, 0};          // b (complex)
     for (int k = 1; k < p; ++k) {
-        FloatExp zr = _zfr_fe[k - 1], zi = _zfi_fe[k - 1];   // z_k
+        FloatExp zr = _zfr_fe[k - 1], zi = _zfi_fe[k - 1]; // z_k
         // l = 2 * z_k * l
         FloatExp nr = fe_scale2(fe_sub(fe_mul(zr, lr), fe_mul(zi, li)), 1);
         FloatExp ni = fe_scale2(fe_add(fe_mul(zr, li), fe_mul(zi, lr)), 1);
-        lr = nr; li = ni;
+        lr = nr;
+        li = ni;
         // b += 1/l = conj(l) / |l|^2
         FloatExp l2 = fe_add(fe_mul(lr, lr), fe_mul(li, li));
-        if (l2.m == 0.0) continue;                  // l underflowed to exactly 0
+        if (l2.m == 0.0) continue; // l underflowed to exactly 0
         br = fe_add(br, fe_div(lr, l2));
         bi = fe_sub(bi, fe_div(li, l2));
     }
@@ -1053,10 +1206,9 @@ FloatExp Mandel::nucleusSizeMag() const {
     FloatExp bmag = fe_sqrt(fe_add(fe_mul(br, br), fe_mul(bi, bi)));
     // |size| = 1 / (|b| * |l|^2)
     FloatExp denom = fe_mul(bmag, fe_mul(lmag, lmag));
-    if (denom.m == 0.0) return FloatExp{ 1.0, 1000000 };     // degenerate -> "huge"
-    return fe_div(FloatExp{ 1.0, 0 }, denom);
+    if (denom.m == 0.0) return FloatExp{1.0, 1000000}; // degenerate -> "huge"
+    return fe_div(FloatExp{1.0, 0}, denom);
 }
-
 
 // Build the deep-zoom reference orbit and return its length. Extracted verbatim
 // from Compute's method==1 path: try a periodic-nucleus reference when eligible,
@@ -1064,8 +1216,7 @@ FloatExp Mandel::nucleusSizeMag() const {
 // floatexp escalation (rebuild in floatexp if the orbit passes too close to zero)
 // and the mxit-boundary sensitivity rebuild (from the exact centre). Sets
 // _ref_period / _ref_bounded / _use_floatexp and accumulates the pf_ref timer.
-int Mandel::buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, int mxit,
-                                int c_method, bool profile, double& pf_ref) {
+int Mandel::buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, int mxit, int c_method, bool profile, double& pf_ref) {
     double tk;
     int ref_it = 0;
     _ref_period = 0;
@@ -1078,9 +1229,11 @@ int Mandel::buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, in
     // non-EDE/non-SAC (the mod-p index / skip cap live only in those paths).
     bool periodic_done = false;
     static int periodic_env = -1;
-    if (periodic_env < 0) { const char* e = getenv("MANDEL_PERIODIC"); periodic_env = e ? atoi(e) : -1; }
-    bool periodic_want = (periodic_env == 1) ||
-                         (periodic_env != 0 && mpf_cmp_d(scale, 1e280) > 0);
+    if (periodic_env < 0) {
+        const char* e = getenv("MANDEL_PERIODIC");
+        periodic_env = e ? atoi(e) : -1;
+    }
+    bool periodic_want = (periodic_env == 1) || (periodic_env != 0 && mpf_cmp_d(scale, 1e280) > 0);
     // EDE / normal-map / DE-overlay track their derivative J inside the delta loop.
     // Ordinary tail-window Feather and Orbit-Trap also support the mod-p reference
     // index. Scoped Custom history coloring disables BLA before this selection
@@ -1093,8 +1246,10 @@ int Mandel::buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, in
         // findNucleus overwrites _ref_z with the nucleus; keep the view centre so a
         // sub-pixel nucleus can fall back to the full (centre) reference.
         mpf_t save_re, save_im;
-        mpf_init2(save_re, mpf_get_prec(_ref_z_re)); mpf_set(save_re, _ref_z_re);
-        mpf_init2(save_im, mpf_get_prec(_ref_z_im)); mpf_set(save_im, _ref_z_im);
+        mpf_init2(save_re, mpf_get_prec(_ref_z_re));
+        mpf_set(save_re, _ref_z_re);
+        mpf_init2(save_im, mpf_get_prec(_ref_z_im));
+        mpf_set(save_im, _ref_z_im);
         int p = findNucleus(_ref_z_re, _ref_z_im, mxit);
         if (p > 2 && p <= mxit) {
             // Build the bounded period-p nucleus reference (this also fills the floatexp
@@ -1123,8 +1278,16 @@ int Mandel::buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, in
                 // Content-aware escalation: if the nucleus orbit passes close enough to
                 // zero that 2*Z*dz underflows, run the exact floatexp path.
                 if (!_use_floatexp) {
-                    double refmin2 = 1e300; bool uf = false;
-                    for (int q = 1; q < p; ++q) { double m2 = _z_m3[q] * 1e6; if (m2 <= 0.0) { uf = true; break; } if (m2 < refmin2) refmin2 = m2; }
+                    double refmin2 = 1e300;
+                    bool uf = false;
+                    for (int q = 1; q < p; ++q) {
+                        double m2 = _z_m3[q] * 1e6;
+                        if (m2 <= 0.0) {
+                            uf = true;
+                            break;
+                        }
+                        if (m2 < refmin2) refmin2 = m2;
+                    }
                     double dcmax = 2.0 / mpf_get_d(scale);
                     if (uf || std::sqrt(refmin2) * dcmax < 1e-300) _use_floatexp = true;
                 }
@@ -1132,25 +1295,30 @@ int Mandel::buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, in
                 // Discard the bounded reference: restore the view centre and reset the
                 // periodic flags so the full reference is built below. createRef also
                 // resets _ref_period / _ref_virtual / _use_bigfixed, a clean fall-through.
-                mpf_set(_ref_z_re, save_re); mpf_set(_ref_z_im, save_im);
-                _ref_period = 0; _ref_virtual = false; _ref_bounded = false;
+                mpf_set(_ref_z_re, save_re);
+                mpf_set(_ref_z_im, save_im);
+                _ref_period = 0;
+                _ref_virtual = false;
+                _ref_bounded = false;
             }
             if (profile) {
                 double lg2 = 0.3010299957;
                 double lsz = (sizeMag.e + std::log2(std::fabs(sizeMag.m == 0.0 ? 1.0 : sizeMag.m))) * lg2;
                 double lpx = (_dxfe.e + std::log2(std::fabs(_dxfe.m == 0.0 ? 1.0 : _dxfe.m))) * lg2;
-                fprintf(stderr, "  [profile] periodic reference: period=%d floatexp=%d subpixel=%d size~1e%.1f px~1e%.1f ratio~1e%.2f\n",
-                        p, _use_floatexp ? 1 : 0, _ref_subpixel ? 1 : 0, lsz, lpx, lsz - lpx);
+                fprintf(stderr, "  [profile] periodic reference: period=%d floatexp=%d subpixel=%d size~1e%.1f px~1e%.1f ratio~1e%.2f\n", p, _use_floatexp ? 1 : 0, _ref_subpixel ? 1 : 0, lsz, lpx, lsz - lpx);
             }
         } else if (profile) {
             fprintf(stderr, "  [profile] periodic reference: no in-view nucleus (period=%d), using full reference\n", p);
         }
-        mpf_clear(save_re); mpf_clear(save_im);
+        mpf_clear(save_re);
+        mpf_clear(save_im);
         pf_ref += nowSec() - tk;
     }
     if (!periodic_done) {
-        s.insert({ _h / 2, _w / 2, 0, 0 });
-        tk = nowSec(); ref_it = createRef(s, mxit, mxit, true, c_method); pf_ref += nowSec() - tk;
+        s.insert({_h / 2, _w / 2, 0, 0});
+        tk = nowSec();
+        ref_it = createRef(s, mxit, mxit, true, c_method);
+        pf_ref += nowSec() - tk;
         // Content-aware floatexp escalation. Even below the hard 1e280 gate the plain
         // double delta loop loses precision when the reference orbit passes close to
         // zero (2*Z*dz falls into the denormal range for far pixels). Detect it from
@@ -1158,22 +1326,26 @@ int Mandel::buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, in
         // references that stay clear of zero (e.g. flake@1e157) keep the fast double
         // path. Only meaningful once dz^2 can underflow (scale > ~1e150).
         if (!_use_floatexp && mpf_cmp_d(scale, 1e150) > 0) {
-            double refmin2 = 1e300; bool underflowed = false;
+            double refmin2 = 1e300;
+            bool underflowed = false;
             for (int q = 1; q <= ref_it; ++q) {
-                double m2 = _z_m3[q] * 1e6;                 // |Z_q|^2 (double shadow)
-                if (m2 <= 0.0) { underflowed = true; break; }   // |Z| below ~1.5e-154
+                double m2 = _z_m3[q] * 1e6; // |Z_q|^2 (double shadow)
+                if (m2 <= 0.0) {
+                    underflowed = true;
+                    break;
+                } // |Z| below ~1.5e-154
                 if (m2 < refmin2) refmin2 = m2;
             }
-            double dcmax = 2.0 / mpf_get_d(scale);          // ~max pixel |dc|
+            double dcmax = 2.0 / mpf_get_d(scale); // ~max pixel |dc|
             if (underflowed || std::sqrt(refmin2) * dcmax < 1e-300) {
                 _use_floatexp = true;
-                s.insert({ _h / 2, _w / 2, 0, 0 });
-                tk = nowSec(); ref_it = createRef(s, mxit, mxit, true, c_method, true); pf_ref += nowSec() - tk;
+                s.insert({_h / 2, _w / 2, 0, 0});
+                tk = nowSec();
+                ref_it = createRef(s, mxit, mxit, true, c_method, true);
+                pf_ref += nowSec() - tk;
             }
         }
-        if (_use_floatexp &&
-            (!_ref_escaped ||
-             _ref_escape_iteration >= mxit - 16)) {
+        if (_use_floatexp && (!_ref_escaped || _ref_escape_iteration >= mxit - 16)) {
             // "Sensitive" = the reference escapes at or just beyond mxit (its
             // classification then depends on accumulated double rounding), so it is
             // rebuilt from the exact geometric centre. Continue the orbit we already
@@ -1181,34 +1353,31 @@ int Mandel::buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, in
             // accuratePointCompute of the whole orbit + derivative (which cost ~3s at
             // 1e876, dwarfing the reference build). refTailEscapes uses the
             // reference's own representation so it is exact and at least as sensitive.
-            bool sensitive =
-                _ref_escaped || refTailEscapes(ref_it, 80);
+            bool sensitive = _ref_escaped || refTailEscapes(ref_it, 80);
             if (sensitive) {
                 // Rebuild from the exact geometric centre so the result cannot depend
                 // on which centre pixel exists for even/odd dimensions.
-                s.insert({ _h / 2, _w / 2, 0, 0 });
-                tk = nowSec(); ref_it = createRef(s, mxit, mxit, true, c_method, true); pf_ref += nowSec() - tk;
+                s.insert({_h / 2, _w / 2, 0, 0});
+                tk = nowSec();
+                ref_it = createRef(s, mxit, mxit, true, c_method, true);
+                pf_ref += nowSec() - tk;
             }
         }
         _ref_bounded = !_ref_escaped;
         if (_use_floatexp && !_ref_bounded) {
             for (int q = 0; q <= ref_it; ++q) {
-                if (_zfr[q] == 0.0 && _zfi[q] == 0.0 &&
-                    (_zfr_fe[q].m != 0.0 || _zfi_fe[q].m != 0.0)) {
+                if (_zfr[q] == 0.0 && _zfi[q] == 0.0 && (_zfr_fe[q].m != 0.0 || _zfi_fe[q].m != 0.0)) {
                     _ref_deep_zero = true;
                     break;
                 }
             }
-            if (profile && _ref_deep_zero)
-                fprintf(stderr, "  [profile] full reference crosses a deep zero: disabling BLA\n");
+            if (profile && _ref_deep_zero) fprintf(stderr, "  [profile] full reference crosses a deep zero: disabling BLA\n");
         }
     }
     return ref_it;
 }
 
-
-void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method,
-                     int full_h, int row_base) {
+void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method, int full_h, int row_base) {
     std::cout << "mxit: " << mxit << '\n';
     _progress_total = 0;
     progressSet(0.0);
@@ -1238,8 +1407,9 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
     mpf_div_ui(_dy, dh, rows - 1);
     mpf_mul_ui(_dy, _dy, 2);
 
-    if (row_base > 0) {                 // move origin to this strip's first row
-        mpf_t off; mpf_init(off);
+    if (row_base > 0) { // move origin to this strip's first row
+        mpf_t off;
+        mpf_init(off);
         mpf_mul_ui(off, _dy, row_base);
         mpf_add(_c0_im, _c0_im, off);
         mpf_clear(off);
@@ -1247,7 +1417,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
 
     mpf_clear(dw);
     mpf_clear(dh);
-    
+
     std::set<std::array<int, 4>> s;
 
     int method = 0;
@@ -1255,17 +1425,12 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
     // Shallow zoom: method = 0, basic algorithm
     // Deep zoom: method = 1, Perturbation + Series Approximation + Rebase
     if (mpf_cmp_d(scale, 1e6) > 0) method = 1;
-    if (getenv("MANDEL_FORCE_PERT")) method = 1;   // exercise perturbation at any scale
-    const bool customHistory =
-        method == 1 &&
-        (((c_method & ColoringMethod::STRIPE_AVERAGE) &&
-          customFeatherAdapter(_customOutputAdapter)) ||
-         ((c_method & ColoringMethod::ORBIT_TRAP) &&
-          customTrapAdapter(_customOutputAdapter)));
+    if (getenv("MANDEL_FORCE_PERT")) method = 1; // exercise perturbation at any scale
+    const bool customHistory = method == 1 && (((c_method & ColoringMethod::STRIPE_AVERAGE) && customFeatherAdapter(_customOutputAdapter)) || ((c_method & ColoringMethod::ORBIT_TRAP) && customTrapAdapter(_customOutputAdapter)));
     _lastCustomHistoryMode = customHistory;
     _lastCustomHistorySeriesBuilt = false;
     _lastCustomHistoryBlaRequested = false;
-    
+
     if (_flag_halt) return;
     int ref_it = 0, pr_it = 0;
     if (method == 0) {
@@ -1274,18 +1439,24 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         Float dx_f = mpf_get_ld(_dx);
         Float dy_f = mpf_get_ld(_dy);
         static int simd0 = -1;
-        if (simd0 < 0) { const char* e = getenv("MANDEL_SIMD"); simd0 = e ? atoi(e) : 1; }
+        if (simd0 < 0) {
+            const char* e = getenv("MANDEL_SIMD");
+            simd0 = e ? atoi(e) : 1;
+        }
         const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
         const bool normalmap = (c_method & ColoringMethod::NORMAL_MAP) != 0;
         const bool trapmap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
         const bool deovl = (c_method & ColoringMethod::DE_OVERLAY) != 0;
         // SAC, the normal map, orbit traps and the DE overlay take the scalar path.
-        const bool simd0on = simd0 && !(c_method & ColoringMethod::STRIPE_AVERAGE) && !normalmap && !trapmap && !deovl;   // shallow SIMD has no SAC
+        const bool simd0on = simd0 && !(c_method & ColoringMethod::STRIPE_AVERAGE) && !normalmap && !trapmap && !deovl; // shallow SIMD has no SAC
         // Coarse-to-fine: a ~1/16-work strided pass paints the whole frame with a
         // blocky preview (picked up immediately by the async display) before the
         // full-resolution pass below sharpens it. ~instant feedback on every view.
         static int coarse_on = -1;
-        if (coarse_on < 0) { const char* e = getenv("MANDEL_COARSE"); coarse_on = e ? atoi(e) : 1; }
+        if (coarse_on < 0) {
+            const char* e = getenv("MANDEL_COARSE");
+            coarse_on = e ? atoi(e) : 1;
+        }
         if (coarse_on && !_flag_halt) {
             const int C = 4;
 #pragma omp parallel for schedule(dynamic, 2)
@@ -1296,8 +1467,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                     double val = floatPointCompute(c0_re_f + dx_f * cj, cim, mxit, c_method);
                     if (ede && val >= 0) val /= dx_f;
                     for (int bi = ci; bi < ci + C && bi < _h; ++bi)
-                        for (int bj = cj; bj < cj + C && bj < _w; ++bj)
-                            _iter[getIndex(bi, bj, 0, 0)] = (float)val;
+                        for (int bj = cj; bj < cj + C && bj < _w; ++bj) _iter[getIndex(bi, bj, 0, 0)] = (float)val;
                 }
             }
         }
@@ -1309,7 +1479,10 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             if (simd0on) {
                 std::vector<double> cre(_w), cimv(_w);
                 std::vector<float> row(_w);
-                for (int j = 0; j < _w; ++j) { cre[j] = c0_re_f + dx_f * j; cimv[j] = cim; }
+                for (int j = 0; j < _w; ++j) {
+                    cre[j] = c0_re_f + dx_f * j;
+                    cimv[j] = cim;
+                }
                 solveShallowSimdList(cre.data(), cimv.data(), _w, row.data(), mxit, c_method);
                 for (int j = 0; j < _w; ++j) {
                     double val = row[j];
@@ -1327,7 +1500,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                     } else if (deovl && _normal) {
                         double de = 0.0;
                         _iter[idx] = (float)floatPointCompute(c0_re_f + dx_f * j, cim, mxit, c_method, &de);
-                        _normal[idx] = (_iter[idx] < 0) ? 0.0f : (float)(de / dx_f);   // pixel-normalised DE
+                        _normal[idx] = (_iter[idx] < 0) ? 0.0f : (float)(de / dx_f); // pixel-normalised DE
                     } else {
                         _iter[idx] = floatPointCompute(c0_re_f + dx_f * j, cim, mxit, c_method);
                         if (ede && _iter[idx] >= 0) _iter[idx] /= dx_f;
@@ -1336,8 +1509,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             }
             progressAdvance();
         }
-    }
-    else if (method == 1) {
+    } else if (method == 1) {
         // BLA (bivariate linear approximation) skips runs of reference iterations for
         // a big deep-zoom speedup (~6x on 1e50+ high-iteration views). It is now
         // CLASSIFICATION-safe (periodicity detector restarted after each skip) and
@@ -1347,51 +1519,76 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         // misclassifications; equal escape-time floor) because rebasing avoids the
         // naive-perturbation double-precision drift. Hence ON by default; set
         // MANDEL_BLA=0 to force it off.
-        { const char* e = getenv("MANDEL_BLA");
-          _use_bla = e ? (atoi(e) != 0) : true;
-          if (customHistory) {
-              _lastCustomHistoryBlaRequested = _use_bla;
-              _use_bla = false;
-          } }
-        { const char* e = getenv("MANDEL_BLA_EPS"); _bla_eps = e ? atof(e) : 0.0; }
-        { const char* e = getenv("MANDEL_BLA_MINSKIP"); int ms = e ? atoi(e) : 8;
-          _bla_minlevel = 0; while ((1 << (_bla_minlevel + 1)) <= ms) ++_bla_minlevel; }
-        if (g_bla_noescape < 0) { const char* e = getenv("MANDEL_BLA_NOESCAPE"); g_bla_noescape = e ? atoi(e) : 0; }
+        {
+            const char* e = getenv("MANDEL_BLA");
+            _use_bla = e ? (atoi(e) != 0) : true;
+            if (customHistory) {
+                _lastCustomHistoryBlaRequested = _use_bla;
+                _use_bla = false;
+            }
+        }
+        {
+            const char* e = getenv("MANDEL_BLA_EPS");
+            _bla_eps = e ? atof(e) : 0.0;
+        }
+        {
+            const char* e = getenv("MANDEL_BLA_MINSKIP");
+            int ms = e ? atoi(e) : 8;
+            _bla_minlevel = 0;
+            while ((1 << (_bla_minlevel + 1)) <= ms) ++_bla_minlevel;
+        }
+        if (g_bla_noescape < 0) {
+            const char* e = getenv("MANDEL_BLA_NOESCAPE");
+            g_bla_noescape = e ? atoi(e) : 0;
+        }
         memset(g_bla_stat, 0, sizeof(g_bla_stat));
         memset(g_fe_stat, 0, sizeof(g_fe_stat));
-        _simd_measured = false; _simd_bla_idle = false;   // re-measured per frame from the coarse probe
-        { const char* e = getenv("MANDEL_INTERIOR"); _use_interior = !e || atoi(e); }
-        { const char* e = getenv("MANDEL_INT_EPS"); double ep = e ? atof(e) : 3e-9; _interior_eps2 = ep * ep; }
-        { const char* e = getenv("MANDEL_INT_CONFIRM"); _interior_confirm = e ? atoi(e) : 4; }
+        _simd_measured = false;
+        _simd_bla_idle = false; // re-measured per frame from the coarse probe
+        {
+            const char* e = getenv("MANDEL_INTERIOR");
+            _use_interior = !e || atoi(e);
+        }
+        {
+            const char* e = getenv("MANDEL_INT_EPS");
+            double ep = e ? atof(e) : 3e-9;
+            _interior_eps2 = ep * ep;
+        }
+        {
+            const char* e = getenv("MANDEL_INT_CONFIRM");
+            _interior_confirm = e ? atoi(e) : 4;
+        }
         // Deep-zoom: below double's ~1e300 representability wall the delta must be
         // rescaled (floatexp scale + double delta). This hard gate catches the
         // representability limit; a finer precision gate is applied after the
         // reference is built (see the escalation below).
-        { const char* e = getenv("MANDEL_FE");
-          _use_floatexp = e ? atoi(e) != 0 : (mpf_cmp_d(scale, 1e280) > 0); }
+        {
+            const char* e = getenv("MANDEL_FE");
+            _use_floatexp = e ? atoi(e) != 0 : (mpf_cmp_d(scale, 1e280) > 0);
+        }
         _deepGmpFallbackPixels.store(0, std::memory_order_relaxed);
         memset(g_blafe_safe, 0, sizeof(g_blafe_safe));
         _fe_cutoff_sensitive = false;
-        if (g_int_rep == -2) { const char* e = getenv("MANDEL_INT_REP"); g_int_rep = e ? atoi(e) : 1; }   // default ON
-        _dxfe = mpf_to_fe(_dx); _dyfe = mpf_to_fe(_dy);
+        if (g_int_rep == -2) {
+            const char* e = getenv("MANDEL_INT_REP");
+            g_int_rep = e ? atoi(e) : 1;
+        } // default ON
+        _dxfe = mpf_to_fe(_dx);
+        _dyfe = mpf_to_fe(_dy);
         double pf_ref = 0, pf_step = 0, pf_bla = 0;
         const bool profile = getenv("MANDEL_PROFILE") != nullptr;
-        auto now = [] { return std::chrono::duration_cast<std::chrono::duration<double>>(
-                            std::chrono::high_resolution_clock::now().time_since_epoch()).count(); };
+        auto now = [] { return std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::high_resolution_clock::now().time_since_epoch()).count(); };
         double tk;
         Float c0_re_f = mpf_get_ld(_c0_re);
         Float c0_im_f = mpf_get_ld(_c0_im);
         floatPointCompute(c0_re_f, c0_im_f, mxit, c_method);
         ref_it = buildReferenceOrbit(s, scale, mxit, c_method, profile, pf_ref);
         if (customHistory) {
-            _lastCustomHistorySeriesBuilt =
-                _SA_flag || _SA_it > 0;
+            _lastCustomHistorySeriesBuilt = _SA_flag || _SA_it > 0;
             disableCustomHistorySeriesApproximation();
         }
-        if (_customEscapeRadiusActive &&
-            _ref_escaped && _ref_escape_iteration < mxit) {
-            const int customDirectThreshold =
-                std::max(2048, std::min(mxit, 100000));
+        if (_customEscapeRadiusActive && _ref_escaped && _ref_escape_iteration < mxit) {
+            const int customDirectThreshold = std::max(2048, std::min(mxit, 100000));
             if (_ref_escape_iteration < customDirectThreshold) {
                 progressBegin(_h, 0.0, 1.0);
 #pragma omp parallel for schedule(dynamic, 1)
@@ -1399,10 +1596,9 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                     if (_flag_halt) continue;
                     for (int j = 0; j < _w; ++j) {
                         if (_flag_halt) break;
-                        std::array<int, 4> pixel{ i, j, 0, 0 };
+                        std::array<int, 4> pixel{i, j, 0, 0};
                         bool cancelled = false;
-                        float value = accuratePixelCompute(
-                            pixel, mxit, c_method, &cancelled);
+                        float value = accuratePixelCompute(pixel, mxit, c_method, &cancelled);
                         if (cancelled) break;
                         setPixel(pixel, value);
                     }
@@ -1418,21 +1614,20 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         // escape. A full escaping reference whose FloatExp orbit crosses below double
         // also cannot use the double-shadow BLA safely; its rescaled AVX2 path is exact.
         if (_ref_subpixel || _ref_deep_zero) _use_bla = false;
-        if (_use_bla) { tk = now(); buildBLA(ref_it, (c_method & (ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::NORMAL_MAP | ColoringMethod::DE_OVERLAY)) != 0); pf_bla += now() - tk; }
+        if (_use_bla) {
+            tk = now();
+            buildBLA(ref_it, (c_method & (ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::NORMAL_MAP | ColoringMethod::DE_OVERLAY)) != 0);
+            pf_bla += now() - tk;
+        }
         // Ordinary Feather can restore omitted reference-orbit stripe terms during
         // BLA skips. Scoped Custom Feather never reaches this path with BLA enabled.
-        const bool customFeather =
-            (c_method & ColoringMethod::STRIPE_AVERAGE) &&
-            customFeatherAdapter(_customOutputAdapter);
+        const bool customFeather = (c_method & ColoringMethod::STRIPE_AVERAGE) && customFeatherAdapter(_customOutputAdapter);
         auto rebuildSacReferencePrefix = [&](int length) {
             if (!_use_bla) {
                 _sacRefPre.clear();
                 return;
             }
-            if (!(_use_bla &&
-                  (c_method & ColoringMethod::STRIPE_AVERAGE) &&
-                  sacWindow() <= 0 &&
-                  (_use_floatexp || customFeather))) {
+            if (!(_use_bla && (c_method & ColoringMethod::STRIPE_AVERAGE) && sacWindow() <= 0 && (_use_floatexp || customFeather))) {
                 _sacRefPre.clear();
                 return;
             }
@@ -1453,13 +1648,15 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         //       instead of scattered single points ("measles") -- the same
         //       coarse-to-fine feedback the shallow path already gives.
         static int coarse_on = -1;
-        if (coarse_on < 0) { const char* e = getenv("MANDEL_COARSE"); coarse_on = e ? atoi(e) : 1; }
+        if (coarse_on < 0) {
+            const char* e = getenv("MANDEL_COARSE");
+            coarse_on = e ? atoi(e) : 1;
+        }
         if ((_use_interior || coarse_on) && !_flag_halt) {
             const int C = 8;
             std::set<std::array<int, 4>> probe;
             for (int i = 0; i < _h; i += C)
-                for (int j = 0; j < _w; j += C)
-                    probe.insert({ i, j, 0, 0 });
+                for (int j = 0; j < _w; j += C) probe.insert({i, j, 0, 0});
             if (!probe.empty() && !_flag_halt) stepParallel(probe, ref_it, mxit, c_method);
             // Measure how much BLA actually skipped on the probe. If it barely skips
             // (compute-bound), the SIMD double kernel wins; if it skips most steps
@@ -1469,16 +1666,17 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             // city at 1.7e40) -- there SIMD still wins.
             {
                 long long sk = 0, no = 0;
-                for (int t = 0; t < 64; ++t) { sk += g_bla_stat[t][0]; no += g_bla_stat[t][2]; }
+                for (int t = 0; t < 64; ++t) {
+                    sk += g_bla_stat[t][0];
+                    no += g_bla_stat[t][2];
+                }
                 double frac = (sk + no) ? (double)sk / (double)(sk + no) : 0.0;
                 // AVX2 still wins with moderately effective BLA: the vectorized
                 // quadratic work outweighs per-lane BLA control until skips exceed
                 // roughly 95%. Above that (e.g. deep51 at 99.6%) scalar remains faster.
                 _simd_bla_idle = !_use_bla || (frac < 0.95);
                 _simd_measured = true;
-                if (profile)
-                    fprintf(stderr, "  [profile] SIMD gate: probe BLA skip-frac=%.3f -> %s\n",
-                            frac, _simd_bla_idle ? "SIMD (compute-bound)" : "scalar (BLA-effective)");
+                if (profile) fprintf(stderr, "  [profile] SIMD gate: probe BLA skip-frac=%.3f -> %s\n", frac, _simd_bla_idle ? "SIMD (compute-bound)" : "scalar (BLA-effective)");
             }
             if (_use_interior) {
                 int nint = 0;
@@ -1501,8 +1699,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                         if (v == EMPTYPIXEL) continue;
                         for (int bi = i; bi < i + C && bi < _h; ++bi)
                             for (int bj = j; bj < j + C && bj < _w; ++bj)
-                                if (bi != i || bj != j)
-                                    _iter[getIndex(bi, bj, 0, 0)] = v;
+                                if (bi != i || bj != j) _iter[getIndex(bi, bj, 0, 0)] = v;
                     }
                 }
                 _iter[cidx] = saveCenter;
@@ -1512,29 +1709,27 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         // probe get recomputed (a negligible ~1/64 fraction); this avoids relying
         // on the caller having pre-initialised _iter to EMPTYPIXEL.
         for (int i = 0; i < _h; ++i)
-            for (int j = 0; j < _w; ++j)
-                s.insert({ i, j, 0, 0 });
-        if (!_ref_virtual)
-            s.erase({ _h / 2, _w / 2, 0, 0 });   // pixel reference was already computed
+            for (int j = 0; j < _w; ++j) s.insert({i, j, 0, 0});
+        if (!_ref_virtual) s.erase({_h / 2, _w / 2, 0, 0}); // pixel reference was already computed
         progressBegin((int)s.size(), 0.08, 0.92);
-        
+
         int ref_pass = 0;
         while (!s.empty()) {
             if (_flag_halt) return;
             size_t pending_before = s.size();
-            tk = now(); stepParallel(s, ref_it, mxit, c_method);
-            double pass_time = now() - tk; pf_step += pass_time;
-            if (profile)
-                fprintf(stderr, "  [profile] ref-pass=%d ref-it=%d pending=%zu resolved=%zu remaining=%zu delta=%.3f s\n",
-                        ref_pass, ref_it, pending_before, pending_before - s.size(), s.size(), pass_time);
+            tk = now();
+            stepParallel(s, ref_it, mxit, c_method);
+            double pass_time = now() - tk;
+            pf_step += pass_time;
+            if (profile) fprintf(stderr, "  [profile] ref-pass=%d ref-it=%d pending=%zu resolved=%zu remaining=%zu delta=%.3f s\n", ref_pass, ref_it, pending_before, pending_before - s.size(), s.size(), pass_time);
             ++ref_pass;
             if (_flag_halt) return;
             if (s.empty()) break;
-            tk = now(); ref_it = createRef(s, mxit, mxit, false, c_method); pf_ref += now() - tk;
+            tk = now();
+            ref_it = createRef(s, mxit, mxit, false, c_method);
+            pf_ref += now() - tk;
             if (customHistory) {
-                _lastCustomHistorySeriesBuilt =
-                    _lastCustomHistorySeriesBuilt ||
-                    _SA_flag || _SA_it > 0;
+                _lastCustomHistorySeriesBuilt = _lastCustomHistorySeriesBuilt || _SA_flag || _SA_it > 0;
                 disableCustomHistorySeriesApproximation();
             }
             _ref_bounded = !_ref_escaped;
@@ -1543,44 +1738,47 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             // no next delta pass, so building a potentially mxit-long BLA table is
             // pure waste. With SS enabled, subpixels may still need this new
             // reference; its previous BLA is stale and must be rebuilt.
-            const bool ss_follows =
-                (_sub > 1) && (c_method & ColoringMethod::SUPER_SAMPLING);
+            const bool ss_follows = (_sub > 1) && (c_method & ColoringMethod::SUPER_SAMPLING);
             if ((!s.empty() || ss_follows) && _use_bla) {
-                tk = now(); buildBLA(ref_it, (c_method & (ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::NORMAL_MAP | ColoringMethod::DE_OVERLAY)) != 0);
+                tk = now();
+                buildBLA(ref_it, (c_method & (ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::NORMAL_MAP | ColoringMethod::DE_OVERLAY)) != 0);
                 pf_bla += now() - tk;
             }
-            if (customFeather)
-                rebuildSacReferencePrefix(ref_it);
+            if (customFeather) rebuildSacReferencePrefix(ref_it);
         }
         if (profile) {
             long long sk = 0, ap = 0, no = 0;
-            for (int t = 0; t < 64; ++t) { sk += g_bla_stat[t][0]; ap += g_bla_stat[t][1]; no += g_bla_stat[t][2]; }
-            fprintf(stderr, "  [profile] reference-orbit (GMP): %.3f s   delta-loop (double): %.3f s   buildBLA: %.3f s   refs=%d\n",
-                    pf_ref, pf_step, pf_bla, _ref_cnt);
-            if (_use_bla)
-                fprintf(stderr, "  [profile] BLA: applies=%lld skipped=%lld normal-steps=%lld  avg-skip=%.1f  skip-frac=%.1f%%\n",
-                        ap, sk, no, ap ? (double)sk / ap : 0.0, (sk + no) ? 100.0 * sk / (sk + no) : 0.0);
+            for (int t = 0; t < 64; ++t) {
+                sk += g_bla_stat[t][0];
+                ap += g_bla_stat[t][1];
+                no += g_bla_stat[t][2];
+            }
+            fprintf(stderr, "  [profile] reference-orbit (GMP): %.3f s   delta-loop (double): %.3f s   buildBLA: %.3f s   refs=%d\n", pf_ref, pf_step, pf_bla, _ref_cnt);
+            if (_use_bla) fprintf(stderr, "  [profile] BLA: applies=%lld skipped=%lld normal-steps=%lld  avg-skip=%.1f  skip-frac=%.1f%%\n", ap, sk, no, ap ? (double)sk / ap : 0.0, (sk + no) ? 100.0 * sk / (sk + no) : 0.0);
             if (_use_floatexp) {
                 long long fsk = 0, fap = 0, fst = 0;
-                for (int t = 0; t < 64; ++t) { fsk += g_fe_stat[t][0]; fap += g_fe_stat[t][1]; fst += g_fe_stat[t][2]; }
-                fprintf(stderr, "  [profile] FE-BLA: applies=%lld skip-iters=%lld normal-steps=%lld  avg-skip=%.1f  skip-frac=%.1f%%\n",
-                        fap, fsk, fst, fap ? (double)fsk / fap : 0.0, (fsk + fst) ? 100.0 * fsk / (fsk + fst) : 0.0);
-                fprintf(stderr, "  [profile] FE: cutoff-sensitive=%d GMP-fallback-pixels=%lld\n",
-                        _fe_cutoff_sensitive ? 1 : 0,
-                        _deepGmpFallbackPixels.load(std::memory_order_relaxed));
-                long long safe = 0; for (int t = 0; t < 64; ++t) safe += g_blafe_safe[t];
+                for (int t = 0; t < 64; ++t) {
+                    fsk += g_fe_stat[t][0];
+                    fap += g_fe_stat[t][1];
+                    fst += g_fe_stat[t][2];
+                }
+                fprintf(stderr, "  [profile] FE-BLA: applies=%lld skip-iters=%lld normal-steps=%lld  avg-skip=%.1f  skip-frac=%.1f%%\n", fap, fsk, fst, fap ? (double)fsk / fap : 0.0, (fsk + fst) ? 100.0 * fsk / (fsk + fst) : 0.0);
+                fprintf(stderr, "  [profile] FE: cutoff-sensitive=%d GMP-fallback-pixels=%lld\n", _fe_cutoff_sensitive ? 1 : 0, _deepGmpFallbackPixels.load(std::memory_order_relaxed));
+                long long safe = 0;
+                for (int t = 0; t < 64; ++t) safe += g_blafe_safe[t];
                 fprintf(stderr, "  [profile] FE-BLA overflow-safe fallbacks=%lld\n", safe);
             }
         }
-        if (profile)
-            memset(g_bla_stat, 0, sizeof(g_bla_stat)); // profile adaptive-SS work separately below
-        if (profile)
-            memset(g_fe_stat, 0, sizeof(g_fe_stat));   // profile adaptive-SS work separately below
+        if (profile) memset(g_bla_stat, 0, sizeof(g_bla_stat)); // profile adaptive-SS work separately below
+        if (profile) memset(g_fe_stat, 0, sizeof(g_fe_stat));   // profile adaptive-SS work separately below
     }
     bool is_super_sampling = (_sub > 1) && (c_method & ColoringMethod::SUPER_SAMPLING);
-    if (!is_super_sampling) { progressSet(1.0); return; }
+    if (!is_super_sampling) {
+        progressSet(1.0);
+        return;
+    }
     if (_flag_halt) return;
-    
+
     // Oversampling pixels that differs from neighbours with (_sub x _sub) pixels
     double ss_select_t0 = nowSec();
     std::vector<std::array<int, 2>> v;
@@ -1590,7 +1788,10 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
     // more pixels supersampled (catches colour-complex pixels the base AA can't
     // resolve). Tunable via MANDEL_SS_K (default 8).
     double ss_k = 8.0;
-    { const char* e = getenv("MANDEL_SS_K"); if (e) ss_k = atof(e); }
+    {
+        const char* e = getenv("MANDEL_SS_K");
+        if (e) ss_k = atof(e);
+    }
     double ss_thresh = log((double)mxit) / ss_k;
     // Feather (SAC) stores a [0,1] stripe value, not an iteration count, so the
     // log(mxit) threshold below never fires for it. The exterior stripe pattern is
@@ -1602,8 +1803,11 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
     // colour changes by more than that many palette steps/pixel (colour index =
     // stripe*density/20*colP, colP=2048); lower = more supersampling (slower).
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
-    double sac_steps = 0.0;   // 0 = boundary only
-    { const char* e = getenv("MANDEL_SAC_SS_STEPS"); if (e) sac_steps = atof(e); }
+    double sac_steps = 0.0; // 0 = boundary only
+    {
+        const char* e = getenv("MANDEL_SAC_SS_STEPS");
+        if (e) sac_steps = atof(e);
+    }
     const double sac_gain = (double)_ss_density * (2048.0 / 20.0);
     // Orbit trap stores a small trap VALUE (not an iteration count), so the log(mxit)
     // iteration-difference threshold below never fires -> SS had no effect. Flag the
@@ -1612,7 +1816,10 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
     // high-frequency, so keep the default moderate; lower = more SS (slower).
     const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
     double trap_steps = 3.0;
-    { const char* e = getenv("MANDEL_TRAP_SS_STEPS"); if (e) trap_steps = atof(e); }
+    {
+        const char* e = getenv("MANDEL_TRAP_SS_STEPS");
+        if (e) trap_steps = atof(e);
+    }
     const double trap_gain = (double)_ss_density / 60.0 * 2048.0;
     for (int i = 0; i < _h; ++i) {
         for (int j = 0; j < _w; ++j) {
@@ -1634,7 +1841,8 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                 }
             } else {
                 float cv = _iter[getIndex(i, j, 0, 0)];
-                float diff = 0; bool boundary = false;
+                float diff = 0;
+                bool boundary = false;
                 for (int xi = -1; xi <= 1; ++xi) {
                     for (int yi = -1; yi <= 1; ++yi) {
                         if (xi == 0 && yi == 0) continue;
@@ -1643,17 +1851,20 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                         if (nx >= 0 && nx < _w && ny >= 0 && ny < _h) {
                             float nv = _iter[getIndex(ny, nx, 0, 0)];
                             diff = std::max(diff, std::abs(cv - nv));
-                            if ((sac || trap) && cv * nv < 0) boundary = true;   // interior/exterior edge
+                            if ((sac || trap) && cv * nv < 0) boundary = true; // interior/exterior edge
                         }
                     }
                 }
-                if (sac)       need_sample = boundary || (sac_steps > 0 && diff * sac_gain > sac_steps);
-                else if (trap) need_sample = boundary || (diff * trap_gain > trap_steps);
-                else           need_sample = (log(diff) > ss_thresh);
+                if (sac)
+                    need_sample = boundary || (sac_steps > 0 && diff * sac_gain > sac_steps);
+                else if (trap)
+                    need_sample = boundary || (diff * trap_gain > trap_steps);
+                else
+                    need_sample = (log(diff) > ss_thresh);
             }
             if (need_sample) {
                 ++mix_cnt;
-                v.push_back({ i, j });
+                v.push_back({i, j});
             }
         }
     }
@@ -1663,8 +1874,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
     const bool contiguous_fe = method == 1 && _use_floatexp;
     if (method == 1) {
         double ss_queue_t0 = nowSec();
-        if (contiguous_fe)
-            ss_contiguous.reserve((size_t)mix_cnt * (_sub * _sub - 1));
+        if (contiguous_fe) ss_contiguous.reserve((size_t)mix_cnt * (_sub * _sub - 1));
         // v is row-major (i,j). The floatexp path resolves every sample in one
         // rebased pass, so keep its millions of coordinates contiguous instead of
         // allocating a set node per sample merely to copy+erase them in stepParallel.
@@ -1674,20 +1884,24 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             for (int yi = -_sub / 2; yi <= _sub / 2; ++yi) {
                 for (int xi = -_sub / 2; xi <= _sub / 2; ++xi) {
                     if (xi == 0 && yi == 0) continue;
-                    std::array<int, 4> sample{ p[0], p[1], yi, xi };
-                    if (contiguous_fe) ss_contiguous.push_back(sample);
-                    else hint = s.emplace_hint(hint, sample);
+                    std::array<int, 4> sample{p[0], p[1], yi, xi};
+                    if (contiguous_fe)
+                        ss_contiguous.push_back(sample);
+                    else
+                        hint = s.emplace_hint(hint, sample);
                 }
             }
         }
         ss_queue_time = nowSec() - ss_queue_t0;
     }
     if (getenv("MANDEL_PROFILE")) {
-        FILE* f = nullptr; fopen_s(&f, "build\\ss_profile.txt", "a");
-        if (f) { fprintf(f, "[ss] supersample-flagged %d / %d px = %.1f%%  (sub=%d -> +%d subpx each) select=%.3fs queue=%.3fs\n",
-                         mix_cnt, _w * _h, 100.0 * mix_cnt / (_w * _h), _sub, _sub * _sub - 1,
-                         ss_select_time, ss_queue_time); fclose(f); }
-    }    
+        FILE* f = nullptr;
+        fopen_s(&f, "build\\ss_profile.txt", "a");
+        if (f) {
+            fprintf(f, "[ss] supersample-flagged %d / %d px = %.1f%%  (sub=%d -> +%d subpx each) select=%.3fs queue=%.3fs\n", mix_cnt, _w * _h, 100.0 * mix_cnt / (_w * _h), _sub, _sub * _sub - 1, ss_select_time, ss_queue_time);
+            fclose(f);
+        }
+    }
     if (_flag_halt) return;
     if (method == 0) {
         Float c0_re_f = mpf_get_ld(_c0_re);
@@ -1695,16 +1909,20 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         Float dx_f = mpf_get_ld(_dx);
         Float dy_f = mpf_get_ld(_dy);
         static int simd0 = -1;
-        if (simd0 < 0) { const char* e = getenv("MANDEL_SIMD"); simd0 = e ? atoi(e) : 1; }
+        if (simd0 < 0) {
+            const char* e = getenv("MANDEL_SIMD");
+            simd0 = e ? atoi(e) : 1;
+        }
         const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
-        const bool simd0on = simd0 && !(c_method & ColoringMethod::STRIPE_AVERAGE);   // shallow SIMD has no SAC
+        const bool simd0on = simd0 && !(c_method & ColoringMethod::STRIPE_AVERAGE); // shallow SIMD has no SAC
         const int nsub = _sub * _sub;
 #pragma omp parallel for schedule(dynamic, 1)
         for (int i = 0; i < v.size(); ++i) {
             if (_flag_halt) continue;
             if (simd0on && nsub <= 128) {
                 // gather this flagged pixel's sub^2-1 subpixel c-coords, solve 4-wide
-                double cre[128], cim[128]; float out[128];
+                double cre[128], cim[128];
+                float out[128];
                 std::array<int, 4> arrs[128];
                 int cnt = 0;
                 for (int xi = -_sub / 2; xi <= _sub / 2; ++xi)
@@ -1712,7 +1930,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                         if (xi == 0 && yi == 0) continue;
                         cre[cnt] = c0_re_f + dx_f * v[i][1] + dx_f * xi / _sub;
                         cim[cnt] = c0_im_f + dy_f * v[i][0] + dy_f * yi / _sub;
-                        arrs[cnt] = { v[i][0], v[i][1], yi, xi };
+                        arrs[cnt] = {v[i][0], v[i][1], yi, xi};
                         ++cnt;
                     }
                 solveShallowSimdList(cre, cim, cnt, out, mxit, c_method);
@@ -1725,7 +1943,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                 for (int xi = -_sub / 2; xi <= _sub / 2; ++xi) {
                     for (int yi = -_sub / 2; yi <= _sub / 2; ++yi) {
                         if (xi == 0 && yi == 0) continue;
-                        std::array<int, 4> arr = { v[i][0], v[i][1], yi, xi };
+                        std::array<int, 4> arr = {v[i][0], v[i][1], yi, xi};
                         double iteration = floatPointCompute(c0_re_f + dx_f * v[i][1] + dx_f * xi / _sub, c0_im_f + dy_f * v[i][0] + dy_f * yi / _sub, mxit, c_method);
                         if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
                             if (iteration >= 0) iteration /= dx_f;
@@ -1735,8 +1953,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                 }
             }
         }
-    }
-    else if (method == 1) {
+    } else if (method == 1) {
         // The first stepParallel uses the base reference's BLA table, which is
         // still valid (its dcmax covers the whole image incl. subpixels). But once
         // a glitched subpixel is re-referenced by createRef, that table is stale
@@ -1752,46 +1969,49 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         }
         while (!contiguous_fe && !s.empty()) {
             // std::cout << ref_it << " === " << _SA_it << ' ' << _SA_order << ' ';
-            if (_flag_halt) { _use_bla = saved_bla; return; }
+            if (_flag_halt) {
+                _use_bla = saved_bla;
+                return;
+            }
             double ss_step_t0 = nowSec();
             stepParallel(s, ref_it, mxit, c_method);
             ss_compute_time += nowSec() - ss_step_t0;
-            if (_flag_halt) { _use_bla = saved_bla; return; }
+            if (_flag_halt) {
+                _use_bla = saved_bla;
+                return;
+            }
             if (s.empty()) break;
             ref_it = createRef(s, mxit, mxit, false, c_method);
             if (customHistory) {
-                _lastCustomHistorySeriesBuilt =
-                    _lastCustomHistorySeriesBuilt ||
-                    _SA_flag || _SA_it > 0;
+                _lastCustomHistorySeriesBuilt = _lastCustomHistorySeriesBuilt || _SA_flag || _SA_it > 0;
                 disableCustomHistorySeriesApproximation();
             }
-            _use_bla = false;   // base BLA table is now stale for the new reference
+            _use_bla = false; // base BLA table is now stale for the new reference
         }
         _use_bla = saved_bla;
     }
     if (getenv("MANDEL_PROFILE")) {
-        FILE* f = nullptr; fopen_s(&f, "build\\ss_profile.txt", "a");
+        FILE* f = nullptr;
+        fopen_s(&f, "build\\ss_profile.txt", "a");
         if (f) {
             long long bsk = 0, bap = 0, bst = 0;
             long long fsk = 0, fap = 0, fst = 0;
             for (int t = 0; t < 64; ++t) {
-                bsk += g_bla_stat[t][0]; bap += g_bla_stat[t][1]; bst += g_bla_stat[t][2];
-                fsk += g_fe_stat[t][0]; fap += g_fe_stat[t][1]; fst += g_fe_stat[t][2];
+                bsk += g_bla_stat[t][0];
+                bap += g_bla_stat[t][1];
+                bst += g_bla_stat[t][2];
+                fsk += g_fe_stat[t][0];
+                fap += g_fe_stat[t][1];
+                fst += g_fe_stat[t][2];
             }
-            fprintf(f, "[ss] compute=%.3fs total=%.3fs\n",
-                    ss_compute_time, ss_select_time + ss_queue_time + ss_compute_time);
-            fprintf(f, "[ss] FE-BLA applies=%lld skip-iters=%lld normal-steps=%lld avg-skip=%.1f skip-frac=%.3f%%\n",
-                    fap, fsk, fst, fap ? (double)fsk / fap : 0.0,
-                    (fsk + fst) ? 100.0 * fsk / (fsk + fst) : 0.0);
-            fprintf(f, "[ss] BLA applies=%lld skip-iters=%lld normal-steps=%lld avg-skip=%.1f skip-frac=%.3f%%\n",
-                    bap, bsk, bst, bap ? (double)bsk / bap : 0.0,
-                    (bsk + bst) ? 100.0 * bsk / (bsk + bst) : 0.0);
+            fprintf(f, "[ss] compute=%.3fs total=%.3fs\n", ss_compute_time, ss_select_time + ss_queue_time + ss_compute_time);
+            fprintf(f, "[ss] FE-BLA applies=%lld skip-iters=%lld normal-steps=%lld avg-skip=%.1f skip-frac=%.3f%%\n", fap, fsk, fst, fap ? (double)fsk / fap : 0.0, (fsk + fst) ? 100.0 * fsk / (fsk + fst) : 0.0);
+            fprintf(f, "[ss] BLA applies=%lld skip-iters=%lld normal-steps=%lld avg-skip=%.1f skip-frac=%.3f%%\n", bap, bsk, bst, bap ? (double)bsk / bap : 0.0, (bsk + bst) ? 100.0 * bsk / (bsk + bst) : 0.0);
             fclose(f);
         }
     }
     progressSet(1.0);
 }
-
 
 void Mandel::setPrecision(int precision) {
     mpf_set_prec(_c0_re, precision);
@@ -1845,21 +2065,17 @@ inline float Mandel::getEscapeTime(mpf_t& z_re, mpf_t& z_im, int i) {
 
 void Mandel::setPixel(std::array<int, 4> p, float iteration) const {
     if (iteration >= 0.0f) {
-        if (_customOutputAdapter ==
-            formula::CustomDeepZoomOutputAdapter::SmoothExpression) {
-            static const float offset = static_cast<float>(
-                -std::log(std::log(2.0)) / std::log(2.0));
+        if (_customOutputAdapter == formula::CustomDeepZoomOutputAdapter::SmoothExpression) {
+            static const float offset = static_cast<float>(-std::log(std::log(2.0)) / std::log(2.0));
             iteration += offset;
-        } else if (_customOutputAdapter ==
-                   formula::CustomDeepZoomOutputAdapter::DistanceExpression) {
+        } else if (_customOutputAdapter == formula::CustomDeepZoomOutputAdapter::DistanceExpression) {
             iteration *= 0.5f;
         }
     }
     _iter[getIndex(p)] = iteration;
 }
 
-void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mxit,
-                          int c_method, const std::vector<std::array<int, 4>>* contiguous) {
+void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mxit, int c_method, const std::vector<std::array<int, 4>>* contiguous) {
     const bool step_profile = getenv("MANDEL_PROFILE") != nullptr;
     double step_t0 = step_profile ? nowSec() : 0.0;
     std::vector<std::array<int, 4>> owned;
@@ -1881,29 +2097,29 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
     // Orbit traps need every orbit point, so BLA (which skips runs) is disabled.
     const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;
-    const bool customFeather =
-        sac && customFeatherAdapter(_customOutputAdapter);
-    const bool customTrap =
-        trap && customTrapAdapter(_customOutputAdapter);
+    const bool customFeather = sac && customFeatherAdapter(_customOutputAdapter);
+    const bool customTrap = trap && customTrapAdapter(_customOutputAdapter);
     const bool customOrbitSeed = customFeather || customTrap;
-    const double customC0Re =
-        customOrbitSeed ? mpf_get_ld(_c0_re) : 0.0;
-    const double customC0Im =
-        customOrbitSeed ? mpf_get_ld(_c0_im) : 0.0;
-    const double customDx =
-        customOrbitSeed ? mpf_get_ld(_dx) : 0.0;
-    const double customDy =
-        customOrbitSeed ? mpf_get_ld(_dy) : 0.0;
+    const double customC0Re = customOrbitSeed ? mpf_get_ld(_c0_re) : 0.0;
+    const double customC0Im = customOrbitSeed ? mpf_get_ld(_c0_im) : 0.0;
+    const double customDx = customOrbitSeed ? mpf_get_ld(_dx) : 0.0;
+    const double customDy = customOrbitSeed ? mpf_get_ld(_dy) : 0.0;
     const bool use_bla_loop = _use_bla && !trap;
     static int simd_env = -1;
-    if (simd_env < 0) { const char* e = getenv("MANDEL_SIMD"); simd_env = e ? atoi(e) : 1; }
+    if (simd_env < 0) {
+        const char* e = getenv("MANDEL_SIMD");
+        simd_env = e ? atoi(e) : 1;
+    }
 
     if (_use_floatexp) {
         // ---- deep-zoom rescaled (floatexp) path: correct past ~1e320 ----
         // Each pixel's dc is built in floatexp (dxfe/dyfe * integer offset) so it
         // never underflows, then iterated with the rescaled delta loop.
         static int fesimd = -1;
-        if (fesimd < 0) { const char* e = getenv("MANDEL_FESIMD"); fesimd = e ? atoi(e) : 1; }
+        if (fesimd < 0) {
+            const char* e = getenv("MANDEL_FESIMD");
+            fesimd = e ? atoi(e) : 1;
+        }
         // The rescaled step vectorises cleanly (4-wide, byte-identical output) but
         // the deep loop is memory/latency-bound on the per-iteration reference
         // gather, so SIMD only ~matches scalar (same as the double-path solveSimd4).
@@ -1913,10 +2129,8 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         const bool feSimdOn = fesimd && !_use_bla && !sac && !deriv && !trap;
 
         std::vector<FloatExp> Dcr(n), Dci(n);
-        std::vector<double> customSeedRe(
-            customOrbitSeed ? n : 0);
-        std::vector<double> customSeedIm(
-            customOrbitSeed ? n : 0);
+        std::vector<double> customSeedRe(customOrbitSeed ? n : 0);
+        std::vector<double> customSeedIm(customOrbitSeed ? n : 0);
         std::vector<float> val(n);
         std::vector<float> nrm((normal || de_ovl) ? n : 0);
 #pragma omp parallel for schedule(dynamic, 1)
@@ -1929,12 +2143,8 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
             Dcr[i] = fe_mul_d(_dxfe, px - _ref_x);
             Dci[i] = fe_mul_d(_dyfe, py - _ref_y);
             if (customOrbitSeed) {
-                customSeedRe[i] =
-                    customC0Re + customDx * arr[1] +
-                    customDx * arr[3] / _sub;
-                customSeedIm[i] =
-                    customC0Im + customDy * arr[0] +
-                    customDy * arr[2] / _sub;
+                customSeedRe[i] = customC0Re + customDx * arr[1] + customDx * arr[3] / _sub;
+                customSeedIm[i] = customC0Im + customDy * arr[0] + customDy * arr[2] / _sub;
             }
         }
         double step_setup = step_profile ? nowSec() - step_t0 - step_copy : 0.0;
@@ -1944,14 +2154,9 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         auto finalize = [&](int i) {
             auto arr = v[i];
             float value = val[i];
-            if (value == EMPTYPIXEL ||
-                (_fe_cutoff_sensitive &&
-                 (customOrbitSeed ||
-                  value < 0 || value > mxit - 16))) {
-                value = accuratePixelCompute(
-                    arr, mxit, c_method);
-                _deepGmpFallbackPixels.fetch_add(
-                    1, std::memory_order_relaxed);
+            if (value == EMPTYPIXEL || (_fe_cutoff_sensitive && (customOrbitSeed || value < 0 || value > mxit - 16))) {
+                value = accuratePixelCompute(arr, mxit, c_method);
+                _deepGmpFallbackPixels.fetch_add(1, std::memory_order_relaxed);
             }
             setPixel(arr, value);
             if ((normal || de_ovl) && _normal) _normal[getIndex(arr)] = nrm[i];
@@ -1970,12 +2175,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
 #pragma omp parallel for schedule(dynamic, 64)
             for (int i = 0; i < (int)v.size(); ++i) {
                 if (_flag_halt) continue;
-                val[i] = pixelRescaled(
-                    Dcr[i], Dci[i],
-                    customOrbitSeed ? customSeedRe[i] : 0.0,
-                    customOrbitSeed ? customSeedIm[i] : 0.0,
-                    mx_ref_it, mxit, c_method,
-                    (normal || de_ovl) ? &nrm[i] : nullptr);
+                val[i] = pixelRescaled(Dcr[i], Dci[i], customOrbitSeed ? customSeedRe[i] : 0.0, customOrbitSeed ? customSeedIm[i] : 0.0, mx_ref_it, mxit, c_method, (normal || de_ovl) ? &nrm[i] : nullptr);
                 finalize(i);
             }
         }
@@ -1983,18 +2183,19 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         // Zhuoran rebasing (rebase whenever |z| < |dz|) keeps the floatexp path
         // glitch-free, so every pixel is resolved in one pass; drop them all.
         if (contiguous) {
-            if (step_profile && n > 100000)
-                fprintf(stderr, "  [profile] stepParallel FE n=%d copy=%.3fs setup=%.3fs solve=%.3fs erase=0.000s total=%.3fs\n",
-                        n, step_copy, step_setup, step_solve, nowSec() - step_t0);
+            if (step_profile && n > 100000) fprintf(stderr, "  [profile] stepParallel FE n=%d copy=%.3fs setup=%.3fs solve=%.3fs erase=0.000s total=%.3fs\n", n, step_copy, step_setup, step_solve, nowSec() - step_t0);
             return;
         }
-        { int i = 0;
-          double step_erase_t0 = step_profile ? nowSec() : 0.0;
-          for (auto it = s.begin(); it != s.end(); ++i)
-              if (_done[i]) it = s.erase(it); else ++it;
-          if (step_profile && n > 100000)
-              fprintf(stderr, "  [profile] stepParallel FE n=%d copy=%.3fs setup=%.3fs solve=%.3fs erase=%.3fs total=%.3fs\n",
-                      n, step_copy, step_setup, step_solve, nowSec() - step_erase_t0, nowSec() - step_t0); }
+        {
+            int i = 0;
+            double step_erase_t0 = step_profile ? nowSec() : 0.0;
+            for (auto it = s.begin(); it != s.end(); ++i)
+                if (_done[i])
+                    it = s.erase(it);
+                else
+                    ++it;
+            if (step_profile && n > 100000) fprintf(stderr, "  [profile] stepParallel FE n=%d copy=%.3fs setup=%.3fs solve=%.3fs erase=%.3fs total=%.3fs\n", n, step_copy, step_setup, step_solve, nowSec() - step_erase_t0, nowSec() - step_t0);
+        }
         return;
     }
 
@@ -2009,7 +2210,10 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
     // reference must stay on the scalar path regardless of the compute-bound gate.
     const bool bla_idle = _simd_measured ? _simd_bla_idle : (!_use_bla || (_bla_rmax2 < _bla_dcmax2));
     static int simd_force = -1;
-    if (simd_force < 0) { const char* e = getenv("MANDEL_SIMD_ALL"); simd_force = e ? atoi(e) : 0; }
+    if (simd_force < 0) {
+        const char* e = getenv("MANDEL_SIMD_ALL");
+        simd_force = e ? atoi(e) : 0;
+    }
     const bool use_simd = simd_env && !deriv && !sac && !trap && _ref_period == 0 && (bla_idle || simd_force);
 
     if (use_simd) {
@@ -2033,321 +2237,323 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                 mpf_div_ui(t1, t1, _sub);
                 mpf_div_ui(t2, t2, _sub);
             }
-            Comp dc{ mpf_get_ld(t1), mpf_get_ld(t2) };
+            Comp dc{mpf_get_ld(t1), mpf_get_ld(t2)};
             mpf_clear(t1);
             mpf_clear(t2);
-            Comp dz = { 0 };
+            Comp dz = {0};
             for (int x = _SA_order; x >= 0; --x) {
                 dz += _Adf_old[x];
                 dz *= dc;
                 dz /= _SA_delta;
             }
-            Adcr[i] = dc.real(); Adci[i] = dc.imag();
-            Adzr[i] = dz.real(); Adzi[i] = dz.imag();
+            Adcr[i] = dc.real();
+            Adci[i] = dc.imag();
+            Adzr[i] = dz.real();
+            Adzi[i] = dz.imag();
         }
         // ---- solve: AVX2, 4 pixels per group ----
 #pragma omp parallel for schedule(dynamic, 1)
         for (int g = 0; g < n; g += 4) {
             if (_flag_halt) continue;
             int lanes = n - g < 4 ? n - g : 4;
-            solveSimd4(v.data(), g, lanes, Adcr.data(), Adci.data(), Adzr.data(), Adzi.data(),
-                       mx_ref_it, mxit, glitch_p.get());
+            solveSimd4(v.data(), g, lanes, Adcr.data(), Adci.data(), Adzr.data(), Adzi.data(), mx_ref_it, mxit, glitch_p.get());
         }
     } else {
 #pragma omp parallel for schedule(dynamic, 1)
-    for (int i = 0; i < v.size(); ++i) {
-        if (_flag_halt) continue;
-        auto arr = v[i];
-        mpf_t t1, t2;
-        mpf_init(t1);
-        mpf_init(t2);
-        glitch_p[i] = -1;
-        // Comp dc = static_cast<Comp>(_dx * (v[i][1] - _ref[1]) + _dx / _sub * (v[i][3] - _ref[3]) + _dy * (v[i][0] - _ref[0]) + _dy / _sub * (v[i][2] - _ref[2]));
-        int xpix = _sub * (arr[1] - _ref[1]) + (arr[3] - _ref[3]);
-        int ypix = _sub * (arr[0] - _ref[0]) + (arr[2] - _ref[2]);
-        mpf_mul_ui(t1, _dx, abs(xpix));
-        mpf_mul_ui(t2, _dy, abs(ypix));
-        if (xpix < 0) mpf_neg(t1, t1);
-        if (ypix < 0) mpf_neg(t2, t2);
-        if (_sub > 1) {
-            mpf_div_ui(t1, t1, _sub);
-            mpf_div_ui(t2, t2, _sub);
-        }
-        Comp dc{ mpf_get_ld(t1), mpf_get_ld(t2) };
-        mpf_clear(t1);
-        mpf_clear(t2);
-        // Periodic reference: the integer-pixel dc above is relative to the nearest
-        // pixel _ref; subtract the nucleus's sub-pixel offset so dc = c_pixel - nucleus.
-        if (_ref_period) { dc = Comp{ dc.real() - _ref_frac_re, dc.imag() - _ref_frac_im }; }
-        Float dxf = mpf_get_ld(_dx);
-        Comp dz = { 0 };
-        Comp dd = { 0 };
-        for (int x = _SA_order; x >= 0; --x) {
-            dz += _Adf_old[x];
-            dz *= dc;
-            dz /= _SA_delta;
-        }
-        if (deriv) {
+        for (int i = 0; i < v.size(); ++i) {
+            if (_flag_halt) continue;
+            auto arr = v[i];
+            mpf_t t1, t2;
+            mpf_init(t1);
+            mpf_init(t2);
+            glitch_p[i] = -1;
+            // Comp dc = static_cast<Comp>(_dx * (v[i][1] - _ref[1]) + _dx / _sub * (v[i][3] - _ref[3]) + _dy * (v[i][0] - _ref[0]) + _dy / _sub * (v[i][2] - _ref[2]));
+            int xpix = _sub * (arr[1] - _ref[1]) + (arr[3] - _ref[3]);
+            int ypix = _sub * (arr[0] - _ref[0]) + (arr[2] - _ref[2]);
+            mpf_mul_ui(t1, _dx, abs(xpix));
+            mpf_mul_ui(t2, _dy, abs(ypix));
+            if (xpix < 0) mpf_neg(t1, t1);
+            if (ypix < 0) mpf_neg(t2, t2);
+            if (_sub > 1) {
+                mpf_div_ui(t1, t1, _sub);
+                mpf_div_ui(t2, t2, _sub);
+            }
+            Comp dc{mpf_get_ld(t1), mpf_get_ld(t2)};
+            mpf_clear(t1);
+            mpf_clear(t2);
+            // Periodic reference: the integer-pixel dc above is relative to the nearest
+            // pixel _ref; subtract the nucleus's sub-pixel offset so dc = c_pixel - nucleus.
+            if (_ref_period) { dc = Comp{dc.real() - _ref_frac_re, dc.imag() - _ref_frac_im}; }
+            Float dxf = mpf_get_ld(_dx);
+            Comp dz = {0};
+            Comp dd = {0};
             for (int x = _SA_order; x >= 0; --x) {
-                dd += _Bdf_old[x];
-                dd *= dc;
-                dd /= _SA_delta;
+                dz += _Adf_old[x];
+                dz *= dc;
+                dz /= _SA_delta;
             }
-        }
-        int j = _SA_it + 1;
-
-        Float dzr = dz.real();
-        Float dzi = dz.imag();
-        Float dcr = dc.real();
-        Float dci = dc.imag();
-        Float ddr = dd.real();
-        Float ddi = dd.imag();
-        Float tmp;
-        Float zr, zi, dr, di;
-        Float dzr2, dzi2, zrad;
-
-
-        int k = j;
-        // Periodic reference: read the orbit modulo the period. rk mirrors k and
-        // rkm1 mirrors k-1, maintained incrementally so the non-periodic path
-        // (per == 0, rk == k, rkm1 == k-1 throughout) stays byte-identical.
-        const int per = _ref_period;
-        int rk = k, rkm1 = k - 1;
-        Float m = 1e100;
-        // Brent-style periodicity detection (interior): compare the full pixel
-        // value z=(zr,zi) to a saved "tortoise" whose position advances at
-        // geometric intervals; a close return means the orbit has entered an
-        // attracting cycle, so the pixel is interior. Works for any period.
-        Float zsr = 1e30, zsi = 1e30;   // sentinel: no match before first save
-        int save_j = j, period_win = 1;
-        // convergence confirmation state (0 = searching for a candidate cycle)
-        int conf_P = 0, conf_next = 0, conf_count = 0, conf_giveup = 0;
-        Float conf_D2 = 0, conf_zr = 0, conf_zi = 0;
-        // Stripe Average Coloring, averaged over the last sacWindow() iterations
-        // (the escaping tail) so it stays rich at deep zoom and pan-invariant. A
-        // BLA skip breaks the tail, so it resets the window.
-        SacAccum sacc; if (sac) sacc.init(sacWindow());
-        TrapAccum trapc;
-        if (customFeather) {
-            if (arr == _ref) {
-                sacc.push(
-                    mpf_get_ld(_ref_z_re),
-                    mpf_get_ld(_ref_z_im));
-            } else {
-                sacc.push(
-                    customC0Re + customDx * arr[1] +
-                        customDx * arr[3] / _sub,
-                    customC0Im + customDy * arr[0] +
-                        customDy * arr[2] / _sub);
-            }
-        }
-        if (customTrap) {
-            if (arr == _ref) {
-                trapc.push(
-                    mpf_get_ld(_ref_z_re),
-                    mpf_get_ld(_ref_z_im));
-            } else {
-                trapc.push(
-                    customC0Re + customDx * arr[1] +
-                        customDx * arr[3] / _sub,
-                    customC0Im + customDy * arr[0] +
-                        customDy * arr[2] / _sub);
-            }
-        }
-        // Exact state-repetition interior detector (MANDEL_INT_REP, default on). The
-        // full pixel state is (dzr, dzi, k); it is deterministic, so if it EXACTLY
-        // repeats, the orbit loops forever -> provably interior (an escaping orbit
-        // never repeats its state). Zero false positives by construction;
-        // BLA-compatible (BLA is deterministic). Brent-style: save a state, compare at
-        // geometric intervals. Gated on _use_interior (auto-off for exterior-only
-        // views -> no overhead) and !trap (trap's interior value depends on the orbit
-        // accumulator).
-        const bool detect_interior = _use_interior && !customTrap;
-        const bool int_rep =
-            g_int_rep > 0 && detect_interior && !trap;
-        double sdzr = 1e300, sdzi = 1e300; int sk = -1; int save_j2 = j, twin2 = 1;
-        while (j < mxit) {
-            if (_flag_halt) break;
-            if (int_rep) {
-                if (k == sk && dzr == sdzr && dzi == sdzi) {   // exact repeat -> interior
-                    setPixel(arr, -2); markDone(i);
-                    break;
-                }
-                if (j - save_j2 >= twin2) { sdzr = dzr; sdzi = dzi; sk = k; save_j2 = j; twin2 += twin2; }
-            }
-            if (use_bla_loop && dzr * dzr + dzi * dzi < _bla_rmax2) {
-                // Only attempt BLA when dz is small enough that some level could be
-                // valid -- avoids the per-iteration lookup cost when dz is large.
-                // BLA start index s = k-1 (loop-top invariant: dz is at ref index k-1).
-                int skip = tryBLA(rkm1, dzr, dzi, ddr, ddi, dcr, dci, deriv,
-                                  escapeRadiusSquared(), mx_ref_it);
-                if (skip > 0) {
-                    int tid = omp_get_thread_num() & 63;
-                    g_bla_stat[tid][0] += skip; ++g_bla_stat[tid][1];
-                    k += skip; j += skip;
-                    rk += skip; if (per && rk >= per) rk -= per; rkm1 = (per && rk == 0) ? per - 1 : rk - 1;
-                    if (sac) {
-                        if (customFeather && sacc.W <= 0 &&
-                            !_sacRefPre.empty() &&
-                            k < (int)_sacRefPre.size()) {
-                            sacc.add_full(
-                                _sacRefPre[k] -
-                                    _sacRefPre[k - skip],
-                                skip);
-                        } else {
-                            sacc.reset_window();
-                        }
-                    }
-                    // A BLA skip jumps j forward, making the tortoise/hare periodicity
-                    // detector stale, so restart it. (The exact-state interior detector
-                    // below is unaffected -- it compares the full (dz,k) state, which is
-                    // deterministic across skips.)
-                    zsr = 1e30; zsi = 1e30; save_j = j; period_win = 1;
-                    conf_P = 0; conf_giveup = 0;
-                    continue;
-                }
-                ++g_bla_stat[omp_get_thread_num() & 63][2];
-            }
-            // dd = 2 * (dd*z + dz*(d+dd))
             if (deriv) {
-                if (k == 0) {
-                    tmp = (dzr * (1 + ddr) - dzi * (1 + ddi)) * 2;
-                    ddi = (dzr * (1 + ddi) + dzi * (1 + ddr)) * 2;
-                } else {
-                    tmp = (ddr * _zfr[k - 1] - ddi * _zfi[k - 1] + dzr * (_dfr[k - 1] + ddr) - dzi * (_dfi[k - 1] + ddi)) * 2;
-                    ddi = (ddr * _zfi[k - 1] + ddi * _zfr[k - 1] + dzr * (_dfi[k - 1] + ddi) + dzi * (_dfr[k - 1] + ddr)) * 2;
+                for (int x = _SA_order; x >= 0; --x) {
+                    dd += _Bdf_old[x];
+                    dd *= dc;
+                    dd /= _SA_delta;
                 }
-                ddr = tmp;
-                dr = ddr + _dfr[k];
-                di = ddi + _dfi[k];
             }
-            // dz = dz^2 + 2*dz*z + dc
-            dzr2 = dzr * dzr;
-            dzi2 = dzi * dzi;
-            if (k == 0) {
-                tmp = dzr2 - dzi2 + dcr;
-                dzi = dzr * dzi * 2 + dci;
-            }
-            else {
-                tmp = (dzr * _zfr[rkm1] - dzi * _zfi[rkm1]) * 2 + dzr2 - dzi2 + dcr;
-                dzi = (dzr * _zfi[rkm1] + dzi * _zfr[rkm1]) * 2 + dzr * dzi * 2 + dci;
-            }
-            dzr = tmp;
-            zr = dzr + _zfr[rk];
-            zi = dzi + _zfi[rk];
-            zrad = zr * zr + zi * zi;
+            int j = _SA_it + 1;
 
-            if (sac) sacc.push(zr, zi);
-            if (trap) trapc.push(zr, zi);
+            Float dzr = dz.real();
+            Float dzi = dz.imag();
+            Float dcr = dc.real();
+            Float dci = dc.imag();
+            Float ddr = dd.real();
+            Float ddi = dd.imag();
+            Float tmp;
+            Float zr, zi, dr, di;
+            Float dzr2, dzi2, zrad;
 
-            ++k;
-            rkm1 = rk; if (per) { if (++rk == per) rk = 0; } else rk = k;
-            if (_customEscapeRadiusActive && _ref_escaped && !per &&
-                k >= _ref_escape_iteration) {
-                setPixel(
-                    arr,
-                    accuratePixelCompute(arr, mxit, c_method));
-                markDone(i);
-                break;
-            }
-            if (zrad > escapeRadiusSquared()) {
-                
-                if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
-                    setPixel(arr, sqrt(zrad) / dxf * log(zrad) / sqrt(dr * dr + di * di));
-                } else if (normal) {
-                    // base colour = smooth value; normal angle = arg(z) - arg(dz/dc).
-                    setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
-                    if (_normal) _normal[getIndex(arr)] = (float)(atan2((double)zi, (double)zr) - atan2((double)di, (double)dr));
-                } else if (de_ovl) {
-                    // base colour = smooth value; overlay = pixel-normalised DE.
-                    setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
-                    if (_normal) _normal[getIndex(arr)] = (float)(sqrt(zrad) / dxf * log(zrad) / sqrt(dr * dr + di * di));
-                } else if (trap) {
-                    setPixel(
-                        arr,
-                        customTrap
-                            ? customTrapEscapeValue(
-                                  trapc, j + 1,
-                                  (double)zr, (double)zi)
-                            : trapc.value(
-                                  j + 1 -
-                                  log(log((double)zrad) / 2 /
-                                      log(2)) / log(2)));
-                } else if (sac) {
-                    setPixel(
-                        arr,
-                        customFeather
-                            ? customFeatherEscapeValue(
-                                  sacc, (double)zr,
-                                  (double)zi, escapeRadius())
-                            : sacc.value(
-                                  (double)zrad,
-                                  escapeRadius()));
+            int k = j;
+            // Periodic reference: read the orbit modulo the period. rk mirrors k and
+            // rkm1 mirrors k-1, maintained incrementally so the non-periodic path
+            // (per == 0, rk == k, rkm1 == k-1 throughout) stays byte-identical.
+            const int per = _ref_period;
+            int rk = k, rkm1 = k - 1;
+            Float m = 1e100;
+            // Brent-style periodicity detection (interior): compare the full pixel
+            // value z=(zr,zi) to a saved "tortoise" whose position advances at
+            // geometric intervals; a close return means the orbit has entered an
+            // attracting cycle, so the pixel is interior. Works for any period.
+            Float zsr = 1e30, zsi = 1e30; // sentinel: no match before first save
+            int save_j = j, period_win = 1;
+            // convergence confirmation state (0 = searching for a candidate cycle)
+            int conf_P = 0, conf_next = 0, conf_count = 0, conf_giveup = 0;
+            Float conf_D2 = 0, conf_zr = 0, conf_zi = 0;
+            // Stripe Average Coloring, averaged over the last sacWindow() iterations
+            // (the escaping tail) so it stays rich at deep zoom and pan-invariant. A
+            // BLA skip breaks the tail, so it resets the window.
+            SacAccum sacc;
+            if (sac) sacc.init(sacWindow());
+            TrapAccum trapc;
+            if (customFeather) {
+                if (arr == _ref) {
+                    sacc.push(mpf_get_ld(_ref_z_re), mpf_get_ld(_ref_z_im));
                 } else {
-                    setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
+                    sacc.push(customC0Re + customDx * arr[1] + customDx * arr[3] / _sub, customC0Im + customDy * arr[0] + customDy * arr[2] / _sub);
                 }
-                markDone(i);
-                break;
             }
-            if (detect_interior) {
-                if (conf_P > 0) {
-                    // Confirm a candidate cycle over several periods. Each period must
-                    // (a) return close to the (updated) anchor -- a real cycle returns
-                    // every period, a coincidental approach does not -- and (b) have
-                    // multiplier |dz|^2 product = prod(4*zrad) < 1 (attracting). Only a
-                    // genuine attracting cycle sustains both => interior.
-                    conf_D2 *= 4 * zrad;
-                    if (conf_D2 > 1e18) conf_D2 = 1e18;
-                    if (j >= conf_next) {
-                        Float pr = zr - conf_zr, pi = zi - conf_zi;
-                        bool ret = (pr * pr + pi * pi < _interior_eps2 * zrad);
-                        if (ret && conf_D2 < 1.0) {
-                            if (++conf_count >= _interior_confirm) { setPixel(arr, trap ? trapc.value(0.0) : -2); markDone(i); break; }
-                            conf_zr = zr; conf_zi = zi; conf_D2 = 1; conf_next = j + conf_P;
-                        } else {
-                            conf_P = 0; ++conf_giveup;            // not a sustained attracting cycle
+            if (customTrap) {
+                if (arr == _ref) {
+                    trapc.push(mpf_get_ld(_ref_z_re), mpf_get_ld(_ref_z_im));
+                } else {
+                    trapc.push(customC0Re + customDx * arr[1] + customDx * arr[3] / _sub, customC0Im + customDy * arr[0] + customDy * arr[2] / _sub);
+                }
+            }
+            // Exact state-repetition interior detector (MANDEL_INT_REP, default on). The
+            // full pixel state is (dzr, dzi, k); it is deterministic, so if it EXACTLY
+            // repeats, the orbit loops forever -> provably interior (an escaping orbit
+            // never repeats its state). Zero false positives by construction;
+            // BLA-compatible (BLA is deterministic). Brent-style: save a state, compare at
+            // geometric intervals. Gated on _use_interior (auto-off for exterior-only
+            // views -> no overhead) and !trap (trap's interior value depends on the orbit
+            // accumulator).
+            const bool detect_interior = _use_interior && !customTrap;
+            const bool int_rep = g_int_rep > 0 && detect_interior && !trap;
+            double sdzr = 1e300, sdzi = 1e300;
+            int sk = -1;
+            int save_j2 = j, twin2 = 1;
+            while (j < mxit) {
+                if (_flag_halt) break;
+                if (int_rep) {
+                    if (k == sk && dzr == sdzr && dzi == sdzi) { // exact repeat -> interior
+                        setPixel(arr, -2);
+                        markDone(i);
+                        break;
+                    }
+                    if (j - save_j2 >= twin2) {
+                        sdzr = dzr;
+                        sdzi = dzi;
+                        sk = k;
+                        save_j2 = j;
+                        twin2 += twin2;
+                    }
+                }
+                if (use_bla_loop && dzr * dzr + dzi * dzi < _bla_rmax2) {
+                    // Only attempt BLA when dz is small enough that some level could be
+                    // valid -- avoids the per-iteration lookup cost when dz is large.
+                    // BLA start index s = k-1 (loop-top invariant: dz is at ref index k-1).
+                    int skip = tryBLA(rkm1, dzr, dzi, ddr, ddi, dcr, dci, deriv, escapeRadiusSquared(), mx_ref_it);
+                    if (skip > 0) {
+                        int tid = omp_get_thread_num() & 63;
+                        g_bla_stat[tid][0] += skip;
+                        ++g_bla_stat[tid][1];
+                        k += skip;
+                        j += skip;
+                        rk += skip;
+                        if (per && rk >= per) rk -= per;
+                        rkm1 = (per && rk == 0) ? per - 1 : rk - 1;
+                        if (sac) {
+                            if (customFeather && sacc.W <= 0 && !_sacRefPre.empty() && k < (int)_sacRefPre.size()) {
+                                sacc.add_full(_sacRefPre[k] - _sacRefPre[k - skip], skip);
+                            } else {
+                                sacc.reset_window();
+                            }
                         }
+                        // A BLA skip jumps j forward, making the tortoise/hare periodicity
+                        // detector stale, so restart it. (The exact-state interior detector
+                        // below is unaffected -- it compares the full (dz,k) state, which is
+                        // deterministic across skips.)
+                        zsr = 1e30;
+                        zsi = 1e30;
+                        save_j = j;
+                        period_win = 1;
+                        conf_P = 0;
+                        conf_giveup = 0;
+                        continue;
                     }
-                } else if ((j & 15) == 0 && conf_giveup < 3) {
-                    // Search for a candidate cycle only every 16 iterations, and give up
-                    // after a few failed confirmations, so escaping (exterior) pixels pay
-                    // almost nothing. A close (relative) return starts a confirmation.
-                    Float pr = zr - zsr, pi = zi - zsi;
-                    if (pr * pr + pi * pi < _interior_eps2 * zrad) {
-                        conf_P = j - save_j; if (conf_P < 1) conf_P = 1;
-                        conf_zr = zr; conf_zi = zi; conf_D2 = 1; conf_next = j + conf_P; conf_count = 0;
-                    }
-                    if (j - save_j >= period_win) { zsr = zr; zsi = zi; save_j = j; period_win += period_win; }
+                    ++g_bla_stat[omp_get_thread_num() & 63][2];
                 }
-            }
-            // ** Zhuoran method: rebase to original reference with index = 0.
-            // Periodic: wrap instead of the ref-end rebase (rk already wraps).
-            if (zrad < dzr * dzr + dzi * dzi || (!per && k == mx_ref_it)) {
-                if ((dzr * dzr + dzi * dzi) / zrad > 10000000) {
-                    // Significant magnitude change causes precision loss.
-                    glitch_p[i] = zrad / _z_m3[per ? j % per : j];
+                // dd = 2 * (dd*z + dz*(d+dd))
+                if (deriv) {
+                    if (k == 0) {
+                        tmp = (dzr * (1 + ddr) - dzi * (1 + ddi)) * 2;
+                        ddi = (dzr * (1 + ddi) + dzi * (1 + ddr)) * 2;
+                    } else {
+                        tmp = (ddr * _zfr[k - 1] - ddi * _zfi[k - 1] + dzr * (_dfr[k - 1] + ddr) - dzi * (_dfi[k - 1] + ddi)) * 2;
+                        ddi = (ddr * _zfi[k - 1] + ddi * _zfr[k - 1] + dzr * (_dfi[k - 1] + ddi) + dzi * (_dfr[k - 1] + ddr)) * 2;
+                    }
+                    ddr = tmp;
+                    dr = ddr + _dfr[k];
+                    di = ddi + _dfi[k];
+                }
+                // dz = dz^2 + 2*dz*z + dc
+                dzr2 = dzr * dzr;
+                dzi2 = dzi * dzi;
+                if (k == 0) {
+                    tmp = dzr2 - dzi2 + dcr;
+                    dzi = dzr * dzi * 2 + dci;
+                } else {
+                    tmp = (dzr * _zfr[rkm1] - dzi * _zfi[rkm1]) * 2 + dzr2 - dzi2 + dcr;
+                    dzi = (dzr * _zfi[rkm1] + dzi * _zfr[rkm1]) * 2 + dzr * dzi * 2 + dci;
+                }
+                dzr = tmp;
+                zr = dzr + _zfr[rk];
+                zi = dzi + _zfi[rk];
+                zrad = zr * zr + zi * zi;
+
+                if (sac) sacc.push(zr, zi);
+                if (trap) trapc.push(zr, zi);
+
+                ++k;
+                rkm1 = rk;
+                if (per) {
+                    if (++rk == per) rk = 0;
+                } else
+                    rk = k;
+                if (_customEscapeRadiusActive && _ref_escaped && !per && k >= _ref_escape_iteration) {
+                    setPixel(arr, accuratePixelCompute(arr, mxit, c_method));
+                    markDone(i);
                     break;
                 }
-                dzr = zr;
-                dzi = zi;
-                if (deriv) {   // EDE, normal-map AND DE-overlay all track dz/dc; reset on rebase
-                    ddr = dr - 1;
-                    ddi = di;
+                if (zrad > escapeRadiusSquared()) {
+
+                    if (c_method & ColoringMethod::EXTERIOR_DIST_EST) {
+                        setPixel(arr, sqrt(zrad) / dxf * log(zrad) / sqrt(dr * dr + di * di));
+                    } else if (normal) {
+                        // base colour = smooth value; normal angle = arg(z) - arg(dz/dc).
+                        setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
+                        if (_normal) _normal[getIndex(arr)] = (float)(atan2((double)zi, (double)zr) - atan2((double)di, (double)dr));
+                    } else if (de_ovl) {
+                        // base colour = smooth value; overlay = pixel-normalised DE.
+                        setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
+                        if (_normal) _normal[getIndex(arr)] = (float)(sqrt(zrad) / dxf * log(zrad) / sqrt(dr * dr + di * di));
+                    } else if (trap) {
+                        setPixel(arr, customTrap ? customTrapEscapeValue(trapc, j + 1, (double)zr, (double)zi) : trapc.value(j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2)));
+                    } else if (sac) {
+                        setPixel(arr, customFeather ? customFeatherEscapeValue(sacc, (double)zr, (double)zi, escapeRadius()) : sacc.value((double)zrad, escapeRadius()));
+                    } else {
+                        setPixel(arr, j + 1 - log(log((double)zrad) / 2 / log(2)) / log(2));
+                    }
+                    markDone(i);
+                    break;
                 }
-                k = 0; rk = 0; rkm1 = per ? per - 1 : -1;
+                if (detect_interior) {
+                    if (conf_P > 0) {
+                        // Confirm a candidate cycle over several periods. Each period must
+                        // (a) return close to the (updated) anchor -- a real cycle returns
+                        // every period, a coincidental approach does not -- and (b) have
+                        // multiplier |dz|^2 product = prod(4*zrad) < 1 (attracting). Only a
+                        // genuine attracting cycle sustains both => interior.
+                        conf_D2 *= 4 * zrad;
+                        if (conf_D2 > 1e18) conf_D2 = 1e18;
+                        if (j >= conf_next) {
+                            Float pr = zr - conf_zr, pi = zi - conf_zi;
+                            bool ret = (pr * pr + pi * pi < _interior_eps2 * zrad);
+                            if (ret && conf_D2 < 1.0) {
+                                if (++conf_count >= _interior_confirm) {
+                                    setPixel(arr, trap ? trapc.value(0.0) : -2);
+                                    markDone(i);
+                                    break;
+                                }
+                                conf_zr = zr;
+                                conf_zi = zi;
+                                conf_D2 = 1;
+                                conf_next = j + conf_P;
+                            } else {
+                                conf_P = 0;
+                                ++conf_giveup; // not a sustained attracting cycle
+                            }
+                        }
+                    } else if ((j & 15) == 0 && conf_giveup < 3) {
+                        // Search for a candidate cycle only every 16 iterations, and give up
+                        // after a few failed confirmations, so escaping (exterior) pixels pay
+                        // almost nothing. A close (relative) return starts a confirmation.
+                        Float pr = zr - zsr, pi = zi - zsi;
+                        if (pr * pr + pi * pi < _interior_eps2 * zrad) {
+                            conf_P = j - save_j;
+                            if (conf_P < 1) conf_P = 1;
+                            conf_zr = zr;
+                            conf_zi = zi;
+                            conf_D2 = 1;
+                            conf_next = j + conf_P;
+                            conf_count = 0;
+                        }
+                        if (j - save_j >= period_win) {
+                            zsr = zr;
+                            zsi = zi;
+                            save_j = j;
+                            period_win += period_win;
+                        }
+                    }
+                }
+                // ** Zhuoran method: rebase to original reference with index = 0.
+                // Periodic: wrap instead of the ref-end rebase (rk already wraps).
+                if (zrad < dzr * dzr + dzi * dzi || (!per && k == mx_ref_it)) {
+                    if ((dzr * dzr + dzi * dzi) / zrad > 10000000) {
+                        // Significant magnitude change causes precision loss.
+                        glitch_p[i] = zrad / _z_m3[per ? j % per : j];
+                        break;
+                    }
+                    dzr = zr;
+                    dzi = zi;
+                    if (deriv) { // EDE, normal-map AND DE-overlay all track dz/dc; reset on rebase
+                        ddr = dr - 1;
+                        ddi = di;
+                    }
+                    k = 0;
+                    rk = 0;
+                    rkm1 = per ? per - 1 : -1;
+                }
+                if (!per && k == mx_ref_it) {
+                    glitch_p[i] = (double)zrad / _z_m3[j];
+                    break;
+                }
+                ++j;
             }
-            if (!per && k == mx_ref_it) {
-                glitch_p[i] = (double)zrad / _z_m3[j];
-                break;
+            if (j >= mxit) {
+                setPixel(arr, trap ? trapc.value(0.0) : -2);
+                markDone(i);
             }
-            ++j;
         }
-        if (j >= mxit) {
-            setPixel(arr, trap ? trapc.value(0.0) : -2);
-            markDone(i);
-        }
-    }
-    }   // end else (scalar path)
+    } // end else (scalar path)
     if (_flag_halt) return;
     // get new reference with minimum |z + dz|
     Float min_orbit = 1e100;
@@ -2363,8 +2569,7 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         if (_done[i]) {
             iter = s.erase(iter);
             ++remove_cnt;
-        }
-        else {
+        } else {
             ++iter;
         }
     }
@@ -2382,7 +2587,7 @@ void Mandel::buildBLA(int reflen, bool ede) {
     _blaD.clear();
     _bla_rmax2 = 0.0;
     if (reflen < 3) return;
-    double eps = _bla_eps > 0 ? _bla_eps : ldexp(1.0, -53);   // negligible vs double rounding
+    double eps = _bla_eps > 0 ? _bla_eps : ldexp(1.0, -53); // negligible vs double rounding
     // Max |dc| over ALL pixels relative to the ACTUAL reference position. The old
     // bound |_SA_delta| assumes a centre reference; after glitch re-referencing the
     // reference is off-centre, so edge pixels have larger |dc| and a centre-based
@@ -2393,7 +2598,7 @@ void Mandel::buildBLA(int reflen, bool ede) {
     double mxx = std::max(_ref_x, (double)(_w - 1) - _ref_x) + 0.5;
     double mxy = std::max(_ref_y, (double)(_h - 1) - _ref_y) + 0.5;
     double dcmax = std::sqrt(dxf * dxf * mxx * mxx + dyf * dyf * mxy * mxy);
-    _bla_dcmax2 = dcmax * dcmax;   // frame max |dc|^2, for the SIMD compute-bound gate
+    _bla_dcmax2 = dcmax * dcmax; // frame max |dc|^2, for the SIMD compute-bound gate
 
     std::vector<BLAEntry> lvl0;
     std::vector<BLACoeff> lvl0Coeff;
@@ -2404,17 +2609,17 @@ void Mandel::buildBLA(int reflen, bool ede) {
     for (int s = 1; s < reflen; ++s) {
         double zr = _zfr[s], zi = _zfi[s];
         double Zmag = sqrt(zr * zr + zi * zi);
-        double ar = 2.0 * zr, ai = 2.0 * zi;             // A = J_f(Z) = 2 Z_s, |B| = 1
+        double ar = 2.0 * zr, ai = 2.0 * zi; // A = J_f(Z) = 2 Z_s, |B| = 1
         double Amag = 2.0 * Zmag;
         // mathr / Zhuoran single-step BLA validity radius:
         //   r = max(0, eps * (|Z| - max|dc|) / (|J_f(Z)| + 1))
         double R = eps * (Zmag - dcmax) / (Amag + 1.0);
         double r2 = R > 0 ? R * R : 0.0;
         if (r2 > _bla_rmax2) _bla_rmax2 = r2;
-        lvl0.push_back({ r2, 1 });
-        lvl0Coeff.push_back({ ar, ai, 1.0, 0.0 });
+        lvl0.push_back({r2, 1});
+        lvl0Coeff.push_back({ar, ai, 1.0, 0.0});
         // Under EDE also carry the derivative-delta coupling C = 2 D_s (dd -> C dz).
-        if (ede) lvl0D.push_back({ 2.0 * _dfr[s], 2.0 * _dfi[s], 0.0, 0.0 });
+        if (ede) lvl0D.push_back({2.0 * _dfr[s], 2.0 * _dfi[s], 0.0, 0.0});
     }
     _bla.push_back(std::move(lvl0));
     _blaCoeff.push_back(std::move(lvl0Coeff));
@@ -2437,9 +2642,9 @@ void Mandel::buildBLA(int reflen, bool ede) {
             const BLACoeff& yc = prevCoeff[i + 1];
             BLAEntry z;
             BLACoeff zc;
-            zc.ar = yc.ar * xc.ar - yc.ai * xc.ai;                 // A_z = A_y A_x
+            zc.ar = yc.ar * xc.ar - yc.ai * xc.ai; // A_z = A_y A_x
             zc.ai = yc.ar * xc.ai + yc.ai * xc.ar;
-            zc.br = yc.ar * xc.br - yc.ai * xc.bi + yc.br;         // B_z = A_y B_x + B_y
+            zc.br = yc.ar * xc.br - yc.ai * xc.bi + yc.br; // B_z = A_y B_x + B_y
             zc.bi = yc.ar * xc.bi + yc.ai * xc.br + yc.bi;
             if (ede) {
                 const BLADeriv& xd = (*prevD)[i];
@@ -2462,24 +2667,22 @@ void Mandel::buildBLA(int reflen, bool ede) {
             nxt.push_back(z);
             nxtCoeff.push_back(zc);
         }
-        _bla.push_back(std::move(nxt));   // odd leftover dropped; still available lower
+        _bla.push_back(std::move(nxt)); // odd leftover dropped; still available lower
         _blaCoeff.push_back(std::move(nxtCoeff));
         if (ede) _blaD.push_back(std::move(nxtD));
     }
 
     if (getenv("MANDEL_PROFILE")) {
-        size_t entries = 0; for (const auto& level : _bla) entries += level.size();
-        fprintf(stderr, "  [profile] buildBLA: reflen=%d levels=%zu entries=%zu dcmax=%.3e rmax=%.3e |Z1|=%.3e SA_it=%d SA_order=%d\n",
-                reflen, _bla.size(), entries, dcmax, sqrt(_bla_rmax2),
-                sqrt(_zfr[1] * _zfr[1] + _zfi[1] * _zfi[1]), _SA_it, _SA_order);
+        size_t entries = 0;
+        for (const auto& level : _bla) entries += level.size();
+        fprintf(stderr, "  [profile] buildBLA: reflen=%d levels=%zu entries=%zu dcmax=%.3e rmax=%.3e |Z1|=%.3e SA_it=%d SA_order=%d\n", reflen, _bla.size(), entries, dcmax, sqrt(_bla_rmax2), sqrt(_zfr[1] * _zfr[1] + _zfi[1] * _zfi[1]), _SA_it, _SA_order);
     }
 }
 
 // Largest valid BLA starting at reference index s. Levels have skip 2^p and start
 // at ref index 1 + i*2^p, so s is a valid start at level p iff (s-1) is a multiple
 // of 2^p. Returns skip applied (0 if none), updating dz on success.
-int Mandel::tryBLA(int s, double& dzr, double& dzi, double& ddr, double& ddi,
-                   double dcr, double dci, bool ede, double ESC2, int mx_ref_it) const {
+int Mandel::tryBLA(int s, double& dzr, double& dzi, double& ddr, double& ddi, double dcr, double dci, bool ede, double ESC2, int mx_ref_it) const {
     if (s < 1 || _bla.empty()) return 0;
     double zmag2 = dzr * dzr + dzi * dzi;
     int maxp = (int)_bla.size() - 1;
@@ -2488,14 +2691,14 @@ int Mandel::tryBLA(int s, double& dzr, double& dzi, double& ddr, double& ddi,
     // levels are aligned, so no per-level alignment test is needed).
     int startp = (s == 1) ? maxp : (int)_tzcnt_u32((unsigned)(s - 1));
     if (startp > maxp) startp = maxp;
-    if (startp < _bla_minlevel) return 0;                   // not aligned enough for a worthwhile skip
+    if (startp < _bla_minlevel) return 0; // not aligned enough for a worthwhile skip
     for (int p = startp; p >= _bla_minlevel; --p) {
         int i = (s - 1) >> p;
-        if (i >= (int)_bla[p].size()) continue;             // past the right edge at this level
+        if (i >= (int)_bla[p].size()) continue; // past the right edge at this level
         const BLAEntry& b = _bla[p][i];
-        if (b.r2 <= 0 || zmag2 >= b.r2) continue;           // radius too small -> smaller skip
-        int land = s + b.l;                                 // dz lands at ref index `land`
-        if (land >= mx_ref_it - 1) continue;                // leave one step of headroom before the ref-end rebase
+        if (b.r2 <= 0 || zmag2 >= b.r2) continue; // radius too small -> smaller skip
+        int land = s + b.l;                       // dz lands at ref index `land`
+        if (land >= mx_ref_it - 1) continue;      // leave one step of headroom before the ref-end rebase
         const BLACoeff& bc = _blaCoeff[p][i];
         double nzr = bc.ar * dzr - bc.ai * dzi + bc.br * dcr - bc.bi * dci;
         double nzi = bc.ar * dzi + bc.ai * dzr + bc.br * dci + bc.bi * dcr;
@@ -2512,9 +2715,11 @@ int Mandel::tryBLA(int s, double& dzr, double& dzi, double& ddr, double& ddi,
             const BLADeriv& bd = _blaD[p][i];
             double nddr = (bd.cr * dzr - bd.ci * dzi) + (bc.ar * ddr - bc.ai * ddi) + (bd.er * dcr - bd.ei * dci);
             double nddi = (bd.cr * dzi + bd.ci * dzr) + (bc.ar * ddi + bc.ai * ddr) + (bd.er * dci + bd.ei * dcr);
-            ddr = nddr; ddi = nddi;
+            ddr = nddr;
+            ddi = nddi;
         }
-        dzr = nzr; dzi = nzi;
+        dzr = nzr;
+        dzi = nzi;
         return b.l;
     }
     return 0;
@@ -2534,12 +2739,16 @@ __declspec(noinline)
 __attribute__((noinline))
 #endif
 static void blaReRescaleUnderflow(FloatExp& S, double& wr, double& wi, double nwr, double nwi) {
-    if (nwr == 0.0 && nwi == 0.0) { S = FloatExp{ 1.0, 0 }; wr = wi = 0.0; return; }
-    FloatExp wmag = fe_sqrt(fe_add(fe_mul(fe_from(nwr), fe_from(nwr)),
-                                   fe_mul(fe_from(nwi), fe_from(nwi))));
+    if (nwr == 0.0 && nwi == 0.0) {
+        S = FloatExp{1.0, 0};
+        wr = wi = 0.0;
+        return;
+    }
+    FloatExp wmag = fe_sqrt(fe_add(fe_mul(fe_from(nwr), fe_from(nwr)), fe_mul(fe_from(nwi), fe_from(nwi))));
     S = fe_mul(S, wmag);
     double inv = 1.0 / fe_to_double(wmag);
-    wr = nwr * inv; wi = nwi * inv;
+    wr = nwr * inv;
+    wi = nwi * inv;
 }
 
 // Cold recovery for a rescaled nonlinear step whose double representation
@@ -2553,27 +2762,26 @@ __declspec(noinline)
 #else
 __attribute__((noinline))
 #endif
-static void feRescaledStepUnderflow(FloatExp Xr, FloatExp Xi,
-                                    FloatExp dcr, FloatExp dci,
-                                    FloatExp& S, double& wr, double& wi) {
+static void feRescaledStepUnderflow(FloatExp Xr, FloatExp Xi, FloatExp dcr, FloatExp dci, FloatExp& S, double& wr, double& wi) {
     const double sm = S.m, sm2 = sm * sm;
     const int64_t se = S.e;
     int64_t e = INT64_MIN;
     const bool has_w = wr != 0.0 || wi != 0.0;
     if (has_w && Xr.m != 0.0) e = std::max(e, Xr.e + se);
     if (has_w && Xi.m != 0.0) e = std::max(e, Xi.e + se);
-    if (has_w)                 e = std::max(e, se + se);
-    if (dcr.m != 0.0)          e = std::max(e, dcr.e);
-    if (dci.m != 0.0)          e = std::max(e, dci.e);
+    if (has_w) e = std::max(e, se + se);
+    if (dcr.m != 0.0) e = std::max(e, dcr.e);
+    if (dci.m != 0.0) e = std::max(e, dci.e);
     if (e == INT64_MIN) {
-        S = FloatExp{ 1.0, 0 }; wr = wi = 0.0;
+        S = FloatExp{1.0, 0};
+        wr = wi = 0.0;
         return;
     }
 
     auto align = [e](double m, int64_t te) {
         int64_t d = te - e;
         if (m == 0.0 || d < -54) return 0.0;
-        uint64_t bits = (uint64_t)(d + 1023) << 52;   // exact normalized 2^d
+        uint64_t bits = (uint64_t)(d + 1023) << 52; // exact normalized 2^d
         double scale;
         std::memcpy(&scale, &bits, sizeof(scale));
         return m * scale;
@@ -2583,14 +2791,13 @@ static void feRescaledStepUnderflow(FloatExp Xr, FloatExp Xi,
     const double s2 = align(sm2, se + se);
     const double cr = align(dcr.m, dcr.e);
     const double ci = align(dci.m, dci.e);
-    const double nr = 2.0 * (xs_r * wr - xs_i * wi)
-                    + s2 * (wr * wr - wi * wi) + cr;
-    const double ni = 2.0 * (xs_r * wi + xs_i * wr)
-                    + 2.0 * s2 * wr * wi + ci;
+    const double nr = 2.0 * (xs_r * wr - xs_i * wi) + s2 * (wr * wr - wi * wi) + cr;
+    const double ni = 2.0 * (xs_r * wi + xs_i * wr) + 2.0 * s2 * wr * wi + ci;
     const double mag2 = nr * nr + ni * ni;
     const double mag = mag2 > 0.0 ? std::sqrt(mag2) : std::hypot(nr, ni);
     if (mag == 0.0) {
-        S = FloatExp{ 1.0, 0 }; wr = wi = 0.0;
+        S = FloatExp{1.0, 0};
+        wr = wi = 0.0;
         return;
     }
     S = fe_renorm(mag, e);
@@ -2603,13 +2810,14 @@ __declspec(noinline)
 #else
 __attribute__((noinline))
 #endif
-static void feDerivativeStepUnderflow(FloatExp zr, FloatExp zi,
-                                      FloatExp& SJ, double& jr, double& ji,
-                                      double& invSJd) {
+static void feDerivativeStepUnderflow(FloatExp zr, FloatExp zi, FloatExp& SJ, double& jr, double& ji, double& invSJd) {
     double im = 0.5 / SJ.m;
     int64_t ie = 1 - SJ.e;
-    if (im >= 1.0) { im *= 0.5; ++ie; }
-    FloatExp invSJ{ im, ie };
+    if (im >= 1.0) {
+        im *= 0.5;
+        ++ie;
+    }
+    FloatExp invSJ{im, ie};
     int64_t e = invSJ.e;
     if (zr.m != 0.0) e = std::max(e, zr.e);
     if (zi.m != 0.0) e = std::max(e, zi.e);
@@ -2627,7 +2835,9 @@ static void feDerivativeStepUnderflow(FloatExp zr, FloatExp zi,
     double ai = 2.0 * (azr * ji + azi * jr);
     double mag = std::sqrt(ar * ar + ai * ai);
     if (mag == 0.0) {
-        SJ = FloatExp{ 1.0, 0 }; jr = ji = 0.0; invSJd = 1.0;
+        SJ = FloatExp{1.0, 0};
+        jr = ji = 0.0;
+        invSJd = 1.0;
         return;
     }
     SJ = fe_mul(SJ, fe_renorm(mag, e));
@@ -2641,24 +2851,21 @@ static void feDerivativeStepUnderflow(FloatExp zr, FloatExp zi,
 // done in floatexp so they stay correct past double underflow, then the result
 // is re-rescaled back into (S,wr,wi). Reuses the same BLA table (built in double)
 // -- the coefficients A,B are O(1) and representable in double.
-int Mandel::tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi,
-                     double dr, double di, double ESC2, int mx_ref_it,
-                     double* outAB) const {
+int Mandel::tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi, double dr, double di, double ESC2, int mx_ref_it, double* outAB) const {
     if (s < 1 || _bla.empty()) return 0;
     int maxp = (int)_bla.size() - 1;
     int startp = (s == 1) ? maxp : (int)_tzcnt_u32((unsigned)(s - 1));
     if (startp > maxp) startp = maxp;
-    if (startp < _bla_minlevel) return 0;   // alignment too low: cheap out before dz2
+    if (startp < _bla_minlevel) return 0; // alignment too low: cheap out before dz2
     // |dz|^2 = S^2 (wr^2 + wi^2); S2 = S*S is cached by the caller (constant
     // between rescales/rebases, so ~1 fe_mul saved per call).
     FloatExp dz2 = fe_mul(S2, fe_from(wr * wr + wi * wi));
-    if (_bla_rmax2 <= 0.0 || !fe_abs_less(dz2, fe_from(_bla_rmax2)))
-        return 0;   // no entry can be valid: merged radii never exceed a level-0 radius
+    if (_bla_rmax2 <= 0.0 || !fe_abs_less(dz2, fe_from(_bla_rmax2))) return 0; // no entry can be valid: merged radii never exceed a level-0 radius
     for (int p = startp; p >= _bla_minlevel; --p) {
         int i = (s - 1) >> p;
         if (i >= (int)_bla[p].size()) continue;
         const BLAEntry& b = _bla[p][i];
-        if (b.r2 <= 0 || !fe_abs_less(dz2, fe_from(b.r2))) continue;   // radius too small
+        if (b.r2 <= 0 || !fe_abs_less(dz2, fe_from(b.r2))) continue; // radius too small
         int land = s + b.l;
         if (land >= mx_ref_it - 1) continue;
         const BLACoeff& bc = _blaCoeff[p][i];
@@ -2673,11 +2880,11 @@ int Mandel::tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi,
         // re-rescale (rare: only very long skips near escape).
         double nwr = (bc.ar * wr - bc.ai * wi) + (bc.br * dr - bc.bi * di);
         double nwi = (bc.ar * wi + bc.ai * wr) + (bc.br * di + bc.bi * dr);
-        const double BIG = 1e150;   // w'^2 must stay < DBL_MAX (~1.8e308)
+        const double BIG = 1e150; // w'^2 must stay < DBL_MAX (~1.8e308)
         const double* zfp = reinterpret_cast<const double*>(_zf);
         if (std::isfinite(nwr) && std::isfinite(nwi) && std::fabs(nwr) < BIG && std::fabs(nwi) < BIG) {
             // fast double path. Never skip past an escape: z = X_land + S*w'.
-            double fr = zfp[2 * land]     + fe_to_double(fe_mul_d(S, nwr));
+            double fr = zfp[2 * land] + fe_to_double(fe_mul_d(S, nwr));
             double fi = zfp[2 * land + 1] + fe_to_double(fe_mul_d(S, nwi));
             if (fr * fr + fi * fi > ESC2) return 0;
             // Accept: re-rescale dz = S*w' -> keep |w| ~ 1, fold |w'| into S.
@@ -2686,14 +2893,18 @@ int Mandel::tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi,
                 // Periodic references can legitimately shrink a nonzero unit delta
                 // below double at the nucleus's deep-zero pass; preserve it. Full
                 // references with such a pass are routed away from BLA up front.
-                if (_ref_period > 0) blaReRescaleUnderflow(S, wr, wi, nwr, nwi);
-                else { S = FloatExp{ 1.0, 0 }; wr = wi = 0.0; }
-            }
-            else {
+                if (_ref_period > 0)
+                    blaReRescaleUnderflow(S, wr, wi, nwr, nwi);
+                else {
+                    S = FloatExp{1.0, 0};
+                    wr = wi = 0.0;
+                }
+            } else {
                 double wmag = std::sqrt(wm2);
                 S = fe_mul(S, fe_from(wmag));
                 double inv = 1.0 / wmag;
-                wr = nwr * inv; wi = nwi * inv;
+                wr = nwr * inv;
+                wi = nwi * inv;
             }
         } else {
             // Overflow-safe floatexp re-rescale: recompute nz = A*dz + B*dc directly in
@@ -2702,19 +2913,28 @@ int Mandel::tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi,
             g_blafe_safe[omp_get_thread_num() & 63]++;
             FloatExp dzr = fe_mul_d(S, wr), dzi = fe_mul_d(S, wi);
             FloatExp dcrfe = fe_mul_d(S, dr), dcife = fe_mul_d(S, di);
-            FloatExp nzr = fe_add(fe_sub(fe_mul_d(dzr, bc.ar), fe_mul_d(dzi, bc.ai)),
-                                  fe_sub(fe_mul_d(dcrfe, bc.br), fe_mul_d(dcife, bc.bi)));
-            FloatExp nzi = fe_add(fe_add(fe_mul_d(dzr, bc.ai), fe_mul_d(dzi, bc.ar)),
-                                  fe_add(fe_mul_d(dcrfe, bc.bi), fe_mul_d(dcife, bc.br)));
+            FloatExp nzr = fe_add(fe_sub(fe_mul_d(dzr, bc.ar), fe_mul_d(dzi, bc.ai)), fe_sub(fe_mul_d(dcrfe, bc.br), fe_mul_d(dcife, bc.bi)));
+            FloatExp nzi = fe_add(fe_add(fe_mul_d(dzr, bc.ai), fe_mul_d(dzi, bc.ar)), fe_add(fe_mul_d(dcrfe, bc.bi), fe_mul_d(dcife, bc.br)));
             double fr = zfp[2 * land] + fe_to_double(nzr), fi = zfp[2 * land + 1] + fe_to_double(nzi);
             if (fr * fr + fi * fi > ESC2) return 0;
             FloatExp Snew = fe_sqrt(fe_add(fe_mul(nzr, nzr), fe_mul(nzi, nzi)));
-            if (Snew.m == 0.0) { S = FloatExp{ 1.0, 0 }; wr = wi = 0.0; }
-            else { S = Snew; wr = fe_to_double(fe_div(nzr, S)); wi = fe_to_double(fe_div(nzi, S)); }
+            if (Snew.m == 0.0) {
+                S = FloatExp{1.0, 0};
+                wr = wi = 0.0;
+            } else {
+                S = Snew;
+                wr = fe_to_double(fe_div(nzr, S));
+                wi = fe_to_double(fe_div(nzi, S));
+            }
         }
         // Export the linear map (A, B) so the caller can carry the EDE total
         // derivative through the same skip: J -> A*J + B (see pixelRescaled).
-        if (outAB) { outAB[0] = bc.ar; outAB[1] = bc.ai; outAB[2] = bc.br; outAB[3] = bc.bi; }
+        if (outAB) {
+            outAB[0] = bc.ar;
+            outAB[1] = bc.ai;
+            outAB[2] = bc.br;
+            outAB[3] = bc.bi;
+        }
         return b.l;
     }
     return 0;
@@ -2726,38 +2946,53 @@ int Mandel::tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi,
 // over the 4 lanes (rare events), keeping the arithmetic vectorized. BLA skips
 // and periodicity-based interior detection are mirrored per lane (see below), so
 // this path is a faithful vector image of the scalar stepParallel loop.
-void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
-                        const double* Adcr, const double* Adci,
-                        const double* Adzr, const double* Adzi,
-                        int mx_ref_it, int mxit, Float* glitch_p) {
+void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes, const double* Adcr, const double* Adci, const double* Adzr, const double* Adzi, int mx_ref_it, int mxit, Float* glitch_p) {
     const double ESC2 = escapeRadiusSquared();
     const double LG2 = log(2.0);
 
-    alignas(32) double dzr_[4] = { 0,0,0,0 }, dzi_[4] = { 0,0,0,0 };
-    alignas(32) double dcr_[4] = { 0,0,0,0 }, dci_[4] = { 0,0,0,0 };
-    int k_[4] = { 0,0,0,0 }, j_[4] = { 0,0,0,0 };
-    bool act[4] = { false,false,false,false };
+    alignas(32) double dzr_[4] = {0, 0, 0, 0}, dzi_[4] = {0, 0, 0, 0};
+    alignas(32) double dcr_[4] = {0, 0, 0, 0}, dci_[4] = {0, 0, 0, 0};
+    int k_[4] = {0, 0, 0, 0}, j_[4] = {0, 0, 0, 0};
+    bool act[4] = {false, false, false, false};
     // Per-lane Brent periodicity (interior) detector state, mirroring the scalar
     // stepParallel loop exactly. Only exercised when _use_interior.
     double zsr[4], zsi[4], confD2[4], confZr[4], confZi[4];
     int save_j[4], pwin[4], confP[4], confNext[4], confCount[4], confGiveup[4];
     for (int l = 0; l < lanes; ++l) {
-        dzr_[l] = Adzr[g + l]; dzi_[l] = Adzi[g + l];
-        dcr_[l] = Adcr[g + l]; dci_[l] = Adci[g + l];
+        dzr_[l] = Adzr[g + l];
+        dzi_[l] = Adzi[g + l];
+        dcr_[l] = Adcr[g + l];
+        dci_[l] = Adci[g + l];
         k_[l] = j_[l] = _SA_it + 1;
         act[l] = true;
-        zsr[l] = 1e30; zsi[l] = 1e30; save_j[l] = j_[l]; pwin[l] = 1;
-        confP[l] = 0; confNext[l] = 0; confCount[l] = 0; confGiveup[l] = 0;
-        confD2[l] = 0.0; confZr[l] = 0.0; confZi[l] = 0.0;
+        zsr[l] = 1e30;
+        zsi[l] = 1e30;
+        save_j[l] = j_[l];
+        pwin[l] = 1;
+        confP[l] = 0;
+        confNext[l] = 0;
+        confCount[l] = 0;
+        confGiveup[l] = 0;
+        confD2[l] = 0.0;
+        confZr[l] = 0.0;
+        confZi[l] = 0.0;
         // Mirror the scalar `while (j < mxit)` entry guard: if series approximation
         // stayed valid to the iteration cap (_SA_it + 1 >= mxit), the pixel is
         // interior (-2) and must NOT enter the loop (which would gather _zfr past
         // the reference end). Rare (tiny views hugging the reference) but real.
-        if (j_[l] >= mxit) { setPixel(v[g + l], -2.f); markDone(g + l); act[l] = false; }
+        if (j_[l] >= mxit) {
+            setPixel(v[g + l], -2.f);
+            markDone(g + l);
+            act[l] = false;
+        }
     }
 
     bool anyactive = false;
-    for (int l = 0; l < lanes; ++l) if (act[l]) { anyactive = true; break; }
+    for (int l = 0; l < lanes; ++l)
+        if (act[l]) {
+            anyactive = true;
+            break;
+        }
 
     __m256d dzr = _mm256_load_pd(dzr_), dzi = _mm256_load_pd(dzi_);
     const __m256d dcr = _mm256_load_pd(dcr_), dci = _mm256_load_pd(dci_);
@@ -2781,29 +3016,41 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
             __m256d dzmag_top = _mm256_add_pd(_mm256_mul_pd(dzr, dzr), _mm256_mul_pd(dzi, dzi));
             int elig = _mm256_movemask_pd(_mm256_cmp_pd(dzmag_top, rmax2v, _CMP_LT_OQ));
             if (elig) {
-                _mm256_store_pd(dzr_, dzr); _mm256_store_pd(dzi_, dzi);
+                _mm256_store_pd(dzr_, dzr);
+                _mm256_store_pd(dzi_, dzi);
                 for (int l = 0; l < lanes; ++l) {
                     if (!act[l] || !(elig & (1 << l))) continue;
                     double ddr = 0, ddi = 0;
-                    int skip = tryBLA(k_[l] - 1, dzr_[l], dzi_[l], ddr, ddi,
-                                      dcr_[l], dci_[l], false, ESC2, mx_ref_it);
+                    int skip = tryBLA(k_[l] - 1, dzr_[l], dzi_[l], ddr, ddi, dcr_[l], dci_[l], false, ESC2, mx_ref_it);
                     int tid = omp_get_thread_num() & 63;
                     if (skip > 0) {
-                        g_bla_stat[tid][0] += skip; ++g_bla_stat[tid][1];
-                        k_[l] += skip; j_[l] += skip; blaSkipped |= 1 << l;
+                        g_bla_stat[tid][0] += skip;
+                        ++g_bla_stat[tid][1];
+                        k_[l] += skip;
+                        j_[l] += skip;
+                        blaSkipped |= 1 << l;
                         // a BLA skip jumps j forward, so the periodicity detector's
                         // tortoise/hare and any in-progress confirmation are stale.
-                        zsr[l] = 1e30; zsi[l] = 1e30; save_j[l] = j_[l]; pwin[l] = 1;
-                        confP[l] = 0; confGiveup[l] = 0;
-                        if (j_[l] >= mxit) {          // skip reached the cap -> interior
-                            setPixel(v[g + l], -2.f); markDone(g + l);
-                            act[l] = false; blaSkipped &= ~(1 << l);
+                        zsr[l] = 1e30;
+                        zsi[l] = 1e30;
+                        save_j[l] = j_[l];
+                        pwin[l] = 1;
+                        confP[l] = 0;
+                        confGiveup[l] = 0;
+                        if (j_[l] >= mxit) { // skip reached the cap -> interior
+                            setPixel(v[g + l], -2.f);
+                            markDone(g + l);
+                            act[l] = false;
+                            blaSkipped &= ~(1 << l);
                         }
                     } else {
                         ++g_bla_stat[tid][2];
                     }
                 }
-                if (blaSkipped) { dzr = _mm256_load_pd(dzr_); dzi = _mm256_load_pd(dzi_); }
+                if (blaSkipped) {
+                    dzr = _mm256_load_pd(dzr_);
+                    dzi = _mm256_load_pd(dzi_);
+                }
             }
         }
 
@@ -2812,9 +3059,15 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
         alignas(32) double zprr[4], zpri[4], zcrr[4], zcri[4];
         for (int l = 0; l < 4; ++l) {
             int kk = k_[l];
-            zcrr[l] = _zfr[kk]; zcri[l] = _zfi[kk];
-            if (kk) { zprr[l] = _zfr[kk - 1]; zpri[l] = _zfi[kk - 1]; }
-            else    { zprr[l] = 0.0;         zpri[l] = 0.0; }
+            zcrr[l] = _zfr[kk];
+            zcri[l] = _zfi[kk];
+            if (kk) {
+                zprr[l] = _zfr[kk - 1];
+                zpri[l] = _zfi[kk - 1];
+            } else {
+                zprr[l] = 0.0;
+                zpri[l] = 0.0;
+            }
         }
         __m256d Zpr = _mm256_load_pd(zprr), Zpi = _mm256_load_pd(zpri);
         __m256d Zcr = _mm256_load_pd(zcrr), Zci = _mm256_load_pd(zcri);
@@ -2837,11 +3090,18 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
         // Preserve BLA-skipped lanes' deltas (they did not step this round).
         if (blaSkipped) {
             alignas(32) double ns_r[4], ns_i[4];
-            _mm256_store_pd(ns_r, ndzr); _mm256_store_pd(ns_i, ndzi);
-            for (int l = 0; l < lanes; ++l) if (blaSkipped & (1 << l)) { ns_r[l] = dzr_[l]; ns_i[l] = dzi_[l]; }
-            ndzr = _mm256_load_pd(ns_r); ndzi = _mm256_load_pd(ns_i);
+            _mm256_store_pd(ns_r, ndzr);
+            _mm256_store_pd(ns_i, ndzi);
+            for (int l = 0; l < lanes; ++l)
+                if (blaSkipped & (1 << l)) {
+                    ns_r[l] = dzr_[l];
+                    ns_i[l] = dzi_[l];
+                }
+            ndzr = _mm256_load_pd(ns_r);
+            ndzi = _mm256_load_pd(ns_i);
         }
-        dzr = ndzr; dzi = ndzi;
+        dzr = ndzr;
+        dzi = ndzi;
         __m256d zr = _mm256_add_pd(dzr, Zcr);
         __m256d zi = _mm256_add_pd(dzi, Zci);
         __m256d zrad = _mm256_add_pd(_mm256_mul_pd(zr, zr), _mm256_mul_pd(zi, zi));
@@ -2853,15 +3113,18 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
         int rm = _mm256_movemask_pd(_mm256_cmp_pd(zrad, dzmag, _CMP_LT_OQ));
         int refit = 0, need = 0;
         for (int l = 0; l < lanes; ++l) {
-            if (!act[l] || (blaSkipped & (1 << l))) continue;   // not a stepping lane
+            if (!act[l] || (blaSkipped & (1 << l))) continue; // not a stepping lane
             int bit = 1 << l;
             ++k_[l];
-            if (_customEscapeRadiusActive && _ref_escaped &&
-                k_[l] >= _ref_escape_iteration)
+            if (_customEscapeRadiusActive && _ref_escaped && k_[l] >= _ref_escape_iteration) need |= bit;
+            if (em & bit)
                 need |= bit;
-            if (em & bit) need |= bit;
-            else if (rm & bit) need |= bit;
-            if (k_[l] == mx_ref_it) { refit |= bit; need |= bit; }
+            else if (rm & bit)
+                need |= bit;
+            if (k_[l] == mx_ref_it) {
+                refit |= bit;
+                need |= bit;
+            }
             // interior detector needs this iteration's z during a confirmation (every
             // iteration) or at a search probe (every 16th) -> take the per-lane path.
             if (use_int && (confP[l] > 0 || ((j_[l] & 15) == 0 && confGiveup[l] < 3))) need |= bit;
@@ -2870,35 +3133,43 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
             anyactive = false;
             for (int l = 0; l < lanes; ++l) {
                 if (!act[l]) continue;
-                if (blaSkipped & (1 << l)) { anyactive = true; continue; }   // skipped: re-loop
-                if (++j_[l] >= mxit) { setPixel(v[g + l], -2.f); markDone(g + l); act[l] = false; }
-                else anyactive = true;
+                if (blaSkipped & (1 << l)) {
+                    anyactive = true;
+                    continue;
+                } // skipped: re-loop
+                if (++j_[l] >= mxit) {
+                    setPixel(v[g + l], -2.f);
+                    markDone(g + l);
+                    act[l] = false;
+                } else
+                    anyactive = true;
             }
-            continue;   // dzr/dzi already hold the updated deltas
+            continue; // dzr/dzi already hold the updated deltas
         }
 
         // slow path: at least one stepping lane escaped / needs interior / rebased.
         alignas(32) double zr_[4], zi_[4], zrad_[4], dzmag_[4], dzrs[4], dzis[4];
-        _mm256_store_pd(zr_, zr);     _mm256_store_pd(zi_, zi);
-        _mm256_store_pd(zrad_, zrad); _mm256_store_pd(dzmag_, dzmag);
-        _mm256_store_pd(dzrs, dzr);   _mm256_store_pd(dzis, dzi);
+        _mm256_store_pd(zr_, zr);
+        _mm256_store_pd(zi_, zi);
+        _mm256_store_pd(zrad_, zrad);
+        _mm256_store_pd(dzmag_, dzmag);
+        _mm256_store_pd(dzrs, dzr);
+        _mm256_store_pd(dzis, dzi);
 
         bool changed = false;
         for (int l = 0; l < lanes; ++l) {
             if (!act[l] || (blaSkipped & (1 << l))) continue;
-            if (_customEscapeRadiusActive && _ref_escaped &&
-                k_[l] >= _ref_escape_iteration) {
-                setPixel(
-                    v[g + l],
-                    accuratePixelCompute(
-                        v[g + l], mxit, 0));
+            if (_customEscapeRadiusActive && _ref_escaped && k_[l] >= _ref_escape_iteration) {
+                setPixel(v[g + l], accuratePixelCompute(v[g + l], mxit, 0));
                 markDone(g + l);
                 act[l] = false;
                 continue;
             }
-            if (em & (1 << l)) {                         // escape (checked first)
+            if (em & (1 << l)) { // escape (checked first)
                 setPixel(v[g + l], (float)(j_[l] + 1 - log(log(zrad_[l]) / 2 / LG2) / LG2));
-                markDone(g + l); act[l] = false; continue;
+                markDone(g + l);
+                act[l] = false;
+                continue;
             }
             // Interior (periodicity) detection, mirroring stepParallel. It only
             // affects whether/when a non-escaping pixel is classified interior
@@ -2906,58 +3177,97 @@ void Mandel::solveSimd4(const std::array<int, 4>* v, int g, int lanes,
             if (use_int) {
                 double zrl = zrad_[l];
                 if (confP[l] > 0) {
-                    confD2[l] *= 4.0 * zrl; if (confD2[l] > 1e18) confD2[l] = 1e18;
+                    confD2[l] *= 4.0 * zrl;
+                    if (confD2[l] > 1e18) confD2[l] = 1e18;
                     if (j_[l] >= confNext[l]) {
                         double pr = zr_[l] - confZr[l], pi = zi_[l] - confZi[l];
                         if (pr * pr + pi * pi < _interior_eps2 * zrl && confD2[l] < 1.0) {
-                            if (++confCount[l] >= _interior_confirm) { setPixel(v[g + l], -2.f); markDone(g + l); act[l] = false; continue; }
-                            confZr[l] = zr_[l]; confZi[l] = zi_[l]; confD2[l] = 1; confNext[l] = j_[l] + confP[l];
-                        } else { confP[l] = 0; ++confGiveup[l]; }
+                            if (++confCount[l] >= _interior_confirm) {
+                                setPixel(v[g + l], -2.f);
+                                markDone(g + l);
+                                act[l] = false;
+                                continue;
+                            }
+                            confZr[l] = zr_[l];
+                            confZi[l] = zi_[l];
+                            confD2[l] = 1;
+                            confNext[l] = j_[l] + confP[l];
+                        } else {
+                            confP[l] = 0;
+                            ++confGiveup[l];
+                        }
                     }
                 } else if ((j_[l] & 15) == 0 && confGiveup[l] < 3) {
                     double pr = zr_[l] - zsr[l], pi = zi_[l] - zsi[l];
                     if (pr * pr + pi * pi < _interior_eps2 * zrl) {
-                        confP[l] = j_[l] - save_j[l]; if (confP[l] < 1) confP[l] = 1;
-                        confZr[l] = zr_[l]; confZi[l] = zi_[l]; confD2[l] = 1; confNext[l] = j_[l] + confP[l]; confCount[l] = 0;
+                        confP[l] = j_[l] - save_j[l];
+                        if (confP[l] < 1) confP[l] = 1;
+                        confZr[l] = zr_[l];
+                        confZi[l] = zi_[l];
+                        confD2[l] = 1;
+                        confNext[l] = j_[l] + confP[l];
+                        confCount[l] = 0;
                     }
-                    if (j_[l] - save_j[l] >= pwin[l]) { zsr[l] = zr_[l]; zsi[l] = zi_[l]; save_j[l] = j_[l]; pwin[l] += pwin[l]; }
+                    if (j_[l] - save_j[l] >= pwin[l]) {
+                        zsr[l] = zr_[l];
+                        zsi[l] = zi_[l];
+                        save_j[l] = j_[l];
+                        pwin[l] += pwin[l];
+                    }
                 }
             }
-            if ((rm & (1 << l)) || (refit & (1 << l))) {  // Zhuoran rebase
+            if ((rm & (1 << l)) || (refit & (1 << l))) { // Zhuoran rebase
                 if (dzmag_[l] / zrad_[l] > 10000000.0) {
                     glitch_p[g + l] = zrad_[l] / _z_m3[j_[l]];
-                    act[l] = false; continue;
+                    act[l] = false;
+                    continue;
                 }
-                dzrs[l] = zr_[l]; dzis[l] = zi_[l]; k_[l] = 0; changed = true;
+                dzrs[l] = zr_[l];
+                dzis[l] = zi_[l];
+                k_[l] = 0;
+                changed = true;
             }
             if (k_[l] == mx_ref_it) {
                 glitch_p[g + l] = zrad_[l] / _z_m3[j_[l]];
-                act[l] = false; continue;
+                act[l] = false;
+                continue;
             }
             if (++j_[l] >= mxit) {
                 setPixel(v[g + l], -2.f);
-                markDone(g + l); act[l] = false; continue;
+                markDone(g + l);
+                act[l] = false;
+                continue;
             }
         }
-        if (changed) { dzr = _mm256_load_pd(dzrs); dzi = _mm256_load_pd(dzis); }
+        if (changed) {
+            dzr = _mm256_load_pd(dzrs);
+            dzi = _mm256_load_pd(dzis);
+        }
         anyactive = false;
-        for (int l = 0; l < lanes; ++l) if (act[l]) { anyactive = true; break; }
+        for (int l = 0; l < lanes; ++l)
+            if (act[l]) {
+                anyactive = true;
+                break;
+            }
     }
 }
 
 // Deep-zoom rescaled (z = S w) perturbation for one pixel. See header comment:
 // w stays an O(1) double, the floatexp scale S carries the deep exponent, so the
 // inner loop is native-double yet correct far past double's ~1e320 underflow.
-float Mandel::pixelRescaled(
-        FloatExp dcr, FloatExp dci,
-        double customSeedRe, double customSeedIm,
-        int mx_ref_it, int mxit, int c_method,
-        float* normalOut) const {
+float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, double customSeedRe, double customSeedIm, int mx_ref_it, int mxit, int c_method, float* normalOut) const {
     const double ESC2 = escapeRadiusSquared();
     const double LG2 = log(2.0);
-    struct FeStat { long long* s; long long sk = 0, skl = 0, st = 0;
-        FeStat(long long* p) : s(p) {} ~FeStat() { s[0] += skl; s[1] += sk; s[2] += st; } }
-        g(g_fe_stat[omp_get_thread_num() & 63]);
+    struct FeStat {
+        long long* s;
+        long long sk = 0, skl = 0, st = 0;
+        FeStat(long long* p) : s(p) {}
+        ~FeStat() {
+            s[0] += skl;
+            s[1] += sk;
+            s[2] += st;
+        }
+    } g(g_fe_stat[omp_get_thread_num() & 63]);
     // The stored reference is _zfr[k] = X_{k+1} (X_0 = 0 is the implicit critical
     // point). Access the orbit as X_m: X_0 = 0, X_m = _zfr[m-1]. Rebasing resets to
     // the critical point m = 0 (X_0 = 0), matching the double path's k==0 case.
@@ -2971,20 +3281,25 @@ float Mandel::pixelRescaled(
     // end (it wraps instead). rm is maintained incrementally so the non-periodic
     // path (per == 0, rm == m-1 throughout) stays byte-identical.
     const int per = _ref_period;
-    int rm = 0;                          // reference index for X_m (mirrors m-1)
+    int rm = 0; // reference index for X_m (mirrors m-1)
 
-    FloatExp S = fe_sqrt(fe_add(fe_mul(dcr, dcr), fe_mul(dci, dci)));   // |dc|
+    FloatExp S = fe_sqrt(fe_add(fe_mul(dcr, dcr), fe_mul(dci, dci))); // |dc|
     double wr, wi, dr, di;
-    if (S.m == 0.0) { S = FloatExp{ 1.0, 0 }; wr = wi = dr = di = 0.0; }
-    else {
-        wr = fe_to_double(fe_div(dcr, S)); wi = fe_to_double(fe_div(dci, S));   // unit
-        dr = wr; di = wi;                                                        // d = dc / S
+    if (S.m == 0.0) {
+        S = FloatExp{1.0, 0};
+        wr = wi = dr = di = 0.0;
+    } else {
+        wr = fe_to_double(fe_div(dcr, S));
+        wi = fe_to_double(fe_div(dci, S)); // unit
+        dr = wr;
+        di = wi; // d = dc / S
     }
     double s = fe_to_double(S);
-    FloatExp S2 = fe_mul(S, S);            // cached |S|^2 for tryBLAfe's radius test
-    int m = 1, iter = 1;                  // dz_1 = dc at reference index m = 1
+    FloatExp S2 = fe_mul(S, S); // cached |S|^2 for tryBLAfe's radius test
+    int m = 1, iter = 1;        // dz_1 = dc at reference index m = 1
 
-    double zsr = 1e30, zsi = 1e30; int save_iter = 1, period_win = 1;
+    double zsr = 1e30, zsi = 1e30;
+    int save_iter = 1, period_win = 1;
     int conf_P = 0, conf_next = 0, conf_count = 0, conf_giveup = 0;
     double conf_D2 = 0, conf_zr = 0, conf_zi = 0;
     // Stripe Average Coloring. Averaged over the last sacWindow() iterations (the
@@ -2992,13 +3307,12 @@ float Mandel::pixelRescaled(
     // the tail, so it resets the window. W<=0 uses the classic full average, and
     // then restores a skip's omitted points via the reference-orbit prefix sum.
     const bool sac = (c_method & ColoringMethod::STRIPE_AVERAGE) != 0;
-    SacAccum sacc; if (sac) sacc.init(sacWindow());
-    const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0;   // BLA disabled below
+    SacAccum sacc;
+    if (sac) sacc.init(sacWindow());
+    const bool trap = (c_method & ColoringMethod::ORBIT_TRAP) != 0; // BLA disabled below
     TrapAccum trapc;
-    const bool customFeather =
-        sac && customFeatherAdapter(_customOutputAdapter);
-    const bool customTrap =
-        trap && customTrapAdapter(_customOutputAdapter);
+    const bool customFeather = sac && customFeatherAdapter(_customOutputAdapter);
+    const bool customTrap = trap && customTrapAdapter(_customOutputAdapter);
     if (customFeather) sacc.push(customSeedRe, customSeedIm);
     if (customTrap) trapc.push(customSeedRe, customSeedIm);
 
@@ -3012,24 +3326,31 @@ float Mandel::pixelRescaled(
     const bool ede = (c_method & ColoringMethod::EXTERIOR_DIST_EST) != 0;
     const bool normal = (c_method & ColoringMethod::NORMAL_MAP) != 0;
     const bool de_ovl = (c_method & ColoringMethod::DE_OVERLAY) != 0;
-    const bool deriv = ede || normal || de_ovl;   // track J = dz/dc for EDE (|J|), normal (arg J), DE overlay
-    FloatExp SJ{ 1.0, 0 };            // |J| scale; J_1 = d(dc)/dc = 1
-    double jr = 1.0, ji = 0.0, invSJd = 1.0;   // invSJd = 1/SJ carries the "+1" seed
+    const bool deriv = ede || normal || de_ovl; // track J = dz/dc for EDE (|J|), normal (arg J), DE overlay
+    FloatExp SJ{1.0, 0};                        // |J| scale; J_1 = d(dc)/dc = 1
+    double jr = 1.0, ji = 0.0, invSJd = 1.0;    // invSJd = 1/SJ carries the "+1" seed
 
     // Exact state-repetition interior detector (see stepParallel). The floatexp
     // pixel state is (wr, wi, S, m); it is deterministic, so a bit-exact repeat
     // proves the orbit loops -> interior. Zero false positives by construction.
     const bool detect_interior = _use_interior && !customTrap;
-    const bool int_rep =
-        g_int_rep > 0 && detect_interior && !trap;
-    double swr = 1e300, swi = 1e300; FloatExp sS{ 1e300, 0 }; int sm = -1, save_iter2 = 1, twin2r = 1;
+    const bool int_rep = g_int_rep > 0 && detect_interior && !trap;
+    double swr = 1e300, swi = 1e300;
+    FloatExp sS{1e300, 0};
+    int sm = -1, save_iter2 = 1, twin2r = 1;
 
     while (iter < mxit) {
         if (_flag_halt) break;
         if (int_rep) {
-            if (m == sm && wr == swr && wi == swi && S.m == sS.m && S.e == sS.e)
-                return -2.f;                       // exact state repeat -> provably interior
-            if (iter - save_iter2 >= twin2r) { swr = wr; swi = wi; sS = S; sm = m; save_iter2 = iter; twin2r += twin2r; }
+            if (m == sm && wr == swr && wi == swi && S.m == sS.m && S.e == sS.e) return -2.f; // exact state repeat -> provably interior
+            if (iter - save_iter2 >= twin2r) {
+                swr = wr;
+                swi = wi;
+                sS = S;
+                sm = m;
+                save_iter2 = iter;
+                twin2r += twin2r;
+            }
         }
         // BLA: skip a run of reference iterations when the rescaled dz is small
         // enough (deep zoom -> almost always). dz is at reference index m (double
@@ -3038,13 +3359,13 @@ float Mandel::pixelRescaled(
         // the periodicity detector (a multi-iter skip leaves its state stale).
         if (_use_bla && !trap && m >= 2) {
             double ab[4];
-            int skip = tryBLAfe(rm, S, S2, wr, wi, dr, di, ESC2,
-                                per ? per : reflen, deriv ? ab : nullptr);
+            int skip = tryBLAfe(rm, S, S2, wr, wi, dr, di, ESC2, per ? per : reflen, deriv ? ab : nullptr);
             if (skip > 0) {
                 if (sac) {
-                    if (sacc.W > 0) sacc.reset_window();      // tail broken by the jump
+                    if (sacc.W > 0)
+                        sacc.reset_window(); // tail broken by the jump
                     else if (!_sacRefPre.empty() && m + skip < (int)_sacRefPre.size())
-                        sacc.add_full(_sacRefPre[m + skip] - _sacRefPre[m], skip);   // full-avg restore
+                        sacc.add_full(_sacRefPre[m + skip] - _sacRefPre[m], skip); // full-avg restore
                 }
                 if (deriv) {
                     // J -> A*J + B, carried in floatexp (A can be large over a run).
@@ -3052,26 +3373,43 @@ float Mandel::pixelRescaled(
                     FloatExp nJr = fe_add(fe_sub(fe_mul_d(Jr, ab[0]), fe_mul_d(Ji, ab[1])), fe_from(ab[2]));
                     FloatExp nJi = fe_add(fe_add(fe_mul_d(Jr, ab[1]), fe_mul_d(Ji, ab[0])), fe_from(ab[3]));
                     SJ = fe_sqrt(fe_add(fe_mul(nJr, nJr), fe_mul(nJi, nJi)));
-                    if (SJ.m == 0.0) { SJ = FloatExp{ 1.0, 0 }; jr = ji = 0.0; invSJd = 1.0; }
-                    else { jr = fe_to_double(fe_div(nJr, SJ)); ji = fe_to_double(fe_div(nJi, SJ)); invSJd = 1.0 / fe_to_double(SJ); }
+                    if (SJ.m == 0.0) {
+                        SJ = FloatExp{1.0, 0};
+                        jr = ji = 0.0;
+                        invSJd = 1.0;
+                    } else {
+                        jr = fe_to_double(fe_div(nJr, SJ));
+                        ji = fe_to_double(fe_div(nJi, SJ));
+                        invSJd = 1.0 / fe_to_double(SJ);
+                    }
                 }
-                m += skip; iter += skip; g.sk++; g.skl += skip;
-                rm += skip; if (per && rm >= per) rm -= per;   // land < per (skip is capped)
-                s = fe_to_double(S); S2 = fe_mul(S, S);
-                dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
-                zsr = 1e30; zsi = 1e30; save_iter = iter; period_win = 1;
-                conf_P = 0; conf_giveup = 0;
+                m += skip;
+                iter += skip;
+                g.sk++;
+                g.skl += skip;
+                rm += skip;
+                if (per && rm >= per) rm -= per; // land < per (skip is capped)
+                s = fe_to_double(S);
+                S2 = fe_mul(S, S);
+                dr = fe_to_double(fe_div(dcr, S));
+                di = fe_to_double(fe_div(dci, S));
+                zsr = 1e30;
+                zsi = 1e30;
+                save_iter = iter;
+                period_win = 1;
+                conf_P = 0;
+                conf_giveup = 0;
                 continue;
             }
         }
         // w' = 2 X_m w + s w^2 + d   (dz_m -> dz_{m+1}); X_0 = 0.
         double Xr = m ? zfp[2 * rm] : 0.0, Xi = m ? zfp[2 * rm + 1] : 0.0;
-        double zmr = Xr + s * wr, zmi = Xi + s * wi;   // z at index m (pre-step), for J' = 2 z J + 1
+        double zmr = Xr + s * wr, zmi = Xi + s * wi; // z at index m (pre-step), for J' = 2 z J + 1
         const bool deriv_underflow = deriv && zmr == 0.0 && zmi == 0.0 && invSJd == 0.0;
         FloatExp zmrfe{}, zmife{};
         if (deriv_underflow) {
-            FloatExp Xrfe = m ? _zfr_fe[rm] : FloatExp{ 0.0, 0 };
-            FloatExp Xife = m ? _zfi_fe[rm] : FloatExp{ 0.0, 0 };
+            FloatExp Xrfe = m ? _zfr_fe[rm] : FloatExp{0.0, 0};
+            FloatExp Xife = m ? _zfi_fe[rm] : FloatExp{0.0, 0};
             zmrfe = fe_add(Xrfe, fe_mul_d(S, wr));
             zmife = fe_add(Xife, fe_mul_d(S, wi));
         }
@@ -3082,42 +3420,48 @@ float Mandel::pixelRescaled(
         // double's 2^-1074 floor, not enough to preserve the nonlinear cancellation.
         // The common path rejects on the first comparison and stays entirely double.
         const bool step_underflow = std::fabs(nwr) < 0x1p-1056 && std::fabs(nwi) < 0x1p-1056;
-        if (step_underflow && (nwr != 0.0 || nwi != 0.0 ||
-                               wr != 0.0 || wi != 0.0 || dcr.m != 0.0 || dci.m != 0.0)) {
-            FloatExp Xrfe = m ? _zfr_fe[rm] : FloatExp{ 0.0, 0 };
-            FloatExp Xife = m ? _zfi_fe[rm] : FloatExp{ 0.0, 0 };
+        if (step_underflow && (nwr != 0.0 || nwi != 0.0 || wr != 0.0 || wi != 0.0 || dcr.m != 0.0 || dci.m != 0.0)) {
+            FloatExp Xrfe = m ? _zfr_fe[rm] : FloatExp{0.0, 0};
+            FloatExp Xife = m ? _zfi_fe[rm] : FloatExp{0.0, 0};
             feRescaledStepUnderflow(Xrfe, Xife, dcr, dci, S, wr, wi);
-            s = fe_to_double(S); S2 = fe_mul(S, S);
-            dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
+            s = fe_to_double(S);
+            S2 = fe_mul(S, S);
+            dr = fe_to_double(fe_div(dcr, S));
+            di = fe_to_double(fe_div(dci, S));
         } else {
-            wr = nwr; wi = nwi;
+            wr = nwr;
+            wi = nwi;
         }
-        ++m; ++iter; g.st++;
-        rm++; if (per && rm == per) rm = 0;             // advance the (mod-per) ref index
-        if (_customEscapeRadiusActive && _ref_escaped && !per &&
-            m >= _ref_escape_iteration)
-            return EMPTYPIXEL;
+        ++m;
+        ++iter;
+        g.st++;
+        rm++;
+        if (per && rm == per) rm = 0; // advance the (mod-per) ref index
+        if (_customEscapeRadiusActive && _ref_escaped && !per && m >= _ref_escape_iteration) return EMPTYPIXEL;
         if (deriv) {
             // J_{m+1} = 2 z_m J_m + 1 (exact; z_m is the reconstructed value).
             if (deriv_underflow) {
                 feDerivativeStepUnderflow(zmrfe, zmife, SJ, jr, ji, invSJd);
             } else {
-                double a = 2.0 * (zmr * jr - zmi * ji) + invSJd;   // "+1" is invSJd in the SJ scale
+                double a = 2.0 * (zmr * jr - zmi * ji) + invSJd; // "+1" is invSJd in the SJ scale
                 double b = 2.0 * (zmr * ji + zmi * jr);
-                jr = a; ji = b;
+                jr = a;
+                ji = b;
                 double jm2 = jr * jr + ji * ji;
-                if (jm2 > 1e16 || (jm2 > 0.0 && jm2 < 1e-16)) {   // keep |j| ~ O(1)
+                if (jm2 > 1e16 || (jm2 > 0.0 && jm2 < 1e-16)) { // keep |j| ~ O(1)
                     FloatExp jmag = fe_sqrt(fe_from(jm2));
                     SJ = fe_mul(SJ, jmag);
                     double inv = 1.0 / fe_to_double(jmag);
-                    jr *= inv; ji *= inv;
+                    jr *= inv;
+                    ji *= inv;
                     invSJd = 1.0 / fe_to_double(SJ);
                 }
             }
         }
 
-        Xr = m ? zfp[2 * rm] : 0.0; Xi = m ? zfp[2 * rm + 1] : 0.0;
-        double zr = Xr + s * wr, zi = Xi + s * wi;      // z = X_m + S w
+        Xr = m ? zfp[2 * rm] : 0.0;
+        Xi = m ? zfp[2 * rm + 1] : 0.0;
+        double zr = Xr + s * wr, zi = Xi + s * wi; // z = X_m + S w
         double zrad = zr * zr + zi * zi;
         if (sac) sacc.push(zr, zi);
         if (trap) trapc.push(zr, zi);
@@ -3141,42 +3485,48 @@ float Mandel::pixelRescaled(
                 return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
             }
             if (trap) {
-                if (customTrap) {
-                    return customTrapEscapeValue(
-                        trapc, iter, zr, zi);
-                }
-                return trapc.value(
-                    (double)iter -
-                    log(log(zrad) / 2.0 / LG2) / LG2);
+                if (customTrap) { return customTrapEscapeValue(trapc, iter, zr, zi); }
+                return trapc.value((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
             }
-            if (!sac)
-                return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
-            return customFeather
-                ? customFeatherEscapeValue(
-                      sacc, zr, zi, escapeRadius())
-                : sacc.value(zrad, escapeRadius());
+            if (!sac) return (float)((double)iter - log(log(zrad) / 2.0 / LG2) / LG2);
+            return customFeather ? customFeatherEscapeValue(sacc, zr, zi, escapeRadius()) : sacc.value(zrad, escapeRadius());
         }
-        if (_customEscapeRadiusActive && !per &&
-            m >= reflen)
-            return EMPTYPIXEL;
+        if (_customEscapeRadiusActive && !per && m >= reflen) return EMPTYPIXEL;
 
         if (detect_interior) {
             if (conf_P > 0) {
-                conf_D2 *= 4.0 * zrad; if (conf_D2 > 1e18) conf_D2 = 1e18;
+                conf_D2 *= 4.0 * zrad;
+                if (conf_D2 > 1e18) conf_D2 = 1e18;
                 if (iter >= conf_next) {
                     double pr = zr - conf_zr, pi = zi - conf_zi;
                     if (pr * pr + pi * pi < _interior_eps2 * zrad && conf_D2 < 1.0) {
                         if (++conf_count >= _interior_confirm) return trap ? trapc.value(0.0) : -2.f;
-                        conf_zr = zr; conf_zi = zi; conf_D2 = 1; conf_next = iter + conf_P;
-                    } else { conf_P = 0; ++conf_giveup; }
+                        conf_zr = zr;
+                        conf_zi = zi;
+                        conf_D2 = 1;
+                        conf_next = iter + conf_P;
+                    } else {
+                        conf_P = 0;
+                        ++conf_giveup;
+                    }
                 }
             } else if ((iter & 15) == 0 && conf_giveup < 3) {
                 double pr = zr - zsr, pi = zi - zsi;
                 if (pr * pr + pi * pi < _interior_eps2 * zrad) {
-                    conf_P = iter - save_iter; if (conf_P < 1) conf_P = 1;
-                    conf_zr = zr; conf_zi = zi; conf_D2 = 1; conf_next = iter + conf_P; conf_count = 0;
+                    conf_P = iter - save_iter;
+                    if (conf_P < 1) conf_P = 1;
+                    conf_zr = zr;
+                    conf_zi = zi;
+                    conf_D2 = 1;
+                    conf_next = iter + conf_P;
+                    conf_count = 0;
                 }
-                if (iter - save_iter >= period_win) { zsr = zr; zsi = zi; save_iter = iter; period_win += period_win; }
+                if (iter - save_iter >= period_win) {
+                    zsr = zr;
+                    zsi = zi;
+                    save_iter = iter;
+                    period_win += period_win;
+                }
             }
         }
 
@@ -3184,10 +3534,14 @@ float Mandel::pixelRescaled(
         double wmag2 = wr * wr + wi * wi;
         if (wmag2 > 1e16 || (wmag2 < 1e-16 && wmag2 > 0.0)) {
             FloatExp wmag = fe_sqrt(fe_from(wmag2));
-            S = fe_mul(S, wmag); s = fe_to_double(S); S2 = fe_mul(S, S);
+            S = fe_mul(S, wmag);
+            s = fe_to_double(S);
+            S2 = fe_mul(S, S);
             double inv = 1.0 / fe_to_double(wmag);
-            wr *= inv; wi *= inv;
-            dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
+            wr *= inv;
+            wi *= inv;
+            dr = fe_to_double(fe_div(dcr, S));
+            di = fe_to_double(fe_div(dci, S));
         }
 
         // Zhuoran rebase to the critical point (m = 0). Rebase whenever the pixel
@@ -3199,56 +3553,67 @@ float Mandel::pixelRescaled(
         // where the zrad<1e-8 branch still handles the near-zero reference passes).
         double dzmag2 = s * s * (wr * wr + wi * wi);
         if (zrad < 1e-8 || zrad < dzmag2 || (!per && m >= reflen)) {
-            FloatExp Xmr = m ? _zfr_fe[rm] : FloatExp{ 0.0, 0 };
-            FloatExp Xmi = m ? _zfi_fe[rm] : FloatExp{ 0.0, 0 };
-            FloatExp Swr = fe_mul_d(S, wr), Swi = fe_mul_d(S, wi);      // S w = dz_true
+            FloatExp Xmr = m ? _zfr_fe[rm] : FloatExp{0.0, 0};
+            FloatExp Xmi = m ? _zfi_fe[rm] : FloatExp{0.0, 0};
+            FloatExp Swr = fe_mul_d(S, wr), Swi = fe_mul_d(S, wi); // S w = dz_true
             FloatExp zrfe = fe_add(Xmr, Swr), zife = fe_add(Xmi, Swi);
             FloatExp zradfe = fe_add(fe_mul(zrfe, zrfe), fe_mul(zife, zife));
             FloatExp dzfe = fe_add(fe_mul(Swr, Swr), fe_mul(Swi, Swi));
             if ((!per && m >= reflen) || fe_abs_less(zradfe, dzfe)) {
                 FloatExp Snew = fe_sqrt(zradfe);
-                if (Snew.m == 0.0) { wr = wi = 0.0; }
-                else {
-                    S = Snew; s = fe_to_double(S); S2 = fe_mul(S, S);
-                    wr = fe_to_double(fe_div(zrfe, S)); wi = fe_to_double(fe_div(zife, S));
-                    dr = fe_to_double(fe_div(dcr, S)); di = fe_to_double(fe_div(dci, S));
+                if (Snew.m == 0.0) {
+                    wr = wi = 0.0;
+                } else {
+                    S = Snew;
+                    s = fe_to_double(S);
+                    S2 = fe_mul(S, S);
+                    wr = fe_to_double(fe_div(zrfe, S));
+                    wi = fe_to_double(fe_div(zife, S));
+                    dr = fe_to_double(fe_div(dcr, S));
+                    di = fe_to_double(fe_div(dci, S));
                 }
-                m = 0; rm = -1;      // critical point; next ++ makes rm = 0 (mirrors m-1)
+                m = 0;
+                rm = -1; // critical point; next ++ makes rm = 0 (mirrors m-1)
             }
         }
     }
-    return trap ? trapc.value(0.0) : -2.f;   // interior (hit maxit): trap-colour or sentinel
+    return trap ? trapc.value(0.0) : -2.f; // interior (hit maxit): trap-colour or sentinel
 }
 
 // (wr,wi), reference index m and iteration count, so lanes stay independent and
 // coherent adjacent pixels vectorise well. The heavy quadratic step is done in a
 // __m256d; BLA skips, |w| rescales and Zhuoran rebases are rare per-lane scalar
 // events. Mirrors pixelRescaled op-for-op (see that function for the math).
-void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g, int lanes,
-                                int mx_ref_it, int mxit, int c_method, float* out) const {
+void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g, int lanes, int mx_ref_it, int mxit, int c_method, float* out) const {
     const double ESC2 = escapeRadiusSquared();
     const double LG2 = log(2.0);
     const int reflen = mx_ref_it + 1;
 
-    alignas(32) double wr[4] = { 0,0,0,0 }, wi[4] = { 0,0,0,0 };
-    alignas(32) double sS[4] = { 1,1,1,1 }, dr[4] = { 0,0,0,0 }, di[4] = { 0,0,0,0 };
+    alignas(32) double wr[4] = {0, 0, 0, 0}, wi[4] = {0, 0, 0, 0};
+    alignas(32) double sS[4] = {1, 1, 1, 1}, dr[4] = {0, 0, 0, 0}, di[4] = {0, 0, 0, 0};
     FloatExp S[4], dcr[4], dci[4];
-    int m[4] = { 0,0,0,0 }, iter[4] = { 0,0,0,0 };
-    bool act[4] = { false,false,false,false };
+    int m[4] = {0, 0, 0, 0}, iter[4] = {0, 0, 0, 0};
+    bool act[4] = {false, false, false, false};
 
     for (int l = 0; l < lanes; ++l) {
         FloatExp DCr = Dcr[g + l], DCi = Dci[g + l];
-        dcr[l] = DCr; dci[l] = DCi;
+        dcr[l] = DCr;
+        dci[l] = DCi;
         FloatExp Sl = fe_sqrt(fe_add(fe_mul(DCr, DCr), fe_mul(DCi, DCi)));
-        if (Sl.m == 0.0) { S[l] = FloatExp{ 1.0, 0 }; wr[l] = wi[l] = dr[l] = di[l] = 0.0; }
-        else {
+        if (Sl.m == 0.0) {
+            S[l] = FloatExp{1.0, 0};
+            wr[l] = wi[l] = dr[l] = di[l] = 0.0;
+        } else {
             S[l] = Sl;
-            wr[l] = fe_to_double(fe_div(DCr, Sl)); wi[l] = fe_to_double(fe_div(DCi, Sl));
-            dr[l] = wr[l]; di[l] = wi[l];
+            wr[l] = fe_to_double(fe_div(DCr, Sl));
+            wi[l] = fe_to_double(fe_div(DCi, Sl));
+            dr[l] = wr[l];
+            di[l] = wi[l];
         }
         sS[l] = fe_to_double(S[l]);
-        m[l] = 1; iter[l] = 1;
-        out[g + l] = -2.f;      // interior default
+        m[l] = 1;
+        iter[l] = 1;
+        out[g + l] = -2.f; // interior default
         act[l] = true;
     }
 
@@ -3262,13 +3627,17 @@ void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g,
         int stepMask = 0;
         for (int l = 0; l < lanes; ++l) {
             if (!act[l]) continue;
-            if (iter[l] >= mxit) { out[g + l] = -2.f; act[l] = false; continue; }
+            if (iter[l] >= mxit) {
+                out[g + l] = -2.f;
+                act[l] = false;
+                continue;
+            }
             bool skipped = false;
             if (_use_bla && m[l] >= 2) {
-                int skip = tryBLAfe(m[l] - 1, S[l], fe_mul(S[l], S[l]), wr[l], wi[l],
-                                    dr[l], di[l], ESC2, reflen);
+                int skip = tryBLAfe(m[l] - 1, S[l], fe_mul(S[l], S[l]), wr[l], wi[l], dr[l], di[l], ESC2, reflen);
                 if (skip > 0) {
-                    m[l] += skip; iter[l] += skip;
+                    m[l] += skip;
+                    iter[l] += skip;
                     sS[l] = fe_to_double(S[l]);
                     dr[l] = fe_to_double(fe_div(dcr[l], S[l]));
                     di[l] = fe_to_double(fe_div(dci[l], S[l]));
@@ -3280,14 +3649,18 @@ void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g,
 
         // Phase 2: gather reference values and run the quadratic step for the
         // lanes that are stepping this round (garbage lanes compute unused zeros).
-        alignas(32) double Xpr[4] = { 0,0,0,0 }, Xpi[4] = { 0,0,0,0 };
-        alignas(32) double Xqr[4] = { 0,0,0,0 }, Xqi[4] = { 0,0,0,0 };
+        alignas(32) double Xpr[4] = {0, 0, 0, 0}, Xpi[4] = {0, 0, 0, 0};
+        alignas(32) double Xqr[4] = {0, 0, 0, 0}, Xqi[4] = {0, 0, 0, 0};
         for (int l = 0; l < 4; ++l) {
             if (!(stepMask & (1 << l))) continue;
             int mm = m[l];
-            if (mm) { Xpr[l] = _zfr[mm - 1]; Xpi[l] = _zfi[mm - 1]; }   // X_m
-            int pi = mm > mx_ref_it ? mx_ref_it : mm;                  // X_{m+1} = _zfr[mm]
-            Xqr[l] = _zfr[pi]; Xqi[l] = _zfi[pi];
+            if (mm) {
+                Xpr[l] = _zfr[mm - 1];
+                Xpi[l] = _zfi[mm - 1];
+            } // X_m
+            int pi = mm > mx_ref_it ? mx_ref_it : mm; // X_{m+1} = _zfr[mm]
+            Xqr[l] = _zfr[pi];
+            Xqi[l] = _zfi[pi];
         }
         __m256d vwr = _mm256_load_pd(wr), vwi = _mm256_load_pd(wi);
         __m256d vs = _mm256_load_pd(sS), vdr = _mm256_load_pd(dr), vdi = _mm256_load_pd(di);
@@ -3306,19 +3679,18 @@ void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g,
         __m256d zrad = _mm256_add_pd(_mm256_mul_pd(zr, zr), _mm256_mul_pd(zi, zi));
         __m256d wmag2 = _mm256_add_pd(_mm256_mul_pd(nwr, nwr), _mm256_mul_pd(nwi, nwi));
         alignas(32) double nwr_[4], nwi_[4], zrad_[4], wmag2_[4];
-        _mm256_store_pd(nwr_, nwr); _mm256_store_pd(nwi_, nwi);
-        _mm256_store_pd(zrad_, zrad); _mm256_store_pd(wmag2_, wmag2);
+        _mm256_store_pd(nwr_, nwr);
+        _mm256_store_pd(nwi_, nwi);
+        _mm256_store_pd(zrad_, zrad);
+        _mm256_store_pd(wmag2_, wmag2);
 
         // Phase 3: per-lane scalar commit + rare rescale / rebase / escape events.
         for (int l = 0; l < lanes; ++l) {
             if (!(stepMask & (1 << l))) continue;
-            if (wmag2_[l] == 0.0 &&
-                (nwr_[l] != 0.0 || nwi_[l] != 0.0 ||
-                wr[l] != 0.0 || wi[l] != 0.0 ||
-                dcr[l].m != 0.0 || dci[l].m != 0.0)) {
+            if (wmag2_[l] == 0.0 && (nwr_[l] != 0.0 || nwi_[l] != 0.0 || wr[l] != 0.0 || wi[l] != 0.0 || dcr[l].m != 0.0 || dci[l].m != 0.0)) {
                 int mm = m[l];
-                FloatExp Xrfe = mm ? _zfr_fe[mm - 1] : FloatExp{ 0.0, 0 };
-                FloatExp Xife = mm ? _zfi_fe[mm - 1] : FloatExp{ 0.0, 0 };
+                FloatExp Xrfe = mm ? _zfr_fe[mm - 1] : FloatExp{0.0, 0};
+                FloatExp Xife = mm ? _zfi_fe[mm - 1] : FloatExp{0.0, 0};
                 feRescaledStepUnderflow(Xrfe, Xife, dcr[l], dci[l], S[l], wr[l], wi[l]);
                 sS[l] = fe_to_double(S[l]);
                 dr[l] = fe_to_double(fe_div(dcr[l], S[l]));
@@ -3329,11 +3701,12 @@ void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g,
                 FloatExp zife = fe_add(_zfi_fe[qi], fe_mul_d(S[l], wi[l]));
                 zrad_[l] = fe_to_double(fe_add(fe_mul(zrfe, zrfe), fe_mul(zife, zife)));
             } else {
-                wr[l] = nwr_[l]; wi[l] = nwi_[l];
+                wr[l] = nwr_[l];
+                wi[l] = nwi_[l];
             }
-            ++m[l]; ++iter[l];
-            if (_customEscapeRadiusActive && _ref_escaped &&
-                m[l] >= _ref_escape_iteration) {
+            ++m[l];
+            ++iter[l];
+            if (_customEscapeRadiusActive && _ref_escaped && m[l] >= _ref_escape_iteration) {
                 out[g + l] = EMPTYPIXEL;
                 act[l] = false;
                 continue;
@@ -3341,38 +3714,45 @@ void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g,
             double zrl = zrad_[l];
             if (zrl > ESC2) {
                 out[g + l] = (float)((double)iter[l] - log(log(zrl) / 2.0 / LG2) / LG2);
-                act[l] = false; continue;
+                act[l] = false;
+                continue;
             }
-            if (_customEscapeRadiusActive &&
-                m[l] >= reflen) {
+            if (_customEscapeRadiusActive && m[l] >= reflen) {
                 out[g + l] = EMPTYPIXEL;
                 act[l] = false;
                 continue;
             }
             double wm = wmag2_[l];
-            if (wm > 1e16 || (wm < 1e-16 && wm > 0.0)) {          // keep |w| ~ O(1)
+            if (wm > 1e16 || (wm < 1e-16 && wm > 0.0)) { // keep |w| ~ O(1)
                 FloatExp wmag = fe_sqrt(fe_from(wm));
-                S[l] = fe_mul(S[l], wmag); sS[l] = fe_to_double(S[l]);
+                S[l] = fe_mul(S[l], wmag);
+                sS[l] = fe_to_double(S[l]);
                 double inv = 1.0 / fe_to_double(wmag);
-                wr[l] *= inv; wi[l] *= inv;
-                dr[l] = fe_to_double(fe_div(dcr[l], S[l])); di[l] = fe_to_double(fe_div(dci[l], S[l]));
+                wr[l] *= inv;
+                wi[l] *= inv;
+                dr[l] = fe_to_double(fe_div(dcr[l], S[l]));
+                di[l] = fe_to_double(fe_div(dci[l], S[l]));
             }
-            double dzmag2 = sS[l] * sS[l] * (wr[l] * wr[l] + wi[l] * wi[l]);   // |S w|^2
-            if (zrl < 1e-8 || zrl < dzmag2 || m[l] >= reflen) {   // Zhuoran rebase (|z|<|dz|)
+            double dzmag2 = sS[l] * sS[l] * (wr[l] * wr[l] + wi[l] * wi[l]); // |S w|^2
+            if (zrl < 1e-8 || zrl < dzmag2 || m[l] >= reflen) {              // Zhuoran rebase (|z|<|dz|)
                 int mm = m[l];
-                FloatExp Xmr = mm ? _zfr_fe[mm - 1] : FloatExp{ 0.0, 0 };
-                FloatExp Xmi = mm ? _zfi_fe[mm - 1] : FloatExp{ 0.0, 0 };
+                FloatExp Xmr = mm ? _zfr_fe[mm - 1] : FloatExp{0.0, 0};
+                FloatExp Xmi = mm ? _zfi_fe[mm - 1] : FloatExp{0.0, 0};
                 FloatExp Swr = fe_mul_d(S[l], wr[l]), Swi = fe_mul_d(S[l], wi[l]);
                 FloatExp zrfe = fe_add(Xmr, Swr), zife = fe_add(Xmi, Swi);
                 FloatExp zradfe = fe_add(fe_mul(zrfe, zrfe), fe_mul(zife, zife));
                 FloatExp dzfe = fe_add(fe_mul(Swr, Swr), fe_mul(Swi, Swi));
                 if (mm >= reflen || fe_abs_less(zradfe, dzfe)) {
                     FloatExp Snew = fe_sqrt(zradfe);
-                    if (Snew.m == 0.0) { wr[l] = wi[l] = 0.0; }
-                    else {
-                        S[l] = Snew; sS[l] = fe_to_double(S[l]);
-                        wr[l] = fe_to_double(fe_div(zrfe, S[l])); wi[l] = fe_to_double(fe_div(zife, S[l]));
-                        dr[l] = fe_to_double(fe_div(dcr[l], S[l])); di[l] = fe_to_double(fe_div(dci[l], S[l]));
+                    if (Snew.m == 0.0) {
+                        wr[l] = wi[l] = 0.0;
+                    } else {
+                        S[l] = Snew;
+                        sS[l] = fe_to_double(S[l]);
+                        wr[l] = fe_to_double(fe_div(zrfe, S[l]));
+                        wi[l] = fe_to_double(fe_div(zife, S[l]));
+                        dr[l] = fe_to_double(fe_div(dcr[l], S[l]));
+                        di[l] = fe_to_double(fe_div(dci[l], S[l]));
                     }
                     m[l] = 0;
                 }
@@ -3380,18 +3760,21 @@ void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g,
         }
 
         anyactive = false;
-        for (int l = 0; l < lanes; ++l) if (act[l]) { anyactive = true; break; }
+        for (int l = 0; l < lanes; ++l)
+            if (act[l]) {
+                anyactive = true;
+                break;
+            }
     }
 }
 
-int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random,
-                      int c_method, bool view_center) {
+int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool random, int c_method, bool view_center) {
     if (s.empty()) return false;
-    _ref_period = 0;   // a normal (non-periodic) reference; delta loop indexes linearly
+    _ref_period = 0; // a normal (non-periodic) reference; delta loop indexes linearly
     _ref_escaped = false;
     _ref_escape_iteration = 0;
     ++_ref_cnt;
-    std::array<int, 4> p{ _h / 2, _w / 2, 0, 0 };
+    std::array<int, 4> p{_h / 2, _w / 2, 0, 0};
     if (view_center) {
         _ref_virtual = true;
         _fe_cutoff_sensitive = false;
@@ -3401,10 +3784,12 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
         // half-pixel position for even dimensions, but is independent of which
         // actual center pixel would otherwise be selected.
         mpf_set(_ref_z_re, _c0_re);
-        mpf_mul_ui(_t1, _dx, _w - 1); mpf_div_ui(_t1, _t1, 2);
+        mpf_mul_ui(_t1, _dx, _w - 1);
+        mpf_div_ui(_t1, _t1, 2);
         mpf_add(_ref_z_re, _ref_z_re, _t1);
         mpf_set(_ref_z_im, _c0_im);
-        mpf_mul_ui(_t1, _dy, _h - 1); mpf_div_ui(_t1, _t1, 2);
+        mpf_mul_ui(_t1, _dy, _h - 1);
+        mpf_div_ui(_t1, _t1, 2);
         mpf_add(_ref_z_im, _ref_z_im, _t1);
     } else {
         _ref_virtual = false;
@@ -3446,14 +3831,17 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
     }
 
     // _ref_z_f = static_cast<Comp>(_ref_z);
-    _ref_z_f = Comp{ mpf_get_ld(_ref_z_re), mpf_get_ld(_ref_z_im) };
-    
+    _ref_z_f = Comp{mpf_get_ld(_ref_z_re), mpf_get_ld(_ref_z_im)};
+
     _ref = p;
-    
+
     // _z[0] = _ref_z;
     mpf_set(_z_re[0], _ref_z_re);
     mpf_set(_z_im[0], _ref_z_im);
-    if (g_bigfixed == -2) { const char* e = getenv("MANDEL_BIGFIXED"); g_bigfixed = e ? atoi(e) : -1; }
+    if (g_bigfixed == -2) {
+        const char* e = getenv("MANDEL_BIGFIXED");
+        g_bigfixed = e ? atoi(e) : -1;
+    }
     // Auto (env unset): use BigFixed on the deep floatexp path, where its high-half
     // short product beats mpf; env forces on (>=1) or off (0). mpf elsewhere.
     _use_bigfixed = (g_bigfixed == -1) ? _use_floatexp : (g_bigfixed > 0);
@@ -3462,28 +3850,39 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
         // (fixed-point loses relative precision as |Z|->0; the extra guard limbs
         // keep >=53 significant bits so the deep floatexp shadow stays accurate).
         int prec = (int)mpf_get_prec(_ref_z_re);
-        _bfL = (prec + 63) / 64 + 2;                 // ceil(prec/64) fractional + integer + 1 round-guard limb
+        _bfL = (prec + 63) / 64 + 2; // ceil(prec/64) fractional + integer + 1 round-guard limb
         _bftmp.assign((size_t)2 * _bfL, 0ull);
-        bf_from_mpf(_bc_re, _ref_z_re, _bfL); bf_from_mpf(_bc_im, _ref_z_im, _bfL);
-        _bz_re[0] = _bc_re; _bz_im[0] = _bc_im;       // z_0 = c
-        _bt1.setL(_bfL); _bt2.setL(_bfL); _bab.setL(_bfL); _bre.setL(_bfL); _bim.setL(_bfL);
+        bf_from_mpf(_bc_re, _ref_z_re, _bfL);
+        bf_from_mpf(_bc_im, _ref_z_im, _bfL);
+        _bz_re[0] = _bc_re;
+        _bz_im[0] = _bc_im; // z_0 = c
+        _bt1.setL(_bfL);
+        _bt2.setL(_bfL);
+        _bab.setL(_bfL);
+        _bre.setL(_bfL);
+        _bim.setL(_bfL);
     }
 
     _zf[0] = _ref_z_f;
     _zfr[0] = _ref_z_f.real();
     _zfi[0] = _ref_z_f.imag();
-    if (_use_floatexp) { _zfr_fe[0] = mpf_to_fe(_ref_z_re); _zfi_fe[0] = mpf_to_fe(_ref_z_im); }
+    if (_use_floatexp) {
+        _zfr_fe[0] = mpf_to_fe(_ref_z_re);
+        _zfi_fe[0] = mpf_to_fe(_ref_z_im);
+    }
 
-    _df[0] = Comp{ 1 };
-    _dfr[0] = 1.0; _dfi[0] = 0.0;
-    _dfe_r = FloatExp{ 1.0, 0 }; _dfe_i = FloatExp{ 0.0, 0 };   // D_0 = 1
+    _df[0] = Comp{1};
+    _dfr[0] = 1.0;
+    _dfi[0] = 0.0;
+    _dfe_r = FloatExp{1.0, 0};
+    _dfe_i = FloatExp{0.0, 0}; // D_0 = 1
 
     // _SA_delta = static_cast<Comp>(_dx * _w / 2 + _dy * _h / 2);
     mpf_mul_ui(_t1, _dx, _w);
     mpf_div_ui(_t1, _t1, 2);
     mpf_mul_ui(_t2, _dy, _h);
     mpf_div_ui(_t2, _t2, 2);
-    _SA_delta = { mpf_get_ld(_t1), mpf_get_ld(_t2) };
+    _SA_delta = {mpf_get_ld(_t1), mpf_get_ld(_t2)};
     for (int i = 0; i < _SA_N; ++i) _Adf_old[i] = _Bdf_old[i] = 0;
     _Adf_old[0] = _SA_delta;
 
@@ -3495,8 +3894,7 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
         if (!calCoefficient(i, pr_it, c_method)) {
             _ref_escaped = true;
             _ref_escape_iteration = i;
-            if (_ref_virtual && _use_floatexp && i >= mxit - 16)
-                _fe_cutoff_sensitive = true;
+            if (_ref_virtual && _use_floatexp && i >= mxit - 16) _fe_cutoff_sensitive = true;
             if (!_ref_virtual) {
                 // The reference (centre) pixel is coloured here, not in the pixel
                 // loop. getEscapeTime only gives the smooth iteration count, so for
@@ -3506,7 +3904,10 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
                     float rv = accuratePointCompute(_ref_z_re, _ref_z_im, mxit, c_method);
                     setPixel(_ref, rv);
                 } else {
-                    if (_use_bigfixed) { bf_to_mpf(_z_re[i & 1], _bz_re[i & 1]); bf_to_mpf(_z_im[i & 1], _bz_im[i & 1]); }
+                    if (_use_bigfixed) {
+                        bf_to_mpf(_z_re[i & 1], _bz_re[i & 1]);
+                        bf_to_mpf(_z_im[i & 1], _bz_im[i & 1]);
+                    }
                     setPixel(_ref, getEscapeTime(_z_re[i & 1], _z_im[i & 1], i));
                 }
             }
@@ -3515,8 +3916,7 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
             // coefficient after the Custom bailout crossing; the crossing itself
             // still determines the reference pixel's escape value.
             if (_customEscapeRadiusActive && i < mxit && !_flag_halt) {
-                calCoefficient(
-                    i + 1, 0, c_method, true);
+                calCoefficient(i + 1, 0, c_method, true);
                 return i + 1;
             }
             return i;
@@ -3527,17 +3927,11 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
         // exquisitely sensitive to accumulated double perturbation rounding.
         // Custom colored values are not escape verdicts (bounded traps are
         // nonnegative), so probe Custom frames with the uncolored oracle.
-        _fe_cutoff_sensitive =
-            accuratePointCompute(
-                _ref_z_re, _ref_z_im, mxit + 64,
-                _customEscapeRadiusActive ? 0 : c_method) >= 0;
+        _fe_cutoff_sensitive = accuratePointCompute(_ref_z_re, _ref_z_im, mxit + 64, _customEscapeRadiusActive ? 0 : c_method) >= 0;
     }
     if (!_flag_halt && !_ref_virtual) {
         if (c_method & ColoringMethod::ORBIT_TRAP) {
-            setPixel(
-                _ref,
-                accuratePointCompute(
-                    _ref_z_re, _ref_z_im, mxit, c_method));
+            setPixel(_ref, accuratePointCompute(_ref_z_re, _ref_z_im, mxit, c_method));
         } else {
             setPixel(_ref, -2.f);
         }
@@ -3545,13 +3939,10 @@ int Mandel::createRef(std::set<std::array<int, 4>>& s, int pr_it, int mxit, bool
     return mxit;
 }
 
-bool Mandel::calCoefficient(int i, int pr_it, int c_method,
-                            bool continuePastEscape) {
+bool Mandel::calCoefficient(int i, int pr_it, int c_method, bool continuePastEscape) {
     // Track the reference derivative for EDE (|D|), the normal map (arg D) and the
     // DE overlay (|D|).
-    const bool deriv = (c_method & ColoringMethod::EXTERIOR_DIST_EST)
-                    || (c_method & ColoringMethod::NORMAL_MAP)
-                    || (c_method & ColoringMethod::DE_OVERLAY);
+    const bool deriv = (c_method & ColoringMethod::EXTERIOR_DIST_EST) || (c_method & ColoringMethod::NORMAL_MAP) || (c_method & ColoringMethod::DE_OVERLAY);
     // The full-precision orbit uses two rotating buffers: c = current (i), p =
     // previous (i-1). Opposite parity, so the two are always distinct.
     const int c = i & 1, p = (i - 1) & 1;
@@ -3562,13 +3953,14 @@ bool Mandel::calCoefficient(int i, int pr_it, int c_method,
     if (_use_bigfixed) {
         // Fixed-point (BigFixed) orbit step: same Karatsuba complex square, but the
         // fixed-size fixed-point bignum avoids mpf's dynamic-size/rounding overhead.
-        const BigFixed& a = _bz_re[p]; const BigFixed& b = _bz_im[p];
-        bf_add(_bt1, a, b);                        // a + b
-        bf_sub(_bt2, a, b);                        // a - b
-        bf_mul(_bab, a, b, _bftmp.data());         // a * b
-        bf_mul(_bre, _bt1, _bt2, _bftmp.data());   // a^2 - b^2
-        bf_add(_bim, _bab, _bab);                  // 2ab
-        bf_add(_bz_re[c], _bre, _bc_re);           // + c
+        const BigFixed& a = _bz_re[p];
+        const BigFixed& b = _bz_im[p];
+        bf_add(_bt1, a, b);                      // a + b
+        bf_sub(_bt2, a, b);                      // a - b
+        bf_mul(_bab, a, b, _bftmp.data());       // a * b
+        bf_mul(_bre, _bt1, _bt2, _bftmp.data()); // a^2 - b^2
+        bf_add(_bim, _bab, _bab);                // 2ab
+        bf_add(_bz_re[c], _bre, _bc_re);         // + c
         bf_add(_bz_im[c], _bim, _bc_im);
         if (_use_floatexp) {
             // Deep path needs both shadows. bf_to_fe already extracts the top-2-limb
@@ -3576,32 +3968,38 @@ bool Mandel::calCoefficient(int i, int pr_it, int c_method,
             // ldexp) instead of a second limb scan in toDouble(). fe_to_double(bf_to_fe(x))
             // == x.toDouble() exactly (same top bits, same rounding), so this is exact.
             FloatExp fr = bf_to_fe(_bz_re[c]), fi = bf_to_fe(_bz_im[c]);
-            _zfr_fe[i] = fr; _zfi_fe[i] = fi;
+            _zfr_fe[i] = fr;
+            _zfi_fe[i] = fi;
             double zr = fe_to_double(fr), zi = fe_to_double(fi);
-            _zf[i] = Comp{ zr, zi };
-            _zfr[i] = zr; _zfi[i] = zi;
+            _zf[i] = Comp{zr, zi};
+            _zfr[i] = zr;
+            _zfi[i] = zi;
         } else {
             double zr = _bz_re[c].toDouble(), zi = _bz_im[c].toDouble();
-            _zf[i] = Comp{ zr, zi };
-            _zfr[i] = zr; _zfi[i] = zi;
+            _zf[i] = Comp{zr, zi};
+            _zfr[i] = zr;
+            _zfi[i] = zi;
         }
     } else {
-    mpf_add(_t1, _z_re[p], _z_im[p]);       // a + b
-    mpf_sub(_t2, _z_re[p], _z_im[p]);       // a - b
-    mpf_mul(_z_im[c], _z_re[p], _z_im[p]);  // a*b   (read a,b before _z_re[c] write)
-    mpf_mul(_z_re[c], _t1, _t2);            // a^2 - b^2
-    mpf_mul_ui(_z_im[c], _z_im[c], 2);      // 2ab
-    mpf_add(_z_re[c], _z_re[c], _ref_z_re);
-    mpf_add(_z_im[c], _z_im[c], _ref_z_im);
+        mpf_add(_t1, _z_re[p], _z_im[p]);      // a + b
+        mpf_sub(_t2, _z_re[p], _z_im[p]);      // a - b
+        mpf_mul(_z_im[c], _z_re[p], _z_im[p]); // a*b   (read a,b before _z_re[c] write)
+        mpf_mul(_z_re[c], _t1, _t2);           // a^2 - b^2
+        mpf_mul_ui(_z_im[c], _z_im[c], 2);     // 2ab
+        mpf_add(_z_re[c], _z_re[c], _ref_z_re);
+        mpf_add(_z_im[c], _z_im[c], _ref_z_im);
 
-    // _zf[i] = static_cast<Comp>(_z[i]);
-    _zf[i] = Comp{ mpf_get_ld(_z_re[c]), mpf_get_ld(_z_im[c]) };
-    _zfr[i] = _zf[i].real();
-    _zfi[i] = _zf[i].imag();
-    if (_use_floatexp) { _zfr_fe[i] = mpf_to_fe(_z_re[c]); _zfi_fe[i] = mpf_to_fe(_z_im[c]); }
+        // _zf[i] = static_cast<Comp>(_z[i]);
+        _zf[i] = Comp{mpf_get_ld(_z_re[c]), mpf_get_ld(_z_im[c])};
+        _zfr[i] = _zf[i].real();
+        _zfi[i] = _zf[i].imag();
+        if (_use_floatexp) {
+            _zfr_fe[i] = mpf_to_fe(_z_re[c]);
+            _zfi_fe[i] = mpf_to_fe(_z_im[c]);
+        }
     }
     // _z_m3[i] = tmp_z.abs().get_real_imag().first / 1000; // for Pauldelbrot condition
-    _z_m3[i] = { (_zfr[i] * _zfr[i] + _zfi[i] * _zfi[i]) / 1000000 };
+    _z_m3[i] = {(_zfr[i] * _zfr[i] + _zfi[i] * _zfi[i]) / 1000000};
 
     if (deriv) {
         // D[i] = 2 * D[i-1] * Z[i-1] + 1  (only feeds the double shadow _dfr/_dfi).
@@ -3610,45 +4008,42 @@ bool Mandel::calCoefficient(int i, int pr_it, int c_method,
         if (_use_floatexp) {
             FloatExp a = _dfe_r, b = _dfe_i;
             FloatExp zr = _zfr_fe[i - 1], zi = _zfi_fe[i - 1];
-            FloatExp re = fe_add(fe_scale2(fe_sub(fe_mul(a, zr), fe_mul(b, zi)), 1), FloatExp{ 1.0, 0 });
+            FloatExp re = fe_add(fe_scale2(fe_sub(fe_mul(a, zr), fe_mul(b, zi)), 1), FloatExp{1.0, 0});
             FloatExp im = fe_scale2(fe_add(fe_mul(a, zi), fe_mul(b, zr)), 1);
-            _dfe_r = re; _dfe_i = im;
-            _dfr[i] = fe_to_double(re); _dfi[i] = fe_to_double(im);
+            _dfe_r = re;
+            _dfe_i = im;
+            _dfr[i] = fe_to_double(re);
+            _dfi[i] = fe_to_double(im);
         } else {
             double a = _dfr[i - 1], b = _dfi[i - 1], zr = _zfr[i - 1], zi = _zfi[i - 1];
             _dfr[i] = 2.0 * (a * zr - b * zi) + 1.0;
             _dfi[i] = 2.0 * (a * zi + b * zr);
         }
-        _df[i] = Comp{ _dfr[i], _dfi[i] };
+        _df[i] = Comp{_dfr[i], _dfi[i]};
     }
 
     if (escape(_zf[i]) && !continuePastEscape) return false;
     if (i <= pr_it) {
         if (_SA_flag) {
             for (int j = 0; j < _SA_N; ++j) {
-                _Adf_new[j] = Comp{ 2 } * _zf[i - 1] * _Adf_old[j];
-                for (int k = 0; k < j / 2; ++k) {
-                    _Adf_new[j] += Comp{ 2 } * _Adf_old[k] * _Adf_old[j - k - 1];
-                }
+                _Adf_new[j] = Comp{2} * _zf[i - 1] * _Adf_old[j];
+                for (int k = 0; k < j / 2; ++k) { _Adf_new[j] += Comp{2} * _Adf_old[k] * _Adf_old[j - k - 1]; }
                 if (j % 2) _Adf_new[j] += _Adf_old[j / 2] * _Adf_old[j / 2];
             }
-            
+
             if (deriv) {
                 for (int j = 0; j < _SA_N; ++j) {
                     _Bdf_new[j] = _Bdf_old[j] * _zf[i - 1] + _Adf_old[j] * _df[i - 1];
-                    for (int k = 0; k < j; ++k) {
-                        _Bdf_new[j] += _Adf_old[k] * _Bdf_old[j - k - 1];
-                    }
-                    _Bdf_new[j] *= Comp{ 2 };
+                    for (int k = 0; k < j; ++k) { _Bdf_new[j] += _Adf_old[k] * _Bdf_old[j - k - 1]; }
+                    _Bdf_new[j] *= Comp{2};
                 }
             }
             _Adf_new[0] += _SA_delta;
             int order = SACheckMagnitude();
-            
+
             if (order < 0) {
                 _SA_flag = false;
-            }
-            else {
+            } else {
                 _SA_it = i;
                 _SA_order = order;
                 for (int j = 0; j < _SA_N; ++j) _Adf_old[j] = _Adf_new[j];
@@ -3668,7 +4063,7 @@ int Mandel::SACheckMagnitude() const {
     re = get_exp(_Adf_new[0].real());
     im = get_exp(_Adf_new[0].imag());
     pre_mn[0] = std::min(re, im);
-    
+
     re = get_exp(_Adf_new[_SA_N - 1].real());
     im = get_exp(_Adf_new[_SA_N - 1].imag());
     suf_mx[_SA_N - 1] = std::max(re, im);
@@ -3682,7 +4077,7 @@ int Mandel::SACheckMagnitude() const {
         im = get_exp(_Adf_new[i].imag());
         suf_mx[i] = std::max(suf_mx[i + 1], std::max(re, im));
     }
-    
+
     for (int i = 0; i < _SA_N - 10; ++i) {
         if (pre_mn[i] - suf_mx[i + 1] >= 80) return std::max(i, 5);
     }
@@ -3709,9 +4104,7 @@ void Mandel::SetProgress(std::atomic<float>* progress, float offset, float scale
 }
 
 void Mandel::progressSet(double local) {
-    if (_progress)
-        _progress->store((float)(_progress_offset + _progress_scale
-            * std::clamp(local, 0.0, 1.0)), std::memory_order_relaxed);
+    if (_progress) _progress->store((float)(_progress_offset + _progress_scale * std::clamp(local, 0.0, 1.0)), std::memory_order_relaxed);
 }
 
 void Mandel::progressBegin(int total, double begin, double span) {
@@ -3726,8 +4119,7 @@ void Mandel::progressBegin(int total, double begin, double span) {
 void Mandel::progressAdvance() {
     if (!_progress || _progress_total <= 0) return;
     int done = _progress_done.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (done == _progress_total || done % _progress_report_step == 0)
-        progressSet(_progress_begin + _progress_span * done / _progress_total);
+    if (done == _progress_total || done % _progress_report_step == 0) progressSet(_progress_begin + _progress_span * done / _progress_total);
 }
 
 inline void Mandel::markDone(int i) {

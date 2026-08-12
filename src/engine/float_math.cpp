@@ -14,7 +14,7 @@
 // value; the perturbation deltas dominate and rebasing absorbs the difference.
 double mpf_get_ld(mpf_t a) {
     signed long int e;
-    double d = mpf_get_d_2exp(&e, a);   // a = d * 2^e, |d| in [0.5, 1)
+    double d = mpf_get_d_2exp(&e, a); // a = d * 2^e, |d| in [0.5, 1)
     return ldexp(d, (int)e);
 }
 
@@ -24,15 +24,15 @@ double mpf_get_ld(mpf_t a) {
 int get_exp(long double ld) {
     if (ld == 0.0L) return -0x40000000;
     int e;
-    (void)frexpl(ld, &e);               // ld = m * 2^e, |m| in [0.5, 1)
-    return e - 1;                       // hardware unbiased exponent
+    (void)frexpl(ld, &e); // ld = m * 2^e, |m| in [0.5, 1)
+    return e - 1;         // hardware unbiased exponent
 }
 
 // Base-2 exponent of an mpf_t: matches the original routine (floor(log2|a|)+1).
 int get_exp(mpf_t a) {
     if (mpf_sgn(a) == 0) return 0;
     signed long int e;
-    (void)mpf_get_d_2exp(&e, a);        // a = d * 2^e, |d| in [0.5, 1)
+    (void)mpf_get_d_2exp(&e, a); // a = d * 2^e, |d| in [0.5, 1)
     return (int)e;
 }
 

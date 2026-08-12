@@ -14,7 +14,7 @@
 namespace formula {
 
 class MpfrComplex {
-public:
+  public:
     explicit MpfrComplex(mpfr_prec_t precision = 256);
     MpfrComplex(const MpfrComplex& other);
     MpfrComplex& operator=(const MpfrComplex& other);
@@ -40,17 +40,38 @@ struct ExpressionOracleContext {
     int iteration = 0;
 };
 
-enum class ExpressionOracleOperation : uint8_t {
-    Constant,
-    Z, C, Z0, Iteration, Parameter,
-    OrbitInvariant,
-    Negate, Add, Subtract, Multiply, Divide, Power,
-    Square,
-    Sin, Cos, Tan, Sinh, Cosh, Tanh,
-    Exp, Log, Log10, Sqrt,
-    Abs, Norm, Arg, Conjugate, Real, Imaginary,
-    MakeComplex, Polar
-};
+enum class ExpressionOracleOperation : uint8_t { Constant,
+                                                 Z,
+                                                 C,
+                                                 Z0,
+                                                 Iteration,
+                                                 Parameter,
+                                                 OrbitInvariant,
+                                                 Negate,
+                                                 Add,
+                                                 Subtract,
+                                                 Multiply,
+                                                 Divide,
+                                                 Power,
+                                                 Square,
+                                                 Sin,
+                                                 Cos,
+                                                 Tan,
+                                                 Sinh,
+                                                 Cosh,
+                                                 Tanh,
+                                                 Exp,
+                                                 Log,
+                                                 Log10,
+                                                 Sqrt,
+                                                 Abs,
+                                                 Norm,
+                                                 Arg,
+                                                 Conjugate,
+                                                 Real,
+                                                 Imaginary,
+                                                 MakeComplex,
+                                                 Polar };
 
 enum ExpressionOracleTraceFlag : uint16_t {
     OracleTraceNone = 0,
@@ -69,22 +90,18 @@ enum ExpressionOracleTraceFlag : uint16_t {
     OracleTraceHasAsymptoticLogPhase = 1 << 7
 };
 
-enum class ExpressionOracleCutLocation : uint8_t {
-    NotApplicable,
-    UpperHalfPlane,
-    LowerHalfPlane,
-    PositiveRealAxis,
-    NegativeRealUpperLip,
-    NegativeRealLowerLip,
-    Origin
-};
+enum class ExpressionOracleCutLocation : uint8_t { NotApplicable,
+                                                   UpperHalfPlane,
+                                                   LowerHalfPlane,
+                                                   PositiveRealAxis,
+                                                   NegativeRealUpperLip,
+                                                   NegativeRealLowerLip,
+                                                   Origin };
 
-enum class ExpressionOraclePointClearance : uint8_t {
-    NotApplicable,
-    ClearAtPoint,
-    ZeroAtPoint,
-    NonFiniteAtPoint
-};
+enum class ExpressionOraclePointClearance : uint8_t { NotApplicable,
+                                                      ClearAtPoint,
+                                                      ZeroAtPoint,
+                                                      NonFiniteAtPoint };
 
 enum class ExpressionOracleCertification : uint8_t {
     // This is a classification of the exact reference point only. It is not an
@@ -97,17 +114,13 @@ struct ExpressionOracleTraceNode {
 
     size_t instructionIndex = 0;
     uint8_t argument = 0;
-    ExpressionOracleOperation operation =
-        ExpressionOracleOperation::Constant;
+    ExpressionOracleOperation operation = ExpressionOracleOperation::Constant;
     uint16_t flags = OracleTraceNone;
     uint16_t leftNode = UINT16_MAX;
     uint16_t rightNode = UINT16_MAX;
-    ExpressionOracleCutLocation cut =
-        ExpressionOracleCutLocation::NotApplicable;
-    ExpressionOraclePointClearance clearance =
-        ExpressionOraclePointClearance::NotApplicable;
-    ExpressionOracleCertification certification =
-        ExpressionOracleCertification::PointOnlyNotCertified;
+    ExpressionOracleCutLocation cut = ExpressionOracleCutLocation::NotApplicable;
+    ExpressionOraclePointClearance clearance = ExpressionOraclePointClearance::NotApplicable;
+    ExpressionOracleCertification certification = ExpressionOracleCertification::PointOnlyNotCertified;
     MpfrComplex output;
     // sin/cos and sinh/cosh companions, tan/tanh or divide denominators, or
     // log(base) for power according to flags. When
@@ -124,35 +137,16 @@ struct ExpressionOracleTrace {
 };
 
 class ExpressionOracle {
-public:
-    static bool evaluate(const ExpressionProgram& program,
-                         const ExpressionOracleContext& context,
-                         MpfrComplex& output,
-                         std::string* error = nullptr);
+  public:
+    static bool evaluate(const ExpressionProgram& program, const ExpressionOracleContext& context, MpfrComplex& output, std::string* error = nullptr);
     // Orbit hot path: output must not alias any context value.
-    static bool evaluateOrbitStep(
-        const ExpressionProgram& program,
-        const ExpressionOracleContext& context,
-        MpfrComplex& output,
-        const MpfrComplex* currentZComponentSquares = nullptr,
-        std::string* error = nullptr);
-    static bool evaluateTrace(const ExpressionProgram& program,
-                              const ExpressionOracleContext& context,
-                              MpfrComplex& output,
-                              ExpressionOracleTrace& trace,
-                              std::string* error = nullptr);
+    static bool evaluateOrbitStep(const ExpressionProgram& program, const ExpressionOracleContext& context, MpfrComplex& output, const MpfrComplex* currentZComponentSquares = nullptr, std::string* error = nullptr);
+    static bool evaluateTrace(const ExpressionProgram& program, const ExpressionOracleContext& context, MpfrComplex& output, ExpressionOracleTrace& trace, std::string* error = nullptr);
     // Releases the reusable evaluator owned by the calling thread.
     static void releaseThreadWorkspace();
 
-private:
-    static bool evaluateInternal(const ExpressionProgram& program,
-                                 const ExpressionOracleContext& context,
-                                 MpfrComplex& output,
-                                 ExpressionOracleTrace* trace,
-                                 bool moveOutput,
-                                 const MpfrComplex*
-                                     currentZComponentSquares,
-                                 std::string* error);
+  private:
+    static bool evaluateInternal(const ExpressionProgram& program, const ExpressionOracleContext& context, MpfrComplex& output, ExpressionOracleTrace* trace, bool moveOutput, const MpfrComplex* currentZComponentSquares, std::string* error);
 };
 
 } // namespace formula

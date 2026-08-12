@@ -6,8 +6,6 @@
 
 class IComputeBackend;
 
-std::unique_ptr<IComputeBackend> createD3D11ComputeBackend(
-    bool warp, std::unique_ptr<IComputeBackend> cpuFallback,
-    std::string* error);
+std::unique_ptr<IComputeBackend> createD3D11ComputeBackend(bool warp, std::unique_ptr<IComputeBackend> cpuFallback, std::string* error);
 
 #endif

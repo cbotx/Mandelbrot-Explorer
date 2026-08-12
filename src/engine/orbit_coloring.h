@@ -57,8 +57,7 @@ struct SacAccum {
     inline void weighted(double& sum, double& weight) const {
         if (W > 0) {
             sum = TS;
-            weight =
-                (double)fill * W - (double)fill * (fill - 1) / 2.0;
+            weight = (double)fill * W - (double)fill * (fill - 1) / 2.0;
         } else {
             sum = full;
             weight = cnt;
@@ -76,29 +75,20 @@ struct SacAccum {
         weighted(sum, weight);
         double including = weight > 0.0 ? sum / weight : 0.0;
         double lastWeight = W > 0 ? (double)W : 1.0;
-        double excluding = weight > lastWeight
-            ? (sum - lastWeight * last) / (weight - lastWeight)
-            : including;
+        double excluding = weight > lastWeight ? (sum - lastWeight * last) / (weight - lastWeight) : including;
         fraction -= std::floor(fraction);
         return (float)(excluding + (including - excluding) * fraction);
     }
 
     inline float value(double zrad, double radius) const {
-        double fraction =
-            1.0 - std::log(std::log(zrad) * 0.5 / std::log(radius)) /
-                      std::log(2.0);
+        double fraction = 1.0 - std::log(std::log(zrad) * 0.5 / std::log(radius)) / std::log(2.0);
         return interpolatedValue(fraction);
     }
 
     inline float powerValue(double magnitude, double radius, int power) const {
-        if (power < 2 || !(radius > 1.0) || !(magnitude > 1.0) ||
-            !std::isfinite(magnitude))
-            return exactValue();
-        double fraction =
-            1.0 - std::log(std::log(magnitude) / std::log(radius)) /
-                      std::log((double)power);
-        return std::isfinite(fraction)
-            ? interpolatedValue(fraction) : exactValue();
+        if (power < 2 || !(radius > 1.0) || !(magnitude > 1.0) || !std::isfinite(magnitude)) return exactValue();
+        double fraction = 1.0 - std::log(std::log(magnitude) / std::log(radius)) / std::log((double)power);
+        return std::isfinite(fraction) ? interpolatedValue(fraction) : exactValue();
     }
 };
 
@@ -121,49 +111,34 @@ struct TrapAccum {
     }
 
     inline float value(double mu) const {
-        double distance = std::min(
-            std::min(std::sqrt(minPoint), minCross * 1.5), minCircle);
+        double distance = std::min(std::min(std::sqrt(minPoint), minCross * 1.5), minCircle);
         if (distance > 1.0) distance = 1.0;
-        double trap =
-            -std::log10(std::max(distance, 1e-14));
+        double trap = -std::log10(std::max(distance, 1e-14));
         if (mu < 0.0) mu = 0.0;
         // Distance plus escape count is seamless across atan2's branch cut.
         return (float)(0.17 * trap + 0.025 * mu);
     }
 };
 
-inline double formulaPowerSmoothMu(
-        int iteration, double magnitude, int power) {
+inline double formulaPowerSmoothMu(int iteration, double magnitude, int power) {
     double mu = (double)iteration;
-    if (power > 1 && magnitude > 1.0 &&
-        std::isfinite(magnitude)) {
-        double smooth = iteration -
-            std::log(std::log(magnitude)) /
-            std::log((double)power);
+    if (power > 1 && magnitude > 1.0 && std::isfinite(magnitude)) {
+        double smooth = iteration - std::log(std::log(magnitude)) / std::log((double)power);
         if (std::isfinite(smooth)) mu = smooth;
     }
     return mu;
 }
 
-inline float formulaPowerFeatherValue(
-        const SacAccum& stripe, double magnitude,
-        double bailout, int power) {
-    return power > 1
-        ? stripe.powerValue(magnitude, bailout, power)
-        : stripe.exactValue();
+inline float formulaPowerFeatherValue(const SacAccum& stripe, double magnitude, double bailout, int power) {
+    return power > 1 ? stripe.powerValue(magnitude, bailout, power) : stripe.exactValue();
 }
 
-inline float formulaPowerTrapValue(
-        const TrapAccum& trap, int iteration,
-        double magnitude, int power) {
-    return trap.value(
-        formulaPowerSmoothMu(iteration, magnitude, power));
+inline float formulaPowerTrapValue(const TrapAccum& trap, int iteration, double magnitude, int power) {
+    return trap.value(formulaPowerSmoothMu(iteration, magnitude, power));
 }
 
-enum class FormulaColorMode {
-    Feather,
-    OrbitTrap
-};
+enum class FormulaColorMode { Feather,
+                              OrbitTrap };
 
 struct FormulaColorAccum {
     FormulaColorMode mode = FormulaColorMode::Feather;
@@ -184,25 +159,20 @@ struct FormulaColorAccum {
             trap.push(re, im);
     }
 
-    inline float escaped(int iteration, double magnitude,
-                         int power, double bailout) const {
+    inline float escaped(int iteration, double magnitude, int power, double bailout) const {
         double result;
         if (mode == FormulaColorMode::Feather) {
-            result = formulaPowerFeatherValue(
-                stripe, magnitude, bailout, power);
+            result = formulaPowerFeatherValue(stripe, magnitude, bailout, power);
         } else {
-            result = formulaPowerTrapValue(
-                trap, iteration, magnitude, power);
+            result = formulaPowerTrapValue(trap, iteration, magnitude, power);
         }
-        return std::isfinite(result) && result >= 0.0
-            ? (float)result : 0.0f;
+        return std::isfinite(result) && result >= 0.0 ? (float)result : 0.0f;
     }
 
     inline float interior() const {
         if (mode == FormulaColorMode::Feather) return -2.0f;
         double result = trap.value(0.0);
-        return std::isfinite(result) && result >= 0.0
-            ? (float)result : 0.0f;
+        return std::isfinite(result) && result >= 0.0 ? (float)result : 0.0f;
     }
 };
 

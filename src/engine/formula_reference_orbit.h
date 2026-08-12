@@ -29,13 +29,8 @@ struct ScaledRealShadow {
 
     bool isZero() const { return mantissa == 0.0; }
     bool isNan() const { return std::isnan(mantissa); }
-    bool isInfinity() const {
-        return std::isinf(mantissa);
-    }
-    bool isFinite() const {
-        return std::isfinite(mantissa) &&
-               mantissa != 0.0;
-    }
+    bool isInfinity() const { return std::isinf(mantissa); }
+    bool isFinite() const { return std::isfinite(mantissa) && mantissa != 0.0; }
 };
 
 struct ScaledComplexShadow {
@@ -52,31 +47,16 @@ struct ScaledRealValue {
 
     bool isZero() const { return mantissa == 0.0; }
     bool isFinite() const { return std::isfinite(mantissa); }
-    bool isNormalized() const {
-        return isZero()
-            ? exponent == 0
-            : isFinite() &&
-              std::abs(mantissa) >= 0.5 &&
-              std::abs(mantissa) < 1.0;
-    }
+    bool isNormalized() const { return isZero() ? exponent == 0 : isFinite() && std::abs(mantissa) >= 0.5 && std::abs(mantissa) < 1.0; }
 };
 
 // Conversion is fallible: every finite result is guaranteed to be
 // reconstructible in the linked MPFR runtime exponent range.
-bool makeScaledRealShadow(
-    mpfr_srcptr value, ScaledRealShadow& output);
-bool makeScaledComplexShadow(
-    const MpfrComplex& value, ScaledComplexShadow& output);
-bool setMpfrFromScaledShadow(
-    mpfr_ptr output, const ScaledRealShadow& shadow,
-    mpfr_rnd_t rounding = MPFR_RNDN);
-bool setMpfrFromScaledShadow(
-    MpfrComplex& output, const ScaledComplexShadow& shadow,
-    mpfr_rnd_t rounding = MPFR_RNDN);
-bool reconstructMpfrFromShadows(
-    MpfrComplex& output, const ScaledComplexShadow& primary,
-    const ScaledComplexShadow& defect,
-    mpfr_rnd_t rounding = MPFR_RNDN);
+bool makeScaledRealShadow(mpfr_srcptr value, ScaledRealShadow& output);
+bool makeScaledComplexShadow(const MpfrComplex& value, ScaledComplexShadow& output);
+bool setMpfrFromScaledShadow(mpfr_ptr output, const ScaledRealShadow& shadow, mpfr_rnd_t rounding = MPFR_RNDN);
+bool setMpfrFromScaledShadow(MpfrComplex& output, const ScaledComplexShadow& shadow, mpfr_rnd_t rounding = MPFR_RNDN);
+bool reconstructMpfrFromShadows(MpfrComplex& output, const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, mpfr_rnd_t rounding = MPFR_RNDN);
 
 struct ExpressionReferenceExactInput {
     // Select exactly one representation. Both mpf pointers must be non-null,
@@ -88,19 +68,13 @@ struct ExpressionReferenceExactInput {
     std::string realDecimal;
     std::string imaginaryDecimal;
 
-    bool usesMpf() const {
-        return realMpf != nullptr || imaginaryMpf != nullptr;
-    }
-    bool usesDecimal() const {
-        return !realDecimal.empty() ||
-               !imaginaryDecimal.empty();
-    }
+    bool usesMpf() const { return realMpf != nullptr || imaginaryMpf != nullptr; }
+    bool usesDecimal() const { return !realDecimal.empty() || !imaginaryDecimal.empty(); }
 };
 
 struct ExpressionReferencePrecisionPolicy {
     // Hard builder cap, independent of a caller's narrower maximumBits policy.
-    static constexpr mpfr_prec_t ApplicationMaximumBits =
-        1 << 16;
+    static constexpr mpfr_prec_t ApplicationMaximumBits = 1 << 16;
 
     mpfr_prec_t requestedBits = 0;
     mpfr_prec_t viewBits = 0;
@@ -109,16 +83,14 @@ struct ExpressionReferencePrecisionPolicy {
     mpfr_prec_t maximumBits = 1 << 20;
 };
 
-enum class ExpressionReferenceBuildStatus : uint8_t {
-    Success,
-    InvalidRequest,
-    ProgramMismatch,
-    UnsupportedProgram,
-    PrecisionOutOfRange,
-    InputParseError,
-    CompactionOutOfRange,
-    ResourceLimit
-};
+enum class ExpressionReferenceBuildStatus : uint8_t { Success,
+                                                      InvalidRequest,
+                                                      ProgramMismatch,
+                                                      UnsupportedProgram,
+                                                      PrecisionOutOfRange,
+                                                      InputParseError,
+                                                      CompactionOutOfRange,
+                                                      ResourceLimit };
 
 struct ExpressionReferenceBuildRequest {
     // canonicalProgram is the user formula before specialization.
@@ -137,7 +109,7 @@ struct ExpressionReferenceBuildRequest {
     // independently iterated oracle at this higher precision. The resulting
     // radii certify the compact data relative to that finite-precision oracle.
     mpfr_prec_t certificationPrecision = 0;
-    size_t memoryLimitBytes = size_t{ 1 } << 30;
+    size_t memoryLimitBytes = size_t{1} << 30;
     std::function<bool()> shouldCancel;
 };
 
@@ -155,14 +127,10 @@ struct ExpressionReferenceTapeNode {
     uint16_t rightNode = UINT16_MAX;
     uint16_t flags = OracleTraceNone;
     uint8_t argument = 0;
-    ExpressionOracleOperation operation =
-        ExpressionOracleOperation::Constant;
-    ExpressionOracleCutLocation cut =
-        ExpressionOracleCutLocation::NotApplicable;
-    ExpressionOraclePointClearance clearance =
-        ExpressionOraclePointClearance::NotApplicable;
-    ExpressionOracleCertification certification =
-        ExpressionOracleCertification::PointOnlyNotCertified;
+    ExpressionOracleOperation operation = ExpressionOracleOperation::Constant;
+    ExpressionOracleCutLocation cut = ExpressionOracleCutLocation::NotApplicable;
+    ExpressionOraclePointClearance clearance = ExpressionOraclePointClearance::NotApplicable;
+    ExpressionOracleCertification certification = ExpressionOracleCertification::PointOnlyNotCertified;
 };
 
 struct ExpressionReferenceSample {
@@ -184,8 +152,7 @@ struct ExpressionReferenceSample {
 };
 
 struct ExpressionReferenceOrbitResult {
-    ExpressionReferenceBuildStatus status =
-        ExpressionReferenceBuildStatus::InvalidRequest;
+    ExpressionReferenceBuildStatus status = ExpressionReferenceBuildStatus::InvalidRequest;
     std::string error;
     bool valid = false;
     bool escaped = false;
@@ -204,8 +171,7 @@ struct ExpressionReferenceOrbitResult {
     std::string programSource;
     size_t sampleCount = 0;
     size_t memoryBytes = 0;
-    ExpressionOracleCertification branchCertification =
-        ExpressionOracleCertification::PointOnlyNotCertified;
+    ExpressionOracleCertification branchCertification = ExpressionOracleCertification::PointOnlyNotCertified;
 
     ScaledComplexShadow c;
     ScaledComplexShadow cDefect;
@@ -236,9 +202,7 @@ struct ExpressionReferenceOrbitResult {
 // perturbation and a conservative maximum-component radius, reconstructing as
 // next+rootDefect+perturbation. Auxiliary companions use the same two-term
 // convention. This avoids assuming that primary shadows form an exact orbit.
-bool buildExpressionReferenceOrbit(
-    const ExpressionReferenceBuildRequest& request,
-    ExpressionReferenceOrbitResult& result);
+bool buildExpressionReferenceOrbit(const ExpressionReferenceBuildRequest& request, ExpressionReferenceOrbitResult& result);
 
 } // namespace formula
 

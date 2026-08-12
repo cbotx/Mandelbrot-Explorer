@@ -18,7 +18,7 @@ struct FormulaEditorCallbacks {
 };
 
 class FormulaEditorPanel {
-public:
+  public:
     static constexpr int DESIGN_WIDTH = 570;
 
     FormulaEditorPanel();
@@ -36,7 +36,7 @@ public:
     void dismissPopups();
     HWND hwnd() const;
 
-private:
+  private:
     struct Impl;
     std::unique_ptr<Impl> _impl;
 };

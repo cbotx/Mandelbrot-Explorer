@@ -44,18 +44,16 @@ struct TextFieldStyle {
 };
 
 class TextField {
-public:
-    enum class Event {
-        Changed,
-        CaretMoved,
-        FocusGained,
-        FocusLost,
-        TabForward,
-        TabBackward,
-        Enter,
-        Escape,
-        ClipboardError
-    };
+  public:
+    enum class Event { Changed,
+                       CaretMoved,
+                       FocusGained,
+                       FocusLost,
+                       TabForward,
+                       TabBackward,
+                       Enter,
+                       Escape,
+                       ClipboardError };
     using Callback = std::function<void(Event, const std::wstring&)>;
 
     TextField() = default;
@@ -63,8 +61,7 @@ public:
     TextField(const TextField&) = delete;
     TextField& operator=(const TextField&) = delete;
 
-    bool create(HWND parent, int controlId, size_t maximumLength,
-                Callback callback);
+    bool create(HWND parent, int controlId, size_t maximumLength, Callback callback);
     void destroy();
 
     void setBounds(RECT bounds);
@@ -83,10 +80,8 @@ public:
     bool replaceSelection(const std::wstring& text, bool allowUndo = true);
     bool undo();
 
-    void draw(HDC dc, HFONT font, const TextFieldStyle& style,
-              const std::vector<TextRangeStyle>& ranges = {});
-    RECT textRangeBounds(size_t first, size_t last,
-                         int leadingPadding = 0) const;
+    void draw(HDC dc, HFONT font, const TextFieldStyle& style, const std::vector<TextRangeStyle>& ranges = {});
+    RECT textRangeBounds(size_t first, size_t last, int leadingPadding = 0) const;
     size_t indexAtPoint(POINT point) const;
     bool mouseDown(POINT point, bool extendSelection);
     bool mouseMove(POINT point);
@@ -94,18 +89,14 @@ public:
     bool dragging() const { return _dragging; }
     void selectWordAt(size_t position);
 
-private:
-    static LRESULT CALLBACK editProc(HWND window, UINT message,
-                                     WPARAM wp, LPARAM lp);
-    LRESULT handleEditMessage(HWND window, UINT message,
-                              WPARAM wp, LPARAM lp);
+  private:
+    static LRESULT CALLBACK editProc(HWND window, UINT message, WPARAM wp, LPARAM lp);
+    LRESULT handleEditMessage(HWND window, UINT message, WPARAM wp, LPARAM lp);
     void onTextServiceEvent(TextService::Event event);
     void notify(Event event, const std::wstring& detail = {});
     bool copySelection(bool cut);
     bool pasteSelection();
-    void updateAdvances(HDC dc, HFONT font, const std::wstring& value,
-                        int availableWidth,
-                        const std::vector<TextRangeStyle>& ranges);
+    void updateAdvances(HDC dc, HFONT font, const std::wstring& value, int availableWidth, const std::vector<TextRangeStyle>& ranges);
     int xForIndex(size_t index) const;
     void resetBlink();
 
@@ -141,12 +132,10 @@ struct DropdownStyle {
 };
 
 class Dropdown {
-public:
-    enum class MouseResult {
-        Ignored,
-        Consumed,
-        SelectionChanged
-    };
+  public:
+    enum class MouseResult { Ignored,
+                             Consumed,
+                             SelectionChanged };
     using Callback = std::function<void(int)>;
 
     void setBounds(RECT bounds);
@@ -162,15 +151,14 @@ public:
     void close();
 
     void draw(HDC dc, HFONT font, const DropdownStyle& style) const;
-    void drawPopup(HDC dc, HFONT font, const DropdownStyle& style,
-                   RECT clip) const;
+    void drawPopup(HDC dc, HFONT font, const DropdownStyle& style, RECT clip) const;
     bool mouseMove(POINT point, RECT clip);
     MouseResult mouseDown(POINT point, RECT clip);
     bool keyDown(UINT virtualKey, bool altDown, RECT clip);
     RECT popupBounds(RECT clip) const;
     RECT itemBounds(int index, RECT clip) const;
 
-private:
+  private:
     void openPopup(RECT clip);
     int itemAtPoint(POINT point, RECT clip) const;
     bool accept(int index);
@@ -194,7 +182,7 @@ struct ScrollbarStyle {
 };
 
 class Scrollbar {
-public:
+  public:
     using Callback = std::function<void(int)>;
 
     void setBounds(RECT bounds) { _bounds = bounds; }
@@ -215,7 +203,7 @@ public:
     bool dragging() const { return _dragging; }
     bool contains(POINT point) const;
 
-private:
+  private:
     RECT thumbBounds() const;
     void changed();
 

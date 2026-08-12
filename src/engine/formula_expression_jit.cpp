@@ -17,9 +17,7 @@ struct ExpressionJit4::Impl {
     std::string planKey;
     size_t invariantCount = 0;
 
-    Impl()
-        : params(makeParams()),
-          runtime(&params) {}
+    Impl() : params(makeParams()), runtime(&params) {}
 
     ~Impl() {
         if (function) runtime.release(function);
@@ -27,20 +25,16 @@ struct ExpressionJit4::Impl {
 
     static asmjit::JitAllocator::CreateParams makeParams() {
         asmjit::JitAllocator::CreateParams result;
-        result.options = asmjit::JitAllocatorOptions::kUseDualMapping |
-                         asmjit::JitAllocatorOptions::kFillUnusedMemory |
-                         asmjit::JitAllocatorOptions::kImmediateRelease;
+        result.options = asmjit::JitAllocatorOptions::kUseDualMapping | asmjit::JitAllocatorOptions::kFillUnusedMemory | asmjit::JitAllocatorOptions::kImmediateRelease;
         return result;
     }
 };
 
 void ExpressionJitInput4::setContexts(const ExpressionContext* contexts) {
-    for (int lane = 0; lane < 4; ++lane)
-        setContextLane(lane, contexts[lane]);
+    for (int lane = 0; lane < 4; ++lane) setContextLane(lane, contexts[lane]);
 }
 
-void ExpressionJitInput4::setContextLane(
-        int lane, const ExpressionContext& context) {
+void ExpressionJitInput4::setContextLane(int lane, const ExpressionContext& context) {
     if (lane < 0 || lane >= 4) return;
     vectors[Z_RE][lane] = context.z.real();
     vectors[Z_IM][lane] = context.z.imag();
@@ -51,26 +45,21 @@ void ExpressionJitInput4::setContextLane(
     vectors[N_RE][lane] = (double)context.iteration;
     vectors[N_IM][lane] = 0.0;
     for (int p = 0; p < 8; ++p) {
-        vectors[PARAM_RE + 2 * p][lane] =
-            context.parameters[p].real();
-        vectors[PARAM_RE + 2 * p + 1][lane] =
-            context.parameters[p].imag();
+        vectors[PARAM_RE + 2 * p][lane] = context.parameters[p].real();
+        vectors[PARAM_RE + 2 * p + 1][lane] = context.parameters[p].imag();
     }
 }
 
-void ExpressionJitInvariantInput4::setPreparedLane(
-        int lane, const ExpressionOrbitPlan& plan,
-        const ExpressionOrbitPlan::Prepared& prepared) {
+void ExpressionJitInvariantInput4::setPreparedLane(int lane, const ExpressionOrbitPlan& plan, const ExpressionOrbitPlan::Prepared& prepared) {
     if (lane < 0 || lane >= 4) return;
     for (size_t index = 0; index < plan.invariantCount(); ++index) {
-        vectors[2 * index][lane] =
-            prepared.values[index].real();
-        vectors[2 * index + 1][lane] =
-            prepared.values[index].imag();
+        vectors[2 * index][lane] = prepared.values[index].real();
+        vectors[2 * index + 1][lane] = prepared.values[index].imag();
     }
 }
 
-ExpressionJit4::ExpressionJit4() : _impl(std::make_unique<Impl>()) {}
+ExpressionJit4::ExpressionJit4() : _impl(std::make_unique<Impl>()) {
+}
 ExpressionJit4::~ExpressionJit4() = default;
 ExpressionJit4::ExpressionJit4(ExpressionJit4&&) noexcept = default;
 ExpressionJit4& ExpressionJit4::operator=(ExpressionJit4&&) noexcept = default;
@@ -80,14 +69,11 @@ bool ExpressionJit4::valid() const {
 }
 
 bool ExpressionJit4::supports(const ExpressionOrbitPlan& plan) const {
-    return valid() && plan.valid() &&
-           _impl->invariantCount == plan.invariantCount() &&
-           _impl->planKey == plan._programKey;
+    return valid() && plan.valid() && _impl->invariantCount == plan.invariantCount() && _impl->planKey == plan._programKey;
 }
 
 bool ExpressionJit4::usesDualMapping() const {
-    return _impl && _impl->runtime.allocator()->hasOption(
-        asmjit::JitAllocatorOptions::kUseDualMapping);
+    return _impl && _impl->runtime.allocator()->hasOption(asmjit::JitAllocatorOptions::kUseDualMapping);
 }
 
 const void* ExpressionJit4::codeAddress() const {
@@ -98,20 +84,16 @@ bool ExpressionJit4::compile(const ExpressionProgram& program, std::string* erro
     return compileProgram(program, 0, nullptr, error);
 }
 
-bool ExpressionJit4::compile(
-        const ExpressionOrbitPlan& plan, std::string* error) {
+bool ExpressionJit4::compile(const ExpressionOrbitPlan& plan, std::string* error) {
     if (!plan.valid() || !plan.profitable()) {
         reset();
         if (error) *error = "orbit plan is not profitable";
         return false;
     }
-    return compileProgram(
-        plan._body, plan.invariantCount(), &plan._programKey, error);
+    return compileProgram(plan._body, plan.invariantCount(), &plan._programKey, error);
 }
 
-bool ExpressionJit4::compileProgram(
-        const ExpressionProgram& program, size_t invariantCount,
-        const std::string* planKey, std::string* error) {
+bool ExpressionJit4::compileProgram(const ExpressionProgram& program, size_t invariantCount, const std::string* planKey, std::string* error) {
     if (error) error->clear();
     if (!_impl) _impl = std::make_unique<Impl>();
     if (_impl->function) {
@@ -130,8 +112,7 @@ bool ExpressionJit4::compileProgram(
     }
 
     asmjit::CodeHolder code;
-    asmjit::Error err = code.init(_impl->runtime.environment(),
-                                  _impl->runtime.cpuFeatures());
+    asmjit::Error err = code.init(_impl->runtime.environment(), _impl->runtime.cpuFeatures());
     if (err) {
         if (error) *error = asmjit::DebugUtils::errorAsString(err);
         return false;
@@ -151,13 +132,8 @@ bool ExpressionJit4::compileProgram(
         a.vmovupd(re, stackRe(index));
         a.vmovupd(im, stackIm(index));
     };
-    auto loadInput = [&](size_t vectorIndex, const Ymm& destination) {
-        a.vmovupd(destination, ptr(rcx, (int32_t)(vectorIndex * 32)));
-    };
-    auto loadInvariant = [&](size_t vectorIndex,
-                             const Ymm& destination) {
-        a.vmovupd(destination, ptr(rdx, (int32_t)(vectorIndex * 32)));
-    };
+    auto loadInput = [&](size_t vectorIndex, const Ymm& destination) { a.vmovupd(destination, ptr(rcx, (int32_t)(vectorIndex * 32))); };
+    auto loadInvariant = [&](size_t vectorIndex, const Ymm& destination) { a.vmovupd(destination, ptr(rdx, (int32_t)(vectorIndex * 32))); };
     auto broadcast = [&](double value, const Ymm& destination) {
         uint64_t bits;
         std::memcpy(&bits, &value, sizeof(bits));
@@ -312,57 +288,35 @@ void ExpressionJit4::reset() {
     }
 }
 
-void ExpressionJit4::evaluate(const ExpressionJitInput4& input,
-                              ExpressionJitOutput4& output) const {
+void ExpressionJit4::evaluate(const ExpressionJitInput4& input, ExpressionJitOutput4& output) const {
     evaluate(input, nullptr, output);
 }
 
-void ExpressionJit4::evaluate(
-        const ExpressionJitInput4& input,
-        const ExpressionJitInvariantInput4* invariants,
-        ExpressionJitOutput4& output) const {
-    if (!_impl || !_impl->function ||
-        (!_impl->planKey.empty() && !invariants))
-        return;
-    _impl->function(
-        &input.vectors[0][0],
-        invariants ? &invariants->vectors[0][0] : nullptr,
-        &output.re[0]);
+void ExpressionJit4::evaluate(const ExpressionJitInput4& input, const ExpressionJitInvariantInput4* invariants, ExpressionJitOutput4& output) const {
+    if (!_impl || !_impl->function || (!_impl->planKey.empty() && !invariants)) return;
+    _impl->function(&input.vectors[0][0], invariants ? &invariants->vectors[0][0] : nullptr, &output.re[0]);
 }
 
-bool ExpressionJit4::evaluate(const ExpressionContext* contexts,
-                              Complex* outputs) const {
-    if (!valid() || !_impl->planKey.empty() || !contexts || !outputs)
-        return false;
+bool ExpressionJit4::evaluate(const ExpressionContext* contexts, Complex* outputs) const {
+    if (!valid() || !_impl->planKey.empty() || !contexts || !outputs) return false;
     ExpressionJitInput4 input;
     ExpressionJitOutput4 output;
     input.setContexts(contexts);
     evaluate(input, output);
-    for (int lane = 0; lane < 4; ++lane)
-        outputs[lane] = { output.re[lane], output.im[lane] };
+    for (int lane = 0; lane < 4; ++lane) outputs[lane] = {output.re[lane], output.im[lane]};
     return true;
 }
 
-bool ExpressionJit4::evaluateOrbit(
-        const ExpressionContext* contexts, int lanes,
-        int mxit, double bailout, float* results,
-        const std::atomic_bool* halt,
-        const ExpressionOrbitPlan* plan) const {
-    if (!valid() || !contexts || !results ||
-        lanes < 1 || lanes > 4 || mxit < 1 ||
-        !(bailout > 0.0) || !std::isfinite(bailout))
-        return false;
-    if ((!_impl->planKey.empty() &&
-         (!plan || !supports(*plan))) ||
-        (_impl->planKey.empty() && plan))
-        return false;
+bool ExpressionJit4::evaluateOrbit(const ExpressionContext* contexts, int lanes, int mxit, double bailout, float* results, const std::atomic_bool* halt, const ExpressionOrbitPlan* plan) const {
+    if (!valid() || !contexts || !results || lanes < 1 || lanes > 4 || mxit < 1 || !(bailout > 0.0) || !std::isfinite(bailout)) return false;
+    if ((!_impl->planKey.empty() && (!plan || !supports(*plan))) || (_impl->planKey.empty() && plan)) return false;
 
     ExpressionJitInput4 input;
     ExpressionJitOutput4 output;
     std::unique_ptr<ExpressionJitInvariantInput4> invariantInput;
     std::unique_ptr<ExpressionOrbitPlan::Prepared[]> prepared;
     input.setContexts(contexts);
-    bool active[4] = { false, false, false, false };
+    bool active[4] = {false, false, false, false};
     uint8_t activeMask = 0;
     int activeCount = 0;
     for (int lane = 0; lane < 4; ++lane) {
@@ -370,8 +324,7 @@ bool ExpressionJit4::evaluateOrbit(
         if (lane >= lanes) continue;
         double re = input.vectors[ExpressionJitInput4::Z_RE][lane];
         double im = input.vectors[ExpressionJitInput4::Z_IM][lane];
-        if (!std::isfinite(re) || !std::isfinite(im) ||
-            std::hypot(re, im) > bailout) {
+        if (!std::isfinite(re) || !std::isfinite(im) || std::hypot(re, im) > bailout) {
             results[lane] = 0.0f;
         } else {
             active[lane] = true;
@@ -380,25 +333,15 @@ bool ExpressionJit4::evaluateOrbit(
         }
     }
     if (plan) {
-        invariantInput =
-            std::make_unique<ExpressionJitInvariantInput4>();
-        prepared =
-            std::make_unique<ExpressionOrbitPlan::Prepared[]>(4);
-        if (!plan->prepare4(
-                contexts, activeMask, prepared.get()))
-            return false;
-        for (int lane = 0; lane < 4; ++lane)
-            invariantInput->setPreparedLane(
-                lane, *plan, prepared[(size_t)lane]);
+        invariantInput = std::make_unique<ExpressionJitInvariantInput4>();
+        prepared = std::make_unique<ExpressionOrbitPlan::Prepared[]>(4);
+        if (!plan->prepare4(contexts, activeMask, prepared.get())) return false;
+        for (int lane = 0; lane < 4; ++lane) invariantInput->setPreparedLane(lane, *plan, prepared[(size_t)lane]);
     }
 
-    for (int iteration = 0;
-         iteration < mxit && activeCount > 0; ++iteration) {
-        if ((iteration & 255) == 0 && halt && *halt)
-            return false;
-        for (int lane = 0; lane < 4; ++lane)
-            input.vectors[ExpressionJitInput4::N_RE][lane] =
-                (double)iteration;
+    for (int iteration = 0; iteration < mxit && activeCount > 0; ++iteration) {
+        if ((iteration & 255) == 0 && halt && *halt) return false;
+        for (int lane = 0; lane < 4; ++lane) input.vectors[ExpressionJitInput4::N_RE][lane] = (double)iteration;
         evaluate(input, invariantInput.get(), output);
         for (int lane = 0; lane < lanes; ++lane) {
             if (!active[lane]) continue;
@@ -406,8 +349,7 @@ bool ExpressionJit4::evaluateOrbit(
             double im = output.im[lane];
             input.vectors[ExpressionJitInput4::Z_RE][lane] = re;
             input.vectors[ExpressionJitInput4::Z_IM][lane] = im;
-            if (!std::isfinite(re) || !std::isfinite(im) ||
-                std::hypot(re, im) > bailout) {
+            if (!std::isfinite(re) || !std::isfinite(im) || std::hypot(re, im) > bailout) {
                 results[lane] = (float)(iteration + 1);
                 active[lane] = false;
                 --activeCount;

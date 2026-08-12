@@ -26,15 +26,8 @@ OrbitWorker::~OrbitWorker() {
     mpf_clear(_scale);
 }
 
-void OrbitWorker::request(mpf_srcptr centerRe, mpf_srcptr centerIm, mpf_srcptr scale,
-                          int pixelX, int pixelY, int width, int height,
-                          int maxIterations, FormulaContext formulaContext,
-                          std::shared_ptr<const formula::ExpressionOrbitSnapshot>
-                              expression,
-                          formula::CustomDeepZoomPlan customDeepZoom) {
-    const mp_bitcnt_t precision = std::max({ mpf_get_prec(centerRe),
-                                             mpf_get_prec(centerIm),
-                                             mpf_get_prec(scale) });
+void OrbitWorker::request(mpf_srcptr centerRe, mpf_srcptr centerIm, mpf_srcptr scale, int pixelX, int pixelY, int width, int height, int maxIterations, FormulaContext formulaContext, std::shared_ptr<const formula::ExpressionOrbitSnapshot> expression, formula::CustomDeepZoomPlan customDeepZoom) {
+    const mp_bitcnt_t precision = std::max({mpf_get_prec(centerRe), mpf_get_prec(centerIm), mpf_get_prec(scale)});
     uint64_t generation;
     OrbitResult staleResult;
     std::shared_ptr<const formula::ExpressionOrbitSnapshot> staleExpression;
@@ -66,8 +59,7 @@ void OrbitWorker::request(mpf_srcptr centerRe, mpf_srcptr centerIm, mpf_srcptr s
 
 bool OrbitWorker::takeLatest(OrbitResult& result) {
     std::lock_guard<std::mutex> lock(_mutex);
-    if (_latest.generation == 0 || _latest.generation == _deliveredGeneration)
-        return false;
+    if (_latest.generation == 0 || _latest.generation == _deliveredGeneration) return false;
     result = _latest;
     _deliveredGeneration = _latest.generation;
     return true;
@@ -101,17 +93,17 @@ void OrbitWorker::run() {
             std::unique_lock<std::mutex> lock(_mutex);
             _wake.wait(lock, [&] { return _stop || _hasRequest; });
             if (_stop) return;
-            precision = std::max({ mpf_get_prec(_centerRe),
-                                   mpf_get_prec(_centerIm),
-                                   mpf_get_prec(_scale) });
+            precision = std::max({mpf_get_prec(_centerRe), mpf_get_prec(_centerIm), mpf_get_prec(_scale)});
             mpf_init2(centerRe, precision);
             mpf_init2(centerIm, precision);
             mpf_init2(scale, precision);
             mpf_set(centerRe, _centerRe);
             mpf_set(centerIm, _centerIm);
             mpf_set(scale, _scale);
-            pixelX = _pixelX; pixelY = _pixelY;
-            width = _width; height = _height;
+            pixelX = _pixelX;
+            pixelY = _pixelY;
+            width = _width;
+            height = _height;
             maxIterations = _maxIterations;
             generation = _pendingGeneration;
             formulaContext = _formula;
@@ -124,13 +116,9 @@ void OrbitWorker::run() {
         result.generation = generation;
         auto begin = Clock::now();
 
-        mpf_t dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni, zr2, zi2,
-              escapeSquared;
-        mpf_inits(dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni, zr2, zi2,
-                  escapeSquared, (mpf_ptr)0);
-        for (mpf_ptr value : { dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni,
-                               zr2, zi2, escapeSquared })
-            mpf_set_prec(value, precision);
+        mpf_t dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni, zr2, zi2, escapeSquared;
+        mpf_inits(dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni, zr2, zi2, escapeSquared, (mpf_ptr)0);
+        for (mpf_ptr value : {dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni, zr2, zi2, escapeSquared}) mpf_set_prec(value, precision);
 
         mpf_set_ui(dw, 2);
         mpf_div(dw, dw, scale);
@@ -153,29 +141,21 @@ void OrbitWorker::run() {
         mpf_add(cIm, cIm, t);
         result.pixelRe = mpf_get_d(cRe);
         result.pixelIm = mpf_get_d(cIm);
-        result.pixelParameter = expression
-            ? expression->pixelParameter : formulaContext.slice.pixel;
+        result.pixelParameter = expression ? expression->pixelParameter : formulaContext.slice.pixel;
 
-        const bool regularQuadratic =
-            formulaContext.formula.id == FormulaId::PowerPlusC &&
-            formulaContext.formula.power == 2 &&
-            formulaContext.slice.pixel == FormulaParameter::C;
-        const bool customDeepQuadratic =
-            formulaContext.formula.id == FormulaId::Expression &&
-            customDeepZoom.usesQuadraticPerturbation();
+        const bool regularQuadratic = formulaContext.formula.id == FormulaId::PowerPlusC && formulaContext.formula.power == 2 && formulaContext.slice.pixel == FormulaParameter::C;
+        const bool customDeepQuadratic = formulaContext.formula.id == FormulaId::Expression && customDeepZoom.usesQuadraticPerturbation();
         if (regularQuadratic || customDeepQuadratic) {
-            const double escapeRadius =
-                customDeepQuadratic ? customDeepZoom.escapeRadius : 4.0;
+            const double escapeRadius = customDeepQuadratic ? customDeepZoom.escapeRadius : 4.0;
             mpf_set_d(escapeSquared, escapeRadius);
             mpf_mul(escapeSquared, escapeSquared, escapeSquared);
             result.usedGmpQuadratic = true;
             mpf_set_ui(zr, 0);
             mpf_set_ui(zi, 0);
             result.points.reserve((size_t)maxIterations + 1);
-            result.points.push_back({ 0.0f, 0.0f });
+            result.points.push_back({0.0f, 0.0f});
             for (int i = 0; i < maxIterations; ++i) {
-                if ((i & 63) == 0 && _requestedGeneration.load() != generation)
-                    break;
+                if ((i & 63) == 0 && _requestedGeneration.load() != generation) break;
                 mpf_mul(nr, zr, zi);
                 mpf_mul(zr2, zr, zr);
                 mpf_mul(zi2, zi, zi);
@@ -183,7 +163,7 @@ void OrbitWorker::run() {
                 mpf_add(zr, zr, cRe);
                 mpf_mul_ui(zi, nr, 2);
                 mpf_add(zi, zi, cIm);
-                result.points.push_back({ (float)mpf_get_d(zr), (float)mpf_get_d(zi) });
+                result.points.push_back({(float)mpf_get_d(zr), (float)mpf_get_d(zi)});
                 result.iterations = i + 1;
 
                 mpf_mul(zr2, zr, zr);
@@ -194,28 +174,16 @@ void OrbitWorker::run() {
                     break;
                 }
             }
-        } else if (formulaContext.formula.id == FormulaId::Expression &&
-                   expression && expression->valid()) {
+        } else if (formulaContext.formula.id == FormulaId::Expression && expression && expression->valid()) {
             formula::ExpressionOrbitEvaluation evaluation;
-            formula::evaluateExpressionOrbit(
-                *expression, { result.pixelRe, result.pixelIm },
-                maxIterations, evaluation,
-                [this, generation] {
-                    return _requestedGeneration.load() != generation;
-                });
+            formula::evaluateExpressionOrbit(*expression, {result.pixelRe, result.pixelIm}, maxIterations, evaluation, [this, generation] { return _requestedGeneration.load() != generation; });
             result.points.reserve(evaluation.points.size());
-            for (const formula::Complex& point : evaluation.points) {
-                result.points.push_back({
-                    (float)point.real(), (float)point.imag()
-                });
-            }
+            for (const formula::Complex& point : evaluation.points) { result.points.push_back({(float)point.real(), (float)point.imag()}); }
             result.iterations = evaluation.iterations;
             result.escaped = evaluation.escaped;
         }
-        result.computeMs = std::chrono::duration<double, std::milli>(
-            Clock::now() - begin).count();
-        mpf_clears(dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni, zr2, zi2,
-                   escapeSquared, (mpf_ptr)0);
+        result.computeMs = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+        mpf_clears(dw, dh, dx, dy, cRe, cIm, t, zr, zi, nr, ni, zr2, zi2, escapeSquared, (mpf_ptr)0);
         mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
 
         {

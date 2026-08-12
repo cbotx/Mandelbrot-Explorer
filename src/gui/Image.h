@@ -19,14 +19,14 @@ extern float color_phase;
 // Optional post-shade: height = smooth escape value, normal from its screen-
 // space gradient, Lambert-shaded by a light direction; modulates the palette
 // colour. Composes with any coloring/palette and with the phase animation.
-extern int   relief_on;          // 1 => apply relief post-shade
-extern int   normal_light_on;    // 1 => apply analytic normal-map post-shade
-extern int   de_overlay_on;      // 1 => apply DE (distance-estimate) B&W overlay
-extern float relief_light_az;    // light azimuth  (radians)
-extern float relief_light_el;    // light elevation (radians)
-extern float relief_strength;    // slope strength
-extern float de_k;               // DE overlay: colour/boundary scale (bw = de/(de+k))
-extern float de_scale;           // DE overlay: optical (inverse-square) falloff scale
+extern int relief_on;         // 1 => apply relief post-shade
+extern int normal_light_on;   // 1 => apply analytic normal-map post-shade
+extern int de_overlay_on;     // 1 => apply DE (distance-estimate) B&W overlay
+extern float relief_light_az; // light azimuth  (radians)
+extern float relief_light_el; // light elevation (radians)
+extern float relief_strength; // slope strength
+extern float de_k;            // DE overlay: colour/boundary scale (bw = de/(de+k))
+extern float de_scale;        // DE overlay: optical (inverse-square) falloff scale
 
 // Post-shade an RGB image (row-major, 3 bytes/pixel) by Lambert slope lighting
 // from a per-pixel height field (NaN => interior/empty, left unshaded). Multiplies
@@ -46,9 +46,9 @@ void writePNGImage(uint8_t* img, int width, int height, const char* filename);
 
 void colorMapInitialize();
 
-void getColor(float iteration, uint8_t& r, uint8_t& g, uint8_t& b, int c_method=0);
+void getColor(float iteration, uint8_t& r, uint8_t& g, uint8_t& b, int c_method = 0);
 
-void getColor(float iteration, float& fr, float& fg, float& fb, int c_method=0);
+void getColor(float iteration, float& fr, float& fg, float& fb, int c_method = 0);
 
 // Analytic anti-aliasing: rebuild the palette box-filter integral (call once per
 // frame before AA coloring), then colour a pixel as the average colour over the
@@ -56,8 +56,7 @@ void getColor(float iteration, float& fr, float& fg, float& fb, int c_method=0);
 // at one sample/pixel. vL/vR/vU/vD are the neighbouring smooth values (pass
 // EMPTYPIXEL / a negative value for missing/interior neighbours).
 void prepareColorFilter();
-void getColorAA(float v, float vL, float vR, float vU, float vD,
-                uint8_t& r, uint8_t& g, uint8_t& b, int c_method=0);
+void getColorAA(float v, float vL, float vR, float vU, float vD, uint8_t& r, uint8_t& g, uint8_t& b, int c_method = 0);
 
 // Split of the analytic-AA colouring into a phase-INDEPENDENT analysis and a
 // cheap phase-DEPENDENT shading, so an animated palette phase can re-shade the
@@ -65,8 +64,7 @@ void getColorAA(float v, float vL, float vR, float vU, float vD,
 // the neighbourhood gradient. getColorAA == colorShadeAA(colorAnalyzeAA(...), color_phase).
 //   baseU  : palette-index centre (colorFunction*colP), or <0 for interior/empty.
 //   width  : palette entries spanned by the pixel footprint (0 => point sample).
-void colorAnalyzeAA(float v, float vL, float vR, float vU, float vD, int c_method,
-                    float& baseU, float& width);
+void colorAnalyzeAA(float v, float vL, float vR, float vU, float vD, int c_method, float& baseU, float& width);
 void colorShadeAA(float baseU, float width, float phase, uint8_t& r, uint8_t& g, uint8_t& b);
 // Phase-independent base palette index for a point sample (Feather / non-AA);
 // returns <0 for interior/empty pixels.

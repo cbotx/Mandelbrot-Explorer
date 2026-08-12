@@ -17,7 +17,7 @@
 namespace ui {
 
 class DpiScale {
-public:
+  public:
     explicit DpiScale(int dpi = 96) : _dpi(dpi > 0 ? dpi : 96) {}
     int dpi() const { return _dpi; }
     void setDpi(int dpi) { _dpi = dpi > 0 ? dpi : 96; }
@@ -25,12 +25,12 @@ public:
     int dip(int pixels) const { return MulDiv(pixels, 96, _dpi); }
     RECT px(RECT dipRect) const;
 
-private:
+  private:
     int _dpi;
 };
 
 class Resources {
-public:
+  public:
     Resources() = default;
     ~Resources();
     Resources(const Resources&) = delete;
@@ -48,7 +48,7 @@ public:
     HBRUSH panelBrush() const { return _panelBrush; }
     HBRUSH cardBrush() const { return _cardBrush; }
 
-private:
+  private:
     DpiScale _scale;
     HFONT _regular = nullptr;
     HFONT _semibold = nullptr;
@@ -63,7 +63,7 @@ private:
 };
 
 class BackBuffer {
-public:
+  public:
     BackBuffer() = default;
     ~BackBuffer();
     BackBuffer(const BackBuffer&) = delete;
@@ -75,7 +75,7 @@ public:
     int width() const { return _width; }
     int height() const { return _height; }
 
-private:
+  private:
     HDC _dc = nullptr;
     HBITMAP _bitmap = nullptr;
     HGDIOBJ _oldBitmap = nullptr;
@@ -84,7 +84,7 @@ private:
 };
 
 class ScrollState {
-public:
+  public:
     bool configure(int contentExtent, int viewportExtent);
     bool setPosition(int position);
     bool scrollBy(int delta);
@@ -96,7 +96,7 @@ public:
     int viewportExtent() const { return _viewportExtent; }
     int maximumPosition() const;
 
-private:
+  private:
     int _contentExtent = 0;
     int _viewportExtent = 0;
     int _position = 0;
@@ -109,7 +109,7 @@ struct HitRegion {
 };
 
 class HitRouter {
-public:
+  public:
     void clear();
     void add(int id, RECT bounds, bool enabled = true);
     int hit(int x, int y) const;
@@ -121,33 +121,27 @@ public:
     int hovered() const { return _hovered; }
     int pressed() const { return _pressed; }
 
-private:
+  private:
     std::vector<HitRegion> _regions;
     int _hovered = 0;
     int _pressed = 0;
 };
 
-enum class ButtonStyle {
-    Normal,
-    Accent,
-    Positive,
-    Subtle
-};
+enum class ButtonStyle { Normal,
+                         Accent,
+                         Positive,
+                         Subtle };
 
-void drawButton(HDC dc, RECT bounds, const std::wstring& text, HFONT font,
-                ButtonStyle style, bool hovered, bool pressed,
-                bool enabled = true, int radius = 7);
+void drawButton(HDC dc, RECT bounds, const std::wstring& text, HFONT font, ButtonStyle style, bool hovered, bool pressed, bool enabled = true, int radius = 7);
 void drawCard(HDC dc, RECT bounds, int radius = 8);
 void drawFocusRing(HDC dc, RECT bounds, int radius = 7);
 
 class TextService {
-public:
-    enum class Event {
-        Changed,
-        CaretMoved,
-        FocusGained,
-        FocusLost
-    };
+  public:
+    enum class Event { Changed,
+                       CaretMoved,
+                       FocusGained,
+                       FocusLost };
     using Callback = std::function<void(Event)>;
 
     TextService() = default;
@@ -155,8 +149,7 @@ public:
     TextService(const TextService&) = delete;
     TextService& operator=(const TextService&) = delete;
 
-    bool create(HWND parent, int controlId, size_t maximumLength,
-                Callback callback);
+    bool create(HWND parent, int controlId, size_t maximumLength, Callback callback);
     void destroy();
     HWND hwnd() const { return _edit; }
 
@@ -171,9 +164,8 @@ public:
     bool undo();
     void selectAll();
 
-private:
-    static LRESULT CALLBACK editProc(HWND window, UINT message,
-                                     WPARAM wp, LPARAM lp);
+  private:
+    static LRESULT CALLBACK editProc(HWND window, UINT message, WPARAM wp, LPARAM lp);
     void notify(Event event);
 
     HWND _edit = nullptr;

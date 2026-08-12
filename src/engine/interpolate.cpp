@@ -10,17 +10,18 @@ void mono_cubic_interpolate(const float* xs, const float* ys, const int length, 
     for (int i = 0; i < length - 1; i++) {
         float dx = xs[i + 1] - xs[i];
         float dy = ys[i + 1] - ys[i];
-        dxs.push_back(dx); dys.push_back(dy); ms.push_back(dy / dx);
+        dxs.push_back(dx);
+        dys.push_back(dy);
+        ms.push_back(dy / dx);
     }
 
     // Get degree-1 coefficients
-    std::vector<float> c1s = { ms[0] };
+    std::vector<float> c1s = {ms[0]};
     for (int i = 0; i < dxs.size() - 1; i++) {
         float m = ms[i], mNext = ms[i + 1];
         if (m * mNext <= 0) {
             c1s.push_back(0);
-        }
-        else {
+        } else {
             float dx_ = dxs[i], dxNext = dxs[i + 1], common = dx_ + dxNext;
             c1s.push_back(3 * common / ((common + dxNext) / m + (common + dx_) / mNext));
         }
@@ -31,7 +32,8 @@ void mono_cubic_interpolate(const float* xs, const float* ys, const int length, 
     std::vector<float> c2s, c3s;
     for (int i = 0; i < c1s.size() - 1; i++) {
         float c1 = c1s[i], m_ = ms[i], invDx = 1 / dxs[i], common_ = c1 + c1s[i + 1] - m_ - m_;
-        c2s.push_back((m_ - c1 - common_) * invDx); c3s.push_back(common_ * invDx * invDx);
+        c2s.push_back((m_ - c1 - common_) * invDx);
+        c3s.push_back(common_ * invDx * invDx);
     }
 
     // Return interpolant function
@@ -45,9 +47,13 @@ void mono_cubic_interpolate(const float* xs, const float* ys, const int length, 
         while (low <= high) {
             mid = (low + high) / 2;
             float xHere = xs[mid];
-            if (xHere < x) { low = mid + 1; }
-            else if (xHere > x) { high = mid - 1; }
-            else { return ys[mid]; }
+            if (xHere < x) {
+                low = mid + 1;
+            } else if (xHere > x) {
+                high = mid - 1;
+            } else {
+                return ys[mid];
+            }
         }
         i = std::max(0, high);
 
@@ -55,9 +61,7 @@ void mono_cubic_interpolate(const float* xs, const float* ys, const int length, 
         float diff = x - xs[i], diffSq = diff * diff;
         return ys[i] + c1s[i] * diff + c2s[i] * diffSq + c3s[i] * diff * diffSq;
     };
-    for (int i = 0; i < mp_sz; ++i) {
-        mp[i] = func(1.f * i / mp_sz);
-    }
+    for (int i = 0; i < mp_sz; ++i) { mp[i] = func(1.f * i / mp_sz); }
 }
 
 void cos_interpolate(const float* xs, const float* ys, const int length, float* mp, const int mp_sz) {

@@ -18,11 +18,7 @@ struct OrbitThumbnailPixel {
     bool cancelled = false;
 };
 
-bool classifyOrbitThumbnailPixel(
-    const formula::ExpressionOrbitSnapshot* expression,
-    formula::Complex pixel, int maxIterations,
-    OrbitThumbnailPixel& result,
-    const std::function<bool()>& shouldCancel = {});
+bool classifyOrbitThumbnailPixel(const formula::ExpressionOrbitSnapshot* expression, formula::Complex pixel, int maxIterations, OrbitThumbnailPixel& result, const std::function<bool()>& shouldCancel = {});
 
 struct OrbitThumbnailResult {
     std::vector<uint8_t> pixels;
@@ -36,22 +32,18 @@ struct OrbitThumbnailResult {
 };
 
 class OrbitThumbnailWorker {
-public:
+  public:
     OrbitThumbnailWorker();
     ~OrbitThumbnailWorker();
 
     OrbitThumbnailWorker(const OrbitThumbnailWorker&) = delete;
     OrbitThumbnailWorker& operator=(const OrbitThumbnailWorker&) = delete;
 
-    uint64_t request(
-        int width, int height,
-        double x0, double x1, double y0, double y1,
-        int maxIterations,
-        std::shared_ptr<const formula::ExpressionOrbitSnapshot> expression);
+    uint64_t request(int width, int height, double x0, double x1, double y0, double y1, int maxIterations, std::shared_ptr<const formula::ExpressionOrbitSnapshot> expression);
     bool takeLatest(OrbitThumbnailResult& result);
     void cancel();
 
-private:
+  private:
     void run();
 
     std::thread _thread;

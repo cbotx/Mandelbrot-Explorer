@@ -11,43 +11,32 @@
 
 namespace formula {
 
-enum class ExpressionTaylorJetStatus : uint8_t {
-    Success,
-    NoCoverage,
-    InvalidRequest,
-    UnsupportedProgram,
-    InvalidTape,
-    ResourceLimit,
-    Cancelled,
-    ExponentRange,
-    Nonfinite,
-    AccuracyBudget,
-    BailoutUncertain,
-    PoleRejected,
-    BranchRejected
-};
+enum class ExpressionTaylorJetStatus : uint8_t { Success,
+                                                 NoCoverage,
+                                                 InvalidRequest,
+                                                 UnsupportedProgram,
+                                                 InvalidTape,
+                                                 ResourceLimit,
+                                                 Cancelled,
+                                                 ExponentRange,
+                                                 Nonfinite,
+                                                 AccuracyBudget,
+                                                 BailoutUncertain,
+                                                 PoleRejected,
+                                                 BranchRejected };
 
-const char* expressionTaylorJetStatusName(
-    ExpressionTaylorJetStatus status);
+const char* expressionTaylorJetStatusName(ExpressionTaylorJetStatus status);
 
-enum class ExpressionTaylorJetLayout : uint8_t {
-    ComplexUnivariate,
-    RealBivariate
-};
+enum class ExpressionTaylorJetLayout : uint8_t { ComplexUnivariate,
+                                                 RealBivariate };
 
-const char* expressionTaylorJetLayoutName(
-    ExpressionTaylorJetLayout layout);
+const char* expressionTaylorJetLayoutName(ExpressionTaylorJetLayout layout);
 
 constexpr int ExpressionTaylorMaximumBivariateOrder = 12;
 
-bool expressionTaylorBivariateMonomialCount(
-    int order, size_t& count);
-bool expressionTaylorBivariateIndex(
-    int order, int qDegree, int conjugateDegree,
-    size_t& index);
-bool expressionTaylorBivariateExponents(
-    int order, size_t index, int& qDegree,
-    int& conjugateDegree);
+bool expressionTaylorBivariateMonomialCount(int order, size_t& count);
+bool expressionTaylorBivariateIndex(int order, int qDegree, int conjugateDegree, size_t& index);
+bool expressionTaylorBivariateExponents(int order, size_t index, int& qDegree, int& conjugateDegree);
 
 struct ExpressionTaylorJetRequest {
     const ExpressionProgram* program = nullptr;
@@ -64,8 +53,7 @@ struct ExpressionTaylorJetRequest {
     int maximumOrder = 20;
     // Real-bivariate jets use triangular storage and quadratic convolution
     // work, so they have an independent, explicit production cap.
-    int maximumBivariateOrder =
-        ExpressionTaylorMaximumBivariateOrder;
+    int maximumBivariateOrder = ExpressionTaylorMaximumBivariateOrder;
     // Independent function-series composition limit.
     int maximumCompositionOrder = 24;
     int minimumLanding = 8;
@@ -74,13 +62,12 @@ struct ExpressionTaylorJetRequest {
     double bailout = 4.0;
     // Uniform maximum-component tail budget on |q| <= 1.
     double accuracyBudget = 0x1p-40;
-    size_t memoryLimitBytes = size_t{ 1 } << 30;
+    size_t memoryLimitBytes = size_t{1} << 30;
     std::function<bool()> shouldCancel;
 };
 
 struct ExpressionTaylorJetResult {
-    ExpressionTaylorJetStatus status =
-        ExpressionTaylorJetStatus::InvalidRequest;
+    ExpressionTaylorJetStatus status = ExpressionTaylorJetStatus::InvalidRequest;
     std::string failureReason;
     bool valid = false;
     bool certified = false;
@@ -88,8 +75,7 @@ struct ExpressionTaylorJetResult {
     ScaledComplexBall parameterOffset;
     ScaledComplexValue parameterScale;
     uint64_t programSemanticHash = 0;
-    ExpressionTaylorJetLayout layout =
-        ExpressionTaylorJetLayout::ComplexUnivariate;
+    ExpressionTaylorJetLayout layout = ExpressionTaylorJetLayout::ComplexUnivariate;
     int landingIteration = 0;
     size_t landingSample = 0;
     int order = 0;
@@ -139,66 +125,44 @@ struct ExpressionTaylorJetResult {
 };
 
 struct ExpressionTaylorJetEvaluation {
-    ExpressionTaylorJetStatus status =
-        ExpressionTaylorJetStatus::InvalidRequest;
+    ExpressionTaylorJetStatus status = ExpressionTaylorJetStatus::InvalidRequest;
     bool valid = false;
     ScaledComplexBall residual;
     uint64_t operationCount = 0;
 };
 
 class ExpressionTaylorJetBuilder {
-public:
-    static bool build(
-        const ExpressionTaylorJetRequest& request,
-        ExpressionTaylorJetResult& result);
+  public:
+    static bool build(const ExpressionTaylorJetRequest& request, ExpressionTaylorJetResult& result);
 };
 
 class ExpressionTaylorJetEvaluator {
-public:
+  public:
     // q may carry a certified construction radius. In real-bivariate mode its
     // conjugate is derived exactly from the same ball; it is not an
     // independent pixel input. Evaluation is allocation free and the
     // immutable jet can be shared by renderer threads.
-    static bool evaluate(
-        const ExpressionTaylorJetResult& jet,
-        const ScaledComplexBall& q,
-        ExpressionTaylorJetEvaluation& result);
+    static bool evaluate(const ExpressionTaylorJetResult& jet, const ScaledComplexBall& q, ExpressionTaylorJetEvaluation& result);
     // Evaluates up to four pixels against one immutable accepted jet. The
     // coefficient traversal is shared while every lane retains its own
     // scaled exponents, signed zeros, and outward certification radius.
-    static bool evaluateBatch(
-        const ExpressionTaylorJetResult& jet,
-        const ScaledComplexBall* q,
-        size_t count,
-        ExpressionTaylorJetEvaluation* results);
+    static bool evaluateBatch(const ExpressionTaylorJetResult& jet, const ScaledComplexBall* q, size_t count, ExpressionTaylorJetEvaluation* results);
 };
 
 // Chooses an exact positive power-of-two D that encloses
 // |Re(delta)| + |Im(delta)| plus both component errors.
-bool makeExpressionTaylorFrameScale(
-    const ScaledRealValue& maximumRealMagnitude,
-    const ScaledRealValue& maximumImaginaryMagnitude,
-    const ScaledRealValue& maximumComponentError,
-    ScaledComplexValue& parameterScale);
+bool makeExpressionTaylorFrameScale(const ScaledRealValue& maximumRealMagnitude, const ScaledRealValue& maximumImaginaryMagnitude, const ScaledRealValue& maximumComponentError, ScaledComplexValue& parameterScale);
 
 // Divides an arbitrary-exponent offset by a power-of-two frame scale without
 // losing exponent information.
-bool makeExpressionTaylorNormalizedQ(
-    const ScaledComplexBall& offset,
-    const ScaledComplexValue& parameterScale,
-    ScaledComplexBall& q);
+bool makeExpressionTaylorNormalizedQ(const ScaledComplexBall& offset, const ScaledComplexValue& parameterScale, ScaledComplexBall& q);
 
 // Constructs q for parameter = reference + P + D*q. The subtraction is
 // certified, including the coordinate and P construction radii.
-bool makeExpressionTaylorLocalQ(
-    const ScaledComplexBall& offset,
-    const ScaledComplexBall& parameterOffset,
-    const ScaledComplexValue& parameterScale,
-    ScaledComplexBall& q);
+bool makeExpressionTaylorLocalQ(const ScaledComplexBall& offset, const ScaledComplexBall& parameterOffset, const ScaledComplexValue& parameterScale, ScaledComplexBall& q);
 
 // Uses the L1 enclosure, so a true result rigorously implies |q| <= 1.
-bool expressionTaylorQInsideUnitDisk(
-    const ScaledComplexBall& q);
+bool expressionTaylorQInsideUnitDisk(const ScaledComplexBall& q);
 
 } // namespace formula
 

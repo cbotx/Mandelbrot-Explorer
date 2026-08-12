@@ -188,8 +188,7 @@ bool inMainCardioidOrBulb(double x, double y) {
     const double y2 = y * y;
     const double xm = x - 0.25;
     const double q = xm * xm + y2;
-    return q * (q + xm) < 0.25 * y2 ||
-           (x + 1.0) * (x + 1.0) + y2 < 0.0625;
+    return q * (q + xm) < 0.25 * y2 || (x + 1.0) * (x + 1.0) + y2 < 0.0625;
 }
 
 struct alignas(16) ShaderParams {
@@ -208,27 +207,15 @@ struct alignas(16) ShaderParams {
 static_assert(sizeof(ShaderParams) == 64, "HLSL constant layout mismatch");
 
 class D3D11ComputeBackend final : public IComputeBackend {
-public:
-    D3D11ComputeBackend(bool warp, std::unique_ptr<IComputeBackend> cpuFallback)
-        : _warp(warp), _cpu(std::move(cpuFallback)) {}
+  public:
+    D3D11ComputeBackend(bool warp, std::unique_ptr<IComputeBackend> cpuFallback) : _warp(warp), _cpu(std::move(cpuFallback)) {}
 
     bool initialize(std::string* error) {
         UINT flags = 0;
-        const D3D_FEATURE_LEVEL requested[] = {
-            D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0
-        };
-        D3D_DRIVER_TYPE driver = _warp
-            ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE;
-        HRESULT hr = D3D11CreateDevice(
-            nullptr, driver, nullptr, flags, requested,
-            static_cast<UINT>(sizeof(requested) / sizeof(requested[0])),
-            D3D11_SDK_VERSION,
-            &_device, &_featureLevel, &_context);
-        if (hr == E_INVALIDARG) {
-            hr = D3D11CreateDevice(
-                nullptr, driver, nullptr, flags, requested + 1, 1,
-                D3D11_SDK_VERSION, &_device, &_featureLevel, &_context);
-        }
+        const D3D_FEATURE_LEVEL requested[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+        D3D_DRIVER_TYPE driver = _warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE;
+        HRESULT hr = D3D11CreateDevice(nullptr, driver, nullptr, flags, requested, static_cast<UINT>(sizeof(requested) / sizeof(requested[0])), D3D11_SDK_VERSION, &_device, &_featureLevel, &_context);
+        if (hr == E_INVALIDARG) { hr = D3D11CreateDevice(nullptr, driver, nullptr, flags, requested + 1, 1, D3D11_SDK_VERSION, &_device, &_featureLevel, &_context); }
         if (FAILED(hr)) {
             if (error) *error = "D3D11 device creation failed (" + hresultText(hr) + ")";
             return false;
@@ -239,28 +226,16 @@ public:
         }
         DXGI_ADAPTER_DESC1 adapter{};
         bool haveAdapter = adapterDescription(&adapter);
-        bool softwareAdapter =
-            haveAdapter &&
-            ((adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 ||
-             (adapter.VendorId == 0x1414 && adapter.DeviceId == 0x008c));
+        bool softwareAdapter = haveAdapter && ((adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 || (adapter.VendorId == 0x1414 && adapter.DeviceId == 0x008c));
         if (!_warp && softwareAdapter) {
-            if (error) {
-                *error = "no physical D3D11 adapter (found " +
-                         narrow(adapter.Description) + ")";
-            }
+            if (error) { *error = "no physical D3D11 adapter (found " + narrow(adapter.Description) + ")"; }
             return false;
         }
 
         ComPtr<ID3DBlob> shaderBlob;
         ComPtr<ID3DBlob> errors;
-        const UINT compileFlags =
-            D3DCOMPILE_ENABLE_STRICTNESS |
-            D3DCOMPILE_IEEE_STRICTNESS |
-            D3DCOMPILE_OPTIMIZATION_LEVEL3;
-        hr = D3DCompile(
-            kShaderSource, sizeof(kShaderSource) - 1, "mandelbrot_shallow.hlsl",
-            nullptr, nullptr, "main", "cs_5_0", compileFlags, 0,
-            &shaderBlob, &errors);
+        const UINT compileFlags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_IEEE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+        hr = D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "mandelbrot_shallow.hlsl", nullptr, nullptr, "main", "cs_5_0", compileFlags, 0, &shaderBlob, &errors);
         if (FAILED(hr)) {
             if (error) {
                 if (errors && errors->GetBufferPointer())
@@ -270,9 +245,7 @@ public:
             }
             return false;
         }
-        hr = _device->CreateComputeShader(
-            shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize(),
-            nullptr, &_shader);
+        hr = _device->CreateComputeShader(shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize(), nullptr, &_shader);
         if (FAILED(hr)) {
             if (error) *error = "compute shader creation failed (" + hresultText(hr) + ")";
             return false;
@@ -296,11 +269,9 @@ public:
             return false;
         }
 
-        std::string adapterName =
-            haveAdapter ? narrow(adapter.Description) : std::string();
+        std::string adapterName = haveAdapter ? narrow(adapter.Description) : std::string();
         _info.name = _warp ? "D3D11 WARP" : "D3D11 GPU";
-        _info.detail = adapterName.empty() ? "2xFP32 bounded-prefix compute"
-                                           : adapterName + "; 2xFP32 bounded-prefix compute";
+        _info.detail = adapterName.empty() ? "2xFP32 bounded-prefix compute" : adapterName + "; 2xFP32 bounded-prefix compute";
         _info.detail += "; max 100k iterations";
         _info.hardwareAccelerated = !_warp;
         _info.fallback = false;
@@ -308,17 +279,9 @@ public:
     }
 
     const ComputeBackendInfo& info() const override { return _info; }
-    bool lastComputeUsedGpuPath() const override {
-        return _lastComputeUsedGpuPath.load(std::memory_order_acquire);
-    }
-    bool lastComputeUsedCustomDeepPath() const override {
-        return _lastComputeUsedCustomDeepPath.load(
-            std::memory_order_acquire);
-    }
-    bool lastComputeUsedGenericDeepPath() const override {
-        return _lastComputeUsedGenericDeepPath.load(
-            std::memory_order_acquire);
-    }
+    bool lastComputeUsedGpuPath() const override { return _lastComputeUsedGpuPath.load(std::memory_order_acquire); }
+    bool lastComputeUsedCustomDeepPath() const override { return _lastComputeUsedCustomDeepPath.load(std::memory_order_acquire); }
+    bool lastComputeUsedGenericDeepPath() const override { return _lastComputeUsedGenericDeepPath.load(std::memory_order_acquire); }
     GenericDeepInfo lastGenericDeepInfo() const override {
         std::lock_guard<std::mutex> lock(_genericMutex);
         return _genericInfo;
@@ -326,35 +289,26 @@ public:
 
     bool compute(const ComputeRequest& request) override {
         bool expected = false;
-        if (!_computing.compare_exchange_strong(expected, true))
-            return false;
+        if (!_computing.compare_exchange_strong(expected, true)) return false;
         ComputeGuard guard{_computing};
         _lastComputeUsedGpuPath.store(false, std::memory_order_release);
-        _lastComputeUsedCustomDeepPath.store(
-            false, std::memory_order_release);
-        _lastComputeUsedGenericDeepPath.store(
-            false, std::memory_order_release);
+        _lastComputeUsedCustomDeepPath.store(false, std::memory_order_release);
+        _lastComputeUsedGenericDeepPath.store(false, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lock(_genericMutex);
             _genericInfo = {};
         }
-        if (_cancelRequested.load(std::memory_order_acquire))
-            return false;
+        if (_cancelRequested.load(std::memory_order_acquire)) return false;
 
-        if (!_gpuHealthy || !eligible(request))
-            return computeCpu(request);
+        if (!_gpuHealthy || !eligible(request)) return computeCpu(request);
 
         if (computeGpu(request)) {
             _lastComputeUsedGpuPath.store(true, std::memory_order_release);
-            const bool success =
-                !_cancelRequested.load(std::memory_order_acquire);
-            if (success && request.progress)
-                request.progress->store(
-                    1.0f, std::memory_order_release);
+            const bool success = !_cancelRequested.load(std::memory_order_acquire);
+            if (success && request.progress) request.progress->store(1.0f, std::memory_order_release);
             return success;
         }
-        if (_cancelRequested.load(std::memory_order_acquire))
-            return false;
+        if (_cancelRequested.load(std::memory_order_acquire)) return false;
 
         if (FAILED(_device->GetDeviceRemovedReason())) _gpuHealthy = false;
         return computeCpu(request);
@@ -372,7 +326,7 @@ public:
         }
     }
 
-private:
+  private:
     struct ComputeGuard {
         std::atomic_bool& flag;
         ~ComputeGuard() { flag.store(false, std::memory_order_release); }
@@ -417,12 +371,8 @@ private:
             }
         }
         bool result = _cpu->compute(request);
-        _lastComputeUsedCustomDeepPath.store(
-            _cpu->lastComputeUsedCustomDeepPath(),
-            std::memory_order_release);
-        _lastComputeUsedGenericDeepPath.store(
-            _cpu->lastComputeUsedGenericDeepPath(),
-            std::memory_order_release);
+        _lastComputeUsedCustomDeepPath.store(_cpu->lastComputeUsedCustomDeepPath(), std::memory_order_release);
+        _lastComputeUsedGenericDeepPath.store(_cpu->lastComputeUsedGenericDeepPath(), std::memory_order_release);
         {
             std::lock_guard<std::mutex> lock(_genericMutex);
             _genericInfo = _cpu->lastGenericDeepInfo();
@@ -430,23 +380,10 @@ private:
         return result;
     }
 
-    static bool eligible(const ComputeRequest& request) {
-        return request.mode == ComputeMode::Mandelbrot &&
-               request.cpuEngine && request.centerRe && request.centerIm &&
-               request.scale && mpf_sgn(request.scale) > 0 &&
-               mpf_cmp_d(request.scale, 1.0e6) <= 0 &&
-               request.width >= 2 && request.height >= 2 &&
-               request.sub >= 1 && (request.sub & 1) != 0 &&
-               request.maxIterations >= 2 &&
-               request.maxIterations <= kMaxGpuIterations &&
-               request.iterations &&
-               request.coloringMethod == 0;
-    }
+    static bool eligible(const ComputeRequest& request) { return request.mode == ComputeMode::Mandelbrot && request.cpuEngine && request.centerRe && request.centerIm && request.scale && mpf_sgn(request.scale) > 0 && mpf_cmp_d(request.scale, 1.0e6) <= 0 && request.width >= 2 && request.height >= 2 && request.sub >= 1 && (request.sub & 1) != 0 && request.maxIterations >= 2 && request.maxIterations <= kMaxGpuIterations && request.iterations && request.coloringMethod == 0; }
 
     bool ensureOutput(UINT count) {
-        if (_outputBuffer && _outputUav && _stagingBuffer &&
-            count <= _outputCapacity)
-            return true;
+        if (_outputBuffer && _outputUav && _stagingBuffer && count <= _outputCapacity) return true;
         _outputCapacity = 0;
         _outputBuffer.Reset();
         _outputUav.Reset();
@@ -465,8 +402,7 @@ private:
         outputView.Format = DXGI_FORMAT_UNKNOWN;
         outputView.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
         outputView.Buffer.NumElements = count;
-        hr = _device->CreateUnorderedAccessView(
-            _outputBuffer.Get(), &outputView, &_outputUav);
+        hr = _device->CreateUnorderedAccessView(_outputBuffer.Get(), &outputView, &_outputUav);
         if (FAILED(hr)) return false;
 
         D3D11_BUFFER_DESC staging = output;
@@ -487,79 +423,61 @@ private:
         const bool profile = getenv("MANDEL_GPU_PROFILE") != nullptr;
         auto publishProgress = [&](float value) {
             if (!request.progress) return;
-            float current =
-                request.progress->load(std::memory_order_relaxed);
-            while (current < value &&
-                   !request.progress->compare_exchange_weak(
-                       current, value,
-                       std::memory_order_release,
-                       std::memory_order_relaxed)) {}
+            float current = request.progress->load(std::memory_order_relaxed);
+            while (current < value && !request.progress->compare_exchange_weak(current, value, std::memory_order_release, std::memory_order_relaxed)) {}
         };
         publishProgress(0.02f);
-        const uint64_t count64 =
-            static_cast<uint64_t>(request.width) * request.height;
-        if (count64 == 0 ||
-            count64 > std::numeric_limits<UINT>::max() / sizeof(float))
-            return false;
+        const uint64_t count64 = static_cast<uint64_t>(request.width) * request.height;
+        if (count64 == 0 || count64 > std::numeric_limits<UINT>::max() / sizeof(float)) return false;
         const UINT count = static_cast<UINT>(count64);
         if (!ensureOutput(count)) return false;
 
-        const mp_bitcnt_t precision = std::max({
-            mpf_get_prec(request.centerRe), mpf_get_prec(request.centerIm),
-            mpf_get_prec(request.scale)
-        });
+        const mp_bitcnt_t precision = std::max({mpf_get_prec(request.centerRe), mpf_get_prec(request.centerIm), mpf_get_prec(request.scale)});
         mpf_t dw, dh, c0Re, c0Im, dx, dy;
-        mpf_init2(dw, precision); mpf_init2(dh, precision);
-        mpf_init2(c0Re, precision); mpf_init2(c0Im, precision);
-        mpf_init2(dx, precision); mpf_init2(dy, precision);
-        mpf_set_ui(dw, 2); mpf_div(dw, dw, request.scale);
-        mpf_set(dh, dw); mpf_div_ui(dh, dh, request.width);
+        mpf_init2(dw, precision);
+        mpf_init2(dh, precision);
+        mpf_init2(c0Re, precision);
+        mpf_init2(c0Im, precision);
+        mpf_init2(dx, precision);
+        mpf_init2(dy, precision);
+        mpf_set_ui(dw, 2);
+        mpf_div(dw, dw, request.scale);
+        mpf_set(dh, dw);
+        mpf_div_ui(dh, dh, request.width);
         mpf_mul_ui(dh, dh, request.height);
         mpf_sub(c0Re, request.centerRe, dw);
         mpf_sub(c0Im, request.centerIm, dh);
-        mpf_mul_ui(dx, dw, 2); mpf_div_ui(dx, dx, request.width - 1);
-        mpf_mul_ui(dy, dh, 2); mpf_div_ui(dy, dy, request.height - 1);
+        mpf_mul_ui(dx, dw, 2);
+        mpf_div_ui(dx, dx, request.width - 1);
+        mpf_mul_ui(dy, dh, 2);
+        mpf_div_ui(dy, dy, request.height - 1);
 
-        const double values[] = {
-            mpf_get_d(c0Re), mpf_get_d(c0Im), mpf_get_d(dx), mpf_get_d(dy)
-        };
+        const double values[] = {mpf_get_d(c0Re), mpf_get_d(c0Im), mpf_get_d(dx), mpf_get_d(dy)};
         mpf_clears(dw, dh, c0Re, c0Im, dx, dy, (mpf_ptr)0);
         for (double value : values) {
-            if (!std::isfinite(value) || std::fabs(value) > 1.0e8)
-                return false;
+            if (!std::isfinite(value) || std::fabs(value) > 1.0e8) return false;
         }
-        const double lastRe =
-            values[0] + values[2] * (request.width - 1);
-        const double lastIm =
-            values[1] + values[3] * (request.height - 1);
-        if (!std::isfinite(lastRe) || !std::isfinite(lastIm) ||
-            std::fabs(lastRe) > 1.0e8 || std::fabs(lastIm) > 1.0e8)
-            return false;
+        const double lastRe = values[0] + values[2] * (request.width - 1);
+        const double lastIm = values[1] + values[3] * (request.height - 1);
+        if (!std::isfinite(lastRe) || !std::isfinite(lastIm) || std::fabs(lastRe) > 1.0e8 || std::fabs(lastIm) > 1.0e8) return false;
 
         ShaderParams params{};
         params.c0Re = splitDouble(values[0]);
         params.c0Im = splitDouble(values[1]);
         params.dx = splitDouble(values[2]);
         params.dy = splitDouble(values[3]);
-        const FloatPair coordinatePairs[] = {
-            params.c0Re, params.c0Im, params.dx, params.dy
-        };
+        const FloatPair coordinatePairs[] = {params.c0Re, params.c0Im, params.dx, params.dy};
         for (const FloatPair pair : coordinatePairs)
-            if (!std::isfinite(pair.hi) || !std::isfinite(pair.lo))
-                return false;
+            if (!std::isfinite(pair.hi) || !std::isfinite(pair.lo)) return false;
         params.width = static_cast<UINT>(request.width);
         params.height = static_cast<UINT>(request.height);
         params.maxIterations = static_cast<UINT>(request.maxIterations);
         double escapeRadius = request.cpuEngine->escapeRadius();
-        if (!std::isfinite(escapeRadius) || escapeRadius < 2.0 ||
-            escapeRadius > 1.0e8)
-            return false;
+        if (!std::isfinite(escapeRadius) || escapeRadius < 2.0 || escapeRadius > 1.0e8) return false;
         double escapeSquared = request.cpuEngine->escapeRadiusSquared();
         if (!std::isfinite(escapeSquared)) return false;
         params.escapeSquared = splitDouble(escapeSquared);
-        if (!std::isfinite(params.escapeSquared.hi) ||
-            !std::isfinite(params.escapeSquared.lo))
-            return false;
+        if (!std::isfinite(params.escapeSquared.hi) || !std::isfinite(params.escapeSquared.lo)) return false;
 
         ID3D11Buffer* constantBuffers[] = {_constantBuffer.Get()};
         ID3D11UnorderedAccessView* uavs[] = {_outputUav.Get()};
@@ -575,18 +493,15 @@ private:
             }
             params.basePixel = base;
             params.pixelCount = std::min(kPixelsPerChunk, count - base);
-            _context->UpdateSubresource(
-                _constantBuffer.Get(), 0, nullptr, &params, 0, 0);
-            UINT groups =
-                (params.pixelCount + kThreadsPerGroup - 1) / kThreadsPerGroup;
+            _context->UpdateSubresource(_constantBuffer.Get(), 0, nullptr, &params, 0, 0);
+            UINT groups = (params.pixelCount + kThreadsPerGroup - 1) / kThreadsPerGroup;
             _context->Dispatch(groups, 1, 1);
             _context->End(_completionQuery.Get());
             _context->Flush();
             HRESULT completed = S_FALSE;
             unsigned spins = 0;
             do {
-                completed = _context->GetData(
-                    _completionQuery.Get(), nullptr, 0, 0);
+                completed = _context->GetData(_completionQuery.Get(), nullptr, 0, 0);
                 if (completed == S_FALSE) {
                     if ((++spins & 255u) == 0)
                         SwitchToThread();
@@ -602,10 +517,7 @@ private:
                 unbind();
                 return false;
             }
-            publishProgress(
-                0.05f + 0.45f *
-                    static_cast<float>(base + params.pixelCount) /
-                    static_cast<float>(count));
+            publishProgress(0.05f + 0.45f * static_cast<float>(base + params.pixelCount) / static_cast<float>(count));
         }
         const auto dispatchEnd = ProfileClock::now();
         unbind();
@@ -613,8 +525,7 @@ private:
         const auto readbackStart = ProfileClock::now();
         _context->CopyResource(_stagingBuffer.Get(), _outputBuffer.Get());
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        HRESULT hr = _context->Map(
-            _stagingBuffer.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        HRESULT hr = _context->Map(_stagingBuffer.Get(), 0, D3D11_MAP_READ, 0, &mapped);
         if (FAILED(hr)) return false;
         _readback.resize(count);
         std::memcpy(_readback.data(), mapped.pData, count * sizeof(float));
@@ -631,7 +542,7 @@ private:
         _refinePixels.resize(count);
         std::atomic<int> refineCount{0};
         long long analytic = 0;
-#pragma omp parallel for schedule(static) reduction(+:analytic)
+#pragma omp parallel for schedule(static) reduction(+ : analytic)
         for (int pixel = 0; pixel < static_cast<int>(count); ++pixel) {
             if (_cancelRequested.load(std::memory_order_relaxed)) continue;
             float value = _readback[pixel];
@@ -664,70 +575,42 @@ private:
             _refineRe[slot] = values[0] + values[2] * x;
             _refineIm[slot] = values[1] + values[3] * y;
         }
-        const int refineBlocks =
-            (refined + kCpuRefineBlock - 1) / kCpuRefineBlock;
+        const int refineBlocks = (refined + kCpuRefineBlock - 1) / kCpuRefineBlock;
         std::atomic<int> refinedBlocks{0};
 #pragma omp parallel for schedule(dynamic, 1)
         for (int block = 0; block < refineBlocks; ++block) {
             if (_cancelRequested.load(std::memory_order_relaxed)) continue;
             int base = block * kCpuRefineBlock;
             int blockCount = std::min(kCpuRefineBlock, refined - base);
-            request.cpuEngine->ComputeShallowPoints(
-                _refineRe.data() + base, _refineIm.data() + base,
-                blockCount, _refineOutput.data() + base,
-                request.maxIterations);
-            const int completed =
-                refinedBlocks.fetch_add(
-                    1, std::memory_order_relaxed) + 1;
-            publishProgress(
-                0.60f + 0.35f *
-                    static_cast<float>(completed) /
-                    static_cast<float>(
-                        std::max(1, refineBlocks)));
+            request.cpuEngine->ComputeShallowPoints(_refineRe.data() + base, _refineIm.data() + base, blockCount, _refineOutput.data() + base, request.maxIterations);
+            const int completed = refinedBlocks.fetch_add(1, std::memory_order_relaxed) + 1;
+            publishProgress(0.60f + 0.35f * static_cast<float>(completed) / static_cast<float>(std::max(1, refineBlocks)));
         }
 #pragma omp parallel for schedule(static)
-        for (int slot = 0; slot < refined; ++slot) {
-            _readback[_refinePixels[slot]] = _refineOutput[slot];
-        }
+        for (int slot = 0; slot < refined; ++slot) { _readback[_refinePixels[slot]] = _refineOutput[slot]; }
         if (_cancelRequested.load(std::memory_order_acquire)) return false;
         publishProgress(0.98f);
         const auto refineEnd = ProfileClock::now();
 
         if (request.sub == 1) {
-            std::memcpy(
-                request.iterations, _readback.data(), count * sizeof(float));
+            std::memcpy(request.iterations, _readback.data(), count * sizeof(float));
         } else {
-            const size_t stride =
-                static_cast<size_t>(request.width) * request.sub;
+            const size_t stride = static_cast<size_t>(request.width) * request.sub;
             const int center = request.sub / 2;
             for (int y = 0; y < request.height; ++y) {
-                size_t destination =
-                    (static_cast<size_t>(y) * request.sub + center) * stride +
-                    center;
-                const float* source =
-                    _readback.data() + static_cast<size_t>(y) * request.width;
-                for (int x = 0; x < request.width; ++x)
-                    request.iterations[destination +
-                        static_cast<size_t>(x) * request.sub] = source[x];
+                size_t destination = (static_cast<size_t>(y) * request.sub + center) * stride + center;
+                const float* source = _readback.data() + static_cast<size_t>(y) * request.width;
+                for (int x = 0; x < request.width; ++x) request.iterations[destination + static_cast<size_t>(x) * request.sub] = source[x];
             }
         }
         if (profile) {
-            auto milliseconds = [](auto begin, auto end) {
-                return std::chrono::duration<double, std::milli>(
-                    end - begin).count();
-            };
+            auto milliseconds = [](auto begin, auto end) { return std::chrono::duration<double, std::milli>(end - begin).count(); };
             const auto totalEnd = ProfileClock::now();
             fprintf(stderr,
                     "  gpu phases: dispatch=%.3f ms readback=%.3f ms "
                     "refine=%.3f ms total=%.3f ms "
                     "gpu-only=%lld analytic=%lld refined=%lld prefix=%u\n",
-                    milliseconds(dispatchStart, dispatchEnd),
-                    milliseconds(readbackStart, readbackEnd),
-                    milliseconds(refineStart, refineEnd),
-                    milliseconds(totalStart, totalEnd),
-                    static_cast<long long>(count) - analytic - refined,
-                    analytic, static_cast<long long>(refined),
-                    kGpuIterationPrefix);
+                    milliseconds(dispatchStart, dispatchEnd), milliseconds(readbackStart, readbackEnd), milliseconds(refineStart, refineEnd), milliseconds(totalStart, totalEnd), static_cast<long long>(count) - analytic - refined, analytic, static_cast<long long>(refined), kGpuIterationPrefix);
             fflush(stderr);
         }
         return true;
@@ -746,22 +629,15 @@ private:
         ComPtr<IDXGIDevice> dxgiDevice;
         ComPtr<IDXGIAdapter> adapter;
         ComPtr<IDXGIAdapter1> adapter1;
-        if (FAILED(_device.As(&dxgiDevice)) ||
-            FAILED(dxgiDevice->GetAdapter(&adapter)) ||
-            FAILED(adapter.As(&adapter1)) ||
-            FAILED(adapter1->GetDesc1(description)))
-            return false;
+        if (FAILED(_device.As(&dxgiDevice)) || FAILED(dxgiDevice->GetAdapter(&adapter)) || FAILED(adapter.As(&adapter1)) || FAILED(adapter1->GetDesc1(description))) return false;
         return true;
     }
 };
 
 } // namespace
 
-std::unique_ptr<IComputeBackend> createD3D11ComputeBackend(
-    bool warp, std::unique_ptr<IComputeBackend> cpuFallback,
-    std::string* error) {
-    auto backend =
-        std::make_unique<D3D11ComputeBackend>(warp, std::move(cpuFallback));
+std::unique_ptr<IComputeBackend> createD3D11ComputeBackend(bool warp, std::unique_ptr<IComputeBackend> cpuFallback, std::string* error) {
+    auto backend = std::make_unique<D3D11ComputeBackend>(warp, std::move(cpuFallback));
     if (!backend->initialize(error)) return nullptr;
     return backend;
 }

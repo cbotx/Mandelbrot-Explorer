@@ -33,23 +33,18 @@ struct OrbitResult {
 };
 
 class OrbitWorker {
-public:
+  public:
     OrbitWorker();
     ~OrbitWorker();
 
     OrbitWorker(const OrbitWorker&) = delete;
     OrbitWorker& operator=(const OrbitWorker&) = delete;
 
-    void request(mpf_srcptr centerRe, mpf_srcptr centerIm, mpf_srcptr scale,
-                 int pixelX, int pixelY, int width, int height, int maxIterations,
-                 FormulaContext formulaContext,
-                 std::shared_ptr<const formula::ExpressionOrbitSnapshot>
-                     expression = nullptr,
-                 formula::CustomDeepZoomPlan customDeepZoom = {});
+    void request(mpf_srcptr centerRe, mpf_srcptr centerIm, mpf_srcptr scale, int pixelX, int pixelY, int width, int height, int maxIterations, FormulaContext formulaContext, std::shared_ptr<const formula::ExpressionOrbitSnapshot> expression = nullptr, formula::CustomDeepZoomPlan customDeepZoom = {});
     bool takeLatest(OrbitResult& result);
     void cancel();
 
-private:
+  private:
     void run();
 
     std::thread _thread;

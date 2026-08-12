@@ -6,8 +6,7 @@
 
 #include "navigator.h"
 
-Navigator::Navigator(int width, int height, double zoom_step, double zoom_time):
-        _w(width), _h(height), _zoom_step(zoom_step), _zoom_time(zoom_time) {
+Navigator::Navigator(int width, int height, double zoom_step, double zoom_time) : _w(width), _h(height), _zoom_step(zoom_step), _zoom_time(zoom_time) {
     _fix_image_cb = nullptr;
     init();
 }
@@ -64,9 +63,7 @@ void Navigator::Drag(int x, int y) {
 
 void Navigator::DragEnd() {
     _dragging = false;
-    if (_zoom_progress >= 1.0) {
-        init();
-    }
+    if (_zoom_progress >= 1.0) { init(); }
 }
 
 void Navigator::Update() {
@@ -76,9 +73,7 @@ void Navigator::Update() {
         _zoom_progress = 1.0 * elapsed_time / _zoom_time;
         if (_zoom_progress >= 1.0) {
             _zoom_progress = 1.0;
-            if (!_dragging) {
-                init();
-            }
+            if (!_dragging) { init(); }
         }
     }
     _k = std::pow(2.0, easeFunction(_zoom_start, _zoom_end, _zoom_progress));
@@ -91,7 +86,6 @@ void Navigator::Update() {
     }
     _display_dx = _dx - (_zoom_x - _dx) * (_k - 1);
     _display_dy = _dy - (_zoom_y - _dy) * (_k - 1);
-
 }
 void Navigator::init() {
     if (_fix_image_cb) _fix_image_cb();
@@ -113,7 +107,6 @@ void Navigator::JumpReset() {
     _zoom_progress = 1;
     _dragging = false;
 }
-
 
 void Navigator::BindFixImageCallback(void (*func)(void)) {
     _fix_image_cb = func;

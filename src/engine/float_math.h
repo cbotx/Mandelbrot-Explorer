@@ -3,7 +3,6 @@
 
 #include <gmp.h>
 
-
 double mpf_get_ld(mpf_t a);
 
 int get_exp(long double ld);

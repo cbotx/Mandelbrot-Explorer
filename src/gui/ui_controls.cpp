@@ -13,12 +13,10 @@
 
 namespace {
 
-constexpr wchar_t TEXT_FIELD_PROPERTY[] =
-    L"MandelbrotExplorer.Ui.TextField.Context";
+constexpr wchar_t TEXT_FIELD_PROPERTY[] = L"MandelbrotExplorer.Ui.TextField.Context";
 
 bool contains(RECT rect, POINT point) {
-    return point.x >= rect.left && point.x < rect.right &&
-           point.y >= rect.top && point.y < rect.bottom;
+    return point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom;
 }
 
 RECT intersected(RECT a, RECT b) {
@@ -30,14 +28,8 @@ RECT intersected(RECT a, RECT b) {
 COLORREF blend(COLORREF from, COLORREF to, unsigned amount) {
     amount = std::min(amount, 255u);
     unsigned inverse = 255u - amount;
-    auto channel = [inverse, amount](BYTE a, BYTE b) {
-        return static_cast<BYTE>(
-            (static_cast<unsigned>(a) * inverse +
-             static_cast<unsigned>(b) * amount + 127u) / 255u);
-    };
-    return RGB(channel(GetRValue(from), GetRValue(to)),
-               channel(GetGValue(from), GetGValue(to)),
-               channel(GetBValue(from), GetBValue(to)));
+    auto channel = [inverse, amount](BYTE a, BYTE b) { return static_cast<BYTE>((static_cast<unsigned>(a) * inverse + static_cast<unsigned>(b) * amount + 127u) / 255u); };
+    return RGB(channel(GetRValue(from), GetRValue(to)), channel(GetGValue(from), GetGValue(to)), channel(GetBValue(from), GetBValue(to)));
 }
 
 bool writeClipboard(HWND owner, const std::wstring& text) {
@@ -75,8 +67,7 @@ bool readClipboard(HWND owner, std::wstring& text) {
     bool ok = false;
     HGLOBAL memory = static_cast<HGLOBAL>(GetClipboardData(CF_UNICODETEXT));
     if (memory) {
-        const wchar_t* source =
-            static_cast<const wchar_t*>(GlobalLock(memory));
+        const wchar_t* source = static_cast<const wchar_t*>(GlobalLock(memory));
         SIZE_T capacity = GlobalSize(memory) / sizeof(wchar_t);
         if (source && capacity > 0) {
             size_t length = 0;
@@ -88,20 +79,15 @@ bool readClipboard(HWND owner, std::wstring& text) {
     } else {
         memory = static_cast<HGLOBAL>(GetClipboardData(CF_TEXT));
         if (memory) {
-            const char* source =
-                static_cast<const char*>(GlobalLock(memory));
+            const char* source = static_cast<const char*>(GlobalLock(memory));
             SIZE_T capacity = GlobalSize(memory);
             if (source && capacity > 0) {
                 size_t bytes = 0;
                 while (bytes < capacity && source[bytes]) ++bytes;
-                int length = MultiByteToWideChar(
-                    CP_ACP, 0, source, static_cast<int>(bytes), nullptr, 0);
+                int length = MultiByteToWideChar(CP_ACP, 0, source, static_cast<int>(bytes), nullptr, 0);
                 if (length >= 0) {
                     text.resize(static_cast<size_t>(length));
-                    ok = length == 0 ||
-                        MultiByteToWideChar(
-                            CP_ACP, 0, source, static_cast<int>(bytes),
-                            text.data(), length) == length;
+                    ok = length == 0 || MultiByteToWideChar(CP_ACP, 0, source, static_cast<int>(bytes), text.data(), length) == length;
                 }
             }
             if (source) GlobalUnlock(memory);
@@ -129,31 +115,26 @@ TextField::~TextField() {
     destroy();
 }
 
-bool TextField::create(HWND parent, int controlId, size_t maximumLength,
-                       Callback callback) {
+bool TextField::create(HWND parent, int controlId, size_t maximumLength, Callback callback) {
     destroy();
     _lifetime = std::make_shared<int>(0);
     _parent = parent;
     _callback = std::move(callback);
     _maximumLength = maximumLength;
     _blinkReset = GetTickCount();
-    if (!_service.create(
-            parent, controlId, maximumLength,
-            [this](TextService::Event event) { onTextServiceEvent(event); })) {
+    if (!_service.create(parent, controlId, maximumLength, [this](TextService::Event event) { onTextServiceEvent(event); })) {
         _parent = nullptr;
         _callback = {};
         return false;
     }
 
     HWND edit = _service.hwnd();
-    if (!SetPropW(edit, TEXT_FIELD_PROPERTY,
-                  reinterpret_cast<HANDLE>(this))) {
+    if (!SetPropW(edit, TEXT_FIELD_PROPERTY, reinterpret_cast<HANDLE>(this))) {
         destroy();
         return false;
     }
     SetLastError(ERROR_SUCCESS);
-    _editOriginal = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
-        edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&TextField::editProc)));
+    _editOriginal = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&TextField::editProc)));
     if (!_editOriginal && GetLastError() != ERROR_SUCCESS) {
         RemovePropW(edit, TEXT_FIELD_PROPERTY);
         destroy();
@@ -166,13 +147,8 @@ void TextField::destroy() {
     _lifetime.reset();
     HWND edit = _service.hwnd();
     if (edit && IsWindow(edit)) {
-        WNDPROC current = reinterpret_cast<WNDPROC>(
-            GetWindowLongPtrW(edit, GWLP_WNDPROC));
-        if (current == &TextField::editProc && _editOriginal) {
-            SetWindowLongPtrW(
-                edit, GWLP_WNDPROC,
-                reinterpret_cast<LONG_PTR>(_editOriginal));
-        }
+        WNDPROC current = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(edit, GWLP_WNDPROC));
+        if (current == &TextField::editProc && _editOriginal) { SetWindowLongPtrW(edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(_editOriginal)); }
         RemovePropW(edit, TEXT_FIELD_PROPERTY);
     }
     _editOriginal = nullptr;
@@ -239,8 +215,7 @@ void TextField::selectAll() {
     _service.selectAll();
 }
 
-bool TextField::replaceSelection(const std::wstring& replacement,
-                                 bool allowUndo) {
+bool TextField::replaceSelection(const std::wstring& replacement, bool allowUndo) {
     resetBlink();
     return _service.replaceSelection(replacement, allowUndo);
 }
@@ -250,10 +225,7 @@ bool TextField::undo() {
     return _service.undo();
 }
 
-void TextField::updateAdvances(HDC dc, HFONT font,
-                               const std::wstring& value,
-                               int availableWidth,
-                               const std::vector<TextRangeStyle>& ranges) {
+void TextField::updateAdvances(HDC dc, HFONT font, const std::wstring& value, int availableWidth, const std::vector<TextRangeStyle>& ranges) {
     _advances.assign(value.size() + 1u, 0);
     if (value.empty()) {
         _scrollX = 0;
@@ -264,11 +236,8 @@ void TextField::updateAdvances(HDC dc, HFONT font,
     std::vector<int> widths(value.size());
     SIZE size{};
     int fit = 0;
-    if (GetTextExtentExPointW(
-            dc, value.c_str(), static_cast<int>(value.size()),
-            (std::numeric_limits<int>::max)(), &fit, widths.data(), &size)) {
-        for (size_t i = 0; i < value.size(); ++i)
-            _advances[i + 1u] = widths[i];
+    if (GetTextExtentExPointW(dc, value.c_str(), static_cast<int>(value.size()), (std::numeric_limits<int>::max)(), &fit, widths.data(), &size)) {
+        for (size_t i = 0; i < value.size(); ++i) _advances[i + 1u] = widths[i];
     } else {
         for (size_t i = 0; i < value.size(); ++i) {
             SIZE character{};
@@ -294,10 +263,8 @@ void TextField::updateAdvances(HDC dc, HFONT font,
     size_t caret = std::min(_activeCaret, value.size());
     int caretX = _advances[caret];
     int margin = std::max(3, availableWidth / 16);
-    if (caretX - _scrollX > availableWidth - margin)
-        _scrollX = caretX - availableWidth + margin;
-    if (caretX - _scrollX < margin)
-        _scrollX = std::max(0, caretX - margin);
+    if (caretX - _scrollX > availableWidth - margin) _scrollX = caretX - availableWidth + margin;
+    if (caretX - _scrollX < margin) _scrollX = std::max(0, caretX - margin);
     int maximum = std::max(0, _advances.back() - availableWidth + margin);
     _scrollX = std::clamp(_scrollX, 0, maximum);
 }
@@ -308,12 +275,8 @@ int TextField::xForIndex(size_t index) const {
     return _inner.left + _advances[index] - _scrollX;
 }
 
-void TextField::draw(HDC dc, HFONT font, const TextFieldStyle& style,
-                     const std::vector<TextRangeStyle>& ranges) {
-    if (!dc || _bounds.right <= _bounds.left ||
-        _bounds.bottom <= _bounds.top) {
-        return;
-    }
+void TextField::draw(HDC dc, HFONT font, const TextFieldStyle& style, const std::vector<TextRangeStyle>& ranges) {
+    if (!dc || _bounds.right <= _bounds.left || _bounds.bottom <= _bounds.top) { return; }
 
     if (style.drawChrome) {
         COLORREF border = focused() ? CLR_ACCENT : style.border;
@@ -335,64 +298,45 @@ void TextField::draw(HDC dc, HFONT font, const TextFieldStyle& style,
     updateAdvances(dc, font, value, _inner.right - _inner.left, ranges);
 
     int saved = SaveDC(dc);
-    IntersectClipRect(dc, _inner.left, _inner.top,
-                     _inner.right, _inner.bottom);
+    IntersectClipRect(dc, _inner.left, _inner.top, _inner.right, _inner.bottom);
     SetBkMode(dc, TRANSPARENT);
     HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
 
     TEXTMETRICW metrics{};
     GetTextMetricsW(dc, &metrics);
-    int lineHeight = std::max(
-        1, static_cast<int>(_inner.bottom - _inner.top));
-    int textHeight = std::max(
-        1, static_cast<int>(metrics.tmHeight));
+    int lineHeight = std::max(1, static_cast<int>(_inner.bottom - _inner.top));
+    int textHeight = std::max(1, static_cast<int>(metrics.tmHeight));
     int textY = _inner.top + (lineHeight - textHeight) / 2;
 
     if (value.empty()) {
         if (!_placeholder.empty()) {
             SetTextColor(dc, style.placeholder);
-            ExtTextOutW(dc, _inner.left, textY, 0, nullptr,
-                        _placeholder.c_str(),
-                        static_cast<UINT>(_placeholder.size()), nullptr);
+            ExtTextOutW(dc, _inner.left, textY, 0, nullptr, _placeholder.c_str(), static_cast<UINT>(_placeholder.size()), nullptr);
         }
     } else {
         for (const TextRangeStyle& range : ranges) {
             size_t first = std::min(range.first, value.size());
             size_t last = std::min(range.last, value.size());
             if (last <= first || range.background == CLR_INVALID) continue;
-            RECT highlight{
-                xForIndex(first) - std::max(0, range.paddingBefore), textY - 1,
-                xForIndex(last), textY + textHeight + 1
-            };
-            fillRound(dc, highlight, range.background,
-                      range.border == CLR_INVALID
-                          ? range.background : range.border,
-                      4);
+            RECT highlight{xForIndex(first) - std::max(0, range.paddingBefore), textY - 1, xForIndex(last), textY + textHeight + 1};
+            fillRound(dc, highlight, range.background, range.border == CLR_INVALID ? range.background : range.border, 4);
         }
 
         auto selected = selection();
         size_t selectionFirst = std::min(selected.first, value.size());
         size_t selectionLast = std::min(selected.second, value.size());
         if (selectionLast > selectionFirst) {
-            RECT selectionRect{
-                xForIndex(selectionFirst), textY - 1,
-                xForIndex(selectionLast), textY + textHeight + 1
-            };
-            fillRect(dc, selectionRect,
-                     focused() ? style.selection
-                               : blend(style.selection, style.fill, 105));
+            RECT selectionRect{xForIndex(selectionFirst), textY - 1, xForIndex(selectionLast), textY + textHeight + 1};
+            fillRect(dc, selectionRect, focused() ? style.selection : blend(style.selection, style.fill, 105));
         }
 
-        std::vector<size_t> boundaries{0u, value.size(),
-                                      selectionFirst, selectionLast};
+        std::vector<size_t> boundaries{0u, value.size(), selectionFirst, selectionLast};
         for (const TextRangeStyle& range : ranges) {
             boundaries.push_back(std::min(range.first, value.size()));
             boundaries.push_back(std::min(range.last, value.size()));
         }
         std::sort(boundaries.begin(), boundaries.end());
-        boundaries.erase(
-            std::unique(boundaries.begin(), boundaries.end()),
-            boundaries.end());
+        boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
 
         for (size_t i = 0; i + 1u < boundaries.size(); ++i) {
             size_t first = boundaries[i];
@@ -400,16 +344,11 @@ void TextField::draw(HDC dc, HFONT font, const TextFieldStyle& style,
             if (last <= first) continue;
             COLORREF color = _enabled ? style.text : style.disabledText;
             for (const TextRangeStyle& range : ranges) {
-                if (first >= range.first && first < range.last) {
-                    color = _enabled ? range.text : style.disabledText;
-                }
+                if (first >= range.first && first < range.last) { color = _enabled ? range.text : style.disabledText; }
             }
-            if (first >= selectionFirst && first < selectionLast)
-                color = style.selectionText;
+            if (first >= selectionFirst && first < selectionLast) color = style.selectionText;
             SetTextColor(dc, color);
-            ExtTextOutW(dc, xForIndex(first), textY, 0, nullptr,
-                        value.data() + first,
-                        static_cast<UINT>(last - first), nullptr);
+            ExtTextOutW(dc, xForIndex(first), textY, 0, nullptr, value.data() + first, static_cast<UINT>(last - first), nullptr);
         }
     }
 
@@ -422,8 +361,7 @@ void TextField::draw(HDC dc, HFONT font, const TextFieldStyle& style,
             if ((elapsed / blinkTime) % 2u == 0u) {
                 size_t caret = std::min(_activeCaret, value.size());
                 int x = xForIndex(caret);
-                drawLine(dc, x, textY - 1, x, textY + textHeight + 1,
-                         style.caret);
+                drawLine(dc, x, textY - 1, x, textY + textHeight + 1, style.caret);
             }
         }
         size_t caret = std::min(_activeCaret, value.size());
@@ -439,8 +377,7 @@ size_t TextField::indexAtPoint(POINT point) const {
     if (_advances.empty()) return 0;
     int target = point.x - _inner.left + _scrollX;
     if (target <= 0) return 0;
-    auto found = std::lower_bound(
-        _advances.begin(), _advances.end(), target);
+    auto found = std::lower_bound(_advances.begin(), _advances.end(), target);
     if (found == _advances.end()) return _advances.size() - 1u;
     size_t index = static_cast<size_t>(found - _advances.begin());
     if (index > 0u) {
@@ -451,19 +388,13 @@ size_t TextField::indexAtPoint(POINT point) const {
     return index;
 }
 
-RECT TextField::textRangeBounds(size_t first, size_t last,
-                                int leadingPadding) const {
+RECT TextField::textRangeBounds(size_t first, size_t last, int leadingPadding) const {
     if (_advances.empty()) return {};
     size_t maximum = _advances.size() - 1u;
     first = std::min(first, maximum);
     last = std::min(last, maximum);
     if (last < first) std::swap(first, last);
-    return {
-        xForIndex(first) - std::max(0, leadingPadding),
-        _inner.top,
-        xForIndex(last),
-        _inner.bottom
-    };
+    return {xForIndex(first) - std::max(0, leadingPadding), _inner.top, xForIndex(last), _inner.bottom};
 }
 
 bool TextField::mouseDown(POINT point, bool extendSelection) {
@@ -474,14 +405,12 @@ bool TextField::mouseDown(POINT point, bool extendSelection) {
         if (selected.first == selected.second)
             _dragAnchor = selected.first;
         else
-            _dragAnchor = _activeCaret == selected.first
-                ? selected.second : selected.first;
+            _dragAnchor = _activeCaret == selected.first ? selected.second : selected.first;
     } else {
         _dragAnchor = position;
     }
     _activeCaret = position;
-    _caretPreference =
-        position < _dragAnchor ? -1 : (position > _dragAnchor ? 1 : 0);
+    _caretPreference = position < _dragAnchor ? -1 : (position > _dragAnchor ? 1 : 0);
     _dragging = true;
     resetBlink();
     std::weak_ptr<int> lifetime = _lifetime;
@@ -496,8 +425,7 @@ bool TextField::mouseMove(POINT point) {
     size_t position = indexAtPoint(point);
     if (position == _activeCaret) return false;
     _activeCaret = position;
-    _caretPreference =
-        position < _dragAnchor ? -1 : (position > _dragAnchor ? 1 : 0);
+    _caretPreference = position < _dragAnchor ? -1 : (position > _dragAnchor ? 1 : 0);
     resetBlink();
     _service.setSelection(_dragAnchor, position);
     return true;
@@ -510,12 +438,9 @@ void TextField::mouseUp() {
 void TextField::selectWordAt(size_t position) {
     std::wstring value = text();
     position = std::min(position, value.size());
-    auto word = [](wchar_t ch) {
-        return std::iswalnum(ch) || ch == L'_';
-    };
+    auto word = [](wchar_t ch) { return std::iswalnum(ch) || ch == L'_'; };
     size_t probe = position;
-    if (probe == value.size() ||
-        (probe < value.size() && !word(value[probe]))) {
+    if (probe == value.size() || (probe < value.size() && !word(value[probe]))) {
         if (probe == 0 || !word(value[probe - 1u])) return;
         --probe;
     }
@@ -536,8 +461,7 @@ void TextField::onTextServiceEvent(TextService::Event event) {
             _activeCaret = selected.first;
         else if (_caretPreference > 0)
             _activeCaret = selected.second;
-        else if (_activeCaret != selected.first &&
-                 _activeCaret != selected.second)
+        else if (_activeCaret != selected.first && _activeCaret != selected.second)
             _activeCaret = selected.second;
         _caretPreference = 0;
         notify(Event::Changed);
@@ -549,8 +473,7 @@ void TextField::onTextServiceEvent(TextService::Event event) {
             _activeCaret = selected.first;
         else if (_caretPreference > 0)
             _activeCaret = selected.second;
-        else if (_activeCaret != selected.first &&
-                 _activeCaret != selected.second)
+        else if (_activeCaret != selected.first && _activeCaret != selected.second)
             _activeCaret = selected.second;
         _caretPreference = 0;
         notify(Event::CaretMoved);
@@ -575,8 +498,7 @@ bool TextField::copySelection(bool cut) {
     size_t last = std::min(selected.second, value.size());
     if (last <= first) return true;
     if (!writeClipboard(_parent, value.substr(first, last - first))) {
-        notify(Event::ClipboardError,
-               L"Copy failed because the clipboard is unavailable.");
+        notify(Event::ClipboardError, L"Copy failed because the clipboard is unavailable.");
         return false;
     }
     if (cut) {
@@ -589,13 +511,11 @@ bool TextField::copySelection(bool cut) {
 bool TextField::pasteSelection() {
     std::wstring clipboard;
     if (!readClipboard(_parent, clipboard)) {
-        notify(Event::ClipboardError,
-               L"Paste failed because the clipboard has no readable text.");
+        notify(Event::ClipboardError, L"Paste failed because the clipboard has no readable text.");
         return false;
     }
     if (!replaceSelection(clipboard, true)) {
-        notify(Event::ClipboardError,
-               L"Paste failed because the text is too long.");
+        notify(Event::ClipboardError, L"Paste failed because the text is too long.");
         return false;
     }
     return true;
@@ -605,16 +525,13 @@ void TextField::resetBlink() {
     _blinkReset = GetTickCount();
 }
 
-LRESULT CALLBACK TextField::editProc(HWND window, UINT message,
-                                     WPARAM wp, LPARAM lp) {
-    TextField* self = static_cast<TextField*>(
-        GetPropW(window, TEXT_FIELD_PROPERTY));
+LRESULT CALLBACK TextField::editProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    TextField* self = static_cast<TextField*>(GetPropW(window, TEXT_FIELD_PROPERTY));
     if (!self) return DefWindowProcW(window, message, wp, lp);
     return self->handleEditMessage(window, message, wp, lp);
 }
 
-LRESULT TextField::handleEditMessage(HWND window, UINT message,
-                                     WPARAM wp, LPARAM lp) {
+LRESULT TextField::handleEditMessage(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     WNDPROC original = _editOriginal;
     if (!original) return DefWindowProcW(window, message, wp, lp);
 
@@ -643,9 +560,7 @@ LRESULT TextField::handleEditMessage(HWND window, UINT message,
                 _caretPreference = -1;
             else if (wp == VK_RIGHT || wp == VK_END || wp == VK_DOWN)
                 _caretPreference = 1;
-        } else if (wp == VK_LEFT || wp == VK_RIGHT ||
-                   wp == VK_HOME || wp == VK_END ||
-                   wp == VK_UP || wp == VK_DOWN) {
+        } else if (wp == VK_LEFT || wp == VK_RIGHT || wp == VK_HOME || wp == VK_END || wp == VK_UP || wp == VK_DOWN) {
             _caretPreference = 0;
         }
         if (wp == VK_TAB) {
@@ -666,28 +581,15 @@ LRESULT TextField::handleEditMessage(HWND window, UINT message,
                 selectAll();
                 notify(Event::CaretMoved);
                 return 0;
-            case 'C':
-                copySelection(false);
-                return 0;
-            case 'X':
-                copySelection(true);
-                return 0;
-            case 'V':
-                pasteSelection();
-                return 0;
-            case 'Z':
-                undo();
-                return 0;
-            default:
-                break;
+            case 'C': copySelection(false); return 0;
+            case 'X': copySelection(true); return 0;
+            case 'V': pasteSelection(); return 0;
+            case 'Z': undo(); return 0;
+            default: break;
             }
         }
     }
-    if (message == WM_CHAR &&
-        (wp == 1 || wp == 3 || wp == 22 || wp == 24 || wp == 26 ||
-         wp == L'\t' || wp == L'\r')) {
-        return 0;
-    }
+    if (message == WM_CHAR && (wp == 1 || wp == 3 || wp == 22 || wp == 24 || wp == 26 || wp == L'\t' || wp == L'\r')) { return 0; }
     return CallWindowProcW(original, window, message, wp, lp);
 }
 
@@ -702,8 +604,7 @@ void Dropdown::setItems(std::vector<std::wstring> items) {
         _selected = -1;
         close();
     } else {
-        _selected = std::clamp(_selected, 0,
-                               static_cast<int>(_items.size()) - 1);
+        _selected = std::clamp(_selected, 0, static_cast<int>(_items.size()) - 1);
     }
 }
 
@@ -724,12 +625,8 @@ RECT Dropdown::popupBounds(RECT clip) const {
     if (!_popup.open || _items.empty()) return {};
     int rows = std::min(_visibleRows, static_cast<int>(_items.size()));
     int height = rows * _itemHeight + 2;
-    RECT result{
-        _bounds.left, _bounds.bottom + 3,
-        _bounds.right, _bounds.bottom + 3 + height
-    };
-    if (result.bottom > clip.bottom &&
-        _bounds.top - 3 - height >= clip.top) {
+    RECT result{_bounds.left, _bounds.bottom + 3, _bounds.right, _bounds.bottom + 3 + height};
+    if (result.bottom > clip.bottom && _bounds.top - 3 - height >= clip.top) {
         result.bottom = _bounds.top - 3;
         result.top = result.bottom - height;
     }
@@ -739,22 +636,15 @@ RECT Dropdown::popupBounds(RECT clip) const {
 }
 
 RECT Dropdown::itemBounds(int index, RECT clip) const {
-    if (!_popup.open || index < 0 ||
-        index >= static_cast<int>(_items.size())) {
-        return {};
-    }
+    if (!_popup.open || index < 0 || index >= static_cast<int>(_items.size())) { return {}; }
     RECT popup = popupBounds(clip);
-    RECT item{
-        popup.left + 1, popup.top + 1 + index * _itemHeight,
-        popup.right - 1, popup.top + 1 + (index + 1) * _itemHeight
-    };
+    RECT item{popup.left + 1, popup.top + 1 + index * _itemHeight, popup.right - 1, popup.top + 1 + (index + 1) * _itemHeight};
     return intersected(item, popup);
 }
 
 void Dropdown::openPopup(RECT clip) {
     if (_items.empty()) return;
-    _popup.show(static_cast<int>(_items.size()),
-                std::max(0, _selected));
+    _popup.show(static_cast<int>(_items.size()), std::max(0, _selected));
     RECT popup = popupBounds(clip);
     int rows = std::max(1L, (popup.bottom - popup.top - 2) / _itemHeight);
     _visibleRows = std::min(rows, static_cast<int>(_items.size()));
@@ -764,8 +654,7 @@ int Dropdown::itemAtPoint(POINT point, RECT clip) const {
     RECT popup = popupBounds(clip);
     if (!contains(popup, point)) return -1;
     int index = (point.y - popup.top - 1) / std::max(1, _itemHeight);
-    return index >= 0 && index < static_cast<int>(_items.size())
-        ? index : -1;
+    return index >= 0 && index < static_cast<int>(_items.size()) ? index : -1;
 }
 
 bool Dropdown::accept(int index) {
@@ -780,19 +669,14 @@ bool Dropdown::accept(int index) {
     return changed;
 }
 
-void Dropdown::draw(HDC dc, HFONT font,
-                    const DropdownStyle& style) const {
+void Dropdown::draw(HDC dc, HFONT font, const DropdownStyle& style) const {
     COLORREF fill = _hovered ? style.hoverFill : style.fill;
-    fillRound(dc, _bounds, fill,
-              _focused ? CLR_ACCENT : style.border, style.radius);
+    fillRound(dc, _bounds, fill, _focused ? CLR_ACCENT : style.border, style.radius);
     RECT text = _bounds;
     text.left += style.horizontalPadding;
     text.right -= 24;
-    std::wstring label = _selected >= 0 &&
-        _selected < static_cast<int>(_items.size())
-        ? _items[static_cast<size_t>(_selected)] : L"";
-    drawText(dc, text, label, style.text, font,
-             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    std::wstring label = _selected >= 0 && _selected < static_cast<int>(_items.size()) ? _items[static_cast<size_t>(_selected)] : L"";
+    drawText(dc, text, label, style.text, font, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     int centerX = _bounds.right - 12;
     int centerY = (_bounds.top + _bounds.bottom) / 2;
@@ -812,8 +696,7 @@ void Dropdown::draw(HDC dc, HFONT font,
     }
 }
 
-void Dropdown::drawPopup(HDC dc, HFONT font,
-                         const DropdownStyle& style, RECT clip) const {
+void Dropdown::drawPopup(HDC dc, HFONT font, const DropdownStyle& style, RECT clip) const {
     if (!_popup.open) return;
     RECT popup = popupBounds(clip);
     if (popup.right <= popup.left || popup.bottom <= popup.top) return;
@@ -821,15 +704,9 @@ void Dropdown::drawPopup(HDC dc, HFONT font,
     int saved = SaveDC(dc);
     IntersectClipRect(dc, clip.left, clip.top, clip.right, clip.bottom);
     fillRound(dc, popup, style.popupFill, style.border, style.radius);
-    int rows = std::min(
-        static_cast<int>(_items.size()),
-        std::max(0, static_cast<int>(
-            (popup.bottom - popup.top - 2) / _itemHeight)));
+    int rows = std::min(static_cast<int>(_items.size()), std::max(0, static_cast<int>((popup.bottom - popup.top - 2) / _itemHeight)));
     for (int i = 0; i < rows; ++i) {
-        RECT item{
-            popup.left + 1, popup.top + 1 + i * _itemHeight,
-            popup.right - 1, popup.top + 1 + (i + 1) * _itemHeight
-        };
+        RECT item{popup.left + 1, popup.top + 1 + i * _itemHeight, popup.right - 1, popup.top + 1 + (i + 1) * _itemHeight};
         bool selected = i == _popup.selected;
         bool hovered = i == _popup.hovered;
         if (selected || hovered) {
@@ -839,9 +716,7 @@ void Dropdown::drawPopup(HDC dc, HFONT font,
         RECT text = item;
         text.left += style.horizontalPadding;
         text.right -= style.horizontalPadding;
-        drawText(dc, text, _items[static_cast<size_t>(i)],
-                 style.text, font,
-                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        drawText(dc, text, _items[static_cast<size_t>(i)], style.text, font, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     RestoreDC(dc, saved);
 }
@@ -853,19 +728,14 @@ bool Dropdown::mouseMove(POINT point, RECT clip) {
         _hovered = hovered;
         changed = true;
     }
-    if (_popup.open) {
-        changed = _popup.setHovered(itemAtPoint(point, clip)) || changed;
-    }
+    if (_popup.open) { changed = _popup.setHovered(itemAtPoint(point, clip)) || changed; }
     return changed;
 }
 
 Dropdown::MouseResult Dropdown::mouseDown(POINT point, RECT clip) {
     if (_popup.open) {
         int index = itemAtPoint(point, clip);
-        if (index >= 0) {
-            return accept(index) ? MouseResult::SelectionChanged
-                                 : MouseResult::Consumed;
-        }
+        if (index >= 0) { return accept(index) ? MouseResult::SelectionChanged : MouseResult::Consumed; }
         if (contains(_bounds, point)) {
             close();
             return MouseResult::Consumed;
@@ -879,10 +749,11 @@ Dropdown::MouseResult Dropdown::mouseDown(POINT point, RECT clip) {
 }
 
 bool Dropdown::keyDown(UINT virtualKey, bool altDown, RECT clip) {
-    if ((virtualKey == VK_DOWN && altDown) ||
-        virtualKey == VK_F4 || virtualKey == VK_SPACE) {
-        if (_popup.open) close();
-        else openPopup(clip);
+    if ((virtualKey == VK_DOWN && altDown) || virtualKey == VK_F4 || virtualKey == VK_SPACE) {
+        if (_popup.open)
+            close();
+        else
+            openPopup(clip);
         return true;
     }
     if (virtualKey == VK_ESCAPE && _popup.open) {
@@ -948,31 +819,21 @@ RECT Scrollbar::thumbBounds() const {
     int trackHeight = std::max(1L, _bounds.bottom - _bounds.top - 4);
     int content = std::max(1, _state.contentExtent());
     int viewport = std::max(1, _state.viewportExtent());
-    int minimumThumb = std::max(
-        8, MulDiv(
-            std::max(1L, _bounds.right - _bounds.left), 24, 10));
-    int thumbHeight = std::clamp(
-        MulDiv(trackHeight, viewport, content),
-        std::min(minimumThumb, trackHeight), trackHeight);
+    int minimumThumb = std::max(8, MulDiv(std::max(1L, _bounds.right - _bounds.left), 24, 10));
+    int thumbHeight = std::clamp(MulDiv(trackHeight, viewport, content), std::min(minimumThumb, trackHeight), trackHeight);
     int travel = std::max(0, trackHeight - thumbHeight);
     int top = _bounds.top + 2;
-    if (_state.maximumPosition() > 0)
-        top += MulDiv(travel, _state.position(),
-                     _state.maximumPosition());
-    return {_bounds.left + 2, top,
-            _bounds.right - 2, top + thumbHeight};
+    if (_state.maximumPosition() > 0) top += MulDiv(travel, _state.position(), _state.maximumPosition());
+    return {_bounds.left + 2, top, _bounds.right - 2, top + thumbHeight};
 }
 
 void Scrollbar::draw(HDC dc, const ScrollbarStyle& style) const {
     if (!visible()) return;
     fillRect(dc, _bounds, style.rail);
-    drawLine(dc, _bounds.left, _bounds.top,
-             _bounds.left, _bounds.bottom, style.border);
+    drawLine(dc, _bounds.left, _bounds.top, _bounds.left, _bounds.bottom, style.border);
     RECT thumb = thumbBounds();
-    COLORREF color = (_hovered || _dragging)
-        ? style.thumbHover : style.thumb;
-    fillRound(dc, thumb, color, color,
-              std::max(2L, (thumb.right - thumb.left) / 2));
+    COLORREF color = (_hovered || _dragging) ? style.thumbHover : style.thumb;
+    fillRound(dc, thumb, color, color, std::max(2L, (thumb.right - thumb.left) / 2));
 }
 
 bool Scrollbar::mouseDown(POINT point) {
@@ -996,16 +857,11 @@ bool Scrollbar::mouseMove(POINT point) {
 
     RECT thumb = thumbBounds();
     int trackTop = _bounds.top + 2;
-    int trackHeight = std::max(
-        1, static_cast<int>(_bounds.bottom - _bounds.top - 4));
-    int thumbHeight = std::max(
-        1, static_cast<int>(thumb.bottom - thumb.top));
+    int trackHeight = std::max(1, static_cast<int>(_bounds.bottom - _bounds.top - 4));
+    int thumbHeight = std::max(1, static_cast<int>(thumb.bottom - thumb.top));
     int travel = std::max(1, trackHeight - thumbHeight);
-    int top = std::clamp(
-                         static_cast<int>(point.y - _dragOffset),
-                         trackTop, trackTop + travel);
-    int position = MulDiv(top - trackTop,
-                          _state.maximumPosition(), travel);
+    int top = std::clamp(static_cast<int>(point.y - _dragOffset), trackTop, trackTop + travel);
+    int position = MulDiv(top - trackTop, _state.maximumPosition(), travel);
     return setPosition(position) || changedHover;
 }
 

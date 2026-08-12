@@ -25,8 +25,7 @@ scripts auto-detect Visual Studio, the Windows SDK, and vcpkg; set the
 
 ## Build
 
-Build scripts live in `scripts\` and emit into `build\` (each `cd`s to the repo
-root itself, so they can be run from anywhere).
+Build scripts live in `scripts\` and emit into `build\` (each `cd`s to the repo root itself, so they can be run from anywhere).
 
 - `scripts\build_gui.bat` — interactive native Win32 explorer -> `build\mandel_gui.exe`
   (single exe; `vcomp140.dll`, the OpenMP runtime, is copied alongside so the
@@ -36,6 +35,15 @@ root itself, so they can be run from anywhere).
 - `scripts\build_render.bat` — headless BMP renderer -> `build\render.exe`
 - `scripts\build_pbench.bat` — clean-room perturbation/BLA bench -> `build\pbench.exe`
 - `scripts\build_bench.bat` — BigFixed vs GMP micro-bench -> `build\bench_bigfixed.exe`
+
+## Formatting
+
+C++ formatting is pinned to clang-format 22.x. The repository intentionally sets `ColumnLimit: 0` and disables comment reflow, so the formatter does not impose an 80-column wrap.
+
+- `scripts\format_cpp.bat` — format every tracked `.cpp` and `.h` file.
+- `scripts\check_format.bat` — fail if any tracked C++ file is not formatted.
+
+Install the development tool with `python -m pip install --user clang-format==22.1.8`.
 
 ## Run
 

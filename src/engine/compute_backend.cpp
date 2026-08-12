@@ -15,9 +15,8 @@
 namespace {
 
 class CpuComputeBackend final : public IComputeBackend {
-public:
-    explicit CpuComputeBackend(bool fallback, const char* requested,
-                               const std::string& reason = {}) {
+  public:
+    explicit CpuComputeBackend(bool fallback, const char* requested, const std::string& reason = {}) {
         _info.name = "CPU";
         _info.detail = "OpenMP + AVX2";
         _info.fallback = fallback;
@@ -35,12 +34,8 @@ public:
 
     const ComputeBackendInfo& info() const override { return _info; }
     bool lastComputeUsedGpuPath() const override { return false; }
-    bool lastComputeUsedCustomDeepPath() const override {
-        return _lastCustomDeep.load(std::memory_order_acquire);
-    }
-    bool lastComputeUsedGenericDeepPath() const override {
-        return _lastGenericDeep.load(std::memory_order_acquire);
-    }
+    bool lastComputeUsedCustomDeepPath() const override { return _lastCustomDeep.load(std::memory_order_acquire); }
+    bool lastComputeUsedGenericDeepPath() const override { return _lastGenericDeep.load(std::memory_order_acquire); }
     GenericDeepInfo lastGenericDeepInfo() const override {
         std::lock_guard<std::mutex> lock(_genericMutex);
         return _genericInfo;
@@ -59,7 +54,7 @@ public:
             }
             _active->SetHalt(false);
         }
-        ActiveGuard guard{ this };
+        ActiveGuard guard{this};
         _lastCustomDeep.store(false, std::memory_order_release);
         _lastGenericDeep.store(false, std::memory_order_release);
         {
@@ -69,142 +64,55 @@ public:
 
         bool result = true;
         switch (request.mode) {
-        case ComputeMode::Mandelbrot:
-            request.cpuEngine->Compute(
-                request.centerRe, request.centerIm, request.scale,
-                request.maxIterations, request.coloringMethod);
-            break;
-        case ComputeMode::Julia:
-            request.cpuEngine->ComputeJulia(
-                request.centerRe, request.centerIm, request.scale,
-                request.fixedCRe, request.fixedCIm,
-                request.maxIterations, request.coloringMethod);
-            break;
-        case ComputeMode::Expression:
-        {
+        case ComputeMode::Mandelbrot: request.cpuEngine->Compute(request.centerRe, request.centerIm, request.scale, request.maxIterations, request.coloringMethod); break;
+        case ComputeMode::Julia: request.cpuEngine->ComputeJulia(request.centerRe, request.centerIm, request.scale, request.fixedCRe, request.fixedCIm, request.maxIterations, request.coloringMethod); break;
+        case ComputeMode::Expression: {
             formula::ExpressionProductionPlan productionPlan;
-            if (request.expressionSource) {
-                productionPlan = formula::makeExpressionProductionPlan(
-                    *request.expressionSource, *request.expression,
-                    *request.expressionFixed, request.expressionPixel,
-                    request.expressionBailout, request.expressionColoring,
-                    request.scale, request.centerRe, request.centerIm,
-                    request.width, request.height);
-            }
-            const bool aboveDirectLimit =
-                mpf_cmp_d(
-                    request.scale,
-                    formula::CUSTOM_DIRECT_ZOOM_LIMIT) > 0;
+            if (request.expressionSource) { productionPlan = formula::makeExpressionProductionPlan(*request.expressionSource, *request.expression, *request.expressionFixed, request.expressionPixel, request.expressionBailout, request.expressionColoring, request.scale, request.centerRe, request.centerIm, request.width, request.height); }
+            const bool aboveDirectLimit = mpf_cmp_d(request.scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) > 0;
             if (productionPlan.usesQuadraticPerturbation()) {
-                const formula::CustomDeepZoomPlan& deepZoom =
-                    productionPlan.quadratic;
-                const int method =
-                    request.coloringMethod &
-                    ~ColoringMethod::SUPER_SAMPLING;
-                const bool methodMatches =
-                    (deepZoom.outputAdapter ==
-                         formula::CustomDeepZoomOutputAdapter::
-                             SmoothExpression &&
-                     method == 0) ||
-                    (deepZoom.outputAdapter ==
-                         formula::CustomDeepZoomOutputAdapter::
-                             DistanceExpression &&
-                     method ==
-                         ColoringMethod::EXTERIOR_DIST_EST) ||
-                    (deepZoom.outputAdapter ==
-                         formula::CustomDeepZoomOutputAdapter::
-                             FeatherExpression &&
-                     method ==
-                         ColoringMethod::STRIPE_AVERAGE) ||
-                    (deepZoom.outputAdapter ==
-                         formula::CustomDeepZoomOutputAdapter::
-                             OrbitTrapExpression &&
-                     method ==
-                         ColoringMethod::ORBIT_TRAP);
+                const formula::CustomDeepZoomPlan& deepZoom = productionPlan.quadratic;
+                const int method = request.coloringMethod & ~ColoringMethod::SUPER_SAMPLING;
+                const bool methodMatches = (deepZoom.outputAdapter == formula::CustomDeepZoomOutputAdapter::SmoothExpression && method == 0) || (deepZoom.outputAdapter == formula::CustomDeepZoomOutputAdapter::DistanceExpression && method == ColoringMethod::EXTERIOR_DIST_EST) || (deepZoom.outputAdapter == formula::CustomDeepZoomOutputAdapter::FeatherExpression && method == ColoringMethod::STRIPE_AVERAGE) || (deepZoom.outputAdapter == formula::CustomDeepZoomOutputAdapter::OrbitTrapExpression && method == ColoringMethod::ORBIT_TRAP);
                 if (!methodMatches) {
-                    std::fill(
-                        request.iterations,
-                        request.iterations +
-                            static_cast<size_t>(
-                                request.width) * request.height,
-                        formula::ExpressionDeepEmptyPixel);
+                    std::fill(request.iterations, request.iterations + static_cast<size_t>(request.width) * request.height, formula::ExpressionDeepEmptyPixel);
                     result = false;
                     break;
                 }
-                Mandel::ScopedCustomCompute customCompute(
-                    *request.cpuEngine, deepZoom.escapeRadius,
-                    deepZoom.outputAdapter);
+                Mandel::ScopedCustomCompute customCompute(*request.cpuEngine, deepZoom.escapeRadius, deepZoom.outputAdapter);
                 if (!customCompute.active()) {
-                    std::fill(
-                        request.iterations,
-                        request.iterations +
-                            static_cast<size_t>(
-                                request.width) * request.height,
-                        formula::ExpressionDeepEmptyPixel);
+                    std::fill(request.iterations, request.iterations + static_cast<size_t>(request.width) * request.height, formula::ExpressionDeepEmptyPixel);
                     result = false;
                     break;
                 }
-                request.cpuEngine->Compute(
-                    request.centerRe, request.centerIm, request.scale,
-                    request.maxIterations, request.coloringMethod);
+                request.cpuEngine->Compute(request.centerRe, request.centerIm, request.scale, request.maxIterations, request.coloringMethod);
                 _lastCustomDeep.store(true, std::memory_order_release);
                 break;
             }
             if (aboveDirectLimit) {
-                if (!request.expressionSource ||
-                    !productionPlan.usesGenericCertifiedDeep()) {
-                    std::fill(
-                        request.iterations,
-                        request.iterations +
-                            static_cast<size_t>(
-                                request.width) * request.height,
-                        formula::ExpressionDeepEmptyPixel);
+                if (!request.expressionSource || !productionPlan.usesGenericCertifiedDeep()) {
+                    std::fill(request.iterations, request.iterations + static_cast<size_t>(request.width) * request.height, formula::ExpressionDeepEmptyPixel);
                     result = false;
                     break;
                 }
                 result = computeGenericDeep(request);
                 break;
             }
-            const char* cubicSetting =
-                std::getenv("MANDEL_CUBIC_RESIDUAL");
-            const char* residualPowerSetting =
-                std::getenv("MANDEL_EXPR_RESIDUAL_POWER");
-            const char* seriesSetting =
-                std::getenv("MANDEL_EXPR_CUBIC_SA");
-            const char* thresholdSetting =
-                std::getenv("MANDEL_CUBIC_RESIDUAL_SCALE");
-            double threshold = thresholdSetting
-                ? std::atof(thresholdSetting) : 1e8;
-            bool useCubicResidual =
-                (!cubicSetting || std::atoi(cubicSetting) != 0) &&
-                (!residualPowerSetting ||
-                 std::atoi(residualPowerSetting) != 0) &&
-                (!seriesSetting || std::atoi(seriesSetting) != 0) &&
-                std::isfinite(threshold) && threshold > 0.0 &&
-                request.expression->fastIntegerPower() == 3 &&
-                request.expressionPixel == FormulaParameter::C &&
-                mpf_cmp_d(request.scale, threshold) >= 0;
+            const char* cubicSetting = std::getenv("MANDEL_CUBIC_RESIDUAL");
+            const char* residualPowerSetting = std::getenv("MANDEL_EXPR_RESIDUAL_POWER");
+            const char* seriesSetting = std::getenv("MANDEL_EXPR_CUBIC_SA");
+            const char* thresholdSetting = std::getenv("MANDEL_CUBIC_RESIDUAL_SCALE");
+            double threshold = thresholdSetting ? std::atof(thresholdSetting) : 1e8;
+            bool useCubicResidual = (!cubicSetting || std::atoi(cubicSetting) != 0) && (!residualPowerSetting || std::atoi(residualPowerSetting) != 0) && (!seriesSetting || std::atoi(seriesSetting) != 0) && std::isfinite(threshold) && threshold > 0.0 && request.expression->fastIntegerPower() == 3 && request.expressionPixel == FormulaParameter::C && mpf_cmp_d(request.scale, threshold) >= 0;
             if (useCubicResidual) {
-                result = request.cpuEngine->ComputeExpressionResidual(
-                    request.centerRe, request.centerIm, request.scale,
-                    *request.expression, *request.expressionFixed,
-                    request.expressionPixel, request.maxIterations,
-                    request.expressionBailout, nullptr,
-                    request.expressionColoring, nullptr,
-                    std::max(8, request.maxIterations * 9 / 10));
+                result = request.cpuEngine->ComputeExpressionResidual(request.centerRe, request.centerIm, request.scale, *request.expression, *request.expressionFixed, request.expressionPixel, request.maxIterations, request.expressionBailout, nullptr, request.expressionColoring, nullptr, std::max(8, request.maxIterations * 9 / 10));
             } else {
-                result = request.cpuEngine->ComputeExpression(
-                    request.centerRe, request.centerIm, request.scale,
-                    *request.expression, *request.expressionFixed,
-                    request.expressionPixel, request.maxIterations,
-                    request.expressionBailout, request.expressionColoring,
-                    request.expressionJit, request.expressionPlan);
+                result = request.cpuEngine->ComputeExpression(request.centerRe, request.centerIm, request.scale, *request.expression, *request.expressionFixed, request.expressionPixel, request.maxIterations, request.expressionBailout, request.expressionColoring, request.expressionJit, request.expressionPlan);
             }
             break;
         }
         }
-        return result &&
-               !_cancelRequested.load(std::memory_order_acquire);
+        return result && !_cancelRequested.load(std::memory_order_acquire);
     }
 
     void cancel() override {
@@ -215,11 +123,10 @@ public:
 
     void resetCancellation() override {
         std::lock_guard<std::mutex> lock(_mutex);
-        if (!_active)
-            _cancelRequested.store(false, std::memory_order_release);
+        if (!_active) _cancelRequested.store(false, std::memory_order_release);
     }
 
-private:
+  private:
     ComputeBackendInfo _info;
     std::atomic_bool _lastCustomDeep{false};
     std::atomic_bool _lastGenericDeep{false};
@@ -239,54 +146,32 @@ private:
         _active = nullptr;
     }
 
-    static const char* phaseName(
-            formula::ExpressionDeepRenderPhase phase) {
+    static const char* phaseName(formula::ExpressionDeepRenderPhase phase) {
         switch (phase) {
-        case formula::ExpressionDeepRenderPhase::Reference:
-            return "reference/Taylor planning";
-        case formula::ExpressionDeepRenderPhase::Preflight:
-            return "certified fallback preflight";
-        case formula::ExpressionDeepRenderPhase::Fast:
-            return "certified Taylor";
-        case formula::ExpressionDeepRenderPhase::Fallback:
-            return "MPFR fallback";
-        case formula::ExpressionDeepRenderPhase::Complete:
-            return "complete";
+        case formula::ExpressionDeepRenderPhase::Reference: return "reference/Taylor planning";
+        case formula::ExpressionDeepRenderPhase::Preflight: return "certified fallback preflight";
+        case formula::ExpressionDeepRenderPhase::Fast: return "certified Taylor";
+        case formula::ExpressionDeepRenderPhase::Fallback: return "MPFR fallback";
+        case formula::ExpressionDeepRenderPhase::Complete: return "complete";
         }
         return "unknown";
     }
 
-    static float phaseProgress(
-            formula::ExpressionDeepRenderPhase phase,
-            uint64_t completed, uint64_t total) {
-        const float fraction = total
-            ? static_cast<float>(
-                static_cast<double>(completed) /
-                static_cast<double>(total))
-            : 1.0f;
+    static float phaseProgress(formula::ExpressionDeepRenderPhase phase, uint64_t completed, uint64_t total) {
+        const float fraction = total ? static_cast<float>(static_cast<double>(completed) / static_cast<double>(total)) : 1.0f;
         switch (phase) {
-        case formula::ExpressionDeepRenderPhase::Reference:
-            return 0.03f;
-        case formula::ExpressionDeepRenderPhase::Preflight:
-            return 0.04f + 0.06f * fraction;
-        case formula::ExpressionDeepRenderPhase::Fast:
-            return 0.12f + 0.68f * fraction;
-        case formula::ExpressionDeepRenderPhase::Fallback:
-            return 0.80f + 0.19f * fraction;
-        case formula::ExpressionDeepRenderPhase::Complete:
-            return 1.0f;
+        case formula::ExpressionDeepRenderPhase::Reference: return 0.03f;
+        case formula::ExpressionDeepRenderPhase::Preflight: return 0.04f + 0.06f * fraction;
+        case formula::ExpressionDeepRenderPhase::Fast: return 0.12f + 0.68f * fraction;
+        case formula::ExpressionDeepRenderPhase::Fallback: return 0.80f + 0.19f * fraction;
+        case formula::ExpressionDeepRenderPhase::Complete: return 1.0f;
         }
         return 0.0f;
     }
 
     bool computeGenericDeep(const ComputeRequest& request) {
-        const uint64_t pixelCount =
-            static_cast<uint64_t>(request.width) *
-            static_cast<uint64_t>(request.height);
-        std::fill(
-            request.iterations,
-            request.iterations + static_cast<size_t>(pixelCount),
-            formula::ExpressionDeepEmptyPixel);
+        const uint64_t pixelCount = static_cast<uint64_t>(request.width) * static_cast<uint64_t>(request.height);
+        std::fill(request.iterations, request.iterations + static_cast<size_t>(pixelCount), formula::ExpressionDeepEmptyPixel);
         _lastGenericDeep.store(true, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lock(_genericMutex);
@@ -297,8 +182,7 @@ private:
             _genericInfo.progress = 0.0f;
             _genericInfo.pixelCount = pixelCount;
         }
-        if (request.progress)
-            request.progress->store(0.0f, std::memory_order_relaxed);
+        if (request.progress) request.progress->store(0.0f, std::memory_order_relaxed);
 
         formula::ExpressionDeepRenderRequest deepRequest;
         deepRequest.canonicalProgram = request.expressionSource;
@@ -313,141 +197,69 @@ private:
         deepRequest.maxIterations = request.maxIterations;
         deepRequest.bailout = request.expressionBailout;
         deepRequest.output = request.iterations;
-        deepRequest.outputCount =
-            static_cast<size_t>(pixelCount);
-        deepRequest.precision.viewBits =
-            static_cast<mpfr_prec_t>(std::max({
-                mpf_get_prec(request.centerRe),
-                mpf_get_prec(request.centerIm),
-                mpf_get_prec(request.scale)
-            }));
-        deepRequest.shouldCancel = [this, engine = request.cpuEngine] {
-            return _cancelRequested.load(std::memory_order_acquire) ||
-                   engine->HaltRequested();
+        deepRequest.outputCount = static_cast<size_t>(pixelCount);
+        deepRequest.precision.viewBits = static_cast<mpfr_prec_t>(std::max({mpf_get_prec(request.centerRe), mpf_get_prec(request.centerIm), mpf_get_prec(request.scale)}));
+        deepRequest.shouldCancel = [this, engine = request.cpuEngine] { return _cancelRequested.load(std::memory_order_acquire) || engine->HaltRequested(); };
+        deepRequest.progress = [this, progress = request.progress](formula::ExpressionDeepRenderPhase phase, uint64_t completed, uint64_t total) {
+            const float value = phaseProgress(phase, completed, total);
+            if (progress) progress->store(value, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(_genericMutex);
+            _genericInfo.phase = phaseName(phase);
+            _genericInfo.progress = value;
         };
-        deepRequest.progress =
-            [this, progress = request.progress](
-                formula::ExpressionDeepRenderPhase phase,
-                uint64_t completed, uint64_t total) {
-                const float value =
-                    phaseProgress(phase, completed, total);
-                if (progress)
-                    progress->store(
-                        value, std::memory_order_relaxed);
-                std::lock_guard<std::mutex> lock(_genericMutex);
-                _genericInfo.phase = phaseName(phase);
-                _genericInfo.progress = value;
-            };
 
         const auto started = std::chrono::steady_clock::now();
         formula::ExpressionDeepRenderResult deepResult;
-        const bool success =
-            formula::renderExpressionDeepFrame(
-                deepRequest, deepResult);
-        const double totalSeconds =
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - started).count();
+        const bool success = formula::renderExpressionDeepFrame(deepRequest, deepResult);
+        const double totalSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         {
             std::lock_guard<std::mutex> lock(_genericMutex);
             _genericInfo.settled = true;
             _genericInfo.success = success;
             _genericInfo.cancelled = deepResult.cancelled;
-            _genericInfo.taylorAccepted =
-                deepResult.taylorAccepted;
-            _genericInfo.preflightAttempted =
-                deepResult.preflightAttempted;
-            _genericInfo.preflightRejectedFast =
-                deepResult.preflightRejectedFast;
-            _genericInfo.specializedPiecewiseMpfr =
-                deepResult.usedSpecializedPiecewiseMpfr;
-            _genericInfo.status =
-                formula::expressionDeepRenderStatusName(
-                    deepResult.status);
-            _genericInfo.predictedPath =
-                formula::expressionDeepPreflightDecisionName(
-                    deepResult.preflightDecision);
+            _genericInfo.taylorAccepted = deepResult.taylorAccepted;
+            _genericInfo.preflightAttempted = deepResult.preflightAttempted;
+            _genericInfo.preflightRejectedFast = deepResult.preflightRejectedFast;
+            _genericInfo.specializedPiecewiseMpfr = deepResult.usedSpecializedPiecewiseMpfr;
+            _genericInfo.status = formula::expressionDeepRenderStatusName(deepResult.status);
+            _genericInfo.predictedPath = formula::expressionDeepPreflightDecisionName(deepResult.preflightDecision);
             _genericInfo.error = deepResult.error;
-            _genericInfo.phase =
-                success ? "complete" :
-                (deepResult.cancelled ? "cancelled" : "failed");
-            _genericInfo.progress =
-                success ? 1.0f : _genericInfo.progress;
-            _genericInfo.fastPixelCount =
-                deepResult.fastPixelCount;
-            _genericInfo.preflightSampleCount =
-                deepResult.preflightSampleCount;
-            _genericInfo.preflightFallbackCount =
-                deepResult.preflightFallbackCount;
-            _genericInfo.preflightAvoidedFastPixelCount =
-                deepResult.preflightAvoidedFastPixelCount;
-            _genericInfo.preflightIterationCount =
-                deepResult.preflightIterationCount;
-            _genericInfo.preflightOperationCount =
-                deepResult.preflightOperationCount;
-            _genericInfo.preflightFoldOperationCount =
-                deepResult.preflightFoldOperationCount;
-            _genericInfo.preflightFirstUncertainHistogram =
-                deepResult.preflightFirstUncertainHistogram;
-            _genericInfo.fallbackPixelCount =
-                deepResult.fallbackPixelCount;
-            _genericInfo.taylorPixelCoverage =
-                deepResult.taylorAcceptedPixelCoverage;
-            _genericInfo.totalIterationCount =
-                deepResult.totalIterations;
-            _genericInfo.specializedPiecewiseMpfrPixelCount =
-                deepResult.specializedPiecewiseMpfrPixelCount;
-            _genericInfo.specializedPiecewiseMpfrIterationCount =
-                deepResult.specializedPiecewiseMpfrIterationCount;
-            _genericInfo.specializedPiecewiseMpfrPeriodicPixelCount =
-                deepResult.
-                    specializedPiecewiseMpfrPeriodicPixelCount;
-            _genericInfo.selectedPrecision =
-                static_cast<uint64_t>(
-                    deepResult.selectedPrecision);
-            _genericInfo.fallbackPrecision =
-                static_cast<uint64_t>(
-                    deepResult.fallbackPrecision);
+            _genericInfo.phase = success ? "complete" : (deepResult.cancelled ? "cancelled" : "failed");
+            _genericInfo.progress = success ? 1.0f : _genericInfo.progress;
+            _genericInfo.fastPixelCount = deepResult.fastPixelCount;
+            _genericInfo.preflightSampleCount = deepResult.preflightSampleCount;
+            _genericInfo.preflightFallbackCount = deepResult.preflightFallbackCount;
+            _genericInfo.preflightAvoidedFastPixelCount = deepResult.preflightAvoidedFastPixelCount;
+            _genericInfo.preflightIterationCount = deepResult.preflightIterationCount;
+            _genericInfo.preflightOperationCount = deepResult.preflightOperationCount;
+            _genericInfo.preflightFoldOperationCount = deepResult.preflightFoldOperationCount;
+            _genericInfo.preflightFirstUncertainHistogram = deepResult.preflightFirstUncertainHistogram;
+            _genericInfo.fallbackPixelCount = deepResult.fallbackPixelCount;
+            _genericInfo.taylorPixelCoverage = deepResult.taylorAcceptedPixelCoverage;
+            _genericInfo.totalIterationCount = deepResult.totalIterations;
+            _genericInfo.specializedPiecewiseMpfrPixelCount = deepResult.specializedPiecewiseMpfrPixelCount;
+            _genericInfo.specializedPiecewiseMpfrIterationCount = deepResult.specializedPiecewiseMpfrIterationCount;
+            _genericInfo.specializedPiecewiseMpfrPeriodicPixelCount = deepResult.specializedPiecewiseMpfrPeriodicPixelCount;
+            _genericInfo.selectedPrecision = static_cast<uint64_t>(deepResult.selectedPrecision);
+            _genericInfo.fallbackPrecision = static_cast<uint64_t>(deepResult.fallbackPrecision);
             _genericInfo.totalSeconds = totalSeconds;
-            _genericInfo.referenceSeconds =
-                deepResult.referenceSeconds;
-            _genericInfo.preflightSeconds =
-                deepResult.preflightSeconds;
-            _genericInfo.taylorSeconds =
-                deepResult.taylorBuildSeconds +
-                deepResult.fastSeconds;
+            _genericInfo.referenceSeconds = deepResult.referenceSeconds;
+            _genericInfo.preflightSeconds = deepResult.preflightSeconds;
+            _genericInfo.taylorSeconds = deepResult.taylorBuildSeconds + deepResult.fastSeconds;
             _genericInfo.fastSeconds = deepResult.fastSeconds;
-            _genericInfo.fallbackSeconds =
-                deepResult.fallbackSeconds;
+            _genericInfo.fallbackSeconds = deepResult.fallbackSeconds;
         }
-        if (success && request.progress)
-            request.progress->store(1.0f, std::memory_order_relaxed);
+        if (success && request.progress) request.progress->store(1.0f, std::memory_order_relaxed);
         return success;
     }
 
     static bool valid(const ComputeRequest& request) {
-        if (!request.cpuEngine || !request.centerRe || !request.centerIm ||
-            !request.scale || mpf_sgn(request.scale) <= 0 ||
-            request.width < 2 || request.height < 2 ||
-            request.sub < 1 || request.maxIterations < 1 ||
-            !request.iterations)
-            return false;
+        if (!request.cpuEngine || !request.centerRe || !request.centerIm || !request.scale || mpf_sgn(request.scale) <= 0 || request.width < 2 || request.height < 2 || request.sub < 1 || request.maxIterations < 1 || !request.iterations) return false;
         switch (request.mode) {
-        case ComputeMode::Mandelbrot:
-            return true;
-        case ComputeMode::Julia:
-            return request.sub == 1 && request.fixedCRe && request.fixedCIm &&
-                   (request.coloringMethod &
-                    ~ColoringMethod::EXTERIOR_DIST_EST) == 0;
-        case ComputeMode::Expression:
-            return request.expression && request.expression->valid() &&
-                   request.expressionFixed &&
-                   request.sub == 1 &&
-                   std::isfinite(request.expressionBailout) &&
-                   request.expressionBailout > 0.0 &&
-                   (request.expressionPixel == FormulaParameter::C ||
-                    request.expressionPixel == FormulaParameter::InitialZ);
-        default:
-            return false;
+        case ComputeMode::Mandelbrot: return true;
+        case ComputeMode::Julia: return request.sub == 1 && request.fixedCRe && request.fixedCIm && (request.coloringMethod & ~ColoringMethod::EXTERIOR_DIST_EST) == 0;
+        case ComputeMode::Expression: return request.expression && request.expression->valid() && request.expressionFixed && request.sub == 1 && std::isfinite(request.expressionBailout) && request.expressionBailout > 0.0 && (request.expressionPixel == FormulaParameter::C || request.expressionPixel == FormulaParameter::InitialZ);
+        default: return false;
         }
     }
 };
@@ -455,21 +267,16 @@ private:
 } // namespace
 
 std::unique_ptr<IComputeBackend> createComputeBackend(const char* requested) {
-    bool cpu = !requested || !*requested || _stricmp(requested, "cpu") == 0 ||
-               _stricmp(requested, "auto") == 0;
+    bool cpu = !requested || !*requested || _stricmp(requested, "cpu") == 0 || _stricmp(requested, "auto") == 0;
     if (cpu) return std::make_unique<CpuComputeBackend>(false, requested);
 
-    const bool gpu = _stricmp(requested, "gpu") == 0 ||
-                     _stricmp(requested, "d3d11") == 0;
-    const bool warp = _stricmp(requested, "warp") == 0 ||
-                      _stricmp(requested, "d3d11-warp") == 0;
+    const bool gpu = _stricmp(requested, "gpu") == 0 || _stricmp(requested, "d3d11") == 0;
+    const bool warp = _stricmp(requested, "warp") == 0 || _stricmp(requested, "d3d11-warp") == 0;
     if (gpu || warp) {
         std::string error;
-        auto backend = createD3D11ComputeBackend(
-            warp, std::make_unique<CpuComputeBackend>(false, "cpu"), &error);
+        auto backend = createD3D11ComputeBackend(warp, std::make_unique<CpuComputeBackend>(false, "cpu"), &error);
         if (backend) return backend;
         return std::make_unique<CpuComputeBackend>(true, requested, error);
     }
-    return std::make_unique<CpuComputeBackend>(
-        true, requested, "unknown backend name");
+    return std::make_unique<CpuComputeBackend>(true, requested, "unknown backend name");
 }

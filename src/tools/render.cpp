@@ -20,14 +20,13 @@
 
 static const int colP = 2048;
 static float color_map[3][colP];
-static float color_density = 60.0f;   // MANDEL_DENS overrides (comparison tooling)
+static float color_density = 60.0f; // MANDEL_DENS overrides (comparison tooling)
 
 static void colorMapInit() {
     static const int N = 6;
-    static const float pos[N] = { 0.0f, 0.16f, 0.42f, 0.6425f, 0.8575f, 1.0f };
-    static const float col[3][N] = { {0,32,237,255,0,0}, {70,107,255,170,2,70}, {100,203,255,0,0,100} };
-    for (int i = 0; i < 3; ++i)
-        mono_cubic_interpolate(pos, col[i], N, color_map[i], colP);
+    static const float pos[N] = {0.0f, 0.16f, 0.42f, 0.6425f, 0.8575f, 1.0f};
+    static const float col[3][N] = {{0, 32, 237, 255, 0, 0}, {70, 107, 255, 170, 2, 70}, {100, 203, 255, 0, 0, 100}};
+    for (int i = 0; i < 3; ++i) mono_cubic_interpolate(pos, col[i], N, color_map[i], colP);
 }
 
 static inline float color_func(float it) {
@@ -45,15 +44,15 @@ static int g_trap = 0;
 // MANDEL_RELIEF_STR (slope strength).
 static int g_relief = 0;
 static double g_light_az = 2.3, g_light_el = 0.55, g_relief_str = 1.0;
-static double g_de_k = 1.5;   // DE-overlay falloff (MANDEL_DE_K)
+static double g_de_k = 1.5; // DE-overlay falloff (MANDEL_DE_K)
 
 static float reliefShadeAt(const float* iter, int y, int x, int Ws, int Hs) {
     float c = iter[(size_t)y * Ws + x];
-    if (c < 0) return 1.0f;                       // interior / empty: unshaded
+    if (c < 0) return 1.0f; // interior / empty: unshaded
     auto val = [&](int yy, int xx) -> float {
         if (xx < 0 || xx >= Ws || yy < 0 || yy >= Hs) return c;
         float v = iter[(size_t)yy * Ws + xx];
-        return v < 0 ? c : v;                     // clamp to centre across the set boundary
+        return v < 0 ? c : v; // clamp to centre across the set boundary
     };
     float sx = (val(y, x + 1) - val(y, x - 1)) * 0.5f;
     float sy = (val(y + 1, x) - val(y - 1, x)) * 0.5f;
@@ -62,47 +61,67 @@ static float reliefShadeAt(const float* iter, int y, int x, int Ws, int Hs) {
     double lx = std::cos(g_light_el) * std::cos(g_light_az);
     double ly = std::cos(g_light_el) * std::sin(g_light_az);
     double lz = std::sin(g_light_el);
-    double d = (nx * lx + ny * ly + nz * lz) * inv;   // L is unit
+    double d = (nx * lx + ny * ly + nz * lz) * inv; // L is unit
     if (d < 0) d = 0;
-    return (float)(0.25 + 0.85 * d);              // ambient + diffuse
+    return (float)(0.25 + 0.85 * d); // ambient + diffuse
 }
 
 static void getColor(float it, float& r, float& g, float& b) {
-    if (it < 0) { r = g = b = 0; return; }   // interior -> black
+    if (it < 0) {
+        r = g = b = 0;
+        return;
+    } // interior -> black
     // SAC value is already in [0,1]; map it around the palette a few times for
     // banded feather texture. Iteration counts use the log-power curve.
-    float f = g_sac ? it * (color_density / 20.0f)
-            : g_ede ? tanhf(it * color_density / 3600.0f * 5.0f)
-            : g_trap ? it                       // orbit-trap value is a palette coordinate
-            : color_func(it);
+    float f = g_sac    ? it * (color_density / 20.0f)
+              : g_ede  ? tanhf(it * color_density / 3600.0f * 5.0f)
+              : g_trap ? it // orbit-trap value is a palette coordinate
+                       : color_func(it);
     int x = (int)(f * colP) % colP;
     if (x < 0) x += colP;
-    r = color_map[0][x]; g = color_map[1][x]; b = color_map[2][x];
+    r = color_map[0][x];
+    g = color_map[1][x];
+    b = color_map[2][x];
 }
 
-static inline float toLin(float c) { return powf(c / 255.f, 2.2f); }
-static inline float toGam(float l) { return 255.f * powf(l < 0 ? 0 : l, 1.f / 2.2f); }
+static inline float toLin(float c) {
+    return powf(c / 255.f, 2.2f);
+}
+static inline float toGam(float l) {
+    return 255.f * powf(l < 0 ? 0 : l, 1.f / 2.2f);
+}
 
 static void writeBMP(const char* path, const std::vector<uint8_t>& rgb, int W, int H) {
-    int row = (W * 3 + 3) & ~3;               // 4-byte aligned rows
+    int row = (W * 3 + 3) & ~3; // 4-byte aligned rows
     int dataSize = row * H;
-    uint8_t fh[14] = { 'B','M' };
+    uint8_t fh[14] = {'B', 'M'};
     uint32_t fsize = 14 + 40 + dataSize;
     memcpy(fh + 2, &fsize, 4);
-    uint32_t off = 54; memcpy(fh + 10, &off, 4);
-    uint8_t ih[40] = { 0 }; uint32_t v;
-    v = 40; memcpy(ih + 0, &v, 4);
-    v = W; memcpy(ih + 4, &v, 4);
-    v = H; memcpy(ih + 8, &v, 4);
-    uint16_t planes = 1, bpp = 24; memcpy(ih + 12, &planes, 2); memcpy(ih + 14, &bpp, 2);
-    v = dataSize; memcpy(ih + 20, &v, 4);
+    uint32_t off = 54;
+    memcpy(fh + 10, &off, 4);
+    uint8_t ih[40] = {0};
+    uint32_t v;
+    v = 40;
+    memcpy(ih + 0, &v, 4);
+    v = W;
+    memcpy(ih + 4, &v, 4);
+    v = H;
+    memcpy(ih + 8, &v, 4);
+    uint16_t planes = 1, bpp = 24;
+    memcpy(ih + 12, &planes, 2);
+    memcpy(ih + 14, &bpp, 2);
+    v = dataSize;
+    memcpy(ih + 20, &v, 4);
     FILE* f = fopen(path, "wb");
-    fwrite(fh, 1, 14, f); fwrite(ih, 1, 40, f);
+    fwrite(fh, 1, 14, f);
+    fwrite(ih, 1, 40, f);
     std::vector<uint8_t> line(row, 0);
-    for (int y = H - 1; y >= 0; --y) {          // BMP is bottom-up
+    for (int y = H - 1; y >= 0; --y) { // BMP is bottom-up
         for (int x = 0; x < W; ++x) {
             const uint8_t* p = &rgb[(y * W + x) * 3];
-            line[x * 3 + 0] = p[2]; line[x * 3 + 1] = p[1]; line[x * 3 + 2] = p[0]; // BGR
+            line[x * 3 + 0] = p[2];
+            line[x * 3 + 1] = p[1];
+            line[x * 3 + 2] = p[0]; // BGR
         }
         fwrite(line.data(), 1, row, f);
     }
@@ -133,15 +152,20 @@ int main(int argc, char** argv) {
         std::string mant = (ep == std::string::npos) ? sa : sa.substr(0, ep);
         int e10 = (ep == std::string::npos) ? 0 : atoi(sa.substr(ep + 1).c_str());
         std::string sign;
-        if (!mant.empty() && (mant[0] == '-' || mant[0] == '+')) { sign = (mant[0] == '-') ? "-" : ""; mant.erase(0, 1); }
+        if (!mant.empty() && (mant[0] == '-' || mant[0] == '+')) {
+            sign = (mant[0] == '-') ? "-" : "";
+            mant.erase(0, 1);
+        }
         size_t dp = mant.find('.');
         int frac = (dp == std::string::npos) ? 0 : (int)(mant.size() - dp - 1);
         if (dp != std::string::npos) mant.erase(dp, 1);
         int zeros = e10 - frac;
-        scale = sign + mant; if (zeros > 0) scale.append(zeros, '0');
+        scale = sign + mant;
+        if (zeros > 0) scale.append(zeros, '0');
     } else {
         int scaleExp = atoi(sa.c_str());
-        scale = "1"; for (int i = 0; i < scaleExp; ++i) scale += "0";
+        scale = "1";
+        for (int i = 0; i < scaleExp; ++i) scale += "0";
     }
     int precision = (int)(scale.size() * log(10) / log(2)) + 64;
     // MANDEL_PREC=<decimal digits> overrides the pixel-spacing-derived precision. Some
@@ -184,12 +208,17 @@ int main(int argc, char** argv) {
     mpf_init_set_str(mcy, cy, 10);
     mpf_init_set_str(msc, scale.c_str(), 10);
 
-    printf("Rendering %dx%d (SS=%d -> %dx%d), scale=%s (%zu digits), mxit=%d, prec=%d ...\n",
-           W, H, SS, Ws, Hs, scaleArg, scale.size(), mxit, precision);
+    printf("Rendering %dx%d (SS=%d -> %dx%d), scale=%s (%zu digits), mxit=%d, prec=%d ...\n", W, H, SS, Ws, Hs, scaleArg, scale.size(), mxit, precision);
     int cmethod = (getenv("MANDEL_EDE") && atoi(getenv("MANDEL_EDE"))) ? ColoringMethod::EXTERIOR_DIST_EST : 0;
     if (cmethod & ColoringMethod::EXTERIOR_DIST_EST) g_ede = 1;
-    if (getenv("MANDEL_SAC") && atoi(getenv("MANDEL_SAC"))) { cmethod |= ColoringMethod::STRIPE_AVERAGE; g_sac = 1; }
-    if (getenv("MANDEL_TRAP") && atoi(getenv("MANDEL_TRAP"))) { cmethod |= ColoringMethod::ORBIT_TRAP; g_trap = 1; }
+    if (getenv("MANDEL_SAC") && atoi(getenv("MANDEL_SAC"))) {
+        cmethod |= ColoringMethod::STRIPE_AVERAGE;
+        g_sac = 1;
+    }
+    if (getenv("MANDEL_TRAP") && atoi(getenv("MANDEL_TRAP"))) {
+        cmethod |= ColoringMethod::ORBIT_TRAP;
+        g_trap = 1;
+    }
     if (normbuf) cmethod |= ColoringMethod::NORMAL_MAP;
     if (debuf) cmethod |= ColoringMethod::DE_OVERLAY;
     mandel.Compute(mcx, mcy, msc, mxit, cmethod);
@@ -209,12 +238,15 @@ int main(int argc, char** argv) {
                 for (int c = 0; c < Ws; ++c) iter[(size_t)(base + r) * Ws + c] = sbuf[(size_t)r * Ws + c];
         }
     }
-    if (getenv("MANDEL_ORACLE")) mandel.ComputeDirect(mxit, iter, 1, cmethod);   // brute-force GMP ground truth
+    if (getenv("MANDEL_ORACLE")) mandel.ComputeDirect(mxit, iter, 1, cmethod); // brute-force GMP ground truth
 
-    if (getenv("MANDEL_DUMPRAW")) {   // raw per-pixel value (float) for exact diffs
+    if (getenv("MANDEL_DUMPRAW")) { // raw per-pixel value (float) for exact diffs
         std::string rp = std::string(out) + ".raw";
         FILE* rf = fopen(rp.c_str(), "wb");
-        if (rf) { fwrite(iter, sizeof(float), (size_t)Ws * Hs, rf); fclose(rf); }
+        if (rf) {
+            fwrite(iter, sizeof(float), (size_t)Ws * Hs, rf);
+            fclose(rf);
+        }
     }
 
     // Colour hi-res, box-downsample SSxSS in linear light.
@@ -227,7 +259,8 @@ int main(int argc, char** argv) {
             for (int a = 0; a < SS; ++a)
                 for (int b = 0; b < SS; ++b) {
                     int yy = i * SS + a, xx = j * SS + b;
-                    float r, g, bb; getColor(iter[(size_t)yy * Ws + xx], r, g, bb);
+                    float r, g, bb;
+                    getColor(iter[(size_t)yy * Ws + xx], r, g, bb);
                     double clinR = toLin(r), clinG = toLin(g), clinB = toLin(bb);
                     if (debuf) {
                         // DE drawn as a PURE black&white layer: greyscale filament lace
@@ -246,16 +279,19 @@ int main(int argc, char** argv) {
                         // Analytic normal-map Lambert shade from arg(z)-arg(dz/dc).
                         float ang = normbuf[(size_t)yy * Ws + xx];
                         double nx = cos(ang), ny = sin(ang), nz = 1.0;
-                        double inv = 1.0 / sqrt(nx*nx + ny*ny + nz*nz);
-                        double lx = cos(g_light_el)*cos(g_light_az);
-                        double ly = cos(g_light_el)*sin(g_light_az);
+                        double inv = 1.0 / sqrt(nx * nx + ny * ny + nz * nz);
+                        double lx = cos(g_light_el) * cos(g_light_az);
+                        double ly = cos(g_light_el) * sin(g_light_az);
                         double lz = sin(g_light_el);
-                        double d = (nx*lx + ny*ly + nz*lz) * inv; if (d < 0) d = 0;
+                        double d = (nx * lx + ny * ly + nz * lz) * inv;
+                        if (d < 0) d = 0;
                         sh = (float)(0.3 + 0.8 * d);
                     } else if (g_relief) {
                         sh = reliefShadeAt(iter, yy, xx, Ws, Hs);
                     }
-                    lr += clinR * sh; lg += clinG * sh; lb += clinB * sh;
+                    lr += clinR * sh;
+                    lg += clinG * sh;
+                    lb += clinB * sh;
                 }
             int n = SS * SS;
             uint8_t* p = &img[(i * W + j) * 3];

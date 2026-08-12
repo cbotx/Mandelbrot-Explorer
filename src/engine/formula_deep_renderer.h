@@ -35,7 +35,7 @@ struct ExpressionDeepThreadPolicy {
 };
 
 struct ExpressionDeepMemoryPolicy {
-    size_t memoryLimitBytes = size_t{ 1 } << 30;
+    size_t memoryLimitBytes = size_t{1} << 30;
     mpfr_prec_t fallbackGuardBits = 128;
 };
 
@@ -49,8 +49,7 @@ struct ExpressionDeepTaylorPolicy {
     int order = 12;
     int minimumOrder = 8;
     int maximumOrder = 20;
-    int maximumBivariateOrder =
-        ExpressionTaylorMaximumBivariateOrder;
+    int maximumBivariateOrder = ExpressionTaylorMaximumBivariateOrder;
     int maximumCompositionOrder = 24;
     int maximumCandidateIteration = 0;
     double accuracyBudget = 0x1p-40;
@@ -73,56 +72,46 @@ struct ExpressionDeepPreflightPolicy {
     uint32_t earlyRejectMinimumFirstUncertainIteration = 8;
 };
 
-enum class ExpressionDeepRenderPhase : uint8_t {
-    Reference,
-    Preflight,
-    Fast,
-    Fallback,
-    Complete
-};
+enum class ExpressionDeepRenderPhase : uint8_t { Reference,
+                                                 Preflight,
+                                                 Fast,
+                                                 Fallback,
+                                                 Complete };
 
-enum class ExpressionDeepPreflightDecision : uint8_t {
-    NotRun,
-    ContinueCertifiedFast,
-    DirectMpfr
-};
+enum class ExpressionDeepPreflightDecision : uint8_t { NotRun,
+                                                       ContinueCertifiedFast,
+                                                       DirectMpfr };
 
 constexpr size_t ExpressionDeepUncertaintyHistogramBins = 16;
 
-enum class ExpressionDeepFallbackReason : uint8_t {
-    UncertifiedSeries,
-    BranchSensitive,
-    UnsupportedOperation,
-    Singular,
-    Nonfinite,
-    ExponentRange,
-    InvalidTape,
-    ReferenceExhausted,
-    CertificationFailure,
-    BailoutUncertain,
-    ReconstructionFailure,
-    Count
-};
+enum class ExpressionDeepFallbackReason : uint8_t { UncertifiedSeries,
+                                                    BranchSensitive,
+                                                    UnsupportedOperation,
+                                                    Singular,
+                                                    Nonfinite,
+                                                    ExponentRange,
+                                                    InvalidTape,
+                                                    ReferenceExhausted,
+                                                    CertificationFailure,
+                                                    BailoutUncertain,
+                                                    ReconstructionFailure,
+                                                    Count };
 
-enum class ExpressionDeepRenderStatus : uint8_t {
-    Success,
-    Cancelled,
-    InvalidRequest,
-    ProgramMismatch,
-    PrecisionOutOfRange,
-    ResourceLimit,
-    ReferenceFailure,
-    UndefinedPixel,
-    InternalError
-};
+enum class ExpressionDeepRenderStatus : uint8_t { Success,
+                                                  Cancelled,
+                                                  InvalidRequest,
+                                                  ProgramMismatch,
+                                                  PrecisionOutOfRange,
+                                                  ResourceLimit,
+                                                  ReferenceFailure,
+                                                  UndefinedPixel,
+                                                  InternalError };
 
-enum class ExpressionDeepVerificationFault : uint8_t {
-    None,
-    FastWorkerAllocation,
-    FastIterationAllocation,
-    FallbackWorkerAllocation,
-    FallbackIterationAllocation
-};
+enum class ExpressionDeepVerificationFault : uint8_t { None,
+                                                       FastWorkerAllocation,
+                                                       FastIterationAllocation,
+                                                       FallbackWorkerAllocation,
+                                                       FallbackIterationAllocation };
 
 struct ExpressionDeepRenderRequest {
     const ExpressionProgram* canonicalProgram = nullptr;
@@ -153,18 +142,15 @@ struct ExpressionDeepRenderRequest {
     int verificationErrorInflationBits = 0;
     // Verification-only deterministic exception injection. Production callers
     // must leave this at None.
-    ExpressionDeepVerificationFault verificationFault =
-        ExpressionDeepVerificationFault::None;
+    ExpressionDeepVerificationFault verificationFault = ExpressionDeepVerificationFault::None;
     // Cancellation may be polled concurrently by worker threads. Progress
     // callbacks are serialized by the renderer.
     std::function<bool()> shouldCancel;
-    std::function<void(
-        ExpressionDeepRenderPhase, uint64_t, uint64_t)> progress;
+    std::function<void(ExpressionDeepRenderPhase, uint64_t, uint64_t)> progress;
 };
 
 struct ExpressionDeepRenderResult {
-    ExpressionDeepRenderStatus status =
-        ExpressionDeepRenderStatus::InvalidRequest;
+    ExpressionDeepRenderStatus status = ExpressionDeepRenderStatus::InvalidRequest;
     std::string error;
     bool success = false;
     bool cancelled = false;
@@ -174,8 +160,7 @@ struct ExpressionDeepRenderResult {
     double fallbackSeconds = 0.0;
     bool preflightAttempted = false;
     bool preflightRejectedFast = false;
-    ExpressionDeepPreflightDecision preflightDecision =
-        ExpressionDeepPreflightDecision::NotRun;
+    ExpressionDeepPreflightDecision preflightDecision = ExpressionDeepPreflightDecision::NotRun;
     uint64_t preflightSampleCount = 0;
     uint64_t preflightFallbackCount = 0;
     uint64_t preflightFastCount = 0;
@@ -183,25 +168,18 @@ struct ExpressionDeepRenderResult {
     uint64_t preflightOperationCount = 0;
     uint64_t preflightFoldOperationCount = 0;
     uint64_t preflightUncertainFoldCount = 0;
-    uint32_t preflightMinimumFirstUncertainIteration =
-        UINT32_MAX;
+    uint32_t preflightMinimumFirstUncertainIteration = UINT32_MAX;
     uint32_t preflightMaximumFirstUncertainIteration = 0;
     uint64_t preflightAvoidedFastPixelCount = 0;
     uint64_t preflightAvoidedIterationEstimate = 0;
     uint64_t preflightAvoidedOperationEstimate = 0;
-    std::array<uint64_t,
-        ExpressionDeepUncertaintyHistogramBins>
-        preflightFirstUncertainHistogram{};
-    std::array<uint64_t,
-        static_cast<size_t>(ExpressionDeepFallbackReason::Count)>
-        preflightFallbackReasonCounts{};
+    std::array<uint64_t, ExpressionDeepUncertaintyHistogramBins> preflightFirstUncertainHistogram{};
+    std::array<uint64_t, static_cast<size_t>(ExpressionDeepFallbackReason::Count)> preflightFallbackReasonCounts{};
     uint64_t fastPixelCount = 0;
     uint64_t fallbackPixelCount = 0;
     uint64_t uncertainPixelCount = 0;
     uint64_t undefinedPixelCount = 0;
-    std::array<uint64_t,
-        static_cast<size_t>(ExpressionDeepFallbackReason::Count)>
-        fallbackReasonCounts{};
+    std::array<uint64_t, static_cast<size_t>(ExpressionDeepFallbackReason::Count)> fallbackReasonCounts{};
     uint64_t maxFallbackReasonCount = 0;
     uint64_t fallbackTileCount = 0;
     double maxTileFallbackRate = 0.0;
@@ -216,9 +194,7 @@ struct ExpressionDeepRenderResult {
     uint64_t fastSeriesOperationCount = 0;
     uint64_t fastFoldOperationCount = 0;
     uint64_t fastUncertainFoldCount = 0;
-    std::array<uint64_t,
-        ExpressionDeepUncertaintyHistogramBins>
-        fallbackFirstUncertainHistogram{};
+    std::array<uint64_t, ExpressionDeepUncertaintyHistogramBins> fallbackFirstUncertainHistogram{};
     bool usedSpecializedPiecewiseMpfr = false;
     uint64_t specializedPiecewiseMpfrPixelCount = 0;
     uint64_t specializedPiecewiseMpfrIterationCount = 0;
@@ -226,8 +202,7 @@ struct ExpressionDeepRenderResult {
     bool taylorAttempted = false;
     bool taylorAccepted = false;
     int taylorOrder = 0;
-    ExpressionTaylorJetLayout taylorLayout =
-        ExpressionTaylorJetLayout::ComplexUnivariate;
+    ExpressionTaylorJetLayout taylorLayout = ExpressionTaylorJetLayout::ComplexUnivariate;
     size_t taylorMonomialCount = 0;
     uint64_t taylorBivariateConvolutionOperationCount = 0;
     int taylorCoveredIterations = 0;
@@ -282,19 +257,14 @@ struct ExpressionDeepRenderResult {
     uint64_t taylorTileMapHash = 0;
     size_t taylorMemoryBytes = 0;
     size_t taylorRetainedBytes = 0;
-    ExpressionTaylorJetStatus taylorStatus =
-        ExpressionTaylorJetStatus::NoCoverage;
+    ExpressionTaylorJetStatus taylorStatus = ExpressionTaylorJetStatus::NoCoverage;
     std::string taylorFailureReason;
-    ExpressionScaledResidualCapability capability =
-        ExpressionScaledResidualCapability::Unsupported;
+    ExpressionScaledResidualCapability capability = ExpressionScaledResidualCapability::Unsupported;
 };
 
-const char* expressionDeepRenderStatusName(
-    ExpressionDeepRenderStatus status);
-const char* expressionDeepFallbackReasonName(
-    ExpressionDeepFallbackReason reason);
-const char* expressionDeepPreflightDecisionName(
-    ExpressionDeepPreflightDecision decision);
+const char* expressionDeepRenderStatusName(ExpressionDeepRenderStatus status);
+const char* expressionDeepFallbackReasonName(ExpressionDeepFallbackReason reason);
+const char* expressionDeepPreflightDecisionName(ExpressionDeepPreflightDecision decision);
 
 // Renders finite-iteration escape classifications. The arithmetic fast path is
 // certified relative to an independently iterated higher-precision MPFR oracle;
@@ -313,9 +283,7 @@ const char* expressionDeepPreflightDecisionName(
 // first-escape, and profitability gates remain in force for every tile.
 // Interior output means only that no escape was observed before maxIterations,
 // not mathematical membership.
-bool renderExpressionDeepFrame(
-    const ExpressionDeepRenderRequest& request,
-    ExpressionDeepRenderResult& result);
+bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, ExpressionDeepRenderResult& result);
 
 } // namespace formula
 

@@ -14,42 +14,48 @@ float color_phase = 0.0f;
 
 // Relief (screen-space slope) lighting. Off by default; enabled by the "Relief"
 // coloring mode. Light from the upper-left, moderate slope.
-int   relief_on = 0;
-int   normal_light_on = 0;
-int   de_overlay_on = 0;
+int relief_on = 0;
+int normal_light_on = 0;
+int de_overlay_on = 0;
 float relief_light_az = 2.3f;
 float relief_light_el = 0.55f;
 float relief_strength = 1.0f;
-float de_k = 4.8f;       // DE overlay: colour-ramp / boundary scale (GUI slider)
-float de_scale = 1.6f;   // DE overlay: optical (inverse-square) falloff scale (GUI slider)
+float de_k = 4.8f;     // DE overlay: colour-ramp / boundary scale (GUI slider)
+float de_scale = 1.6f; // DE overlay: optical (inverse-square) falloff scale (GUI slider)
 
 // INTERIOR_SENTINEL (-2.0f) is declared in Image.h. A far-field point can escape
 // with a slightly NEGATIVE smooth count, so "interior" must be the exact sentinel.
-static inline bool isInterior(float it) { return it == INTERIOR_SENTINEL; }
+static inline bool isInterior(float it) {
+    return it == INTERIOR_SENTINEL;
+}
 
 static float colorFunction(float it, int method) {
-    if (method & ColoringMethod::STRIPE_AVERAGE)
-        return it * (color_density / 20.0f);   // SAC value in [0,1] -> banded palette
-    if (method & ColoringMethod::ORBIT_TRAP)
-        return it * (color_density / 60.0f);    // density scales the trap band frequency
-    if (method & ColoringMethod::EXTERIOR_DIST_EST)
-        return tanhf(it * color_density / 3600.0f * 5.0f);
-    if (it < 0.0f) it = 0.0f;                  // far-field fast escapes: small negative count
+    if (method & ColoringMethod::STRIPE_AVERAGE) return it * (color_density / 20.0f); // SAC value in [0,1] -> banded palette
+    if (method & ColoringMethod::ORBIT_TRAP) return it * (color_density / 60.0f);     // density scales the trap band frequency
+    if (method & ColoringMethod::EXTERIOR_DIST_EST) return tanhf(it * color_density / 3600.0f * 5.0f);
+    if (it < 0.0f) it = 0.0f; // far-field fast escapes: small negative count
     float l = logf(it + 2.0f);
     return powf(l, l * l * color_density / 3600.0f);
 }
 
 void getColor(float iteration, float& r, float& g, float& b, int method) {
-    if (isInterior(iteration)) { r = g = b = 0; return; }
+    if (isInterior(iteration)) {
+        r = g = b = 0;
+        return;
+    }
     int x = (int)(colorFunction(iteration, method) * colP + color_phase) % colP;
     if (x < 0) x += colP;
-    r = color_map[0][x]; g = color_map[1][x]; b = color_map[2][x];
+    r = color_map[0][x];
+    g = color_map[1][x];
+    b = color_map[2][x];
 }
 
 void getColor(float iteration, uint8_t& r, uint8_t& g, uint8_t& b, int method) {
     float fr, fg, fb;
     getColor(iteration, fr, fg, fb, method);
-    r = (uint8_t)fr; g = (uint8_t)fg; b = (uint8_t)fb;
+    r = (uint8_t)fr;
+    g = (uint8_t)fg;
+    b = (uint8_t)fb;
 }
 
 // ---- gamma-correct (sRGB linear-light) colour averaging -------------------
@@ -78,20 +84,30 @@ static void initSrgbLut() {
 float srgbEncode255(double L) {
     if (L <= 0.0) return 0.0f;
     if (L >= 1.0) return 255.0f;
-    double f = L * ENC_N; int i = (int)f; double t = f - i;
+    double f = L * ENC_N;
+    int i = (int)f;
+    double t = f - i;
     return g_enc255[i] * (float)(1.0 - t) + g_enc255[i + 1] * (float)t;
 }
-static inline double srgb2linF(double v255) {           // fractional sRGB 0..255 -> linear
-    double c = v255 / 255.0; if (c < 0) c = 0; else if (c > 1) c = 1;
+static inline double srgb2linF(double v255) { // fractional sRGB 0..255 -> linear
+    double c = v255 / 255.0;
+    if (c < 0)
+        c = 0;
+    else if (c > 1)
+        c = 1;
     return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
 }
-float srgbEncode(double L) {                            // linear 0..1 -> sRGB 0..1
+float srgbEncode(double L) { // linear 0..1 -> sRGB 0..1
     if (L <= 0.0) return 0.0f;
     if (L >= 1.0) return 1.0f;
     return (float)(L <= 0.0031308 ? 12.92 * L : 1.055 * std::pow(L, 1.0 / 2.4) - 0.055);
 }
-static inline double enc255(double L) { return srgbEncode(L) * 255.0; }
-void ensureSrgbLut() { if (!g_lutReady) initSrgbLut(); }
+static inline double enc255(double L) {
+    return srgbEncode(L) * 255.0;
+}
+void ensureSrgbLut() {
+    if (!g_lutReady) initSrgbLut();
+}
 
 // Lambert slope (relief) post-shade shared by the live view and the PNG export.
 // height: per-pixel smooth value, NaN for interior/empty (left unshaded).
@@ -104,14 +120,14 @@ void applyReliefTo(uint8_t* rgb, const float* height, int W, int H) {
     for (int i = 0; i < H; ++i)
         for (int j = 0; j < W; ++j) {
             float hc = height[(size_t)i * W + j];
-            if (std::isnan(hc)) continue;                 // interior/empty: unshaded
+            if (std::isnan(hc)) continue; // interior/empty: unshaded
             auto Hh = [&](int yy, int xx) -> float {
                 float t = height[(size_t)yy * W + xx];
-                return std::isnan(t) ? hc : t;            // clamp across set boundary
+                return std::isnan(t) ? hc : t; // clamp across set boundary
             };
-            float hl = j > 0     ? Hh(i, j - 1) : hc;
+            float hl = j > 0 ? Hh(i, j - 1) : hc;
             float hr = j < W - 1 ? Hh(i, j + 1) : hc;
-            float hu = i > 0     ? Hh(i - 1, j) : hc;
+            float hu = i > 0 ? Hh(i - 1, j) : hc;
             float hd = i < H - 1 ? Hh(i + 1, j) : hc;
             double nx = -((double)(hr - hl) * 0.5) * str;
             double ny = -((double)(hd - hu) * 0.5) * str;
@@ -119,7 +135,7 @@ void applyReliefTo(uint8_t* rgb, const float* height, int W, int H) {
             double inv = 1.0 / std::sqrt(nx * nx + ny * ny + nz * nz);
             double d = (nx * lx + ny * ly + nz * lz) * inv;
             if (d < 0) d = 0;
-            double sh = 0.25 + 0.85 * d;                  // ambient + diffuse
+            double sh = 0.25 + 0.85 * d; // ambient + diffuse
             uint8_t* q = rgb + ((size_t)i * W + j) * 3;
             q[0] = (uint8_t)(srgbEncode(g_srgb2lin[q[0]] * sh) * 255.0 + 0.5);
             q[1] = (uint8_t)(srgbEncode(g_srgb2lin[q[1]] * sh) * 255.0 + 0.5);
@@ -139,7 +155,7 @@ void applyNormalLightTo(uint8_t* rgb, const float* angle, int W, int H) {
     for (int i = 0; i < H; ++i)
         for (int j = 0; j < W; ++j) {
             float a = angle[(size_t)i * W + j];
-            if (std::isnan(a)) continue;                  // interior/empty: unshaded
+            if (std::isnan(a)) continue; // interior/empty: unshaded
             double nx = std::cos((double)a) * str, ny = std::sin((double)a) * str, nz = 1.0;
             double inv = 1.0 / std::sqrt(nx * nx + ny * ny + nz * nz);
             double d = (nx * lx + ny * ly + nz * lz) * inv;
@@ -158,22 +174,22 @@ void applyNormalLightTo(uint8_t* rgb, const float* angle, int W, int H) {
 // as GUI sliders -- de_k (colour/boundary scale) and de_scale (optical falloff distance);
 // the rest are the constants dialled in with the standalone DE gradient editor.
 void applyDEOverlayTo(uint8_t* rgb, const float* de, int W, int H) {
-    const double k = de_k;                          // bw = de/(de+k)  colour-ramp scale
-    const double scaleDe = std::max(1e-3, (double)de_scale);   // optical falloff distance
-    const double riseW = 0.27, riseCurve = 2.0;     // black -> glow ramp (edge shape)
-    const double coreDe = 0.0, fadeExp = 2.0;       // fadeExp=2 -> 1/r^2 inverse-square
-    const double glow = 1.0;                        // white glow (linear radiance)
+    const double k = de_k;                                   // bw = de/(de+k)  colour-ramp scale
+    const double scaleDe = std::max(1e-3, (double)de_scale); // optical falloff distance
+    const double riseW = 0.27, riseCurve = 2.0;              // black -> glow ramp (edge shape)
+    const double coreDe = 0.0, fadeExp = 2.0;                // fadeExp=2 -> 1/r^2 inverse-square
+    const double glow = 1.0;                                 // white glow (linear radiance)
 #pragma omp parallel for schedule(static)
     for (int i = 0; i < H; ++i)
         for (int j = 0; j < W; ++j) {
             float dd = de[(size_t)i * W + j];
-            if (std::isnan(dd)) continue;                 // interior/empty: leave as-is
+            if (std::isnan(dd)) continue; // interior/empty: leave as-is
             double d = (double)dd;
-            double bw = d / (d + k);                      // 0 boundary -> 1 far
+            double bw = d / (d + k); // 0 boundary -> 1 far
             double level = (bw >= riseW) ? 1.0 : std::pow(bw / riseW, riseCurve);
-            double rad = d - coreDe;                      // distance beyond the light core
+            double rad = d - coreDe; // distance beyond the light core
             double alpha = (rad <= 0.0) ? 1.0 : 1.0 / (1.0 + std::pow(rad / scaleDe, fadeExp));
-            double gcol = glow * level;                   // glow radiance (grey level)
+            double gcol = glow * level; // glow radiance (grey level)
             uint8_t* q = rgb + ((size_t)i * W + j) * 3;
             double r = gcol * alpha + g_srgb2lin[q[0]] * (1.0 - alpha);
             double g = gcol * alpha + g_srgb2lin[q[1]] * (1.0 - alpha);
@@ -185,18 +201,20 @@ void applyDEOverlayTo(uint8_t* rgb, const float* de, int W, int H) {
 }
 // Integrates the palette in LINEAR light so the analytic average is gamma-correct
 // and consistent with the supersampled (SmoothColor) path.
-static double g_palInt[3][colP + 1];   // prefix sum of linear(color_map), [colP] = full sum
-static double g_palMean[3];            // sRGB(mean linear) of the whole palette (full-cycle limit)
-float g_palLin[3][colP];               // per-entry linear radiance of the palette (SS re-colour)
+static double g_palInt[3][colP + 1]; // prefix sum of linear(color_map), [colP] = full sum
+static double g_palMean[3];          // sRGB(mean linear) of the whole palette (full-cycle limit)
+float g_palLin[3][colP];             // per-entry linear radiance of the palette (SS re-colour)
 
 void prepareColorFilter() {
     if (!g_lutReady) initSrgbLut();
     for (int c = 0; c < 3; ++c) {
-        double s = 0; g_palInt[c][0] = 0;
+        double s = 0;
+        g_palInt[c][0] = 0;
         for (int i = 0; i < colP; ++i) {
             double lin = srgb2linF(color_map[c][i]);
             g_palLin[c][i] = (float)lin;
-            s += lin; g_palInt[c][i + 1] = s;
+            s += lin;
+            g_palInt[c][i + 1] = s;
         }
         g_palMean[c] = enc255(s / colP);
     }
@@ -205,8 +223,9 @@ void prepareColorFilter() {
 // prefix integral of channel-c squares from 0..x (x in palette-index units, any real)
 static double palPrefix(int c, double x) {
     double q = std::floor(x / colP);
-    double r = x - q * colP;                 // r in [0, colP)
-    int i = (int)r; if (i >= colP) i = colP - 1;
+    double r = x - q * colP; // r in [0, colP)
+    int i = (int)r;
+    if (i >= colP) i = colP - 1;
     double t = r - i;
     double part = g_palInt[c][i] * (1.0 - t) + g_palInt[c][i + 1] * t;
     return q * g_palInt[c][colP] + part;
@@ -215,9 +234,12 @@ static double palPrefix(int c, double x) {
 // Phase-independent analysis: the palette-index centre (baseU) and the palette
 // footprint width. Neither depends on color_phase, so both can be cached and
 // re-shaded cheaply as the phase animates. baseU < 0 marks interior/empty.
-void colorAnalyzeAA(float v, float vL, float vR, float vU, float vD, int method,
-                    float& baseU, float& width) {
-    if (isInterior(v)) { baseU = -1.0f; width = 0.0f; return; }   // interior
+void colorAnalyzeAA(float v, float vL, float vR, float vU, float vD, int method, float& baseU, float& width) {
+    if (isInterior(v)) {
+        baseU = -1.0f;
+        width = 0.0f;
+        return;
+    } // interior
     // A neighbour counts for the gradient if it is a real exterior sample (not
     // empty, not the interior sentinel). Far-field escapes have a small negative
     // smooth count but are still exterior, so test against the sentinel, not < 0.
@@ -226,38 +248,54 @@ void colorAnalyzeAA(float v, float vL, float vR, float vU, float vD, int method,
     auto cf = [&](float nv) { return colorFunction(nv, method); };
     // screen-space gradient of the (monotonic) colour value f, from neighbours
     float fx = 0, fy = 0;
-    if (ext(vL) && ext(vR)) fx = 0.5f * (cf(vR) - cf(vL));
-    else if (ext(vR)) fx = cf(vR) - f;
-    else if (ext(vL)) fx = f - cf(vL);
-    if (ext(vU) && ext(vD)) fy = 0.5f * (cf(vD) - cf(vU));
-    else if (ext(vD)) fy = cf(vD) - f;
-    else if (ext(vU)) fy = f - cf(vU);
-    float gradf = std::sqrt(fx * fx + fy * fy);          // colour cycles per pixel
-    width = (float)((double)gradf * colP);               // palette entries spanned
+    if (ext(vL) && ext(vR))
+        fx = 0.5f * (cf(vR) - cf(vL));
+    else if (ext(vR))
+        fx = cf(vR) - f;
+    else if (ext(vL))
+        fx = f - cf(vL);
+    if (ext(vU) && ext(vD))
+        fy = 0.5f * (cf(vD) - cf(vU));
+    else if (ext(vD))
+        fy = cf(vD) - f;
+    else if (ext(vU))
+        fy = f - cf(vU);
+    float gradf = std::sqrt(fx * fx + fy * fy); // colour cycles per pixel
+    width = (float)((double)gradf * colP);      // palette entries spanned
     baseU = (float)((double)f * colP);
 }
 
 // Phase-dependent shading of an analysed (baseU, width) pixel. Cheap: no
 // colorFunction / gradient, just a palette-integral average shifted by phase.
 void colorShadeAA(float baseU, float width, float phase, uint8_t& r, uint8_t& g, uint8_t& b) {
-    if (baseU < 0) { r = g = b = 0; return; }            // interior
+    if (baseU < 0) {
+        r = g = b = 0;
+        return;
+    } // interior
     double centerU = (double)baseU + phase;
-    if (width < 1.0) {                                   // sub-cycle: point sample
-        int x = ((int)centerU) % colP; if (x < 0) x += colP;
-        r = (uint8_t)color_map[0][x]; g = (uint8_t)color_map[1][x]; b = (uint8_t)color_map[2][x];
+    if (width < 1.0) { // sub-cycle: point sample
+        int x = ((int)centerU) % colP;
+        if (x < 0) x += colP;
+        r = (uint8_t)color_map[0][x];
+        g = (uint8_t)color_map[1][x];
+        b = (uint8_t)color_map[2][x];
         return;
     }
-    if (width >= colP) {                                 // >= a full cycle: palette mean
-        r = (uint8_t)g_palMean[0]; g = (uint8_t)g_palMean[1]; b = (uint8_t)g_palMean[2];
+    if (width >= colP) { // >= a full cycle: palette mean
+        r = (uint8_t)g_palMean[0];
+        g = (uint8_t)g_palMean[1];
+        b = (uint8_t)g_palMean[2];
         return;
     }
     double a = centerU - 0.5 * width, e = centerU + 0.5 * width;
     auto avg = [&](int c) {
-        double m = (palPrefix(c, e) - palPrefix(c, a)) / width;   // mean linear radiance
-        if (m < 0) m = 0;                                          // guard fp cancellation
-        return srgbEncode255(m);                                   // LUT encode to sRGB [0,255]
+        double m = (palPrefix(c, e) - palPrefix(c, a)) / width; // mean linear radiance
+        if (m < 0) m = 0;                                       // guard fp cancellation
+        return srgbEncode255(m);                                // LUT encode to sRGB [0,255]
     };
-    r = (uint8_t)avg(0); g = (uint8_t)avg(1); b = (uint8_t)avg(2);
+    r = (uint8_t)avg(0);
+    g = (uint8_t)avg(1);
+    b = (uint8_t)avg(2);
 }
 
 float colorBaseIndex(float iteration, int method) {
@@ -265,13 +303,11 @@ float colorBaseIndex(float iteration, int method) {
     return (float)((double)colorFunction(iteration, method) * colP);
 }
 
-void getColorAA(float v, float vL, float vR, float vU, float vD,
-                uint8_t& r, uint8_t& g, uint8_t& b, int method) {
+void getColorAA(float v, float vL, float vR, float vU, float vD, uint8_t& r, uint8_t& g, uint8_t& b, int method) {
     float baseU, width;
     colorAnalyzeAA(v, vL, vR, vU, vD, method, baseU, width);
     colorShadeAA(baseU, width, color_phase, r, g, b);
 }
-
 
 void rgbRotate(float& r, float& g, float& b, float rad) {
     float c = cosf(rad), s = sinf(rad), t = 1.0f / 3.0f, q = sqrtf(t);
@@ -285,9 +321,7 @@ void rgbRotate(float& r, float& g, float& b, float rad) {
 }
 
 void colorMapInitialize() {
-    static const float pos[] = { 0.0f, 0.16f, 0.42f, 0.6425f, 0.8575f, 1.0f };
-    static const float col[3][6] = {
-        {0,32,237,255,0,0}, {70,107,255,170,2,70}, {100,203,255,0,0,100}
-    };
+    static const float pos[] = {0.0f, 0.16f, 0.42f, 0.6425f, 0.8575f, 1.0f};
+    static const float col[3][6] = {{0, 32, 237, 255, 0, 0}, {70, 107, 255, 170, 2, 70}, {100, 203, 255, 0, 0, 100}};
     for (int c = 0; c < 3; ++c) mono_cubic_interpolate(pos, col[c], 6, color_map[c], colP);
 }

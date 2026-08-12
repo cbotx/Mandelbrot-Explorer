@@ -14,11 +14,9 @@
 
 class Mandel;
 
-enum class ComputeMode {
-    Mandelbrot,
-    Julia,
-    Expression
-};
+enum class ComputeMode { Mandelbrot,
+                         Julia,
+                         Expression };
 
 struct ComputeRequest {
     ComputeMode mode = ComputeMode::Mandelbrot;
@@ -45,8 +43,7 @@ struct ComputeRequest {
     const formula::ExpressionOrbitPlan* expressionPlan = nullptr;
     const formula::ExpressionJit4* expressionJit = nullptr;
     FormulaParameter expressionPixel = FormulaParameter::C;
-    formula::ExpressionColoring expressionColoring =
-        formula::ExpressionColoring::Raw;
+    formula::ExpressionColoring expressionColoring = formula::ExpressionColoring::Raw;
     double expressionBailout = 4.0;
 };
 
@@ -78,8 +75,7 @@ struct GenericDeepInfo {
     uint64_t preflightIterationCount = 0;
     uint64_t preflightOperationCount = 0;
     uint64_t preflightFoldOperationCount = 0;
-    std::array<uint64_t, 16>
-        preflightFirstUncertainHistogram{};
+    std::array<uint64_t, 16> preflightFirstUncertainHistogram{};
     uint64_t fastPixelCount = 0;
     uint64_t fallbackPixelCount = 0;
     uint64_t taylorPixelCoverage = 0;
@@ -98,7 +94,7 @@ struct GenericDeepInfo {
 };
 
 class IComputeBackend {
-public:
+  public:
     virtual ~IComputeBackend() = default;
     virtual const ComputeBackendInfo& info() const = 0;
     virtual bool lastComputeUsedGpuPath() const = 0;
