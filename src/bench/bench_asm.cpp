@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <immintrin.h>
 #include <vector>
 
 extern "C" uint64_t mm_addmul_1(uint64_t* rp, const uint64_t* up, int64_t n, uint64_t v);
@@ -18,6 +19,46 @@ static uint64_t rnd64() {
     uint64_t x = 0;
     for (int i = 0; i < 4; ++i) x = (x << 16) ^ (uint64_t)(rand() & 0xffff);
     return x;
+}
+
+static __forceinline void rescaledStep(__m256d& wr, __m256d& wi, __m256d xr, __m256d xi, __m256d scale, __m256d dr, __m256d di) {
+    const __m256d factorReal = _mm256_add_pd(_mm256_add_pd(xr, xr), _mm256_mul_pd(scale, wr));
+    const __m256d factorImaginary = _mm256_add_pd(_mm256_add_pd(xi, xi), _mm256_mul_pd(scale, wi));
+    const __m256d nextReal = _mm256_add_pd(_mm256_sub_pd(_mm256_mul_pd(factorReal, wr), _mm256_mul_pd(factorImaginary, wi)), dr);
+    const __m256d nextImaginary = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(factorReal, wi), _mm256_mul_pd(factorImaginary, wr)), di);
+    wr = nextReal;
+    wi = nextImaginary;
+}
+
+static void benchRescaledPipelines() {
+    constexpr long iterations = 50000000;
+    const __m256d xr = _mm256_set_pd(0.12, -0.08, 0.05, -0.11);
+    const __m256d xi = _mm256_set_pd(-0.09, 0.07, 0.1, 0.04);
+    const __m256d scale = _mm256_set1_pd(0.0001);
+    const __m256d dr = _mm256_set_pd(1e-5, -2e-5, 3e-5, -4e-5);
+    const __m256d di = _mm256_set_pd(-3e-5, 4e-5, -1e-5, 2e-5);
+    __m256d wr0 = _mm256_set_pd(0.3, -0.2, 0.1, -0.4);
+    __m256d wi0 = _mm256_set_pd(-0.15, 0.25, -0.35, 0.05);
+
+    auto start = Clock::now();
+    for (long iteration = 0; iteration < iterations; ++iteration) rescaledStep(wr0, wi0, xr, xi, scale, dr, di);
+    auto stop = Clock::now();
+    const double singleNs = ns_per(start, stop, iterations);
+
+    __m256d wr1 = _mm256_set_pd(-0.22, 0.17, -0.31, 0.28);
+    __m256d wi1 = _mm256_set_pd(0.19, -0.27, 0.13, -0.16);
+    start = Clock::now();
+    for (long iteration = 0; iteration < iterations; ++iteration) {
+        rescaledStep(wr0, wi0, xr, xi, scale, dr, di);
+        rescaledStep(wr1, wi1, xr, xi, scale, dr, di);
+    }
+    stop = Clock::now();
+    const double dualNs = ns_per(start, stop, iterations * 2);
+
+    alignas(32) double sink[4];
+    _mm256_store_pd(sink, _mm256_add_pd(_mm256_add_pd(wr0, wi0), _mm256_add_pd(wr1, wi1)));
+    printf("\n== AVX2 rescaled-step software pipeline ==\n");
+    printf("  single-chain %.3f ns/group | dual-chain %.3f ns/group | throughput %.2fx | sink=%.17g\n", singleNs, dualNs, singleNs / dualNs, sink[0] + sink[1] + sink[2] + sink[3]);
 }
 
 int main() {
@@ -50,5 +91,6 @@ int main() {
 
         printf("  n=%2d: GMP %6.1f ns | mine %6.1f ns | ratio %.2fx  %s\n", n, gmp, mine, gmp / mine, ok ? "correct" : "WRONG");
     }
+    benchRescaledPipelines();
     return 0;
 }

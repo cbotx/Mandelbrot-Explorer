@@ -2125,6 +2125,11 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
             const char* e = getenv("MANDEL_FESIMD");
             fesimd = e ? atoi(e) : 1;
         }
+        static int feDual = -1;
+        if (feDual < 0) {
+            const char* e = getenv("MANDEL_FE_DUAL");
+            feDual = e ? atoi(e) : 1;
+        }
         // The rescaled step vectorises cleanly (4-wide, byte-identical output) but
         // the deep loop is memory/latency-bound on the per-iteration reference
         // gather, so SIMD only ~matches scalar (same as the double-path solveSimd4).
@@ -2169,12 +2174,22 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
         };
         double step_solve_t0 = step_profile ? nowSec() : 0.0;
         if (feSimdOn) {
+            if (feDual > 0 && !_use_bla) {
 #pragma omp parallel for schedule(dynamic, 1)
-            for (int gg = 0; gg < n; gg += 4) {
-                if (_flag_halt) continue;
-                int lanes = n - gg < 4 ? n - gg : 4;
-                solveRescaledSimd4(Dcr.data(), Dci.data(), gg, lanes, mx_ref_it, mxit, c_method, val.data());
-                for (int l = 0; l < lanes; ++l) finalize(gg + l);
+                for (int gg = 0; gg < n; gg += 8) {
+                    if (_flag_halt) continue;
+                    int lanes = n - gg < 8 ? n - gg : 8;
+                    solveRescaledSimd8NoBla(Dcr.data(), Dci.data(), gg, lanes, mx_ref_it, mxit, val.data());
+                    for (int l = 0; l < lanes; ++l) finalize(gg + l);
+                }
+            } else {
+#pragma omp parallel for schedule(dynamic, 1)
+                for (int gg = 0; gg < n; gg += 4) {
+                    if (_flag_halt) continue;
+                    int lanes = n - gg < 4 ? n - gg : 4;
+                    solveRescaledSimd4(Dcr.data(), Dci.data(), gg, lanes, mx_ref_it, mxit, c_method, val.data());
+                    for (int l = 0; l < lanes; ++l) finalize(gg + l);
+                }
             }
         } else {
 #pragma omp parallel for schedule(dynamic, 64)
@@ -3593,6 +3608,204 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, double customSeedRe, dou
     return trap ? trapc.value(0.0) : -2.f; // interior (hit maxit): trap-colour or sentinel
 }
 
+void Mandel::solveRescaledSimd8NoBla(const FloatExp* Dcr, const FloatExp* Dci, int g, int lanes, int mx_ref_it, int mxit, float* out) const {
+    const double escapeSquared = escapeRadiusSquared();
+    const double logTwo = log(2.0);
+    const int referenceLength = mx_ref_it + 1;
+
+    alignas(32) double wr[8] = {}, wi[8] = {}, scaleDouble[8] = {}, dr[8] = {}, di[8] = {};
+    FloatExp scale[8], dcr[8], dci[8];
+    int referenceIndex[8] = {}, iteration[8] = {};
+    bool active[8] = {};
+    for (int lane = 0; lane < lanes; ++lane) {
+        dcr[lane] = Dcr[g + lane];
+        dci[lane] = Dci[g + lane];
+        const FloatExp initialScale = fe_sqrt(fe_add(fe_mul(dcr[lane], dcr[lane]), fe_mul(dci[lane], dci[lane])));
+        if (initialScale.m == 0.0) {
+            scale[lane] = FloatExp{1.0, 0};
+        } else {
+            scale[lane] = initialScale;
+            wr[lane] = fe_to_double(fe_div(dcr[lane], initialScale));
+            wi[lane] = fe_to_double(fe_div(dci[lane], initialScale));
+            dr[lane] = wr[lane];
+            di[lane] = wi[lane];
+        }
+        scaleDouble[lane] = fe_to_double(scale[lane]);
+        referenceIndex[lane] = 1;
+        iteration[lane] = 1;
+        out[g + lane] = -2.0f;
+        active[lane] = true;
+    }
+
+    const __m256d two = _mm256_set1_pd(2.0);
+    while (true) {
+        if (_flag_halt) return;
+        int stepMask = 0;
+        for (int lane = 0; lane < lanes; ++lane) {
+            if (!active[lane]) continue;
+            if (iteration[lane] >= mxit) {
+                out[g + lane] = -2.0f;
+                active[lane] = false;
+            } else {
+                stepMask |= 1 << lane;
+            }
+        }
+        if (stepMask == 0) break;
+
+        alignas(32) double previousReal[8] = {}, previousImaginary[8] = {}, currentReal[8] = {}, currentImaginary[8] = {};
+        for (int lane = 0; lane < lanes; ++lane) {
+            if (!(stepMask & (1 << lane))) continue;
+            const int index = referenceIndex[lane];
+            if (index > 0) {
+                previousReal[lane] = _zfr[index - 1];
+                previousImaginary[lane] = _zfi[index - 1];
+            }
+            const int current = index > mx_ref_it ? mx_ref_it : index;
+            currentReal[lane] = _zfr[current];
+            currentImaginary[lane] = _zfi[current];
+        }
+
+        const __m256d wr0 = _mm256_load_pd(wr);
+        const __m256d wi0 = _mm256_load_pd(wi);
+        const __m256d wr1 = _mm256_load_pd(wr + 4);
+        const __m256d wi1 = _mm256_load_pd(wi + 4);
+        const __m256d scale0 = _mm256_load_pd(scaleDouble);
+        const __m256d scale1 = _mm256_load_pd(scaleDouble + 4);
+        const __m256d dr0 = _mm256_load_pd(dr);
+        const __m256d dr1 = _mm256_load_pd(dr + 4);
+        const __m256d di0 = _mm256_load_pd(di);
+        const __m256d di1 = _mm256_load_pd(di + 4);
+        const __m256d previousReal0 = _mm256_load_pd(previousReal);
+        const __m256d previousReal1 = _mm256_load_pd(previousReal + 4);
+        const __m256d previousImaginary0 = _mm256_load_pd(previousImaginary);
+        const __m256d previousImaginary1 = _mm256_load_pd(previousImaginary + 4);
+
+        __m256d nextWr0, nextWi0, nextWr1, nextWi1;
+        if (g_fused_perturb > 0) {
+            const __m256d factorReal0 = _mm256_add_pd(_mm256_add_pd(previousReal0, previousReal0), _mm256_mul_pd(scale0, wr0));
+            const __m256d factorReal1 = _mm256_add_pd(_mm256_add_pd(previousReal1, previousReal1), _mm256_mul_pd(scale1, wr1));
+            const __m256d factorImaginary0 = _mm256_add_pd(_mm256_add_pd(previousImaginary0, previousImaginary0), _mm256_mul_pd(scale0, wi0));
+            const __m256d factorImaginary1 = _mm256_add_pd(_mm256_add_pd(previousImaginary1, previousImaginary1), _mm256_mul_pd(scale1, wi1));
+            nextWr0 = _mm256_add_pd(_mm256_sub_pd(_mm256_mul_pd(factorReal0, wr0), _mm256_mul_pd(factorImaginary0, wi0)), dr0);
+            nextWr1 = _mm256_add_pd(_mm256_sub_pd(_mm256_mul_pd(factorReal1, wr1), _mm256_mul_pd(factorImaginary1, wi1)), dr1);
+            nextWi0 = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(factorReal0, wi0), _mm256_mul_pd(factorImaginary0, wr0)), di0);
+            nextWi1 = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(factorReal1, wi1), _mm256_mul_pd(factorImaginary1, wr1)), di1);
+        } else {
+            const __m256d squareReal0 = _mm256_sub_pd(_mm256_mul_pd(wr0, wr0), _mm256_mul_pd(wi0, wi0));
+            const __m256d squareReal1 = _mm256_sub_pd(_mm256_mul_pd(wr1, wr1), _mm256_mul_pd(wi1, wi1));
+            const __m256d squareImaginary0 = _mm256_mul_pd(two, _mm256_mul_pd(wr0, wi0));
+            const __m256d squareImaginary1 = _mm256_mul_pd(two, _mm256_mul_pd(wr1, wi1));
+            const __m256d linearReal0 = _mm256_sub_pd(_mm256_mul_pd(previousReal0, wr0), _mm256_mul_pd(previousImaginary0, wi0));
+            const __m256d linearReal1 = _mm256_sub_pd(_mm256_mul_pd(previousReal1, wr1), _mm256_mul_pd(previousImaginary1, wi1));
+            const __m256d linearImaginary0 = _mm256_add_pd(_mm256_mul_pd(previousReal0, wi0), _mm256_mul_pd(previousImaginary0, wr0));
+            const __m256d linearImaginary1 = _mm256_add_pd(_mm256_mul_pd(previousReal1, wi1), _mm256_mul_pd(previousImaginary1, wr1));
+            nextWr0 = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(two, linearReal0), _mm256_mul_pd(scale0, squareReal0)), dr0);
+            nextWr1 = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(two, linearReal1), _mm256_mul_pd(scale1, squareReal1)), dr1);
+            nextWi0 = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(two, linearImaginary0), _mm256_mul_pd(scale0, squareImaginary0)), di0);
+            nextWi1 = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(two, linearImaginary1), _mm256_mul_pd(scale1, squareImaginary1)), di1);
+        }
+
+        const __m256d currentReal0 = _mm256_load_pd(currentReal);
+        const __m256d currentReal1 = _mm256_load_pd(currentReal + 4);
+        const __m256d currentImaginary0 = _mm256_load_pd(currentImaginary);
+        const __m256d currentImaginary1 = _mm256_load_pd(currentImaginary + 4);
+        const __m256d actualReal0 = _mm256_add_pd(currentReal0, _mm256_mul_pd(scale0, nextWr0));
+        const __m256d actualReal1 = _mm256_add_pd(currentReal1, _mm256_mul_pd(scale1, nextWr1));
+        const __m256d actualImaginary0 = _mm256_add_pd(currentImaginary0, _mm256_mul_pd(scale0, nextWi0));
+        const __m256d actualImaginary1 = _mm256_add_pd(currentImaginary1, _mm256_mul_pd(scale1, nextWi1));
+        const __m256d actualMagnitude0 = _mm256_add_pd(_mm256_mul_pd(actualReal0, actualReal0), _mm256_mul_pd(actualImaginary0, actualImaginary0));
+        const __m256d actualMagnitude1 = _mm256_add_pd(_mm256_mul_pd(actualReal1, actualReal1), _mm256_mul_pd(actualImaginary1, actualImaginary1));
+        const __m256d deltaMagnitude0 = _mm256_add_pd(_mm256_mul_pd(nextWr0, nextWr0), _mm256_mul_pd(nextWi0, nextWi0));
+        const __m256d deltaMagnitude1 = _mm256_add_pd(_mm256_mul_pd(nextWr1, nextWr1), _mm256_mul_pd(nextWi1, nextWi1));
+
+        alignas(32) double nextWr[8], nextWi[8], actualMagnitude[8], deltaMagnitude[8];
+        _mm256_store_pd(nextWr, nextWr0);
+        _mm256_store_pd(nextWr + 4, nextWr1);
+        _mm256_store_pd(nextWi, nextWi0);
+        _mm256_store_pd(nextWi + 4, nextWi1);
+        _mm256_store_pd(actualMagnitude, actualMagnitude0);
+        _mm256_store_pd(actualMagnitude + 4, actualMagnitude1);
+        _mm256_store_pd(deltaMagnitude, deltaMagnitude0);
+        _mm256_store_pd(deltaMagnitude + 4, deltaMagnitude1);
+
+        for (int lane = 0; lane < lanes; ++lane) {
+            if (!(stepMask & (1 << lane))) continue;
+            if (deltaMagnitude[lane] == 0.0 && (nextWr[lane] != 0.0 || nextWi[lane] != 0.0 || wr[lane] != 0.0 || wi[lane] != 0.0 || dcr[lane].m != 0.0 || dci[lane].m != 0.0)) {
+                const int index = referenceIndex[lane];
+                const FloatExp referenceReal = index ? _zfr_fe[index - 1] : FloatExp{0.0, 0};
+                const FloatExp referenceImaginary = index ? _zfi_fe[index - 1] : FloatExp{0.0, 0};
+                feRescaledStepUnderflow(referenceReal, referenceImaginary, dcr[lane], dci[lane], scale[lane], wr[lane], wi[lane]);
+                scaleDouble[lane] = fe_to_double(scale[lane]);
+                dr[lane] = fe_to_double(fe_div(dcr[lane], scale[lane]));
+                di[lane] = fe_to_double(fe_div(dci[lane], scale[lane]));
+                const int current = index > mx_ref_it ? mx_ref_it : index;
+                const FloatExp actualReal = fe_add(_zfr_fe[current], fe_mul_d(scale[lane], wr[lane]));
+                const FloatExp actualImaginary = fe_add(_zfi_fe[current], fe_mul_d(scale[lane], wi[lane]));
+                actualMagnitude[lane] = fe_to_double(fe_add(fe_mul(actualReal, actualReal), fe_mul(actualImaginary, actualImaginary)));
+                deltaMagnitude[lane] = wr[lane] * wr[lane] + wi[lane] * wi[lane];
+            } else {
+                wr[lane] = nextWr[lane];
+                wi[lane] = nextWi[lane];
+            }
+
+            ++referenceIndex[lane];
+            ++iteration[lane];
+            if (_customEscapeRadiusActive && _ref_escaped && referenceIndex[lane] >= _ref_escape_iteration) {
+                out[g + lane] = EMPTYPIXEL;
+                active[lane] = false;
+                continue;
+            }
+            if (actualMagnitude[lane] > escapeSquared) {
+                out[g + lane] = static_cast<float>(static_cast<double>(iteration[lane]) - log(log(actualMagnitude[lane]) / 2.0 / logTwo) / logTwo);
+                active[lane] = false;
+                continue;
+            }
+            if (_customEscapeRadiusActive && referenceIndex[lane] >= referenceLength) {
+                out[g + lane] = EMPTYPIXEL;
+                active[lane] = false;
+                continue;
+            }
+            const double magnitude = deltaMagnitude[lane];
+            if (magnitude > 1e16 || (magnitude < 1e-16 && magnitude > 0.0)) {
+                const FloatExp normalizedMagnitude = fe_sqrt(fe_from(magnitude));
+                scale[lane] = fe_mul(scale[lane], normalizedMagnitude);
+                scaleDouble[lane] = fe_to_double(scale[lane]);
+                const double inverse = 1.0 / fe_to_double(normalizedMagnitude);
+                wr[lane] *= inverse;
+                wi[lane] *= inverse;
+                dr[lane] = fe_to_double(fe_div(dcr[lane], scale[lane]));
+                di[lane] = fe_to_double(fe_div(dci[lane], scale[lane]));
+            }
+            const double absoluteDelta = scaleDouble[lane] * scaleDouble[lane] * (wr[lane] * wr[lane] + wi[lane] * wi[lane]);
+            if (actualMagnitude[lane] < 1e-8 || actualMagnitude[lane] < absoluteDelta || referenceIndex[lane] >= referenceLength) {
+                const int index = referenceIndex[lane];
+                const FloatExp referenceReal = index ? _zfr_fe[index - 1] : FloatExp{0.0, 0};
+                const FloatExp referenceImaginary = index ? _zfi_fe[index - 1] : FloatExp{0.0, 0};
+                const FloatExp scaledReal = fe_mul_d(scale[lane], wr[lane]);
+                const FloatExp scaledImaginary = fe_mul_d(scale[lane], wi[lane]);
+                const FloatExp actualReal = fe_add(referenceReal, scaledReal);
+                const FloatExp actualImaginary = fe_add(referenceImaginary, scaledImaginary);
+                const FloatExp actualSquared = fe_add(fe_mul(actualReal, actualReal), fe_mul(actualImaginary, actualImaginary));
+                const FloatExp deltaSquared = fe_add(fe_mul(scaledReal, scaledReal), fe_mul(scaledImaginary, scaledImaginary));
+                if (index >= referenceLength || fe_abs_less(actualSquared, deltaSquared)) {
+                    const FloatExp nextScale = fe_sqrt(actualSquared);
+                    if (nextScale.m == 0.0) {
+                        wr[lane] = wi[lane] = 0.0;
+                    } else {
+                        scale[lane] = nextScale;
+                        scaleDouble[lane] = fe_to_double(nextScale);
+                        wr[lane] = fe_to_double(fe_div(actualReal, nextScale));
+                        wi[lane] = fe_to_double(fe_div(actualImaginary, nextScale));
+                        dr[lane] = fe_to_double(fe_div(dcr[lane], nextScale));
+                        di[lane] = fe_to_double(fe_div(dci[lane], nextScale));
+                    }
+                    referenceIndex[lane] = 0;
+                }
+            }
+        }
+    }
+}
+
 // (wr,wi), reference index m and iteration count, so lanes stay independent and
 // coherent adjacent pixels vectorise well. The heavy quadratic step is done in a
 // __m256d; BLA skips, |w| rescales and Zhuoran rebases are rare per-lane scalar
@@ -3647,7 +3860,7 @@ void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g,
             }
             bool skipped = false;
             if (_use_bla && m[l] >= 2) {
-                int skip = tryBLAfe(m[l] - 1, S[l], fe_mul(S[l], S[l]), wr[l], wi[l], dr[l], di[l], ESC2, reflen);
+                const int skip = tryBLAfe(m[l] - 1, S[l], fe_mul(S[l], S[l]), wr[l], wi[l], dr[l], di[l], ESC2, reflen);
                 if (skip > 0) {
                     m[l] += skip;
                     iter[l] += skip;

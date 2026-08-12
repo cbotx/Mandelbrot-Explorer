@@ -253,6 +253,7 @@ class Mandel {
     // rebase as cheap per-lane scalar events. Writes smooth-iteration values into
     // out[g..g+lanes). Mirrors pixelRescaled's math; no EDE derivative (dz-only).
     void solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g, int lanes, int mx_ref_it, int mxit, int c_method, float* out) const;
+    void solveRescaledSimd8NoBla(const FloatExp* Dcr, const FloatExp* Dci, int g, int lanes, int mx_ref_it, int mxit, float* out) const;
     int SACheckMagnitude() const;
     float accuratePointCompute(mpf_t c_re, mpf_t c_im, int mxit, int c_method = 0, bool* cancelled = nullptr) const;
     float accuratePixelCompute(const std::array<int, 4>& pixel, int mxit, int c_method, bool* cancelled = nullptr) const;
