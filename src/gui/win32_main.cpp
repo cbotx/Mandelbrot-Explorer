@@ -572,8 +572,9 @@ public:
                 file,
                 "stage=%s used=%d success=%d status=%s "
                 "pixels=%llu fast=%llu fallback=%llu "
-                "total=%.6f reference=%.6f Taylor=%.6f "
-                "fallback_time=%.6f path=%s\n",
+                "preflight=%llu/%llu predicted=%s avoided=%llu "
+                "total=%.6f reference=%.6f preflight_time=%.6f "
+                "Taylor=%.6f fallback_time=%.6f path=%s\n",
                 genericDeepSmokeStage == 0
                     ? "arithmetic" : "transcendental",
                 info.used ? 1 : 0, info.success ? 1 : 0,
@@ -581,8 +582,16 @@ public:
                 (unsigned long long)info.pixelCount,
                 (unsigned long long)info.fastPixelCount,
                 (unsigned long long)info.fallbackPixelCount,
+                (unsigned long long)
+                    info.preflightFallbackCount,
+                (unsigned long long)
+                    info.preflightSampleCount,
+                info.predictedPath.c_str(),
+                (unsigned long long)
+                    info.preflightAvoidedFastPixelCount,
                 info.totalSeconds, info.referenceSeconds,
-                info.taylorSeconds, info.fallbackSeconds,
+                info.preflightSeconds, info.taylorSeconds,
+                info.fallbackSeconds,
                 nav->GetExpressionAccelerationText().c_str());
             fclose(file);
         }
@@ -2157,9 +2166,53 @@ public:
         }
         FILE* f = nullptr; fopen_s(&f, "build\\gui_bench.txt", "a");
         if (f) {
+            const GenericDeepInfo deep =
+                nav->GetLastGenericDeepInfo();
             fprintf(f, "SS=%d  render=%.1f ms  recolor=%.3f ms  full=%.3f  buildDisplay=%.3f  present(paint)=%.3f  view=%ldx%ld win=%ldx%ld\n",
                     ssOn ? 1 : 0, renderMs, rp, ub, bd, pt,
                     vr.right - vr.left, vr.bottom - vr.top, rcw.right, rcw.bottom);
+            if (deep.used) {
+                fprintf(
+                    f,
+                    "generic status=%s pixels=%llu fast=%llu fallback=%llu Taylor=%llu preflight=%llu/%llu predicted=%s avoided=%llu specialized_mpfr=%d total=%.6f reference=%.6f preflight_time=%.6f build+eval=%.6f fast_time=%.6f fallback_time=%.6f preflight_iter=%llu preflight_ops=%llu preflight_folds=%llu first_uncertain=",
+                    deep.status.c_str(),
+                    (unsigned long long)deep.pixelCount,
+                    (unsigned long long)deep.fastPixelCount,
+                    (unsigned long long)deep.fallbackPixelCount,
+                    (unsigned long long)deep.taylorPixelCoverage,
+                    (unsigned long long)
+                        deep.preflightFallbackCount,
+                    (unsigned long long)
+                        deep.preflightSampleCount,
+                    deep.predictedPath.c_str(),
+                    (unsigned long long)
+                        deep.preflightAvoidedFastPixelCount,
+                    deep.specializedPiecewiseMpfr ? 1 : 0,
+                    deep.totalSeconds, deep.referenceSeconds,
+                    deep.preflightSeconds, deep.taylorSeconds,
+                    deep.fastSeconds, deep.fallbackSeconds,
+                    (unsigned long long)
+                        deep.preflightIterationCount,
+                    (unsigned long long)
+                        deep.preflightOperationCount,
+                    (unsigned long long)
+                        deep.preflightFoldOperationCount);
+                for (size_t bin = 0;
+                     bin <
+                         deep.
+                             preflightFirstUncertainHistogram.
+                                 size();
+                     ++bin) {
+                    if (bin != 0) fputc(',', f);
+                    fprintf(
+                        f, "%llu",
+                        (unsigned long long)
+                            deep.
+                                preflightFirstUncertainHistogram[
+                                    bin]);
+                }
+                fputc('\n', f);
+            }
             fclose(f);
         }
         PostQuitMessage(0);

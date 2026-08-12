@@ -734,6 +734,28 @@ bool ExpressionProgram::scaledResidualRequiresTaylor() const {
         });
 }
 
+ExpressionPiecewiseQuadraticKind
+ExpressionProgram::piecewiseQuadraticKind() const {
+    if (!_valid) return ExpressionPiecewiseQuadraticKind::None;
+    auto is = [&](size_t index, Op op) {
+        return index < _code.size() &&
+               _code[index].op == op;
+    };
+    if (_code.size() == 10 &&
+        is(0, Op::Z) &&
+        is(1, Op::Real) &&
+        is(2, Op::Abs) &&
+        is(3, Op::Z) &&
+        is(4, Op::Imaginary) &&
+        is(5, Op::Abs) &&
+        is(6, Op::MakeComplex) &&
+        is(7, Op::Square) &&
+        is(8, Op::C) &&
+        is(9, Op::Add))
+        return ExpressionPiecewiseQuadraticKind::BurningShip;
+    return ExpressionPiecewiseQuadraticKind::None;
+}
+
 uint64_t ExpressionProgram::semanticHash() const {
     if (!_valid) return 0;
     constexpr uint64_t offset = 1469598103934665603ULL;

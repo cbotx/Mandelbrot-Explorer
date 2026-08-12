@@ -2051,6 +2051,11 @@ public:
 
                     const ScaledRealValue magnitude =
                         absoluteValue(center.value.re);
+                    if (center.value.re.isZero() &&
+                        radius.isZero()) {
+                        sign = 2;
+                        return ScaledArithmeticStatus::Success;
+                    }
                     if (center.value.re.mantissa > 0.0 &&
                         compareScaledNonnegative(
                             magnitude, radius) > 0)
@@ -4108,6 +4113,16 @@ public:
                                 candidate.
                                     foldRejectionReason =
                                         candidate.reason;
+                                break;
+                            }
+                            if (sign == 2) {
+                                for (size_t index = 0;
+                                     index < monomialCount;
+                                     ++index)
+                                    coefficient(local, index) = {};
+                                remainders[local] = {};
+                                exactReal[local] = 1;
+                                exactZero[local] = 1;
                                 break;
                             }
                             if (!candidate.

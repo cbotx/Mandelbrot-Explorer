@@ -1293,6 +1293,14 @@ ExpressionScaledResidualStatus certifiedScaledDiffAbsReal(
     arithmetic = validateBall(endpoint);
     if (arithmetic != ScaledArithmeticStatus::Success)
         return residualStatus(arithmetic);
+    if (reference.value.isZero() &&
+        reference.radius.isZero() &&
+        residual.value.isZero() &&
+        residual.radius.isZero()) {
+        output = {};
+        output.value.mantissa = 0.0;
+        return ExpressionScaledResidualStatus::Success;
+    }
 
     auto strictSign = [](
             const ScaledRealBall& ball) {
@@ -2501,6 +2509,7 @@ ExpressionScaledResidualEvaluator::evaluate(
                     : ExpressionScaledResidualStatus::BranchUncertain;
             return result;
         case ExpressionOracleOperation::Abs: {
+            ++result.foldOperationCount;
             if (!_states[node.leftNode].realValued) {
                 result.status =
                     ExpressionScaledResidualStatus::
@@ -2555,6 +2564,10 @@ ExpressionScaledResidualEvaluator::evaluate(
             if (diffStatus !=
                     ExpressionScaledResidualStatus::
                         Success) {
+                if (diffStatus ==
+                        ExpressionScaledResidualStatus::
+                            BranchUncertain)
+                    ++result.uncertainFoldCount;
                 result.status = diffStatus;
                 return result;
             }

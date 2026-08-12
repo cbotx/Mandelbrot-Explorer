@@ -66,12 +66,28 @@ struct ExpressionDeepTaylorPolicy {
     bool requirePredictedBenefit = true;
 };
 
+struct ExpressionDeepPreflightPolicy {
+    bool enable = true;
+    size_t maximumSamples = 16;
+    size_t minimumSamples = 8;
+    uint32_t earlyRejectMinimumFirstUncertainIteration = 8;
+};
+
 enum class ExpressionDeepRenderPhase : uint8_t {
     Reference,
+    Preflight,
     Fast,
     Fallback,
     Complete
 };
+
+enum class ExpressionDeepPreflightDecision : uint8_t {
+    NotRun,
+    ContinueCertifiedFast,
+    DirectMpfr
+};
+
+constexpr size_t ExpressionDeepUncertaintyHistogramBins = 16;
 
 enum class ExpressionDeepFallbackReason : uint8_t {
     UncertifiedSeries,
@@ -125,11 +141,14 @@ struct ExpressionDeepRenderRequest {
     ExpressionDeepThreadPolicy threading;
     ExpressionDeepMemoryPolicy memory;
     ExpressionDeepTaylorPolicy taylor;
+    ExpressionDeepPreflightPolicy preflight;
     // This is a verification/benchmark switch. Production callers must leave
     // it false because local transcendental series are not interval-certified.
     bool allowUncertifiedForBenchmark = false;
     // Verification-only all-MPFR baseline for the identical formula.
     bool forceMpfrFallbackForVerification = false;
+    // Verification-only generic bytecode-oracle baseline.
+    bool disableSpecializedPiecewiseMpfrForVerification = false;
     // Verification-only outward inflation of every certification radius.
     int verificationErrorInflationBits = 0;
     // Verification-only deterministic exception injection. Production callers
@@ -150,8 +169,32 @@ struct ExpressionDeepRenderResult {
     bool success = false;
     bool cancelled = false;
     double referenceSeconds = 0.0;
+    double preflightSeconds = 0.0;
     double fastSeconds = 0.0;
     double fallbackSeconds = 0.0;
+    bool preflightAttempted = false;
+    bool preflightRejectedFast = false;
+    ExpressionDeepPreflightDecision preflightDecision =
+        ExpressionDeepPreflightDecision::NotRun;
+    uint64_t preflightSampleCount = 0;
+    uint64_t preflightFallbackCount = 0;
+    uint64_t preflightFastCount = 0;
+    uint64_t preflightIterationCount = 0;
+    uint64_t preflightOperationCount = 0;
+    uint64_t preflightFoldOperationCount = 0;
+    uint64_t preflightUncertainFoldCount = 0;
+    uint32_t preflightMinimumFirstUncertainIteration =
+        UINT32_MAX;
+    uint32_t preflightMaximumFirstUncertainIteration = 0;
+    uint64_t preflightAvoidedFastPixelCount = 0;
+    uint64_t preflightAvoidedIterationEstimate = 0;
+    uint64_t preflightAvoidedOperationEstimate = 0;
+    std::array<uint64_t,
+        ExpressionDeepUncertaintyHistogramBins>
+        preflightFirstUncertainHistogram{};
+    std::array<uint64_t,
+        static_cast<size_t>(ExpressionDeepFallbackReason::Count)>
+        preflightFallbackReasonCounts{};
     uint64_t fastPixelCount = 0;
     uint64_t fallbackPixelCount = 0;
     uint64_t uncertainPixelCount = 0;
@@ -168,6 +211,17 @@ struct ExpressionDeepRenderResult {
     mpfr_prec_t certificationPrecision = 0;
     mpfr_prec_t fallbackPrecision = 0;
     uint64_t totalIterations = 0;
+    uint64_t fastIterationCount = 0;
+    uint64_t fastOperationCount = 0;
+    uint64_t fastSeriesOperationCount = 0;
+    uint64_t fastFoldOperationCount = 0;
+    uint64_t fastUncertainFoldCount = 0;
+    std::array<uint64_t,
+        ExpressionDeepUncertaintyHistogramBins>
+        fallbackFirstUncertainHistogram{};
+    bool usedSpecializedPiecewiseMpfr = false;
+    uint64_t specializedPiecewiseMpfrPixelCount = 0;
+    uint64_t specializedPiecewiseMpfrIterationCount = 0;
     bool taylorAttempted = false;
     bool taylorAccepted = false;
     int taylorOrder = 0;
@@ -238,6 +292,8 @@ const char* expressionDeepRenderStatusName(
     ExpressionDeepRenderStatus status);
 const char* expressionDeepFallbackReasonName(
     ExpressionDeepFallbackReason reason);
+const char* expressionDeepPreflightDecisionName(
+    ExpressionDeepPreflightDecision decision);
 
 // Renders finite-iteration escape classifications. The arithmetic fast path is
 // certified relative to an independently iterated higher-precision MPFR oracle;
@@ -247,7 +303,12 @@ const char* expressionDeepFallbackReasonName(
 // relative to the same higher-precision reference tape. Accepted immutable
 // jets land into the existing certified residual tail; uncovered leaves retain
 // the per-step scaled path when supported and otherwise use MPFR. Existing
-// entire, meromorphic, principal-branch, Arg, Polar, real-bivariate, bailout,
+// piecewise formulas first run a bounded deterministic certified sample; when
+// every representative pixel becomes uncertain, it can only reject fast work
+// and routes the whole frame to MPFR. Recognized componentwise-abs quadratics
+// use an operation-equivalent reusable MPFR kernel after that rejection.
+// Existing entire, meromorphic, principal-branch, Arg, Polar, real-bivariate,
+// bailout,
 // first-escape, and profitability gates remain in force for every tile.
 // Interior output means only that no escape was observed before maxIterations,
 // not mathematical membership.

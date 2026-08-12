@@ -3,6 +3,7 @@
 
 #include <gmp.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -62,16 +63,29 @@ struct GenericDeepInfo {
     bool success = false;
     bool cancelled = false;
     bool taylorAccepted = false;
+    bool preflightAttempted = false;
+    bool preflightRejectedFast = false;
+    bool specializedPiecewiseMpfr = false;
     std::string status;
     std::string error;
     std::string phase;
+    std::string predictedPath;
     float progress = 0.0f;
     uint64_t pixelCount = 0;
+    uint64_t preflightSampleCount = 0;
+    uint64_t preflightFallbackCount = 0;
+    uint64_t preflightAvoidedFastPixelCount = 0;
+    uint64_t preflightIterationCount = 0;
+    uint64_t preflightOperationCount = 0;
+    uint64_t preflightFoldOperationCount = 0;
+    std::array<uint64_t, 16>
+        preflightFirstUncertainHistogram{};
     uint64_t fastPixelCount = 0;
     uint64_t fallbackPixelCount = 0;
     uint64_t taylorPixelCoverage = 0;
     double totalSeconds = 0.0;
     double referenceSeconds = 0.0;
+    double preflightSeconds = 0.0;
     double taylorSeconds = 0.0;
     double fastSeconds = 0.0;
     double fallbackSeconds = 0.0;

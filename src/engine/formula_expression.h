@@ -61,6 +61,11 @@ enum class ExpressionScaledResidualCapability : uint8_t {
     Unsupported
 };
 
+enum class ExpressionPiecewiseQuadraticKind : uint8_t {
+    None,
+    BurningShip
+};
+
 class ExpressionProgram {
 public:
     static constexpr size_t MAX_SOURCE = 4096;
@@ -103,6 +108,7 @@ public:
     bool derivativeCompatible() const { return _derivativeCompatible; }
     ExpressionScaledResidualCapability scaledResidualCapability() const;
     bool scaledResidualRequiresTaylor() const;
+    ExpressionPiecewiseQuadraticKind piecewiseQuadraticKind() const;
 
 private:
     enum class Op : uint8_t {

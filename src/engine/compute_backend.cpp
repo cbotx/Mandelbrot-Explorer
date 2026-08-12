@@ -244,6 +244,8 @@ private:
         switch (phase) {
         case formula::ExpressionDeepRenderPhase::Reference:
             return "reference/Taylor planning";
+        case formula::ExpressionDeepRenderPhase::Preflight:
+            return "certified fallback preflight";
         case formula::ExpressionDeepRenderPhase::Fast:
             return "certified Taylor";
         case formula::ExpressionDeepRenderPhase::Fallback:
@@ -265,6 +267,8 @@ private:
         switch (phase) {
         case formula::ExpressionDeepRenderPhase::Reference:
             return 0.03f;
+        case formula::ExpressionDeepRenderPhase::Preflight:
+            return 0.04f + 0.06f * fraction;
         case formula::ExpressionDeepRenderPhase::Fast:
             return 0.12f + 0.68f * fraction;
         case formula::ExpressionDeepRenderPhase::Fallback:
@@ -350,9 +354,18 @@ private:
             _genericInfo.cancelled = deepResult.cancelled;
             _genericInfo.taylorAccepted =
                 deepResult.taylorAccepted;
+            _genericInfo.preflightAttempted =
+                deepResult.preflightAttempted;
+            _genericInfo.preflightRejectedFast =
+                deepResult.preflightRejectedFast;
+            _genericInfo.specializedPiecewiseMpfr =
+                deepResult.usedSpecializedPiecewiseMpfr;
             _genericInfo.status =
                 formula::expressionDeepRenderStatusName(
                     deepResult.status);
+            _genericInfo.predictedPath =
+                formula::expressionDeepPreflightDecisionName(
+                    deepResult.preflightDecision);
             _genericInfo.error = deepResult.error;
             _genericInfo.phase =
                 success ? "complete" :
@@ -361,6 +374,20 @@ private:
                 success ? 1.0f : _genericInfo.progress;
             _genericInfo.fastPixelCount =
                 deepResult.fastPixelCount;
+            _genericInfo.preflightSampleCount =
+                deepResult.preflightSampleCount;
+            _genericInfo.preflightFallbackCount =
+                deepResult.preflightFallbackCount;
+            _genericInfo.preflightAvoidedFastPixelCount =
+                deepResult.preflightAvoidedFastPixelCount;
+            _genericInfo.preflightIterationCount =
+                deepResult.preflightIterationCount;
+            _genericInfo.preflightOperationCount =
+                deepResult.preflightOperationCount;
+            _genericInfo.preflightFoldOperationCount =
+                deepResult.preflightFoldOperationCount;
+            _genericInfo.preflightFirstUncertainHistogram =
+                deepResult.preflightFirstUncertainHistogram;
             _genericInfo.fallbackPixelCount =
                 deepResult.fallbackPixelCount;
             _genericInfo.taylorPixelCoverage =
@@ -368,6 +395,8 @@ private:
             _genericInfo.totalSeconds = totalSeconds;
             _genericInfo.referenceSeconds =
                 deepResult.referenceSeconds;
+            _genericInfo.preflightSeconds =
+                deepResult.preflightSeconds;
             _genericInfo.taylorSeconds =
                 deepResult.taylorBuildSeconds +
                 deepResult.fastSeconds;

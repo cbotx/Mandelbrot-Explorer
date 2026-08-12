@@ -196,6 +196,8 @@ struct ExpressionScaledResidualResult {
     bool certified = false;
     size_t operationCount = 0;
     size_t seriesOperationCount = 0;
+    size_t foldOperationCount = 0;
+    size_t uncertainFoldCount = 0;
 };
 
 class ExpressionScaledResidualEvaluator {

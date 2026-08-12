@@ -4778,6 +4778,11 @@ static int runExpressionScaledCase() {
               { value(-0.0, 0), {} },
               ExpressionScaledResidualStatus::Success,
               true },
+            { "exact-zero-input",
+              { value(-0.0, 0), {} },
+              { value(0.0, 0), {} },
+              ExpressionScaledResidualStatus::Success,
+              true },
             { "reference-positive-zero",
               { value(0.0, 0), {} },
               { value(0.5, 0), {} },
@@ -9575,6 +9580,8 @@ static int runExpressionDeepRenderCase() {
                     perStepTelemetry = perStepResult;
                 }
             }
+            benchmarkOkay = benchmarkOkay &&
+                !telemetry.preflightAttempted;
             const double minimumAccelerated =
                 *std::min_element(
                     acceleratedSeconds.begin(),
@@ -9637,6 +9644,227 @@ static int runExpressionDeepRenderCase() {
                    (unsigned long long)
                        perStepTelemetry.fallbackPixelCount,
                    100.0 * foldRate);
+        }
+    }
+
+    // Production regression for the reported componentwise-abs deep view.
+    // Preflight may only reject certified work; the final image remains the
+    // independently evaluated generic MPFR bytecode result.
+    {
+        ProgramPair pair;
+        const char* source =
+            "sqr(complex(abs(real(z)),abs(imag(z))))+c";
+        const char* centerReal =
+            "-1.013951002213813310632862698887121834129";
+        const char* centerImaginary =
+            "-0.7988691125646760914741501921763298573252";
+        const char* scale =
+            "3.245427860252859436180864346639097915255e12";
+        if (!compilePair(
+                source, FormulaParameter::C,
+                transcendentalFixed, pair)) {
+            printf("  reported diffabs setup failed\n");
+            ++failures;
+        } else {
+            auto configure = [&](std::vector<float>& output) {
+                ExpressionDeepRenderRequest request =
+                    makeRequest(
+                        pair, transcendentalFixed,
+                        FormulaParameter::C,
+                        centerReal, centerImaginary,
+                        33, 21, 2000, output);
+                request.scale.decimal = scale;
+                request.bailout = 100.0;
+                return request;
+            };
+            std::vector<float> production;
+            ExpressionDeepRenderRequest productionRequest =
+                configure(production);
+            productionRequest.threading.threads = 1;
+            ExpressionDeepRenderResult productionResult;
+            bool okay =
+                formula::renderExpressionDeepFrame(
+                    productionRequest,
+                    productionResult);
+
+            std::vector<float> threaded;
+            ExpressionDeepRenderRequest threadedRequest =
+                configure(threaded);
+            threadedRequest.threading.threads = 4;
+            ExpressionDeepRenderResult threadedResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    threadedRequest,
+                    threadedResult);
+
+            std::vector<float> genericMpfr;
+            ExpressionDeepRenderRequest genericRequest =
+                configure(genericMpfr);
+            genericRequest.preflight.enable = false;
+            genericRequest.taylor.enableTaylor = false;
+            genericRequest.
+                forceMpfrFallbackForVerification = true;
+            genericRequest.
+                disableSpecializedPiecewiseMpfrForVerification =
+                    true;
+            ExpressionDeepRenderResult genericResult;
+            okay = okay &&
+                formula::renderExpressionDeepFrame(
+                    genericRequest, genericResult);
+
+            const uint64_t pixels =
+                static_cast<uint64_t>(
+                    production.size());
+            okay = okay &&
+                production == threaded &&
+                production == genericMpfr &&
+                productionResult.preflightAttempted &&
+                productionResult.preflightRejectedFast &&
+                productionResult.preflightFallbackCount ==
+                    productionResult.preflightSampleCount &&
+                productionResult.preflightSampleCount == 16 &&
+                productionResult.fastPixelCount == 0 &&
+                productionResult.fallbackPixelCount == pixels &&
+                !productionResult.taylorAttempted &&
+                productionResult.
+                    usedSpecializedPiecewiseMpfr &&
+                productionResult.
+                    preflightFallbackReasonCounts[
+                        static_cast<size_t>(
+                            ExpressionDeepFallbackReason::
+                                BranchSensitive)] == 16 &&
+                productionResult.
+                    preflightFirstUncertainHistogram[6] == 16 &&
+                productionResult.
+                    preflightMinimumFirstUncertainIteration >=
+                    productionRequest.preflight.
+                        earlyRejectMinimumFirstUncertainIteration &&
+                threadedResult.preflightRejectedFast &&
+                threadedResult.preflightFallbackCount ==
+                    productionResult.preflightFallbackCount &&
+                threadedResult.
+                    preflightFirstUncertainHistogram ==
+                    productionResult.
+                        preflightFirstUncertainHistogram &&
+                genericResult.fastPixelCount == 0 &&
+                genericResult.fallbackPixelCount == pixels &&
+                !genericResult.usedSpecializedPiecewiseMpfr;
+            if (!okay) {
+                printf("  reported diffabs regression failed production=%llu/%llu preflight=%llu/%llu Taylor=%d specialized=%d min-uncertain=%u generic=%llu/%llu\n",
+                       (unsigned long long)
+                           productionResult.fastPixelCount,
+                       (unsigned long long)
+                           productionResult.fallbackPixelCount,
+                       (unsigned long long)
+                           productionResult.
+                               preflightFallbackCount,
+                       (unsigned long long)
+                           productionResult.
+                               preflightSampleCount,
+                       productionResult.taylorAttempted
+                           ? 1 : 0,
+                       productionResult.
+                           usedSpecializedPiecewiseMpfr
+                           ? 1 : 0,
+                       productionResult.
+                           preflightMinimumFirstUncertainIteration,
+                       (unsigned long long)
+                           genericResult.fastPixelCount,
+                       (unsigned long long)
+                           genericResult.fallbackPixelCount);
+                ++failures;
+            } else {
+                ++exactFrames;
+            }
+
+            std::vector<float> cancelledOutput;
+            ExpressionDeepRenderRequest cancelRequest =
+                configure(cancelledOutput);
+            std::atomic<bool> inPreflight{ false };
+            std::atomic<int> preflightPolls{ 0 };
+            cancelRequest.progress =
+                [&](ExpressionDeepRenderPhase phase,
+                    uint64_t, uint64_t) {
+                    inPreflight.store(
+                        phase ==
+                            ExpressionDeepRenderPhase::
+                                Preflight,
+                        std::memory_order_release);
+                };
+            cancelRequest.shouldCancel = [&] {
+                return inPreflight.load(
+                           std::memory_order_acquire) &&
+                       preflightPolls.fetch_add(
+                           1,
+                           std::memory_order_relaxed) > 4;
+            };
+            ExpressionDeepRenderResult cancelResult;
+            const bool cancelOkay =
+                formula::renderExpressionDeepFrame(
+                    cancelRequest, cancelResult);
+            if (cancelOkay || !cancelResult.cancelled ||
+                std::count(
+                    cancelledOutput.begin(),
+                    cancelledOutput.end(),
+                    formula::ExpressionDeepEmptyPixel) !=
+                    static_cast<ptrdiff_t>(
+                        cancelledOutput.size())) {
+                printf("  reported diffabs preflight cancellation failed\n");
+                ++failures;
+            }
+
+            const struct {
+                const char* centerRe;
+                const char* centerIm;
+                const char* zoom;
+                int iterations;
+                double escape;
+            } nearby[] = {
+                { centerReal, centerImaginary,
+                  "9.99e11", 500, 100.0 },
+                { centerReal, centerImaginary,
+                  "1.001e12", 500, 100.0 },
+                { "-1.0139510022135",
+                  "-0.7988691125650",
+                  scale, 900, 4.0 }
+            };
+            for (const auto& view : nearby) {
+                std::vector<float> actual, expected;
+                ExpressionDeepRenderRequest actualRequest =
+                    makeRequest(
+                        pair, transcendentalFixed,
+                        FormulaParameter::C,
+                        view.centerRe, view.centerIm,
+                        9, 7, view.iterations, actual);
+                actualRequest.scale.decimal = view.zoom;
+                actualRequest.bailout = view.escape;
+                ExpressionDeepRenderResult actualResult;
+                ExpressionDeepRenderRequest expectedRequest =
+                    actualRequest;
+                expected.assign(
+                    actual.size(),
+                    formula::ExpressionDeepEmptyPixel);
+                expectedRequest.output = expected.data();
+                expectedRequest.outputCount =
+                    expected.size();
+                expectedRequest.preflight.enable = false;
+                expectedRequest.taylor.enableTaylor = false;
+                expectedRequest.
+                    forceMpfrFallbackForVerification = true;
+                expectedRequest.
+                    disableSpecializedPiecewiseMpfrForVerification =
+                        true;
+                ExpressionDeepRenderResult expectedResult;
+                if (!formula::renderExpressionDeepFrame(
+                        actualRequest, actualResult) ||
+                    !formula::renderExpressionDeepFrame(
+                        expectedRequest, expectedResult) ||
+                    actual != expected) {
+                    printf("  reported diffabs nearby parity failed zoom=%s\n",
+                           view.zoom);
+                    ++failures;
+                }
+            }
         }
     }
 
@@ -9759,7 +9987,7 @@ static int runExpressionDeepRenderCase() {
                  adaptiveResult.
                          taylorFoldRejectedJetCount > 0 &&
                      adaptiveResult.fallbackPixelCount ==
-                         33) &&
+                         32) &&
                 (!expectCut ||
                  adaptiveResult.
                          taylorCutRejectedJetCount > 0 &&
@@ -16772,6 +17000,357 @@ static std::string pow10(int n) {
     return s;
 }
 
+static int runCustomSlowdownCase(int width, int height) {
+    using formula::ExpressionContext;
+    using formula::ExpressionDeepFallbackReason;
+    using formula::ExpressionDeepRenderRequest;
+    using formula::ExpressionDeepRenderResult;
+    using formula::ExpressionError;
+    using formula::ExpressionJit4;
+    using formula::ExpressionOrbitPlan;
+    using formula::ExpressionProgram;
+
+    constexpr int maxIterations = 2000;
+    constexpr double bailout = 100.0;
+    const char* source =
+        "sqr(complex(abs(real(z)),abs(imag(z))))+c";
+    const char* centerReal =
+        "-1.013951002213813310632862698887121834129";
+    const char* centerImaginary =
+        "-0.7988691125646760914741501921763298573252";
+    const char* scaleText =
+        "3.245427860252859436180864346639097915255e12";
+
+    ExpressionProgram canonical;
+    ExpressionProgram runtime;
+    ExpressionError error;
+    ExpressionContext fixed;
+    if (!canonical.compile(source, &error) ||
+        !canonical.specialize(
+            fixed, FormulaParameter::C,
+            runtime, &error)) {
+        printf("custom slowdown compile failed: %s\n",
+               error.message.c_str());
+        return 1;
+    }
+
+    const size_t pixelCount =
+        static_cast<size_t>(width) *
+        static_cast<size_t>(height);
+    auto makeRequest = [&](std::vector<float>& output) {
+        output.assign(
+            pixelCount,
+            formula::ExpressionDeepEmptyPixel);
+        ExpressionDeepRenderRequest request;
+        request.canonicalProgram = &canonical;
+        request.runtimeProgram = &runtime;
+        request.center.realDecimal = centerReal;
+        request.center.imaginaryDecimal =
+            centerImaginary;
+        request.scale.decimal = scaleText;
+        request.fixed = fixed;
+        request.pixelParameter = FormulaParameter::C;
+        request.width = width;
+        request.height = height;
+        request.maxIterations = maxIterations;
+        request.bailout = bailout;
+        request.output = output.data();
+        request.outputCount = output.size();
+        request.precision.minimumBits = 128;
+        request.precision.guardBits = 64;
+        request.precision.maximumBits = 4096;
+        request.memory.fallbackGuardBits = 128;
+        request.threading.tileWidth = 16;
+        request.threading.tileHeight = 8;
+        return request;
+    };
+    auto render = [&](const char* name,
+                      ExpressionDeepRenderRequest request,
+                      ExpressionDeepRenderResult& result,
+                      double& seconds) {
+        const Clock::time_point start = Clock::now();
+        const bool okay =
+            formula::renderExpressionDeepFrame(
+                request, result);
+        seconds = since(start);
+        printf("  %-20s %.3f s fast/fallback=%llu/%llu preflight=%llu/%llu %s Taylor=%llu/%llu preflight iter/ops/folds=%llu/%llu/%llu fast iter/ops/folds=%llu/%llu/%llu specialized=%d\n",
+               name, seconds,
+               (unsigned long long)result.fastPixelCount,
+               (unsigned long long)
+                   result.fallbackPixelCount,
+               (unsigned long long)
+                   result.preflightFallbackCount,
+               (unsigned long long)
+                   result.preflightSampleCount,
+               formula::expressionDeepPreflightDecisionName(
+                   result.preflightDecision),
+               (unsigned long long)
+                   result.taylorAcceptedJetCount,
+               (unsigned long long)
+                   result.taylorAttemptedJetCount,
+               (unsigned long long)
+                   result.preflightIterationCount,
+               (unsigned long long)
+                   result.preflightOperationCount,
+               (unsigned long long)
+                   result.preflightFoldOperationCount,
+               (unsigned long long)
+                   result.fastIterationCount,
+               (unsigned long long)
+                   result.fastOperationCount,
+               (unsigned long long)
+                   result.fastFoldOperationCount,
+               result.usedSpecializedPiecewiseMpfr ? 1 : 0);
+        printf("    first uncertain preflight:");
+        for (size_t bin = 0;
+             bin <
+                 result.preflightFirstUncertainHistogram.
+                     size();
+             ++bin)
+            if (result.
+                    preflightFirstUncertainHistogram[bin])
+                printf(" b%zu=%llu", bin,
+                       (unsigned long long)
+                           result.
+                               preflightFirstUncertainHistogram[
+                                   bin]);
+        printf(" reasons:");
+        for (size_t reason = 0;
+             reason <
+                 result.preflightFallbackReasonCounts.
+                     size();
+             ++reason)
+            if (result.
+                    preflightFallbackReasonCounts[reason])
+                printf(" %s=%llu",
+                       formula::
+                           expressionDeepFallbackReasonName(
+                               static_cast<
+                                   ExpressionDeepFallbackReason>(
+                                   reason)),
+                       (unsigned long long)
+                           result.
+                               preflightFallbackReasonCounts[
+                                   reason]);
+        printf("\n");
+        printf("    full fallback reasons:");
+        for (size_t reason = 0;
+             reason <
+                 result.fallbackReasonCounts.size();
+             ++reason)
+            if (result.fallbackReasonCounts[reason])
+                printf(" %s=%llu",
+                       formula::
+                           expressionDeepFallbackReasonName(
+                               static_cast<
+                                   ExpressionDeepFallbackReason>(
+                                   reason)),
+                       (unsigned long long)
+                           result.fallbackReasonCounts[
+                               reason]);
+        printf(" first uncertain:");
+        for (size_t bin = 0;
+             bin <
+                 result.fallbackFirstUncertainHistogram.
+                     size();
+             ++bin)
+            if (result.
+                    fallbackFirstUncertainHistogram[bin])
+                printf(" b%zu=%llu", bin,
+                       (unsigned long long)
+                           result.
+                               fallbackFirstUncertainHistogram[
+                                   bin]);
+        printf("\n");
+        if (!okay)
+            printf("    status=%s error=%s\n",
+                   formula::expressionDeepRenderStatusName(
+                       result.status),
+                   result.error.c_str());
+        return okay;
+    };
+
+    std::vector<float> production;
+    ExpressionDeepRenderRequest productionRequest =
+        makeRequest(production);
+    ExpressionDeepRenderResult productionResult;
+    double productionSeconds = 0.0;
+    bool okay = render(
+        "production", productionRequest,
+        productionResult, productionSeconds);
+
+    std::vector<float> specialized;
+    ExpressionDeepRenderRequest specializedRequest =
+        makeRequest(specialized);
+    specializedRequest.preflight.enable = false;
+    specializedRequest.taylor.enableTaylor = false;
+    specializedRequest.forceMpfrFallbackForVerification =
+        true;
+    ExpressionDeepRenderResult specializedResult;
+    double specializedSeconds = 0.0;
+    okay = render(
+        "all-MPFR specialized", specializedRequest,
+        specializedResult, specializedSeconds) && okay;
+
+    std::vector<float> generic;
+    ExpressionDeepRenderRequest genericRequest =
+        makeRequest(generic);
+    genericRequest.preflight.enable = false;
+    genericRequest.taylor.enableTaylor = false;
+    genericRequest.forceMpfrFallbackForVerification =
+        true;
+    genericRequest.
+        disableSpecializedPiecewiseMpfrForVerification =
+            true;
+    ExpressionDeepRenderResult genericResult;
+    double genericSeconds = 0.0;
+    okay = render(
+        "all-MPFR generic", genericRequest,
+        genericResult, genericSeconds) && okay;
+
+    if (production != generic ||
+        specialized != generic) {
+        size_t productionMismatch = 0;
+        size_t specializedMismatch = 0;
+        for (size_t index = 0;
+             index < pixelCount; ++index) {
+            productionMismatch +=
+                production[index] != generic[index];
+            specializedMismatch +=
+                specialized[index] != generic[index];
+        }
+        printf("  MPFR parity mismatch production/specialized=%zu/%zu\n",
+               productionMismatch,
+               specializedMismatch);
+        okay = false;
+    }
+
+    if (pixelCount <= 50000) {
+        std::vector<float> current;
+        ExpressionDeepRenderRequest currentRequest =
+            makeRequest(current);
+        currentRequest.preflight.enable = false;
+        ExpressionDeepRenderResult currentResult;
+        double currentSeconds = 0.0;
+        okay = render(
+            "certified current", currentRequest,
+            currentResult, currentSeconds) && okay;
+
+        std::vector<float> perStep;
+        ExpressionDeepRenderRequest perStepRequest =
+            makeRequest(perStep);
+        perStepRequest.preflight.enable = false;
+        perStepRequest.taylor.enableTaylor = false;
+        ExpressionDeepRenderResult perStepResult;
+        double perStepSeconds = 0.0;
+        okay = render(
+            "scaled no Taylor", perStepRequest,
+            perStepResult, perStepSeconds) && okay;
+        if (current != generic || perStep != generic) {
+            printf("  certified variant output mismatch\n");
+            okay = false;
+        }
+    }
+
+    mpf_t centerRe, centerIm, scale;
+    mpf_init2(centerRe, 256);
+    mpf_init2(centerIm, 256);
+    mpf_init2(scale, 256);
+    const bool parsed =
+        mpf_set_str(centerRe, centerReal, 10) == 0 &&
+        mpf_set_str(centerIm, centerImaginary, 10) == 0 &&
+        mpf_set_str(scale, scaleText, 10) == 0;
+    std::vector<float> direct(
+        pixelCount, formula::ExpressionDeepEmptyPixel);
+    Mandel directRenderer(
+        width, height, maxIterations, 1,
+        direct.data());
+    ExpressionOrbitPlan orbitPlan;
+    ExpressionJit4 jit;
+    const bool havePlan =
+        orbitPlan.build(runtime, &error) &&
+        orbitPlan.profitable();
+    const bool haveJit =
+        VERIFY_JIT &&
+        (havePlan
+             ? jit.compile(orbitPlan)
+             : jit.compile(runtime));
+    const Clock::time_point directStart = Clock::now();
+    const bool directOkay = parsed &&
+        directRenderer.ComputeExpression(
+            centerRe, centerIm, scale,
+            runtime, fixed, FormulaParameter::C,
+            maxIterations, bailout,
+            formula::ExpressionColoring::Raw,
+            haveJit ? &jit : nullptr,
+            havePlan ? &orbitPlan : nullptr);
+    const double directSeconds = since(directStart);
+    mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
+    size_t directMismatch = 0;
+    size_t directClassMismatch = 0;
+    for (size_t index = 0;
+         directOkay && index < pixelCount; ++index) {
+        if (direct[index] != generic[index])
+            ++directMismatch;
+        if ((direct[index] < 0.0f) !=
+            (generic[index] < 0.0f))
+            ++directClassMismatch;
+    }
+    const double zoom = std::strtod(scaleText, nullptr);
+    const double centerReDouble =
+        std::strtod(centerReal, nullptr);
+    const double centerImDouble =
+        std::strtod(centerImaginary, nullptr);
+    const double halfWidth = 2.0 / zoom;
+    const double halfHeight =
+        halfWidth * static_cast<double>(height) /
+        static_cast<double>(width);
+    const double dx =
+        2.0 * halfWidth /
+        static_cast<double>(width - 1);
+    const double dy =
+        2.0 * halfHeight /
+        static_cast<double>(height - 1);
+    auto ulp = [](double value) {
+        const double magnitude = std::fabs(value);
+        return std::nextafter(
+                   magnitude,
+                   std::numeric_limits<double>::infinity()) -
+               magnitude;
+    };
+    const double xUlp = ulp(
+        std::fabs(centerReDouble) + halfWidth);
+    const double yUlp = ulp(
+        std::fabs(centerImDouble) + halfHeight);
+    const double coordinateUlpMargin =
+        std::min(dx / xUlp, dy / yUlp);
+    printf("  %-20s %.3f s mismatch/class=%zu/%zu coordinate margin=%.2f ulp; recurrence proof rejected\n",
+           "direct binary64", directSeconds,
+           directMismatch, directClassMismatch,
+           coordinateUlpMargin);
+
+    const bool preflightOkay =
+        productionResult.preflightAttempted &&
+        productionResult.preflightRejectedFast &&
+        productionResult.preflightSampleCount >= 8 &&
+        productionResult.preflightFallbackCount ==
+            productionResult.preflightSampleCount &&
+        productionResult.fastPixelCount == 0 &&
+        productionResult.fallbackPixelCount == pixelCount;
+    const double speedup =
+        productionSeconds > 0.0
+        ? genericSeconds / productionSeconds : 0.0;
+    printf("=== custom diffabs production slowdown %dx%d\n",
+           width, height);
+    printf("  production/generic MPFR %.3f/%.3f s speedup %.2fx direct exact=%d\n",
+           productionSeconds, genericSeconds, speedup,
+           directOkay && directMismatch == 0 ? 1 : 0);
+    printf("  => %s\n\n",
+           okay && preflightOkay
+               ? "PASS" : "CHECK (custom slowdown failure)");
+    return okay && preflightOkay ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     std::string which = (argc > 1) ? argv[1] : "all";
     const int W = (argc > 2) ? atoi(argv[2]) : 120;
@@ -16923,6 +17502,7 @@ int main(int argc, char** argv) {
     if (which == "multibrot")                  rc |= runMultibrotCase();
     if (which == "backend")                    rc |= runBackendCase();
     if (which == "generic-deep")               rc |= runGenericDeepBackendCase();
+    if (which == "custom-slowdown")            rc |= runCustomSlowdownCase(W, H);
     if (which == "gpu")
         rc |= runGpuBenchmarkCase(
             argc > 2 ? W : 1920, argc > 3 ? H : 1080);

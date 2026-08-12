@@ -900,15 +900,22 @@ std::string MandelNavigator::GetExpressionAccelerationText() const {
     }
     if (production.usesGenericCertifiedDeep()) {
         const GenericDeepInfo info = _backend->lastGenericDeepInfo();
-        if (!info.used || !info.settled)
+        if (!info.used || !info.settled) {
+            if (info.phase == "certified fallback preflight")
+                return "generic deep certified MPFR preflight";
             return "generic deep Taylor";
+        }
         if (!info.success) {
             return "generic deep failed (" +
                 (info.status.empty() ? std::string("unknown")
                                      : info.status) + ")";
         }
         std::string path;
-        if (info.pixelCount != 0 &&
+        if (info.preflightRejectedFast) {
+            path = info.specializedPiecewiseMpfr
+                ? "generic deep specialized MPFR (preflight)"
+                : "generic deep MPFR (preflight)";
+        } else if (info.pixelCount != 0 &&
             info.fallbackPixelCount == info.pixelCount &&
             info.fastPixelCount == 0) {
             path = "generic deep MPFR";
@@ -929,6 +936,25 @@ std::string MandelNavigator::GetExpressionAccelerationText() const {
              << " (" << std::fixed << std::setprecision(1)
              << fallbackRate << "%), Taylor coverage "
              << taylorCoverage << "%";
+        if (info.preflightAttempted) {
+            const double preflightFallbackRate =
+                info.preflightSampleCount
+                ? 100.0 *
+                      static_cast<double>(
+                          info.preflightFallbackCount) /
+                      static_cast<double>(
+                          info.preflightSampleCount)
+                : 0.0;
+            text << ", preflight "
+                 << info.preflightFallbackCount << "/"
+                 << info.preflightSampleCount << " ("
+                 << preflightFallbackRate << "%) -> "
+                 << info.predictedPath;
+            if (info.preflightAvoidedFastPixelCount != 0)
+                text << ", avoided "
+                     << info.preflightAvoidedFastPixelCount
+                     << " fast pixels";
+        }
         return text.str();
     }
     if (production.path ==

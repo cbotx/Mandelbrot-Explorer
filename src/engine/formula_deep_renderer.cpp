@@ -245,7 +245,23 @@ struct FallbackWorkerWorkspace {
           context(precision),
           pixel(precision),
           next(precision),
-          magnitudeStorage(precision) {}
+          magnitudeStorage(precision) {
+        for (mpfr_ptr value : piecewiseScratch)
+            mpfr_init2(value, precision);
+        mpfr_init2(piecewiseBailoutSquared, precision);
+        mpfr_set_d(
+            piecewiseBailoutSquared,
+            request.bailout, RND);
+        mpfr_sqr(
+            piecewiseBailoutSquared,
+            piecewiseBailoutSquared, RND);
+    }
+
+    ~FallbackWorkerWorkspace() {
+        for (mpfr_ptr value : piecewiseScratch)
+            mpfr_clear(value);
+        mpfr_clear(piecewiseBailoutSquared);
+    }
 
     ExactGeometry geometry;
     bool geometryReady = false;
@@ -253,7 +269,59 @@ struct FallbackWorkerWorkspace {
     MpfrComplex pixel;
     MpfrComplex next;
     MpfrComplex magnitudeStorage;
+    mpfr_t piecewiseScratch[5];
+    mpfr_t piecewiseBailoutSquared;
 };
+
+bool evaluatePiecewiseQuadraticMpfr(
+        ExpressionPiecewiseQuadraticKind kind,
+        const ExpressionOracleContext& context,
+        MpfrComplex& output, mpfr_t (&scratch)[5]) {
+    if (kind !=
+            ExpressionPiecewiseQuadraticKind::BurningShip)
+        return false;
+    // The generic oracle computes hypot(component, +0) after real()/imag().
+    // Its exact mathematical result is representable, so abs is identical and
+    // avoids two general square-root calls.
+    mpfr_abs(scratch[1], context.z.re, RND);
+    mpfr_abs(scratch[2], context.z.im, RND);
+    mpfr_mul(
+        scratch[3], scratch[1], scratch[1], RND);
+    mpfr_mul(
+        scratch[4], scratch[2], scratch[2], RND);
+    mpfr_sub(output.re, scratch[3], scratch[4], RND);
+    mpfr_mul(
+        scratch[3], scratch[1], scratch[2], RND);
+    // The generic complex square adds two identical rounded products.
+    mpfr_mul_2ui(output.im, scratch[3], 1, RND);
+    mpfr_add(output.re, output.re, context.c.re, RND);
+    mpfr_add(output.im, output.im, context.c.im, RND);
+    return true;
+}
+
+bool piecewiseOutsideBailout(
+        const MpfrComplex& value,
+        mpfr_srcptr bailoutSquared,
+        double bailout,
+        mpfr_ptr magnitude,
+        mpfr_t (&scratch)[5],
+        bool& outside) {
+    mpfr_sqr(scratch[0], value.re, MPFR_RNDU);
+    mpfr_sqr(scratch[1], value.im, MPFR_RNDU);
+    mpfr_add(
+        scratch[2], scratch[0], scratch[1],
+        MPFR_RNDU);
+    if (mpfr_cmp(scratch[2], bailoutSquared) <= 0) {
+        outside = false;
+        return true;
+    }
+    mpfr_hypot(
+        magnitude, value.re, value.im, RND);
+    if (mpfr_nan_p(magnitude)) return false;
+    outside = mpfr_inf_p(magnitude) ||
+              mpfr_cmp_d(magnitude, bailout) > 0;
+    return true;
+}
 
 bool checkedAddSize(
         size_t& total, size_t count, size_t bytes) {
@@ -1023,7 +1091,298 @@ struct FastPixelResult {
     ExpressionDeepFallbackReason reason =
         ExpressionDeepFallbackReason::InvalidTape;
     uint64_t iterations = 0;
+    uint64_t operationCount = 0;
+    uint64_t seriesOperationCount = 0;
+    uint64_t foldOperationCount = 0;
+    uint64_t uncertainFoldCount = 0;
+    uint32_t firstUncertainIteration = 0;
 };
+
+size_t uncertaintyHistogramBin(uint32_t iteration) {
+    if (iteration == 0) return 0;
+    size_t bin = 1;
+    while (iteration > 1 &&
+           bin + 1 <
+               ExpressionDeepUncertaintyHistogramBins) {
+        iteration >>= 1;
+        ++bin;
+    }
+    return bin;
+}
+
+uint64_t saturatingMultiply(
+        uint64_t left, uint64_t right) {
+    if (left == 0 || right == 0) return 0;
+    return left >
+            std::numeric_limits<uint64_t>::max() / right
+        ? std::numeric_limits<uint64_t>::max()
+        : left * right;
+}
+
+std::vector<size_t> makePreflightSamples(
+        int width, int height, size_t maximumSamples) {
+    std::vector<size_t> samples;
+    if (width < 1 || height < 1 || maximumSamples == 0)
+        return samples;
+    const size_t pixelCount =
+        static_cast<size_t>(width) *
+        static_cast<size_t>(height);
+    maximumSamples = std::min(maximumSamples, pixelCount);
+    int columns = static_cast<int>(std::ceil(std::sqrt(
+        static_cast<double>(maximumSamples) *
+        static_cast<double>(width) /
+        static_cast<double>(height))));
+    columns = std::max(1, std::min(columns, width));
+    int rows = static_cast<int>(
+        (maximumSamples +
+         static_cast<size_t>(columns) - 1) /
+        static_cast<size_t>(columns));
+    rows = std::max(1, std::min(rows, height));
+    samples.reserve(maximumSamples);
+    const size_t gridCount =
+        static_cast<size_t>(columns) *
+        static_cast<size_t>(rows);
+    for (size_t sample = 0;
+         sample < maximumSamples; ++sample) {
+        const size_t slot = maximumSamples == 1
+            ? gridCount / 2
+            : sample * (gridCount - 1) /
+                (maximumSamples - 1);
+        const int row = static_cast<int>(
+            slot / static_cast<size_t>(columns));
+        const int column = static_cast<int>(
+            slot % static_cast<size_t>(columns));
+        const int y = rows == 1
+            ? height / 2
+            : static_cast<int>(
+                static_cast<int64_t>(row) *
+                (height - 1) / (rows - 1));
+        const int x = columns == 1
+            ? width / 2
+            : static_cast<int>(
+                static_cast<int64_t>(column) *
+                (width - 1) / (columns - 1));
+        const size_t index =
+            static_cast<size_t>(y) *
+                static_cast<size_t>(width) +
+            static_cast<size_t>(x);
+        if (samples.empty() ||
+            samples.back() != index)
+            samples.push_back(index);
+    }
+    return samples;
+}
+
+template<typename Cancel>
+FastPixelResult evaluateCertifiedPerStepPixel(
+        const ExpressionDeepRenderRequest& request,
+        ExpressionScaledResidualCapability capability,
+        bool certifiedPiecewiseCandidate,
+        const ExpressionReferenceOrbitResult& reference,
+        ExpressionScaledResidualEvaluator& evaluator,
+        const ScaledComplexBall& initialReference,
+        bool initialReferenceExponentUnsafe,
+        const BailoutThreshold& bailoutThreshold,
+        const ScaledComplexBall& offset,
+        Cancel&& pollCancellation) {
+    FastPixelResult pixel;
+    ExpressionScaledResidualInput input;
+    ScaledComplexBall stateDelta;
+    ScaledArithmeticStatus arithmetic =
+        initialReferenceExponentUnsafe
+        ? ScaledArithmeticStatus::ExponentRange
+        : certifyScaledMpfrExponentRange(offset);
+    if (arithmetic != ScaledArithmeticStatus::Success) {
+        pixel.reason = reasonForArithmeticStatus(arithmetic);
+        return pixel;
+    }
+    if (request.pixelParameter == FormulaParameter::C) {
+        input.c = offset.value;
+        input.cError = offset.radius;
+        stateDelta.radius = initialReference.radius;
+    } else {
+        input.z0 = offset.value;
+        input.z0Error = offset.radius;
+        stateDelta = offset;
+    }
+
+    ScaledComplexBall initialBase;
+    initialBase.value = initialReference.value;
+    ScaledComplexBall initialValue;
+    arithmetic = certifyScaledMpfrExponentRange(initialBase);
+    if (arithmetic == ScaledArithmeticStatus::Success)
+        arithmetic = certifyScaledMpfrExponentRange(stateDelta);
+    if (arithmetic == ScaledArithmeticStatus::Success)
+        arithmetic = certifiedScaledAdd(
+            initialBase, stateDelta, initialValue);
+    if (arithmetic == ScaledArithmeticStatus::Success)
+        arithmetic = certifyScaledMpfrExponentRange(initialValue);
+    if (arithmetic != ScaledArithmeticStatus::Success) {
+        pixel.reason = reasonForArithmeticStatus(arithmetic);
+        return pixel;
+    }
+
+    ScaledArithmeticStatus gateStatus =
+        ScaledArithmeticStatus::Success;
+    BailoutDecision decision = decideBailout(
+        initialValue.value, initialValue.radius,
+        bailoutThreshold, gateStatus);
+    if (decision == BailoutDecision::Error) {
+        pixel.reason = reasonForArithmeticStatus(gateStatus);
+        return pixel;
+    }
+    if (decision == BailoutDecision::Uncertain) {
+        pixel.reason =
+            ExpressionDeepFallbackReason::BailoutUncertain;
+        return pixel;
+    }
+    if (decision == BailoutDecision::Outside) {
+        pixel.decided = true;
+        pixel.output = 0.0f;
+        return pixel;
+    }
+
+    for (int iteration = 0;
+         iteration < request.maxIterations; ++iteration) {
+        pixel.firstUncertainIteration =
+            static_cast<uint32_t>(iteration);
+        if (pollCancellation()) break;
+        if (static_cast<size_t>(iteration) >=
+                reference.samples.size()) {
+            pixel.reason =
+                ExpressionDeepFallbackReason::
+                    ReferenceExhausted;
+            break;
+        }
+        input.z = stateDelta.value;
+        input.zError = stateDelta.radius;
+        input.iteration = iteration;
+        const ExpressionScaledResidualResult evaluated =
+            evaluator.evaluate(
+                static_cast<size_t>(iteration), input);
+        ++pixel.iterations;
+        pixel.operationCount = saturatingAdd(
+            pixel.operationCount,
+            static_cast<uint64_t>(
+                evaluated.operationCount));
+        pixel.seriesOperationCount = saturatingAdd(
+            pixel.seriesOperationCount,
+            static_cast<uint64_t>(
+                evaluated.seriesOperationCount));
+        pixel.foldOperationCount = saturatingAdd(
+            pixel.foldOperationCount,
+            static_cast<uint64_t>(
+                evaluated.foldOperationCount));
+        pixel.uncertainFoldCount = saturatingAdd(
+            pixel.uncertainFoldCount,
+            static_cast<uint64_t>(
+                evaluated.uncertainFoldCount));
+        if (evaluated.status !=
+                ExpressionScaledResidualStatus::Success) {
+            pixel.reason =
+                reasonForResidualStatus(evaluated.status);
+            break;
+        }
+        if (evaluated.uncertified &&
+            !request.allowUncertifiedForBenchmark) {
+            pixel.reason =
+                ExpressionDeepFallbackReason::
+                    UncertifiedSeries;
+            break;
+        }
+        if ((capability ==
+                 ExpressionScaledResidualCapability::
+                     ExactCenteredArithmetic ||
+             certifiedPiecewiseCandidate) &&
+            !evaluated.certified) {
+            pixel.reason =
+                ExpressionDeepFallbackReason::
+                    CertificationFailure;
+            break;
+        }
+
+        const ExpressionReferenceSample& sample =
+            reference.samples[
+                static_cast<size_t>(iteration)];
+        ScaledComplexBall outputBase;
+        ScaledComplexBall residualBall;
+        ScaledComplexBall actualOutput;
+        arithmetic = makeScaledComplexValue(
+            sample.next, sample.rootDefect,
+            outputBase.value);
+        if (arithmetic == ScaledArithmeticStatus::Success)
+            arithmetic = certifyScaledMpfrExponentRange(
+                outputBase);
+        residualBall.value = evaluated.residual;
+        residualBall.radius = evaluated.radius;
+        if (arithmetic == ScaledArithmeticStatus::Success)
+            arithmetic = certifiedScaledAdd(
+                outputBase, residualBall, actualOutput);
+        if (arithmetic == ScaledArithmeticStatus::Success)
+            arithmetic = certifyScaledMpfrExponentRange(
+                actualOutput);
+        if (arithmetic != ScaledArithmeticStatus::Success) {
+            pixel.reason =
+                reasonForArithmeticStatus(arithmetic);
+            break;
+        }
+
+        decision = decideBailout(
+            actualOutput.value, actualOutput.radius,
+            bailoutThreshold, gateStatus);
+        if (decision == BailoutDecision::Error) {
+            pixel.reason =
+                reasonForArithmeticStatus(gateStatus);
+            break;
+        }
+        if (decision == BailoutDecision::Uncertain) {
+            pixel.reason =
+                ExpressionDeepFallbackReason::
+                    BailoutUncertain;
+            break;
+        }
+        if (decision == BailoutDecision::Outside) {
+            pixel.decided = true;
+            pixel.output =
+                static_cast<float>(iteration + 1);
+            break;
+        }
+        if (iteration + 1 == request.maxIterations) {
+            pixel.decided = true;
+            pixel.output = ExpressionDeepInteriorPixel;
+            break;
+        }
+        if (static_cast<size_t>(iteration + 1) >=
+                reference.samples.size()) {
+            pixel.reason =
+                ExpressionDeepFallbackReason::
+                    ReferenceExhausted;
+            break;
+        }
+        ScaledComplexBall nextBase;
+        arithmetic = makeScaledComplexValue(
+            reference.samples[
+                static_cast<size_t>(iteration + 1)].z,
+            reference.samples[
+                static_cast<size_t>(iteration + 1)].zDefect,
+            nextBase.value);
+        if (arithmetic == ScaledArithmeticStatus::Success)
+            arithmetic = certifyScaledMpfrExponentRange(
+                nextBase);
+        if (arithmetic == ScaledArithmeticStatus::Success)
+            arithmetic = certifiedScaledSubtract(
+                actualOutput, nextBase, stateDelta);
+        if (arithmetic == ScaledArithmeticStatus::Success)
+            arithmetic = certifyScaledMpfrExponentRange(
+                stateDelta);
+        if (arithmetic != ScaledArithmeticStatus::Success) {
+            pixel.reason =
+                reasonForArithmeticStatus(arithmetic);
+            break;
+        }
+    }
+    return pixel;
+}
 
 ExpressionDeepRenderStatus mapReferenceStatus(
         ExpressionReferenceBuildStatus status) {
@@ -1098,6 +1457,19 @@ const char* expressionDeepFallbackReasonName(
     return "invalid";
 }
 
+const char* expressionDeepPreflightDecisionName(
+        ExpressionDeepPreflightDecision decision) {
+    switch (decision) {
+    case ExpressionDeepPreflightDecision::NotRun:
+        return "not-run";
+    case ExpressionDeepPreflightDecision::ContinueCertifiedFast:
+        return "certified-fast";
+    case ExpressionDeepPreflightDecision::DirectMpfr:
+        return "direct-mpfr";
+    }
+    return "invalid";
+}
+
 bool renderExpressionDeepFrame(
         const ExpressionDeepRenderRequest& request,
         ExpressionDeepRenderResult& result) {
@@ -1164,6 +1536,17 @@ bool renderExpressionDeepFrame(
             return fail(
                 ExpressionDeepRenderStatus::InvalidRequest,
                 "fallback guard precision is invalid");
+        if (request.preflight.maximumSamples < 1 ||
+            request.preflight.maximumSamples > 256 ||
+            request.preflight.minimumSamples < 1 ||
+            request.preflight.minimumSamples >
+                request.preflight.maximumSamples ||
+            request.preflight.
+                    earlyRejectMinimumFirstUncertainIteration >
+                static_cast<uint32_t>(1 << 24))
+            return fail(
+                ExpressionDeepRenderStatus::InvalidRequest,
+                "preflight policy is invalid");
         if (request.taylor.minimumLanding < 1 ||
             request.taylor.minimumOrder < 8 ||
             request.taylor.maximumOrder > 20 ||
@@ -1329,6 +1712,11 @@ bool renderExpressionDeepFrame(
             certifiedPiecewiseCandidate &&
             !request.runtimeProgram->
                 scaledResidualRequiresTaylor();
+        const bool earlyPiecewisePreflight =
+            piecewisePerStepEligible &&
+            request.runtimeProgram->
+                piecewiseQuadraticKind() !=
+                ExpressionPiecewiseQuadraticKind::None;
         const bool certifiedTaylorEligible =
             !certifiedTaylorCandidate ||
             piecewisePerStepEligible ||
@@ -1356,7 +1744,13 @@ bool renderExpressionDeepFrame(
                   sizeof(ScaledOffset)) ||
               !checkedAddSize(
                   rendererBaseBytes, request.height,
-                  sizeof(ScaledOffset)))) ||
+                  sizeof(ScaledOffset)) ||
+              (request.preflight.enable &&
+               piecewisePerStepEligible &&
+               !checkedAddSize(
+                   rendererBaseBytes,
+                   request.preflight.maximumSamples,
+                   sizeof(size_t))))) ||
             !checkedAddSize(
                 rendererBaseBytes, pixelCount,
                 sizeof(uint8_t)) ||
@@ -1816,6 +2210,202 @@ bool renderExpressionDeepFrame(
                     rendererBytes = rendererBaseBytes;
                     result.rendererBytes = rendererBytes;
                 }
+            }
+            auto rejectFastFromPreflight = [&]() {
+                result.preflightRejectedFast = true;
+                result.preflightDecision =
+                    ExpressionDeepPreflightDecision::
+                        DirectMpfr;
+                result.preflightAvoidedFastPixelCount =
+                    pixelCount64;
+                const uint64_t sampleCount =
+                    std::max<uint64_t>(
+                        1, result.preflightSampleCount);
+                const uint64_t averageIterations =
+                    (result.preflightIterationCount +
+                     sampleCount - 1) / sampleCount;
+                const uint64_t averageOperations =
+                    (result.preflightOperationCount +
+                     sampleCount - 1) / sampleCount;
+                result.preflightAvoidedIterationEstimate =
+                    saturatingMultiply(
+                        averageIterations, pixelCount64);
+                result.preflightAvoidedOperationEstimate =
+                    saturatingMultiply(
+                        averageOperations, pixelCount64);
+                runFast = false;
+                certificationUnavailable = true;
+                reference = {};
+                result.referenceBytes = 0;
+                validationEvaluator.reset();
+                std::vector<ScaledOffset>().swap(xOffsets);
+                std::vector<ScaledOffset>().swap(yOffsets);
+                rendererBaseBytes = 0;
+                if (!checkedAddSize(
+                        rendererBaseBytes, pixelCount,
+                        sizeof(uint8_t)) ||
+                    !checkedAddSize(
+                        rendererBaseBytes, pixelCount,
+                        sizeof(size_t)))
+                    return fail(
+                        ExpressionDeepRenderStatus::
+                            ResourceLimit,
+                        "preflight fallback renderer memory calculation overflow");
+                fastThreadBytesTotal = 0;
+                rendererBytes = rendererBaseBytes;
+                result.rendererBytes = rendererBytes;
+                std::fill(
+                    fallbackReason.begin(),
+                    fallbackReason.end(),
+                    static_cast<uint8_t>(
+                        ExpressionDeepFallbackReason::
+                            CertificationFailure));
+                return true;
+            };
+            auto runCertifiedPreflight = [&]() {
+                result.preflightAttempted = true;
+                notifyProgress(
+                    ExpressionDeepRenderPhase::Preflight,
+                    0, request.preflight.maximumSamples);
+                const Clock::time_point preflightStart =
+                    Clock::now();
+                const std::vector<size_t> samples =
+                    makePreflightSamples(
+                        request.width, request.height,
+                        request.preflight.maximumSamples);
+                for (size_t sampleNumber = 0;
+                     sampleNumber < samples.size();
+                     ++sampleNumber) {
+                    if (pollCancellation()) break;
+                    const size_t index = samples[sampleNumber];
+                    const int y = static_cast<int>(
+                        index /
+                            static_cast<size_t>(
+                                request.width));
+                    const int x = static_cast<int>(
+                        index %
+                            static_cast<size_t>(
+                                request.width));
+                    ScaledComplexBall offset;
+                    const ScaledOffset& xOffset =
+                        xOffsets[static_cast<size_t>(x)];
+                    const ScaledOffset& yOffset =
+                        yOffsets[static_cast<size_t>(y)];
+                    offset.value.re = xOffset.value;
+                    offset.value.im = yOffset.value;
+                    offset.radius =
+                        compareScaledNonnegative(
+                            xOffset.error,
+                            yOffset.error) >= 0
+                        ? xOffset.error : yOffset.error;
+                    const FastPixelResult pixel =
+                        evaluateCertifiedPerStepPixel(
+                            request, result.capability,
+                            certifiedPiecewiseCandidate,
+                            reference,
+                            *validationEvaluator,
+                            initialReference,
+                            initialReferenceExponentUnsafe,
+                            bailoutThreshold, offset,
+                            pollCancellation);
+                    ++result.preflightSampleCount;
+                    result.preflightIterationCount =
+                        saturatingAdd(
+                            result.preflightIterationCount,
+                            pixel.iterations);
+                    result.preflightOperationCount =
+                        saturatingAdd(
+                            result.preflightOperationCount,
+                            pixel.operationCount);
+                    result.preflightFoldOperationCount =
+                        saturatingAdd(
+                            result.preflightFoldOperationCount,
+                            pixel.foldOperationCount);
+                    result.preflightUncertainFoldCount =
+                        saturatingAdd(
+                            result.preflightUncertainFoldCount,
+                            pixel.uncertainFoldCount);
+                    if (pixel.decided) {
+                        ++result.preflightFastCount;
+                    } else {
+                        ++result.preflightFallbackCount;
+                        result.
+                            preflightMinimumFirstUncertainIteration =
+                                std::min(
+                                    result.
+                                        preflightMinimumFirstUncertainIteration,
+                                    pixel.
+                                        firstUncertainIteration);
+                        result.
+                            preflightMaximumFirstUncertainIteration =
+                                std::max(
+                                    result.
+                                        preflightMaximumFirstUncertainIteration,
+                                    pixel.
+                                        firstUncertainIteration);
+                        const size_t reasonIndex =
+                            static_cast<size_t>(
+                                pixel.reason);
+                        if (reasonIndex <
+                                result.
+                                    preflightFallbackReasonCounts.
+                                        size())
+                            ++result.
+                                preflightFallbackReasonCounts[
+                                    reasonIndex];
+                        ++result.
+                            preflightFirstUncertainHistogram[
+                                uncertaintyHistogramBin(
+                                    pixel.
+                                        firstUncertainIteration)];
+                    }
+                    notifyProgress(
+                        ExpressionDeepRenderPhase::Preflight,
+                        result.preflightSampleCount,
+                        samples.size());
+                }
+                result.preflightSeconds =
+                    secondsSince(preflightStart);
+                if (cancelled.load(
+                        std::memory_order_acquire))
+                    return fail(
+                        ExpressionDeepRenderStatus::Cancelled,
+                        "render cancelled during certified preflight");
+                const uint64_t minimumSamples =
+                    std::min<uint64_t>(
+                        static_cast<uint64_t>(
+                            request.preflight.minimumSamples),
+                        pixelCount64);
+                const bool rejectFast =
+                    result.preflightSampleCount >=
+                        minimumSamples &&
+                    result.preflightFallbackCount ==
+                        result.preflightSampleCount &&
+                    result.preflightFastCount == 0 &&
+                    (!request.taylor.enableTaylor ||
+                     result.
+                         preflightMinimumFirstUncertainIteration >=
+                         request.preflight.
+                             earlyRejectMinimumFirstUncertainIteration);
+                if (rejectFast) {
+                    if (!rejectFastFromPreflight())
+                        return false;
+                } else {
+                    result.preflightDecision =
+                        ExpressionDeepPreflightDecision::
+                            ContinueCertifiedFast;
+                }
+                return true;
+            };
+            if (runFast &&
+                request.preflight.enable &&
+                (!request.taylor.enableTaylor ||
+                 earlyPiecewisePreflight) &&
+                piecewisePerStepEligible &&
+                validationEvaluator &&
+                validationEvaluator->ready()) {
+                if (!runCertifiedPreflight())
+                    return false;
             }
             // Validation is complete; destroy its retained vector capacities
             // before Taylor construction and the parallel render peak.
@@ -2694,6 +3284,38 @@ bool renderExpressionDeepFrame(
                          taylorBuildSecondsBefore));
             }
             if (runFast &&
+                request.preflight.enable &&
+                !result.preflightAttempted &&
+                piecewisePerStepEligible &&
+                !useTaylor) {
+                validationEvaluator =
+                    std::make_unique<
+                        ExpressionScaledResidualEvaluator>();
+                if (validationEvaluator->prepare(
+                        *request.runtimeProgram,
+                        reference) &&
+                    validationEvaluator->ready()) {
+                    if (!runCertifiedPreflight())
+                        return false;
+                }
+                validationEvaluator.reset();
+            }
+            if (runFast &&
+                piecewisePerStepEligible &&
+                result.preflightAttempted &&
+                !result.preflightRejectedFast &&
+                !useTaylor &&
+                result.preflightSampleCount >=
+                    std::min<uint64_t>(
+                        request.preflight.minimumSamples,
+                        pixelCount64) &&
+                result.preflightFallbackCount ==
+                    result.preflightSampleCount &&
+                result.preflightFastCount == 0) {
+                if (!rejectFastFromPreflight())
+                    return false;
+            }
+            if (runFast &&
                 certifiedTaylorCapability(
                     result.capability) &&
                 !piecewisePerStepEligible &&
@@ -2758,6 +3380,15 @@ bool renderExpressionDeepFrame(
         std::atomic<uint64_t> taylorFallbackPixels{ 0 };
         std::atomic<uint64_t> taylorEvaluationNanoseconds{ 0 };
         std::atomic<uint64_t> taylorResidualNanoseconds{ 0 };
+        std::atomic<uint64_t> fastOperationCount{ 0 };
+        std::atomic<uint64_t> fastSeriesOperationCount{ 0 };
+        std::atomic<uint64_t> fastFoldOperationCount{ 0 };
+        std::atomic<uint64_t> fastUncertainFoldCount{ 0 };
+        std::array<std::atomic<uint64_t>,
+            ExpressionDeepUncertaintyHistogramBins>
+            firstUncertainHistogram{};
+        for (auto& count : firstUncertainHistogram)
+            count.store(0, std::memory_order_relaxed);
         std::atomic<uint64_t> fastCompleted{ 0 };
         std::atomic_bool fastResourceError{ false };
         std::atomic_bool fastInternalError{ false };
@@ -2794,6 +3425,13 @@ bool renderExpressionDeepFrame(
                 uint64_t localTaylorFallbackPixels = 0;
                 uint64_t localTaylorEvaluationNanoseconds = 0;
                 uint64_t localTaylorResidualNanoseconds = 0;
+                uint64_t localFastOperationCount = 0;
+                uint64_t localFastSeriesOperationCount = 0;
+                uint64_t localFastFoldOperationCount = 0;
+                uint64_t localFastUncertainFoldCount = 0;
+                std::array<uint64_t,
+                    ExpressionDeepUncertaintyHistogramBins>
+                    localFirstUncertainHistogram{};
                 TaylorBatchCache batchCache;
 #pragma omp for schedule(dynamic, 1)
                 for (long long tile = 0;
@@ -3141,6 +3779,11 @@ bool renderExpressionDeepFrame(
                                              iteration <
                                                  request.maxIterations;
                                              ++iteration) {
+                                            pixel.
+                                                firstUncertainIteration =
+                                                    static_cast<
+                                                        uint32_t>(
+                                                        iteration);
                                             if (pollCancellation())
                                                 break;
                                             if (static_cast<size_t>(
@@ -3163,6 +3806,39 @@ bool renderExpressionDeepFrame(
                                                             iteration),
                                                         input);
                                             ++pixel.iterations;
+                                            pixel.operationCount =
+                                                saturatingAdd(
+                                                    pixel.
+                                                        operationCount,
+                                                    static_cast<
+                                                        uint64_t>(
+                                                        evaluated.
+                                                            operationCount));
+                                            pixel.
+                                                seriesOperationCount =
+                                                    saturatingAdd(
+                                                        pixel.
+                                                            seriesOperationCount,
+                                                        static_cast<
+                                                            uint64_t>(
+                                                            evaluated.
+                                                                seriesOperationCount));
+                                            pixel.foldOperationCount =
+                                                saturatingAdd(
+                                                    pixel.
+                                                        foldOperationCount,
+                                                    static_cast<
+                                                        uint64_t>(
+                                                        evaluated.
+                                                            foldOperationCount));
+                                            pixel.uncertainFoldCount =
+                                                saturatingAdd(
+                                                    pixel.
+                                                        uncertainFoldCount,
+                                                    static_cast<
+                                                        uint64_t>(
+                                                        evaluated.
+                                                            uncertainFoldCount));
                                             if (evaluated.status !=
                                                     ExpressionScaledResidualStatus::
                                                         Success) {
@@ -3331,6 +4007,22 @@ bool renderExpressionDeepFrame(
                                 }
                             }
                             localIterations += pixel.iterations;
+                            localFastOperationCount =
+                                saturatingAdd(
+                                    localFastOperationCount,
+                                    pixel.operationCount);
+                            localFastSeriesOperationCount =
+                                saturatingAdd(
+                                    localFastSeriesOperationCount,
+                                    pixel.seriesOperationCount);
+                            localFastFoldOperationCount =
+                                saturatingAdd(
+                                    localFastFoldOperationCount,
+                                    pixel.foldOperationCount);
+                            localFastUncertainFoldCount =
+                                saturatingAdd(
+                                    localFastUncertainFoldCount,
+                                    pixel.uncertainFoldCount);
                             if (cancelled.load(
                                     std::memory_order_acquire))
                                 break;
@@ -3349,6 +4041,10 @@ bool renderExpressionDeepFrame(
                                 fallbackReason[index] =
                                     static_cast<uint8_t>(
                                         pixel.reason);
+                                ++localFirstUncertainHistogram[
+                                    uncertaintyHistogramBin(
+                                        pixel.
+                                            firstUncertainIteration)];
                             }
                             ++completedInTile;
                         }
@@ -3393,6 +4089,24 @@ bool renderExpressionDeepFrame(
                 taylorResidualNanoseconds.fetch_add(
                     localTaylorResidualNanoseconds,
                     std::memory_order_relaxed);
+                fastOperationCount.fetch_add(
+                    localFastOperationCount,
+                    std::memory_order_relaxed);
+                fastSeriesOperationCount.fetch_add(
+                    localFastSeriesOperationCount,
+                    std::memory_order_relaxed);
+                fastFoldOperationCount.fetch_add(
+                    localFastFoldOperationCount,
+                    std::memory_order_relaxed);
+                fastUncertainFoldCount.fetch_add(
+                    localFastUncertainFoldCount,
+                    std::memory_order_relaxed);
+                for (size_t bin = 0;
+                     bin < localFirstUncertainHistogram.size();
+                     ++bin)
+                    firstUncertainHistogram[bin].fetch_add(
+                        localFirstUncertainHistogram[bin],
+                        std::memory_order_relaxed);
             }
         }
         result.fastSeconds = secondsSince(fastStart);
@@ -3400,6 +4114,8 @@ bool renderExpressionDeepFrame(
             fastPixels.load(std::memory_order_relaxed);
         result.totalIterations =
             totalIterations.load(std::memory_order_relaxed);
+        result.fastIterationCount =
+            result.totalIterations;
         result.taylorAcceptedPixelCount =
             taylorAcceptedPixels.load(
                 std::memory_order_relaxed);
@@ -3416,6 +4132,25 @@ bool renderExpressionDeepFrame(
                 taylorResidualNanoseconds.load(
                     std::memory_order_relaxed)) /
             1.0e9;
+        result.fastOperationCount =
+            fastOperationCount.load(
+                std::memory_order_relaxed);
+        result.fastSeriesOperationCount =
+            fastSeriesOperationCount.load(
+                std::memory_order_relaxed);
+        result.fastFoldOperationCount =
+            fastFoldOperationCount.load(
+                std::memory_order_relaxed);
+        result.fastUncertainFoldCount =
+            fastUncertainFoldCount.load(
+                std::memory_order_relaxed);
+        for (size_t bin = 0;
+             bin < result.
+                 fallbackFirstUncertainHistogram.size();
+             ++bin)
+            result.fallbackFirstUncertainHistogram[bin] =
+                firstUncertainHistogram[bin].load(
+                    std::memory_order_relaxed);
         if (fastResourceError.load(
                 std::memory_order_acquire))
             return fail(
@@ -3534,9 +4269,10 @@ bool renderExpressionDeepFrame(
                 return fail(
                     ExpressionDeepRenderStatus::ResourceLimit,
                     "MPFR workspace calculation overflow");
-            // Worker state (34), oracle scratch (12), and up to six
-            // simultaneous operation temporaries, plus the bytecode stack.
-            size_t mpfrValuesPerThread = 52;
+            // Worker state (34), oracle scratch (12), up to six simultaneous
+            // operation temporaries, and five reusable piecewise temporaries,
+            // plus the bytecode stack.
+            size_t mpfrValuesPerThread = 58;
             if (!checkedAddSize(
                     mpfrValuesPerThread,
                     request.runtimeProgram->stackDepth(), 2))
@@ -3593,11 +4329,20 @@ bool renderExpressionDeepFrame(
         const Clock::time_point fallbackStart = Clock::now();
         std::atomic<uint64_t> fallbackCompleted{ 0 };
         std::atomic<uint64_t> undefinedPixels{ 0 };
+        std::atomic<uint64_t> specializedPiecewisePixels{ 0 };
+        std::atomic<uint64_t> specializedPiecewiseIterations{ 0 };
         std::atomic_bool fallbackResourceError{ false };
         std::atomic_bool fallbackInternalError{ false };
         std::atomic_bool fallbackIterationFaultInjected{
             false
         };
+        const ExpressionPiecewiseQuadraticKind
+            piecewiseQuadraticKind =
+                request.
+                    disableSpecializedPiecewiseMpfrForVerification
+                ? ExpressionPiecewiseQuadraticKind::None
+                : request.runtimeProgram->
+                      piecewiseQuadraticKind();
         if (!fallbackQueue.empty()) {
 #pragma omp parallel num_threads(threadCount)
             {
@@ -3628,6 +4373,8 @@ bool renderExpressionDeepFrame(
                         true, std::memory_order_release);
                 }
                 uint64_t localIterations = 0;
+                uint64_t localSpecializedPixels = 0;
+                uint64_t localSpecializedIterations = 0;
 #pragma omp for schedule(dynamic, 8)
                 for (long long queueIndex = 0;
                      queueIndex <
@@ -3671,6 +4418,10 @@ bool renderExpressionDeepFrame(
                     bool undefined =
                         !geometry.coordinate(
                             x, y, request, pixel);
+                    const bool specializedPiecewise =
+                        piecewiseQuadraticKind !=
+                            ExpressionPiecewiseQuadraticKind::
+                                None;
                     if (!undefined) {
                         if (request.pixelParameter ==
                                 FormulaParameter::C) {
@@ -3693,6 +4444,22 @@ bool renderExpressionDeepFrame(
                             mpfr_inf_p(context.z.im)) {
                             output = 0.0f;
                             decided = true;
+                        } else if (specializedPiecewise) {
+                            bool outside = false;
+                            if (!piecewiseOutsideBailout(
+                                    context.z,
+                                    workspace->
+                                        piecewiseBailoutSquared,
+                                    request.bailout,
+                                    magnitude,
+                                    workspace->
+                                        piecewiseScratch,
+                                    outside)) {
+                                undefined = true;
+                            } else if (outside) {
+                                output = 0.0f;
+                                decided = true;
+                            }
                         } else {
                             mpfr_hypot(
                                 magnitude,
@@ -3718,11 +4485,18 @@ bool renderExpressionDeepFrame(
                         context.iteration = iteration;
                         std::string oracleError;
                         const bool oracleDefined =
-                            ExpressionOracle::evaluate(
+                            specializedPiecewise
+                            ? evaluatePiecewiseQuadraticMpfr(
+                                piecewiseQuadraticKind,
+                                context, next,
+                                workspace->piecewiseScratch)
+                            : ExpressionOracle::evaluate(
                                 *request.runtimeProgram,
                                 context, next,
                                 &oracleError);
                         ++localIterations;
+                        if (specializedPiecewise)
+                            ++localSpecializedIterations;
                         if (mpfr_nan_p(next.re) ||
                             mpfr_nan_p(next.im)) {
                             undefined = true;
@@ -3742,18 +4516,36 @@ bool renderExpressionDeepFrame(
                             break;
                         }
                         context.z.set(next);
-                        mpfr_hypot(
-                            magnitude,
-                            context.z.re, context.z.im,
-                            RND);
-                        if (mpfr_nan_p(magnitude)) {
-                            undefined = true;
-                            break;
-                        }
-                        if (mpfr_inf_p(magnitude) ||
-                            mpfr_cmp_d(
+                        bool outside = false;
+                        if (specializedPiecewise) {
+                            if (!piecewiseOutsideBailout(
+                                    context.z,
+                                    workspace->
+                                        piecewiseBailoutSquared,
+                                    request.bailout,
+                                    magnitude,
+                                    workspace->
+                                        piecewiseScratch,
+                                    outside)) {
+                                undefined = true;
+                                break;
+                            }
+                        } else {
+                            mpfr_hypot(
                                 magnitude,
-                                request.bailout) > 0) {
+                                context.z.re,
+                                context.z.im, RND);
+                            if (mpfr_nan_p(magnitude)) {
+                                undefined = true;
+                                break;
+                            }
+                            outside =
+                                mpfr_inf_p(magnitude) ||
+                                mpfr_cmp_d(
+                                    magnitude,
+                                    request.bailout) > 0;
+                        }
+                        if (outside) {
                             output = static_cast<float>(
                                 iteration + 1);
                             decided = true;
@@ -3780,6 +4572,8 @@ bool renderExpressionDeepFrame(
                                     ExpressionDeepEmptyPixel;
                         }
                     }
+                    if (specializedPiecewise)
+                        ++localSpecializedPixels;
                     const uint64_t completed =
                         fallbackCompleted.fetch_add(
                             1,
@@ -3804,6 +4598,12 @@ bool renderExpressionDeepFrame(
                 totalIterations.fetch_add(
                     localIterations,
                     std::memory_order_relaxed);
+                specializedPiecewisePixels.fetch_add(
+                    localSpecializedPixels,
+                    std::memory_order_relaxed);
+                specializedPiecewiseIterations.fetch_add(
+                    localSpecializedIterations,
+                    std::memory_order_relaxed);
             }
         }
         result.fallbackSeconds =
@@ -3812,6 +4612,14 @@ bool renderExpressionDeepFrame(
             totalIterations.load(std::memory_order_relaxed);
         result.undefinedPixelCount =
             undefinedPixels.load(std::memory_order_relaxed);
+        result.specializedPiecewiseMpfrPixelCount =
+            specializedPiecewisePixels.load(
+                std::memory_order_relaxed);
+        result.specializedPiecewiseMpfrIterationCount =
+            specializedPiecewiseIterations.load(
+                std::memory_order_relaxed);
+        result.usedSpecializedPiecewiseMpfr =
+            result.specializedPiecewiseMpfrPixelCount != 0;
         if (fallbackResourceError.load(
                 std::memory_order_acquire))
             return fail(
