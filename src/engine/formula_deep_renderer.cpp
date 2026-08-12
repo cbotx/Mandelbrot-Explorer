@@ -937,7 +937,7 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
         const bool certifiedTaylorCandidate = certifiedTaylorCapability(result.capability);
         const bool certifiedPiecewiseCandidate = result.capability == ExpressionScaledResidualCapability::CertifiedPiecewiseCandidate;
         const bool piecewisePerStepEligible = certifiedPiecewiseCandidate && !request.runtimeProgram->scaledResidualRequiresTaylor();
-        const bool earlyPiecewisePreflight = piecewisePerStepEligible && request.runtimeProgram->piecewiseQuadraticKind() != ExpressionPiecewiseQuadraticKind::None;
+        const bool earlyPiecewisePreflight = piecewisePerStepEligible;
         const bool certifiedTaylorEligible = !certifiedTaylorCandidate || piecewisePerStepEligible || (request.taylor.enableTaylor && request.maxIterations > request.taylor.minimumLanding);
         bool runFast = !request.forceMpfrFallbackForVerification && certifiedTaylorEligible && (certifiedReferenceCapability(result.capability) || (result.capability == ExpressionScaledResidualCapability::UncertifiedSeries && request.allowUncertifiedForBenchmark));
         bool certificationUnavailable = request.forceMpfrFallbackForVerification || (certifiedTaylorCandidate && !certifiedTaylorEligible);

@@ -5507,7 +5507,7 @@ static int runExpressionDeepRenderCase() {
                     perStepTelemetry = perStepResult;
                 }
             }
-            benchmarkOkay = benchmarkOkay && !telemetry.preflightAttempted;
+            benchmarkOkay = benchmarkOkay && telemetry.preflightAttempted && !telemetry.preflightRejectedFast && telemetry.preflightFallbackCount == 0 && telemetry.preflightFastCount == telemetry.preflightSampleCount;
             const double minimumAccelerated = *std::min_element(acceleratedSeconds.begin(), acceleratedSeconds.end());
             const double maximumAccelerated = *std::max_element(acceleratedSeconds.begin(), acceleratedSeconds.end());
             const double minimumMpfr = *std::min_element(mpfrSeconds.begin(), mpfrSeconds.end());
@@ -9940,7 +9940,8 @@ static int runCustomSlowdownCase(int width, int height) {
         return value ? std::clamp(atoi(value), 1, 5000000) : 2000;
     }();
     constexpr double bailout = 100.0;
-    const char* source = "sqr(complex(abs(real(z)),abs(imag(z))))+c";
+    const char* source = getenv("MANDEL_CUSTOM_SLOW_SOURCE");
+    if (!source) source = "sqr(complex(abs(real(z)),abs(imag(z))))+c";
     const char* centerReal = getenv("MANDEL_CUSTOM_SLOW_CX");
     if (!centerReal) centerReal = "-1.013951002213813310632862698887121834129";
     const char* centerImaginary = getenv("MANDEL_CUSTOM_SLOW_CY");
@@ -9956,6 +9957,7 @@ static int runCustomSlowdownCase(int width, int height) {
         printf("custom slowdown compile failed: %s\n", error.message.c_str());
         return 1;
     }
+    printf("  formula source=%s instructions=%zu piecewise=%d\n", source, runtime.instructionCount(), runtime.piecewiseQuadraticKind() == formula::ExpressionPiecewiseQuadraticKind::BurningShip ? 1 : 0);
 
     const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
     auto makeRequest = [&](std::vector<float>& output) {
@@ -9976,9 +9978,11 @@ static int runCustomSlowdownCase(int width, int height) {
         request.outputCount = output.size();
         const char* minimumBits = getenv("MANDEL_CUSTOM_SLOW_BITS");
         request.precision.minimumBits = minimumBits ? std::clamp<mpfr_prec_t>(static_cast<mpfr_prec_t>(strtoll(minimumBits, nullptr, 10)), 53, 4096) : 128;
-        request.precision.guardBits = 64;
+        const char* guardBits = getenv("MANDEL_CUSTOM_SLOW_GUARD");
+        request.precision.guardBits = guardBits ? std::clamp<mpfr_prec_t>(static_cast<mpfr_prec_t>(strtoll(guardBits, nullptr, 10)), 0, 4096) : 64;
         request.precision.maximumBits = 4096;
-        request.memory.fallbackGuardBits = 128;
+        const char* fallbackGuardBits = getenv("MANDEL_CUSTOM_SLOW_FALLBACK_GUARD");
+        request.memory.fallbackGuardBits = fallbackGuardBits ? std::clamp<mpfr_prec_t>(static_cast<mpfr_prec_t>(strtoll(fallbackGuardBits, nullptr, 10)), 0, 4096) : 128;
         request.threading.tileWidth = 16;
         request.threading.tileHeight = 8;
         return request;
@@ -10032,6 +10036,45 @@ static int runCustomSlowdownCase(int width, int height) {
     double genericSeconds = 0.0;
     okay = render("all-MPFR generic", genericRequest, genericResult, genericSeconds) && okay;
 
+    if (getenv("MANDEL_CUSTOM_SLOW_GUARD") || getenv("MANDEL_CUSTOM_SLOW_FALLBACK_GUARD")) {
+        std::vector<float> highPrecision(pixelCount, formula::ExpressionDeepEmptyPixel);
+        ExpressionDeepRenderRequest highRequest = genericRequest;
+        highRequest.output = highPrecision.data();
+        highRequest.outputCount = highPrecision.size();
+        highRequest.precision.requestedBits = 319;
+        highRequest.precision.minimumBits = 53;
+        highRequest.precision.guardBits = 0;
+        highRequest.memory.fallbackGuardBits = 128;
+        ExpressionDeepRenderResult highResult;
+        double highSeconds = 0.0;
+        okay = render("all-MPFR high GT", highRequest, highResult, highSeconds) && okay;
+        size_t classMismatch = 0;
+        double maxDifference = 0.0;
+        double sumDifference = 0.0;
+        std::vector<double> differences;
+        differences.reserve(pixelCount);
+        for (size_t index = 0; index < pixelCount; ++index) {
+            const bool lowInterior = generic[index] < 0.0f;
+            const bool highInterior = highPrecision[index] < 0.0f;
+            if (lowInterior != highInterior) {
+                ++classMismatch;
+            } else if (!lowInterior) {
+                const double difference = std::fabs(static_cast<double>(generic[index]) - static_cast<double>(highPrecision[index]));
+                maxDifference = std::max(maxDifference, difference);
+                sumDifference += difference;
+                differences.push_back(difference);
+            }
+        }
+        const double meanDifference = differences.empty() ? 0.0 : sumDifference / differences.size();
+        double p99Difference = 0.0;
+        if (!differences.empty()) {
+            const size_t percentileIndex = static_cast<size_t>(std::ceil(0.99 * differences.size())) - 1;
+            std::nth_element(differences.begin(), differences.begin() + percentileIndex, differences.end());
+            p99Difference = differences[percentileIndex];
+        }
+        printf("  low-vs-high GT class=%zu max/mean/p99=%.3f/%.3f/%.3f low/high=%.3f/%.3f s\n", classMismatch, maxDifference, meanDifference, p99Difference, genericSeconds, highSeconds);
+    }
+
     if (production != generic || specialized != generic) {
         size_t productionMismatch = 0;
         size_t specializedMismatch = 0;
@@ -10081,9 +10124,29 @@ static int runCustomSlowdownCase(int width, int height) {
     mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
     size_t directMismatch = 0;
     size_t directClassMismatch = 0;
+    double directMaxDifference = 0.0;
+    double directSumDifference = 0.0;
+    std::vector<double> directDifferences;
+    directDifferences.reserve(pixelCount);
     for (size_t index = 0; directOkay && index < pixelCount; ++index) {
         if (direct[index] != generic[index]) ++directMismatch;
-        if ((direct[index] < 0.0f) != (generic[index] < 0.0f)) ++directClassMismatch;
+        const bool directInterior = direct[index] < 0.0f;
+        const bool genericInterior = generic[index] < 0.0f;
+        if (directInterior != genericInterior) {
+            ++directClassMismatch;
+        } else if (!directInterior) {
+            const double difference = std::fabs(static_cast<double>(direct[index]) - static_cast<double>(generic[index]));
+            directMaxDifference = std::max(directMaxDifference, difference);
+            directSumDifference += difference;
+            directDifferences.push_back(difference);
+        }
+    }
+    const double directMeanDifference = directDifferences.empty() ? 0.0 : directSumDifference / directDifferences.size();
+    double directP99Difference = 0.0;
+    if (!directDifferences.empty()) {
+        const size_t percentileIndex = static_cast<size_t>(std::ceil(0.99 * directDifferences.size())) - 1;
+        std::nth_element(directDifferences.begin(), directDifferences.begin() + percentileIndex, directDifferences.end());
+        directP99Difference = directDifferences[percentileIndex];
     }
     const double zoom = std::strtod(scaleText, nullptr);
     const double centerReDouble = std::strtod(centerReal, nullptr);
@@ -10099,7 +10162,7 @@ static int runCustomSlowdownCase(int width, int height) {
     const double xUlp = ulp(std::fabs(centerReDouble) + halfWidth);
     const double yUlp = ulp(std::fabs(centerImDouble) + halfHeight);
     const double coordinateUlpMargin = std::min(dx / xUlp, dy / yUlp);
-    printf("  %-20s %.3f s mismatch/class=%zu/%zu coordinate margin=%.2f ulp; recurrence proof rejected\n", "direct binary64", directSeconds, directMismatch, directClassMismatch, coordinateUlpMargin);
+    printf("  %-20s %.3f s mismatch/class=%zu/%zu max/mean/p99=%.3f/%.3f/%.3f coordinate margin=%.2f ulp; recurrence proof rejected\n", "direct binary64", directSeconds, directMismatch, directClassMismatch, directMaxDifference, directMeanDifference, directP99Difference, coordinateUlpMargin);
 
     const bool preflightOkay = productionResult.preflightAttempted && productionResult.preflightRejectedFast && productionResult.preflightSampleCount >= 8 && productionResult.preflightFallbackCount == productionResult.preflightSampleCount && productionResult.fastPixelCount == 0 && productionResult.fallbackPixelCount == pixelCount;
     const double speedup = productionSeconds > 0.0 ? genericSeconds / productionSeconds : 0.0;
