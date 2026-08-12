@@ -31,6 +31,7 @@ static long long g_fe_stat[64][3];       // [tid] 0=BLA skip-iters 1=BLA applies
 static long long g_blafe_safe[64] = {0}; // [tid] tryBLAfe overflow-safe floatexp fallbacks
 static int g_int_rep = -2;               // env MANDEL_INT_REP: exact state-repetition interior detection (default on; -2=unread)
 static int g_bigfixed = -2;              // env MANDEL_BIGFIXED: -2 unparsed, -1 auto (on for floatexp), 0 off, >=1 force on
+static int g_fused_perturb = -1;         // env MANDEL_FUSED_PERTURB: fused rescaled step (default on, 0 restores expanded form)
 
 // Monotonic seconds, for the MANDEL_PROFILE phase timers.
 static inline double nowSec() {
@@ -1573,6 +1574,10 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
             const char* e = getenv("MANDEL_INT_REP");
             g_int_rep = e ? atoi(e) : 1;
         } // default ON
+        if (g_fused_perturb == -1) {
+            const char* e = getenv("MANDEL_FUSED_PERTURB");
+            g_fused_perturb = e ? atoi(e) : 1;
+        }
         _dxfe = mpf_to_fe(_dx);
         _dyfe = mpf_to_fe(_dy);
         double pf_ref = 0, pf_step = 0, pf_bla = 0;
@@ -3413,9 +3418,17 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, double customSeedRe, dou
             zmrfe = fe_add(Xrfe, fe_mul_d(S, wr));
             zmife = fe_add(Xife, fe_mul_d(S, wi));
         }
-        double w2r = wr * wr - wi * wi, w2i = 2.0 * wr * wi;
-        double nwr = 2.0 * (Xr * wr - Xi * wi) + s * w2r + dr;
-        double nwi = 2.0 * (Xr * wi + Xi * wr) + s * w2i + di;
+        double nwr, nwi;
+        if (g_fused_perturb > 0) {
+            const double factorReal = Xr + Xr + s * wr;
+            const double factorImaginary = Xi + Xi + s * wi;
+            nwr = factorReal * wr - factorImaginary * wi + dr;
+            nwi = factorReal * wi + factorImaginary * wr + di;
+        } else {
+            double w2r = wr * wr - wi * wi, w2i = 2.0 * wr * wi;
+            nwr = 2.0 * (Xr * wr - Xi * wi) + s * w2r + dr;
+            nwi = 2.0 * (Xr * wi + Xi * wr) + s * w2i + di;
+        }
         // A subnormal w' below 2^-1056 retains fewer than ~18 significant bits above
         // double's 2^-1074 floor, not enough to preserve the nonlinear cancellation.
         // The common path rejects on the first comparison and stays entirely double.
@@ -3665,14 +3678,22 @@ void Mandel::solveRescaledSimd4(const FloatExp* Dcr, const FloatExp* Dci, int g,
         __m256d vwr = _mm256_load_pd(wr), vwi = _mm256_load_pd(wi);
         __m256d vs = _mm256_load_pd(sS), vdr = _mm256_load_pd(dr), vdi = _mm256_load_pd(di);
         __m256d vXpr = _mm256_load_pd(Xpr), vXpi = _mm256_load_pd(Xpi);
-        __m256d w2r = _mm256_sub_pd(_mm256_mul_pd(vwr, vwr), _mm256_mul_pd(vwi, vwi));
-        __m256d w2i = _mm256_mul_pd(two, _mm256_mul_pd(vwr, vwi));
-        // nwr = 2*(Xpr*wr - Xpi*wi) + s*w2r + dr
-        __m256d a = _mm256_sub_pd(_mm256_mul_pd(vXpr, vwr), _mm256_mul_pd(vXpi, vwi));
-        __m256d nwr = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(two, a), _mm256_mul_pd(vs, w2r)), vdr);
-        // nwi = 2*(Xpr*wi + Xpi*wr) + s*w2i + di
-        __m256d b = _mm256_add_pd(_mm256_mul_pd(vXpr, vwi), _mm256_mul_pd(vXpi, vwr));
-        __m256d nwi = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(two, b), _mm256_mul_pd(vs, w2i)), vdi);
+        __m256d nwr, nwi;
+        if (g_fused_perturb > 0) {
+            const __m256d factorReal = _mm256_add_pd(_mm256_add_pd(vXpr, vXpr), _mm256_mul_pd(vs, vwr));
+            const __m256d factorImaginary = _mm256_add_pd(_mm256_add_pd(vXpi, vXpi), _mm256_mul_pd(vs, vwi));
+            nwr = _mm256_add_pd(_mm256_sub_pd(_mm256_mul_pd(factorReal, vwr), _mm256_mul_pd(factorImaginary, vwi)), vdr);
+            nwi = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(factorReal, vwi), _mm256_mul_pd(factorImaginary, vwr)), vdi);
+        } else {
+            __m256d w2r = _mm256_sub_pd(_mm256_mul_pd(vwr, vwr), _mm256_mul_pd(vwi, vwi));
+            __m256d w2i = _mm256_mul_pd(two, _mm256_mul_pd(vwr, vwi));
+            // nwr = 2*(Xpr*wr - Xpi*wi) + s*w2r + dr
+            __m256d a = _mm256_sub_pd(_mm256_mul_pd(vXpr, vwr), _mm256_mul_pd(vXpi, vwi));
+            nwr = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(two, a), _mm256_mul_pd(vs, w2r)), vdr);
+            // nwi = 2*(Xpr*wi + Xpi*wr) + s*w2i + di
+            __m256d b = _mm256_add_pd(_mm256_mul_pd(vXpr, vwi), _mm256_mul_pd(vXpi, vwr));
+            nwi = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(two, b), _mm256_mul_pd(vs, w2i)), vdi);
+        }
         __m256d vXqr = _mm256_load_pd(Xqr), vXqi = _mm256_load_pd(Xqi);
         __m256d zr = _mm256_add_pd(vXqr, _mm256_mul_pd(vs, nwr));
         __m256d zi = _mm256_add_pd(vXqi, _mm256_mul_pd(vs, nwi));
