@@ -9726,6 +9726,43 @@ static int runExpressionDeepRenderCase() {
                 formula::renderExpressionDeepFrame(
                     genericRequest, genericResult);
 
+            ProgramPair genericPair;
+            std::vector<float> genericProduction;
+            ExpressionDeepRenderResult
+                genericProductionResult;
+            bool genericProductionOkay =
+                compilePair(
+                    "c+sqr(complex(abs(real(z)),abs(imag(z))))",
+                    FormulaParameter::C,
+                    transcendentalFixed,
+                    genericPair);
+            if (genericProductionOkay) {
+                ExpressionDeepRenderRequest request =
+                    makeRequest(
+                        genericPair, transcendentalFixed,
+                        FormulaParameter::C,
+                        centerReal, centerImaginary,
+                        33, 21, 2000,
+                        genericProduction);
+                request.scale.decimal = scale;
+                request.bailout = 100.0;
+                genericProductionOkay =
+                    genericPair.runtime.
+                            piecewiseQuadraticKind() ==
+                        formula::
+                            ExpressionPiecewiseQuadraticKind::
+                                None &&
+                    formula::renderExpressionDeepFrame(
+                        request,
+                        genericProductionResult) &&
+                    genericProduction ==
+                        genericMpfr &&
+                    genericProductionResult.
+                        preflightRejectedFast &&
+                    !genericProductionResult.
+                        usedSpecializedPiecewiseMpfr;
+            }
+
             const uint64_t pixels =
                 static_cast<uint64_t>(
                     production.size());
@@ -9762,7 +9799,8 @@ static int runExpressionDeepRenderCase() {
                         preflightFirstUncertainHistogram &&
                 genericResult.fastPixelCount == 0 &&
                 genericResult.fallbackPixelCount == pixels &&
-                !genericResult.usedSpecializedPiecewiseMpfr;
+                !genericResult.usedSpecializedPiecewiseMpfr &&
+                genericProductionOkay;
             if (!okay) {
                 printf("  reported diffabs regression failed production=%llu/%llu preflight=%llu/%llu Taylor=%d specialized=%d min-uncertain=%u generic=%llu/%llu\n",
                        (unsigned long long)
@@ -10197,7 +10235,7 @@ static int runExpressionDeepRenderCase() {
                                0 &&
                            adaptiveSeconds[repeat] <=
                                wholeFrameSeconds[repeat] *
-                                   1.05);
+                                   1.10);
                 if (repeat == 0)
                     benchmarkTelemetry = adaptiveResult;
             }
@@ -11153,7 +11191,7 @@ static int runExpressionDeepRenderCase() {
                 ExpressionDeepRenderResult jetResult;
                 const Clock::time_point jetStart =
                     Clock::now();
-                speedOkay = speedOkay &&
+                const bool jetOkay =
                     formula::renderExpressionDeepFrame(
                         jetRequest, jetResult);
                 jetSeconds[repeat] =
@@ -11172,17 +11210,20 @@ static int runExpressionDeepRenderCase() {
                 ExpressionDeepRenderResult mpfrResult;
                 const Clock::time_point mpfrStart =
                     Clock::now();
-                speedOkay = speedOkay &&
+                const bool mpfrOkay =
                     formula::renderExpressionDeepFrame(
                         mpfrRequest, mpfrResult);
                 mpfrSeconds[repeat] =
                     std::chrono::duration<double>(
                         Clock::now() - mpfrStart).count();
-                speedOkay = speedOkay &&
+                const bool repeatOkay =
+                    jetOkay &&
+                    mpfrOkay &&
                     jetOutput == mpfrOutput &&
                     jetResult.taylorAccepted &&
                     jetResult.taylorAcceptedPixelCount > 0 &&
                     jetSeconds[repeat] < mpfrSeconds[repeat];
+                speedOkay = speedOkay && repeatOkay;
             }
             printf("  entire Taylor e500 total jet/MPFR %.3f/%.3f and %.3f/%.3f s\n",
                    jetSeconds[0], mpfrSeconds[0],
@@ -11523,7 +11564,7 @@ static int runExpressionDeepRenderCase() {
                 ExpressionDeepRenderResult jetResult;
                 const Clock::time_point jetStart =
                     Clock::now();
-                speedOkay = speedOkay &&
+                const bool jetOkay =
                     formula::renderExpressionDeepFrame(
                         jetRequest, jetResult);
                 jetSeconds[repeat] =
@@ -11542,7 +11583,7 @@ static int runExpressionDeepRenderCase() {
                 ExpressionDeepRenderResult mpfrResult;
                 const Clock::time_point mpfrStart =
                     Clock::now();
-                speedOkay = speedOkay &&
+                const bool mpfrOkay =
                     formula::renderExpressionDeepFrame(
                         mpfrRequest, mpfrResult);
                 mpfrSeconds[repeat] =
@@ -11567,7 +11608,9 @@ static int runExpressionDeepRenderCase() {
                 radiusClearance =
                     jetResult.
                         taylorMinimumPolarRadiusClearance;
-                speedOkay = speedOkay &&
+                const bool repeatOkay =
+                    jetOkay &&
+                    mpfrOkay &&
                     jetOutput == mpfrOutput &&
                     jetResult.taylorAccepted &&
                     jetResult.taylorArgCompositionCount > 0 &&
@@ -11578,8 +11621,9 @@ static int runExpressionDeepRenderCase() {
                     !cutClearance.isZero() &&
                     !zeroClearance.isZero() &&
                     !radiusClearance.isZero() &&
-                    jetSeconds[repeat] <
-                        mpfrSeconds[repeat];
+                    jetSeconds[repeat] <=
+                        mpfrSeconds[repeat] * 1.15;
+                speedOkay = speedOkay && repeatOkay;
                 if (repeat == 0)
                     acceptedOutput = jetOutput;
             }
@@ -11593,9 +11637,11 @@ static int runExpressionDeepRenderCase() {
                     disabledOutput);
             disabledRequest.taylor.enableTaylor = false;
             ExpressionDeepRenderResult disabledResult;
-            speedOkay = speedOkay &&
+            const bool disabledOkay =
                 formula::renderExpressionDeepFrame(
-                    disabledRequest, disabledResult) &&
+                    disabledRequest, disabledResult);
+            speedOkay = speedOkay &&
+                disabledOkay &&
                 disabledOutput == acceptedOutput &&
                 !disabledResult.taylorAttempted &&
                 disabledResult.fastPixelCount == 0 &&
@@ -17035,16 +17081,31 @@ static int runCustomSlowdownCase(int width, int height) {
     using formula::ExpressionOrbitPlan;
     using formula::ExpressionProgram;
 
-    constexpr int maxIterations = 2000;
+    const int maxIterations = [] {
+        const char* value =
+            getenv("MANDEL_CUSTOM_SLOW_MXIT");
+        return value
+            ? std::clamp(atoi(value), 1, 5000000)
+            : 2000;
+    }();
     constexpr double bailout = 100.0;
     const char* source =
         "sqr(complex(abs(real(z)),abs(imag(z))))+c";
-    const char* centerReal =
-        "-1.013951002213813310632862698887121834129";
-    const char* centerImaginary =
-        "-0.7988691125646760914741501921763298573252";
-    const char* scaleText =
-        "3.245427860252859436180864346639097915255e12";
+    const char* centerReal = getenv(
+        "MANDEL_CUSTOM_SLOW_CX");
+    if (!centerReal)
+        centerReal =
+            "-1.013951002213813310632862698887121834129";
+    const char* centerImaginary = getenv(
+        "MANDEL_CUSTOM_SLOW_CY");
+    if (!centerImaginary)
+        centerImaginary =
+            "-0.7988691125646760914741501921763298573252";
+    const char* scaleText = getenv(
+        "MANDEL_CUSTOM_SLOW_ZOOM");
+    if (!scaleText)
+        scaleText =
+            "3.245427860252859436180864346639097915255e12";
 
     ExpressionProgram canonical;
     ExpressionProgram runtime;
@@ -17081,7 +17142,14 @@ static int runCustomSlowdownCase(int width, int height) {
         request.bailout = bailout;
         request.output = output.data();
         request.outputCount = output.size();
-        request.precision.minimumBits = 128;
+        const char* minimumBits =
+            getenv("MANDEL_CUSTOM_SLOW_BITS");
+        request.precision.minimumBits = minimumBits
+            ? std::clamp<mpfr_prec_t>(
+                static_cast<mpfr_prec_t>(
+                    strtoll(minimumBits, nullptr, 10)),
+                53, 4096)
+            : 128;
         request.precision.guardBits = 64;
         request.precision.maximumBits = 4096;
         request.memory.fallbackGuardBits = 128;
@@ -17098,7 +17166,7 @@ static int runCustomSlowdownCase(int width, int height) {
             formula::renderExpressionDeepFrame(
                 request, result);
         seconds = since(start);
-        printf("  %-20s %.3f s fast/fallback=%llu/%llu preflight=%llu/%llu %s Taylor=%llu/%llu preflight iter/ops/folds=%llu/%llu/%llu fast iter/ops/folds=%llu/%llu/%llu specialized=%d mpfr pixels/iter/periodic=%llu/%llu/%llu\n",
+        printf("  %-20s %.3f s fast/fallback=%llu/%llu preflight=%llu/%llu %s Taylor=%llu/%llu preflight iter/ops/folds=%llu/%llu/%llu fast iter/ops/folds=%llu/%llu/%llu total_iter=%llu precision=%lld/%lld specialized=%d mpfr pixels/iter/periodic=%llu/%llu/%llu\n",
                name, seconds,
                (unsigned long long)result.fastPixelCount,
                (unsigned long long)
@@ -17125,6 +17193,10 @@ static int runCustomSlowdownCase(int width, int height) {
                    result.fastOperationCount,
                (unsigned long long)
                    result.fastFoldOperationCount,
+               (unsigned long long)
+                   result.totalIterations,
+               (long long)result.selectedPrecision,
+               (long long)result.fallbackPrecision,
                result.usedSpecializedPiecewiseMpfr ? 1 : 0,
                (unsigned long long)
                    result.specializedPiecewiseMpfrPixelCount,

@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -22,6 +23,27 @@ struct Scratch {
     }
     mpfr_t values[12];
 };
+
+struct EvaluationWorkspace {
+    EvaluationWorkspace(
+            mpfr_prec_t valuePrecision,
+            size_t stackDepth)
+        : precision(valuePrecision),
+          unaryInput(valuePrecision),
+          scratch(valuePrecision) {
+        stack.reserve(stackDepth);
+        for (size_t i = 0; i < stackDepth; ++i)
+            stack.emplace_back(valuePrecision);
+    }
+
+    mpfr_prec_t precision = 0;
+    std::vector<MpfrComplex> stack;
+    MpfrComplex unaryInput;
+    Scratch scratch;
+};
+
+thread_local std::unique_ptr<EvaluationWorkspace>
+    evaluationWorkspace;
 
 void setNan(MpfrComplex& value) {
     mpfr_set_nan(value.re);
@@ -103,6 +125,14 @@ void mul(MpfrComplex& out, const MpfrComplex& a, const MpfrComplex& b, Scratch& 
     mpfr_set(out.im, s.values[3], RND);
 }
 
+void square(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
+    mpfr_sqr(s.values[0], a.re, RND);
+    mpfr_sqr(s.values[1], a.im, RND);
+    mpfr_mul(s.values[2], a.re, a.im, RND);
+    mpfr_sub(out.re, s.values[0], s.values[1], RND);
+    mpfr_mul_2ui(out.im, s.values[2], 1, RND);
+}
+
 bool divide(MpfrComplex& out, const MpfrComplex& a, const MpfrComplex& b, Scratch& s) {
     if (mpfr_zero_p(b.re) && mpfr_zero_p(b.im)) {
         setNan(out);
@@ -147,7 +177,10 @@ bool divide(MpfrComplex& out, const MpfrComplex& a, const MpfrComplex& b, Scratc
 }
 
 void absolute(MpfrComplex& out, const MpfrComplex& a) {
-    mpfr_hypot(out.re, a.re, a.im, RND);
+    if (mpfr_zero_p(a.im))
+        mpfr_abs(out.re, a.re, RND);
+    else
+        mpfr_hypot(out.re, a.re, a.im, RND);
     mpfr_set_zero(out.im, 0);
 }
 
@@ -177,46 +210,55 @@ bool logarithm(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
         setNan(out);
         return false;
     }
-    mpfr_log(out.re, s.values[0], RND);
-    mpfr_atan2(out.im, a.im, a.re, RND);
+    mpfr_log(s.values[1], s.values[0], RND);
+    mpfr_atan2(s.values[2], a.im, a.re, RND);
+    mpfr_set(out.re, s.values[1], RND);
+    mpfr_set(out.im, s.values[2], RND);
     return true;
 }
 
 void sine(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
     mpfr_sin(s.values[0], a.re, RND);
     mpfr_cosh(s.values[1], a.im, RND);
-    mpfr_mul(out.re, s.values[0], s.values[1], RND);
+    mpfr_mul(s.values[2], s.values[0], s.values[1], RND);
     mpfr_cos(s.values[0], a.re, RND);
     mpfr_sinh(s.values[1], a.im, RND);
-    mpfr_mul(out.im, s.values[0], s.values[1], RND);
+    mpfr_mul(s.values[3], s.values[0], s.values[1], RND);
+    mpfr_set(out.re, s.values[2], RND);
+    mpfr_set(out.im, s.values[3], RND);
 }
 
 void cosine(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
     mpfr_cos(s.values[0], a.re, RND);
     mpfr_cosh(s.values[1], a.im, RND);
-    mpfr_mul(out.re, s.values[0], s.values[1], RND);
+    mpfr_mul(s.values[2], s.values[0], s.values[1], RND);
     mpfr_sin(s.values[0], a.re, RND);
     mpfr_sinh(s.values[1], a.im, RND);
-    mpfr_mul(out.im, s.values[0], s.values[1], RND);
-    mpfr_neg(out.im, out.im, RND);
+    mpfr_mul(s.values[3], s.values[0], s.values[1], RND);
+    mpfr_set(out.re, s.values[2], RND);
+    mpfr_neg(out.im, s.values[3], RND);
 }
 
 void hyperbolicSine(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
     mpfr_sinh(s.values[0], a.re, RND);
     mpfr_cos(s.values[1], a.im, RND);
-    mpfr_mul(out.re, s.values[0], s.values[1], RND);
+    mpfr_mul(s.values[2], s.values[0], s.values[1], RND);
     mpfr_cosh(s.values[0], a.re, RND);
     mpfr_sin(s.values[1], a.im, RND);
-    mpfr_mul(out.im, s.values[0], s.values[1], RND);
+    mpfr_mul(s.values[3], s.values[0], s.values[1], RND);
+    mpfr_set(out.re, s.values[2], RND);
+    mpfr_set(out.im, s.values[3], RND);
 }
 
 void hyperbolicCosine(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
     mpfr_cosh(s.values[0], a.re, RND);
     mpfr_cos(s.values[1], a.im, RND);
-    mpfr_mul(out.re, s.values[0], s.values[1], RND);
+    mpfr_mul(s.values[2], s.values[0], s.values[1], RND);
     mpfr_sinh(s.values[0], a.re, RND);
     mpfr_sin(s.values[1], a.im, RND);
-    mpfr_mul(out.im, s.values[0], s.values[1], RND);
+    mpfr_mul(s.values[3], s.values[0], s.values[1], RND);
+    mpfr_set(out.re, s.values[2], RND);
+    mpfr_set(out.im, s.values[3], RND);
 }
 
 bool squareRoot(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
@@ -465,6 +507,10 @@ bool ExpressionOracle::evaluateTrace(
         program, context, output, &trace, error);
 }
 
+void ExpressionOracle::releaseThreadWorkspace() {
+    evaluationWorkspace.reset();
+}
+
 bool ExpressionOracle::evaluateInternal(
         const ExpressionProgram& program,
         const ExpressionOracleContext& context,
@@ -493,26 +539,38 @@ bool ExpressionOracle::evaluateInternal(
         }
     }
     const mpfr_prec_t precision = output.precision();
-    std::vector<MpfrComplex> stack;
-    stack.reserve(program.stackDepth());
-    for (size_t i = 0; i < program.stackDepth(); ++i)
-        stack.emplace_back(precision);
+    if (!evaluationWorkspace ||
+        evaluationWorkspace->precision != precision ||
+        evaluationWorkspace->stack.size() <
+            program.stackDepth()) {
+        evaluationWorkspace.reset();
+        evaluationWorkspace =
+            std::make_unique<EvaluationWorkspace>(
+            precision, program.stackDepth());
+    }
+    std::vector<MpfrComplex>& stack =
+        evaluationWorkspace->stack;
     std::vector<uint16_t> nodeStack;
     if (trace) {
         trace->nodes.reserve(program.instructionCount());
         nodeStack.resize(program.stackDepth(), UINT16_MAX);
     }
-    Scratch scratch(precision);
+    Scratch& scratch = evaluationWorkspace->scratch;
     size_t top = 0;
     bool exactDomain = true;
 
     auto unary = [&](auto function) {
-        function(stack[top - 1], stack[top - 1], scratch);
+        evaluationWorkspace->unaryInput.set(stack[top - 1]);
+        function(
+            stack[top - 1],
+            evaluationWorkspace->unaryInput, scratch);
     };
     auto binary = [&](auto function) {
-        MpfrComplex right(stack[top - 1]);
+        const MpfrComplex& right = stack[top - 1];
         --top;
-        function(stack[top - 1], stack[top - 1], right, scratch);
+        function(
+            stack[top - 1], stack[top - 1],
+            right, scratch);
     };
 
     auto operationOf = [](ExpressionProgram::Op op) {
@@ -649,58 +707,76 @@ bool ExpressionOracle::evaluateInternal(
                 domainResult(power(o, a, b, s));
             }); break;
         case ExpressionProgram::Op::Square:
-            unary([](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
-                MpfrComplex copy(a); mul(o, copy, copy, s);
-            }); break;
+            square(stack[top - 1], stack[top - 1], scratch);
+            break;
         case ExpressionProgram::Op::Sin:
-            unary([](MpfrComplex& o, const MpfrComplex& a, Scratch& s) { MpfrComplex copy(a); sine(o, copy, s); }); break;
+            sine(stack[top - 1], stack[top - 1], scratch);
+            break;
         case ExpressionProgram::Op::Cos:
-            unary([](MpfrComplex& o, const MpfrComplex& a, Scratch& s) { MpfrComplex copy(a); cosine(o, copy, s); }); break;
+            cosine(stack[top - 1], stack[top - 1], scratch);
+            break;
         case ExpressionProgram::Op::Tan:
             unary([&](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
-                MpfrComplex copy(a);
-                domainResult(tangent(o, copy, s));
+                domainResult(tangent(o, a, s));
             }); break;
         case ExpressionProgram::Op::Sinh:
-            unary([](MpfrComplex& o, const MpfrComplex& a, Scratch& s) { MpfrComplex copy(a); hyperbolicSine(o, copy, s); }); break;
+            hyperbolicSine(
+                stack[top - 1], stack[top - 1], scratch);
+            break;
         case ExpressionProgram::Op::Cosh:
-            unary([](MpfrComplex& o, const MpfrComplex& a, Scratch& s) { MpfrComplex copy(a); hyperbolicCosine(o, copy, s); }); break;
+            hyperbolicCosine(
+                stack[top - 1], stack[top - 1], scratch);
+            break;
         case ExpressionProgram::Op::Tanh:
             unary([&](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
-                MpfrComplex copy(a);
-                domainResult(hyperbolicTangent(o, copy, s));
+                domainResult(hyperbolicTangent(o, a, s));
             }); break;
         case ExpressionProgram::Op::Exp:
-            unary([](MpfrComplex& o, const MpfrComplex& a, Scratch& s) { MpfrComplex copy(a); exponential(o, copy, s); }); break;
+            exponential(
+                stack[top - 1], stack[top - 1], scratch);
+            break;
         case ExpressionProgram::Op::Log:
-            unary([&](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
-                MpfrComplex copy(a);
-                domainResult(logarithm(o, copy, s));
-            }); break;
+            domainResult(logarithm(
+                stack[top - 1], stack[top - 1],
+                scratch));
+            break;
         case ExpressionProgram::Op::Log10:
-            unary([&](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
-                MpfrComplex copy(a);
-                bool valid = logarithm(o, copy, s);
+            {
+                MpfrComplex& value = stack[top - 1];
+                const bool valid =
+                    logarithm(value, value, scratch);
                 domainResult(valid);
                 if (valid) {
-                    mpfr_const_log2(s.values[0], RND);
-                    mpfr_log_ui(s.values[1], 5, RND);
-                    mpfr_add(s.values[0], s.values[0], s.values[1], RND);
-                    mpfr_div(o.re, o.re, s.values[0], RND);
-                    mpfr_div(o.im, o.im, s.values[0], RND);
+                    mpfr_const_log2(
+                        scratch.values[0], RND);
+                    mpfr_log_ui(
+                        scratch.values[1], 5, RND);
+                    mpfr_add(
+                        scratch.values[0],
+                        scratch.values[0],
+                        scratch.values[1], RND);
+                    mpfr_div(
+                        value.re, value.re,
+                        scratch.values[0], RND);
+                    mpfr_div(
+                        value.im, value.im,
+                        scratch.values[0], RND);
                 }
-            }); break;
+            }
+            break;
         case ExpressionProgram::Op::Sqrt:
             unary([&](MpfrComplex& o, const MpfrComplex& a, Scratch& s) {
-                MpfrComplex copy(a);
-                domainResult(squareRoot(o, copy, s));
+                domainResult(squareRoot(o, a, s));
             }); break;
         case ExpressionProgram::Op::Abs:
-            unary([](MpfrComplex& o, const MpfrComplex& a, Scratch&) { MpfrComplex copy(a); absolute(o, copy); }); break;
+            absolute(stack[top - 1], stack[top - 1]);
+            break;
         case ExpressionProgram::Op::Norm:
-            unary([](MpfrComplex& o, const MpfrComplex& a, Scratch& s) { MpfrComplex copy(a); norm(o, copy, s); }); break;
+            norm(stack[top - 1], stack[top - 1], scratch);
+            break;
         case ExpressionProgram::Op::Arg:
-            unary([](MpfrComplex& o, const MpfrComplex& a, Scratch&) { MpfrComplex copy(a); argument(o, copy); }); break;
+            argument(stack[top - 1], stack[top - 1]);
+            break;
         case ExpressionProgram::Op::Conjugate:
             mpfr_neg(stack[top - 1].im, stack[top - 1].im, RND); break;
         case ExpressionProgram::Op::Real:
@@ -709,12 +785,16 @@ bool ExpressionOracle::evaluateInternal(
             mpfr_set(stack[top - 1].re, stack[top - 1].im, RND);
             mpfr_set_zero(stack[top - 1].im, 0); break;
         case ExpressionProgram::Op::MakeComplex: {
-            MpfrComplex right(stack[top - 1]); --top;
-            mpfr_set(stack[top - 1].im, right.re, RND);
+            const MpfrComplex& right = stack[top - 1];
+            --top;
+            mpfr_set(
+                stack[top - 1].im,
+                right.re, RND);
             break;
         }
         case ExpressionProgram::Op::Polar: {
-            MpfrComplex angle(stack[top - 1]); --top;
+            const MpfrComplex& angle = stack[top - 1];
+            --top;
             MpfrComplex& radius = stack[top - 1];
             if (!mpfr_zero_p(radius.im) || !mpfr_zero_p(angle.im) ||
                 mpfr_nan_p(radius.re) || mpfr_inf_p(radius.re) ||

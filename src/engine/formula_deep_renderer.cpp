@@ -318,6 +318,14 @@ bool piecewiseOutsideBailout(
         componentSquares.re, value.re, RND);
     const int imRounded = mpfr_sqr(
         componentSquares.im, value.im, RND);
+    if (mpfr_nan_p(componentSquares.re) ||
+        mpfr_nan_p(componentSquares.im))
+        return false;
+    if (mpfr_inf_p(componentSquares.re) ||
+        mpfr_inf_p(componentSquares.im)) {
+        outside = true;
+        return true;
+    }
     const bool realClearlyInside =
         mpfr_zero_p(componentSquares.re) ||
         mpfr_get_exp(componentSquares.re) <=
@@ -1947,9 +1955,18 @@ bool renderExpressionDeepFrame(
 
             const Clock::time_point referenceStart =
                 Clock::now();
-            const bool referenceBuilt =
-                buildExpressionReferenceOrbit(
-                    referenceRequest, reference);
+            bool referenceBuilt = false;
+            {
+                struct OracleWorkspaceRelease {
+                    ~OracleWorkspaceRelease() {
+                        ExpressionOracle::
+                            releaseThreadWorkspace();
+                    }
+                } releaseOracleWorkspace;
+                referenceBuilt =
+                    buildExpressionReferenceOrbit(
+                        referenceRequest, reference);
+            }
             result.referenceSeconds =
                 secondsSince(referenceStart);
             result.referenceBytes = reference.memoryBytes;
@@ -4297,10 +4314,10 @@ bool renderExpressionDeepFrame(
                 return fail(
                     ExpressionDeepRenderStatus::ResourceLimit,
                     "MPFR workspace calculation overflow");
-            // Worker state (34), oracle scratch (12), up to six simultaneous
+            // Worker state (34), oracle scratch (12), up to eight simultaneous
             // operation temporaries, and five reusable piecewise temporaries,
             // plus the bytecode stack.
-            size_t mpfrValuesPerThread = 58;
+            size_t mpfrValuesPerThread = 62;
             if (!checkedAddSize(
                     mpfrValuesPerThread,
                     request.runtimeProgram->stackDepth(), 2))
@@ -4497,17 +4514,21 @@ bool renderExpressionDeepFrame(
                                 decided = true;
                             }
                         } else {
-                            mpfr_hypot(
-                                magnitude,
-                                context.z.re, context.z.im,
-                                RND);
-                            if (mpfr_nan_p(magnitude)) {
-                                undefined = true;
-                            } else if (
-                                mpfr_inf_p(magnitude) ||
-                                mpfr_cmp_d(
+                            bool outside = false;
+                            if (!piecewiseOutsideBailout(
+                                    context.z,
+                                    workspace->
+                                        piecewiseBailoutSquared,
+                                    request.bailout,
                                     magnitude,
-                                    request.bailout) > 0) {
+                                    workspace->piecewiseSquares,
+                                    workspace->
+                                        piecewiseInsideSquareExponent,
+                                    workspace->
+                                        piecewiseScratch,
+                                    outside)) {
+                                undefined = true;
+                            } else if (outside) {
                                 output = 0.0f;
                                 decided = true;
                             }
@@ -4537,12 +4558,10 @@ bool renderExpressionDeepFrame(
                                 next,
                                 workspace->piecewiseScratch);
                         } else {
-                            std::string oracleError;
                             oracleDefined =
                                 ExpressionOracle::evaluate(
                                 *request.runtimeProgram,
-                                context, next,
-                                &oracleError);
+                                context, next, nullptr);
                         }
                         ++localIterations;
                         if (specializedPiecewise)
@@ -4585,19 +4604,21 @@ bool renderExpressionDeepFrame(
                                 break;
                             }
                         } else {
-                            mpfr_hypot(
-                                magnitude,
-                                context.z.re,
-                                context.z.im, RND);
-                            if (mpfr_nan_p(magnitude)) {
+                            if (!piecewiseOutsideBailout(
+                                    context.z,
+                                    workspace->
+                                        piecewiseBailoutSquared,
+                                    request.bailout,
+                                    magnitude,
+                                    workspace->piecewiseSquares,
+                                    workspace->
+                                        piecewiseInsideSquareExponent,
+                                    workspace->
+                                        piecewiseScratch,
+                                    outside)) {
                                 undefined = true;
                                 break;
                             }
-                            outside =
-                                mpfr_inf_p(magnitude) ||
-                                mpfr_cmp_d(
-                                    magnitude,
-                                    request.bailout) > 0;
                         }
                         if (outside) {
                             output = static_cast<float>(
@@ -4687,6 +4708,7 @@ bool renderExpressionDeepFrame(
                 specializedPiecewisePeriodicPixels.fetch_add(
                     localSpecializedPeriodicPixels,
                     std::memory_order_relaxed);
+                ExpressionOracle::releaseThreadWorkspace();
             }
         }
         result.fallbackSeconds =

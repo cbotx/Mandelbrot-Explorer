@@ -134,6 +134,8 @@ public:
                               MpfrComplex& output,
                               ExpressionOracleTrace& trace,
                               std::string* error = nullptr);
+    // Releases the reusable evaluator owned by the calling thread.
+    static void releaseThreadWorkspace();
 
 private:
     static bool evaluateInternal(const ExpressionProgram& program,

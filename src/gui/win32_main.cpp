@@ -2174,7 +2174,7 @@ public:
             if (deep.used) {
                 fprintf(
                     f,
-                    "generic status=%s pixels=%llu fast=%llu fallback=%llu Taylor=%llu preflight=%llu/%llu predicted=%s avoided=%llu specialized_mpfr=%d mpfr_pixels=%llu mpfr_iter=%llu periodic=%llu precision=%llu/%llu total=%.6f reference=%.6f preflight_time=%.6f build+eval=%.6f fast_time=%.6f fallback_time=%.6f preflight_iter=%llu preflight_ops=%llu preflight_folds=%llu first_uncertain=",
+                    "generic status=%s pixels=%llu fast=%llu fallback=%llu Taylor=%llu preflight=%llu/%llu predicted=%s avoided=%llu specialized_mpfr=%d total_iter=%llu mpfr_pixels=%llu mpfr_iter=%llu periodic=%llu precision=%llu/%llu total=%.6f reference=%.6f preflight_time=%.6f build+eval=%.6f fast_time=%.6f fallback_time=%.6f preflight_iter=%llu preflight_ops=%llu preflight_folds=%llu first_uncertain=",
                     deep.status.c_str(),
                     (unsigned long long)deep.pixelCount,
                     (unsigned long long)deep.fastPixelCount,
@@ -2188,6 +2188,8 @@ public:
                     (unsigned long long)
                         deep.preflightAvoidedFastPixelCount,
                     deep.specializedPiecewiseMpfr ? 1 : 0,
+                    (unsigned long long)
+                        deep.totalIterationCount,
                     (unsigned long long)
                         deep.specializedPiecewiseMpfrPixelCount,
                     (unsigned long long)
@@ -2481,6 +2483,14 @@ public:
                 if (getenv("MANDEL_GUI_FORMULA_JULIA_RESTORE")) {
                     switchJuliaMode(true, false);
                     switchJuliaMode(false, false);
+                }
+            }
+            if (anyBench) {
+                if (const char* value =
+                        getenv("MANDEL_GUI_MXIT")) {
+                    maxIter = std::clamp(
+                        atoi(value), 1, 5000000);
+                    nav->SetMxit(maxIter);
                 }
             }
             if (orbitThumbnailSmoke)
