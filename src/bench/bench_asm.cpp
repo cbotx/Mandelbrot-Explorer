@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <chrono>
 #include <immintrin.h>
 #include <vector>
@@ -61,6 +62,88 @@ static void benchRescaledPipelines() {
     printf("  single-chain %.3f ns/group | dual-chain %.3f ns/group | throughput %.2fx | sink=%.17g\n", singleNs, dualNs, singleNs / dualNs, sink[0] + sink[1] + sink[2] + sink[3]);
 }
 
+struct LookupEntry {
+    double radiusSquared;
+    int skip;
+};
+
+struct LookupCoefficient {
+    double ar, ai, br, bi;
+};
+
+struct FlatLookup {
+    LookupEntry entry;
+    LookupCoefficient coefficient;
+};
+
+static void benchBlaLayouts() {
+    constexpr int referenceLength = 16384;
+    constexpr int levels = 14;
+    std::vector<std::vector<LookupEntry>> entries(levels);
+    std::vector<std::vector<LookupCoefficient>> coefficients(levels);
+    for (int level = 0; level < levels; ++level) {
+        const int count = (referenceLength - 1) >> level;
+        entries[level].resize(count);
+        coefficients[level].resize(count);
+        for (int index = 0; index < count; ++index) {
+            entries[level][index] = {std::ldexp(1.0 + (index & 7) * 0.03125, -2 * level), 1 << level};
+            coefficients[level][index] = {1.0 + level * 0.001, level * 0.0001, 0.5 + index * 1e-8, -0.25};
+        }
+    }
+
+    std::vector<uint32_t> offsets(referenceLength + 1);
+    std::vector<FlatLookup> flat;
+    flat.reserve(referenceLength * 2);
+    for (int reference = 1; reference < referenceLength; ++reference) {
+        offsets[reference] = static_cast<uint32_t>(flat.size());
+        int startLevel = reference == 1 ? levels - 1 : static_cast<int>(_tzcnt_u32(static_cast<unsigned>(reference - 1)));
+        if (startLevel >= levels) startLevel = levels - 1;
+        for (int level = startLevel; level >= 0; --level) {
+            const int index = (reference - 1) >> level;
+            if (index < static_cast<int>(entries[level].size())) flat.push_back({entries[level][index], coefficients[level][index]});
+        }
+    }
+    offsets[referenceLength] = static_cast<uint32_t>(flat.size());
+
+    constexpr long iterations = 20000000;
+    volatile double sink = 0.0;
+    auto start = Clock::now();
+    for (long iteration = 0; iteration < iterations; ++iteration) {
+        const int reference = 1 + static_cast<int>((static_cast<uint64_t>(iteration) * 11400714819323198485ull) % (referenceLength - 2));
+        const double magnitude = std::ldexp(0.75 + (iteration & 7) * 0.03125, -2 * (iteration % 8));
+        int startLevel = reference == 1 ? levels - 1 : static_cast<int>(_tzcnt_u32(static_cast<unsigned>(reference - 1)));
+        if (startLevel >= levels) startLevel = levels - 1;
+        for (int level = startLevel; level >= 0; --level) {
+            const int index = (reference - 1) >> level;
+            if (index >= static_cast<int>(entries[level].size())) continue;
+            const LookupEntry& entry = entries[level][index];
+            if (magnitude >= entry.radiusSquared) continue;
+            const LookupCoefficient& coefficient = coefficients[level][index];
+            sink = sink + coefficient.ar + coefficient.br + entry.skip;
+            break;
+        }
+    }
+    auto stop = Clock::now();
+    const double hierarchyNs = ns_per(start, stop, iterations);
+
+    start = Clock::now();
+    for (long iteration = 0; iteration < iterations; ++iteration) {
+        const int reference = 1 + static_cast<int>((static_cast<uint64_t>(iteration) * 11400714819323198485ull) % (referenceLength - 2));
+        const double magnitude = std::ldexp(0.75 + (iteration & 7) * 0.03125, -2 * (iteration % 8));
+        for (uint32_t index = offsets[reference]; index < offsets[reference + 1]; ++index) {
+            const FlatLookup& candidate = flat[index];
+            if (magnitude >= candidate.entry.radiusSquared) continue;
+            sink = sink + candidate.coefficient.ar + candidate.coefficient.br + candidate.entry.skip;
+            break;
+        }
+    }
+    stop = Clock::now();
+    const double flatNs = ns_per(start, stop, iterations);
+
+    printf("\n== BLA candidate layout lookup ==\n");
+    printf("  hierarchy %.3f ns/query | flat %.3f ns/query | speedup %.2fx | candidates=%zu | sink=%.17g\n", hierarchyNs, flatNs, hierarchyNs / flatNs, flat.size(), sink);
+}
+
 int main() {
     srand(2024);
     printf("== mm_addmul_1 (hand asm) vs mpn_addmul_1 (GMP) ==\n");
@@ -92,5 +175,6 @@ int main() {
         printf("  n=%2d: GMP %6.1f ns | mine %6.1f ns | ratio %.2fx  %s\n", n, gmp, mine, gmp / mine, ok ? "correct" : "WRONG");
     }
     benchRescaledPipelines();
+    benchBlaLayouts();
     return 0;
 }
