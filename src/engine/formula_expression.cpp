@@ -25,6 +25,247 @@ uint64_t allocateProgramIdentity() {
     return identity;
 }
 
+template <size_t N>
+__m256d evaluatePolynomial(__m256d value, const double (&coefficients)[N]) {
+    __m256d result = _mm256_set1_pd(coefficients[N - 1]);
+    for (size_t index = N - 1; index-- > 0;) result = _mm256_add_pd(_mm256_set1_pd(coefficients[index]), _mm256_mul_pd(value, result));
+    return result;
+}
+
+void vectorRealSinCos(__m256d value, __m256d& sine, __m256d& cosine, int (&quadrants)[4]) {
+    constexpr double InverseHalfPi = 0.63661977236758134308;
+    constexpr double HalfPiHigh = 1.57079632673412561417;
+    constexpr double HalfPiLow = 6.07710050650619224932e-11;
+    constexpr double SineCoefficients[] = {
+        -1.66666666666666657415e-1,
+        8.33333333333333321769e-3,
+        -1.98412698412698412530e-4,
+        2.75573192239858925112e-6,
+        -2.50521083854417187751e-8,
+        1.60590438368216133409e-10,
+        -7.64716373181981640551e-13,
+        2.81145725434552059811e-15,
+        -8.22063524662432949554e-18,
+    };
+    constexpr double CosineCoefficients[] = {
+        -5.00000000000000000000e-1,
+        4.16666666666666643537e-2,
+        -1.38888888888888894189e-3,
+        2.48015873015873015658e-5,
+        -2.75573192239858925112e-7,
+        2.08767569878680989792e-9,
+        -1.14707455977297245073e-11,
+        4.77947733238738525345e-14,
+        -1.56192069685862252711e-16,
+        4.11031762331216484407e-19,
+    };
+
+    const __m256d multiple = _mm256_round_pd(_mm256_mul_pd(value, _mm256_set1_pd(InverseHalfPi)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    const __m128i integerMultiple = _mm256_cvttpd_epi32(multiple);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(quadrants), integerMultiple);
+    __m256d reduced = _mm256_sub_pd(value, _mm256_mul_pd(multiple, _mm256_set1_pd(HalfPiHigh)));
+    reduced = _mm256_sub_pd(reduced, _mm256_mul_pd(multiple, _mm256_set1_pd(HalfPiLow)));
+    const __m256d squared = _mm256_mul_pd(reduced, reduced);
+    sine = _mm256_add_pd(reduced, _mm256_mul_pd(_mm256_mul_pd(reduced, squared), evaluatePolynomial(squared, SineCoefficients)));
+    cosine = _mm256_add_pd(_mm256_set1_pd(1.0), _mm256_mul_pd(squared, evaluatePolynomial(squared, CosineCoefficients)));
+}
+
+__m256d vectorPositiveExp(__m256d value) {
+    constexpr double InverseLn2 = 1.44269504088896338700;
+    constexpr double Ln2High = 6.93147180369123816490e-1;
+    constexpr double Ln2Low = 1.90821492927058770002e-10;
+    constexpr double ExpCoefficients[] = {
+        1.66666666666666019037e-1,
+        -2.77777777770155933842e-3,
+        6.61375632143793436117e-5,
+        -1.65339022054652515390e-6,
+        4.13813679705723846039e-8,
+    };
+
+    const __m256d multiple = _mm256_round_pd(_mm256_mul_pd(value, _mm256_set1_pd(InverseLn2)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    const __m256d high = _mm256_sub_pd(value, _mm256_mul_pd(multiple, _mm256_set1_pd(Ln2High)));
+    const __m256d low = _mm256_mul_pd(multiple, _mm256_set1_pd(Ln2Low));
+    const __m256d reduced = _mm256_sub_pd(high, low);
+    const __m256d squared = _mm256_mul_pd(reduced, reduced);
+    const __m256d correction = _mm256_sub_pd(reduced, _mm256_mul_pd(squared, evaluatePolynomial(squared, ExpCoefficients)));
+    const __m256d fraction = _mm256_div_pd(_mm256_mul_pd(reduced, correction), _mm256_sub_pd(_mm256_set1_pd(2.0), correction));
+    const __m256d polynomial = _mm256_sub_pd(_mm256_set1_pd(1.0), _mm256_sub_pd(_mm256_sub_pd(low, fraction), high));
+
+    alignas(16) int exponents[4];
+    _mm_store_si128(reinterpret_cast<__m128i*>(exponents), _mm256_cvttpd_epi32(multiple));
+    alignas(32) double scales[4];
+    for (int lane = 0; lane < 4; ++lane) {
+        const uint64_t bits = static_cast<uint64_t>(exponents[lane] + 1023) << 52;
+        std::memcpy(&scales[lane], &bits, sizeof(bits));
+    }
+    return _mm256_mul_pd(polynomial, _mm256_load_pd(scales));
+}
+
+void vectorRealSinhCosh(__m256d value, __m256d& hyperbolicSine, __m256d& hyperbolicCosine) {
+    constexpr double SinhCoefficients[] = {
+        1.66666666666666657415e-1,
+        8.33333333333333321769e-3,
+        1.98412698412698412530e-4,
+        2.75573192239858925112e-6,
+        2.50521083854417187751e-8,
+        1.60590438368216133409e-10,
+        7.64716373181981640551e-13,
+        2.81145725434552059811e-15,
+    };
+    constexpr double CoshCoefficients[] = {
+        5.00000000000000000000e-1,
+        4.16666666666666643537e-2,
+        1.38888888888888894189e-3,
+        2.48015873015873015658e-5,
+        2.75573192239858925112e-7,
+        2.08767569878680989792e-9,
+        1.14707455977297245073e-11,
+        4.77947733238738525345e-14,
+        1.56192069685862252711e-16,
+    };
+
+    const __m256d signMask = _mm256_set1_pd(-0.0);
+    const __m256d absolute = _mm256_andnot_pd(signMask, value);
+    const __m256d squared = _mm256_mul_pd(value, value);
+    const __m256d smallSine = _mm256_add_pd(value, _mm256_mul_pd(_mm256_mul_pd(value, squared), evaluatePolynomial(squared, SinhCoefficients)));
+    const __m256d smallCosine = _mm256_add_pd(_mm256_set1_pd(1.0), _mm256_mul_pd(squared, evaluatePolynomial(squared, CoshCoefficients)));
+
+    const __m256d exponential = vectorPositiveExp(absolute);
+    const __m256d reciprocal = _mm256_div_pd(_mm256_set1_pd(1.0), exponential);
+    const __m256d half = _mm256_set1_pd(0.5);
+    __m256d largeSine = _mm256_mul_pd(half, _mm256_sub_pd(exponential, reciprocal));
+    largeSine = _mm256_xor_pd(largeSine, _mm256_and_pd(value, signMask));
+    const __m256d largeCosine = _mm256_mul_pd(half, _mm256_add_pd(exponential, reciprocal));
+    const __m256d small = _mm256_cmp_pd(absolute, _mm256_set1_pd(0.5), _CMP_LE_OQ);
+    hyperbolicSine = _mm256_blendv_pd(largeSine, smallSine, small);
+    hyperbolicCosine = _mm256_blendv_pd(largeCosine, smallCosine, small);
+}
+
+void evaluateVectorComplexSinCos(__m256d inputReal, __m256d inputImaginary, bool cosineOperation, __m256d& outputReal, __m256d& outputImaginary) {
+    alignas(32) double real[4], imaginary[4];
+    _mm256_store_pd(real, inputReal);
+    _mm256_store_pd(imaginary, inputImaginary);
+    alignas(32) double evaluationReal[4], evaluationImaginary[4];
+    bool safe[4];
+    bool haveSafeLane = false;
+    for (int lane = 0; lane < 4; ++lane) {
+        safe[lane] = std::isfinite(real[lane]) && std::isfinite(imaginary[lane]) && real[lane] != 0.0 && imaginary[lane] != 0.0 && std::fabs(real[lane]) <= 128.0 && std::fabs(imaginary[lane]) <= 20.0;
+        haveSafeLane = haveSafeLane || safe[lane];
+        evaluationReal[lane] = safe[lane] ? real[lane] : 0.0;
+        evaluationImaginary[lane] = safe[lane] ? imaginary[lane] : 0.0;
+    }
+
+    alignas(32) double resultReal[4], resultImaginary[4];
+    if (haveSafeLane) {
+        __m256d realSine, realCosine, imaginarySine, imaginaryCosine;
+        int quadrants[4];
+        alignas(32) double reducedSine[4], reducedCosine[4], hyperbolicSine[4], hyperbolicCosine[4];
+        vectorRealSinCos(_mm256_load_pd(evaluationReal), realSine, realCosine, quadrants);
+        _mm256_store_pd(reducedSine, realSine);
+        _mm256_store_pd(reducedCosine, realCosine);
+        vectorRealSinhCosh(_mm256_load_pd(evaluationImaginary), imaginarySine, imaginaryCosine);
+        _mm256_store_pd(hyperbolicSine, imaginarySine);
+        _mm256_store_pd(hyperbolicCosine, imaginaryCosine);
+        for (int lane = 0; lane < 4; ++lane) {
+            double sine = reducedSine[lane];
+            double cosine = reducedCosine[lane];
+            switch (quadrants[lane] & 3) {
+            case 1:
+                std::swap(sine, cosine);
+                cosine = -cosine;
+                break;
+            case 2:
+                sine = -sine;
+                cosine = -cosine;
+                break;
+            case 3:
+                std::swap(sine, cosine);
+                sine = -sine;
+                break;
+            }
+            if (cosineOperation) {
+                resultReal[lane] = cosine * hyperbolicCosine[lane];
+                resultImaginary[lane] = -sine * hyperbolicSine[lane];
+            } else {
+                resultReal[lane] = sine * hyperbolicCosine[lane];
+                resultImaginary[lane] = cosine * hyperbolicSine[lane];
+            }
+        }
+    }
+
+    for (int lane = 0; lane < 4; ++lane) {
+        if (safe[lane]) continue;
+        const Complex input{real[lane], imaginary[lane]};
+        const Complex result = cosineOperation ? std::cos(input) : std::sin(input);
+        resultReal[lane] = result.real();
+        resultImaginary[lane] = result.imag();
+    }
+    outputReal = _mm256_load_pd(resultReal);
+    outputImaginary = _mm256_load_pd(resultImaginary);
+}
+
+void evaluateVectorComplexTan(__m256d inputReal, __m256d inputImaginary, __m256d& outputReal, __m256d& outputImaginary) {
+    alignas(32) double real[4], imaginary[4];
+    _mm256_store_pd(real, inputReal);
+    _mm256_store_pd(imaginary, inputImaginary);
+    alignas(32) double evaluationReal[4], evaluationImaginary[4];
+    bool safe[4];
+    bool haveSafeLane = false;
+    for (int lane = 0; lane < 4; ++lane) {
+        safe[lane] = std::isfinite(real[lane]) && std::isfinite(imaginary[lane]) && real[lane] != 0.0 && imaginary[lane] != 0.0 && std::fabs(real[lane]) <= 128.0 && std::fabs(imaginary[lane]) <= 20.0;
+        haveSafeLane = haveSafeLane || safe[lane];
+        evaluationReal[lane] = safe[lane] ? real[lane] : 0.0;
+        evaluationImaginary[lane] = safe[lane] ? imaginary[lane] : 0.0;
+    }
+
+    alignas(32) double resultReal[4], resultImaginary[4];
+    if (haveSafeLane) {
+        __m256d realSine, realCosine, imaginarySine, imaginaryCosine;
+        int quadrants[4];
+        alignas(32) double reducedSine[4], reducedCosine[4], hyperbolicSine[4], hyperbolicCosine[4];
+        vectorRealSinCos(_mm256_load_pd(evaluationReal), realSine, realCosine, quadrants);
+        _mm256_store_pd(reducedSine, realSine);
+        _mm256_store_pd(reducedCosine, realCosine);
+        vectorRealSinhCosh(_mm256_load_pd(evaluationImaginary), imaginarySine, imaginaryCosine);
+        _mm256_store_pd(hyperbolicSine, imaginarySine);
+        _mm256_store_pd(hyperbolicCosine, imaginaryCosine);
+        for (int lane = 0; lane < 4; ++lane) {
+            double sine = reducedSine[lane];
+            double cosine = reducedCosine[lane];
+            switch (quadrants[lane] & 3) {
+            case 1:
+                std::swap(sine, cosine);
+                cosine = -cosine;
+                break;
+            case 2:
+                sine = -sine;
+                cosine = -cosine;
+                break;
+            case 3:
+                std::swap(sine, cosine);
+                sine = -sine;
+                break;
+            }
+            const double denominator = cosine * cosine + hyperbolicSine[lane] * hyperbolicSine[lane];
+            if (!(denominator > 1e-4) || !std::isfinite(denominator)) {
+                safe[lane] = false;
+                continue;
+            }
+            resultReal[lane] = sine * cosine / denominator;
+            resultImaginary[lane] = hyperbolicSine[lane] * hyperbolicCosine[lane] / denominator;
+        }
+    }
+
+    for (int lane = 0; lane < 4; ++lane) {
+        if (safe[lane]) continue;
+        const Complex result = std::tan(Complex{real[lane], imaginary[lane]});
+        resultReal[lane] = result.real();
+        resultImaginary[lane] = result.imag();
+    }
+    outputReal = _mm256_load_pd(resultReal);
+    outputImaginary = _mm256_load_pd(resultImaginary);
+}
+
 } // namespace
 
 class ExpressionParser {
@@ -1131,10 +1372,10 @@ bool ExpressionOrbitPlan::evaluate4(const ExpressionContext* contexts, const Pre
     return _body.evaluate4Prepared(contexts, invariants, _invariantPrograms.size(), outputs);
 }
 
-bool ExpressionOrbitPlan::evaluate4Hybrid(const ExpressionContext* contexts, const Prepared* prepared, Complex* outputs) const {
+bool ExpressionOrbitPlan::evaluate4Hybrid(const ExpressionContext* contexts, const Prepared* prepared, Complex* outputs, int vectorTranscendentalMode) const {
     if (!_valid || !prepared) return false;
     const Complex* invariants[4] = {prepared[0].values.data(), prepared[1].values.data(), prepared[2].values.data(), prepared[3].values.data()};
-    return _body.evaluate4HybridPrepared(contexts, invariants, _invariantPrograms.size(), outputs);
+    return _body.evaluate4HybridPrepared(contexts, invariants, _invariantPrograms.size(), outputs, vectorTranscendentalMode);
 }
 
 Complex ExpressionProgram::evaluate(const ExpressionContext& context) const {
@@ -1281,11 +1522,11 @@ bool ExpressionProgram::evaluate4Prepared(const ExpressionContext* contexts, con
     return true;
 }
 
-bool ExpressionProgram::evaluate4Hybrid(const ExpressionContext* contexts, Complex* outputs) const {
-    return evaluate4HybridPrepared(contexts, nullptr, 0, outputs);
+bool ExpressionProgram::evaluate4Hybrid(const ExpressionContext* contexts, Complex* outputs, int vectorTranscendentalMode) const {
+    return evaluate4HybridPrepared(contexts, nullptr, 0, outputs, vectorTranscendentalMode);
 }
 
-bool ExpressionProgram::evaluate4HybridPrepared(const ExpressionContext* contexts, const Complex* const* invariants, size_t invariantCount, Complex* outputs) const {
+bool ExpressionProgram::evaluate4HybridPrepared(const ExpressionContext* contexts, const Complex* const* invariants, size_t invariantCount, Complex* outputs, int vectorTranscendentalMode) const {
     if (!_valid || !_batchCompatible || !contexts || !outputs) return false;
     struct VecComplex {
         __m256d re, im;
@@ -1322,6 +1563,14 @@ bool ExpressionProgram::evaluate4HybridPrepared(const ExpressionContext* context
         }
         left.re = _mm256_load_pd(leftRe);
         left.im = _mm256_load_pd(leftIm);
+    };
+    auto vectorSinCos = [&](bool cosineOperation) {
+        VecComplex& value = stack[top - 1];
+        evaluateVectorComplexSinCos(value.re, value.im, cosineOperation, value.re, value.im);
+    };
+    auto vectorTan = [&] {
+        VecComplex& value = stack[top - 1];
+        evaluateVectorComplexTan(value.re, value.im, value.re, value.im);
     };
     for (const Instruction& instruction : _code) {
         switch (instruction.op) {
@@ -1374,9 +1623,24 @@ bool ExpressionProgram::evaluate4HybridPrepared(const ExpressionContext* context
             value.im = im;
             break;
         }
-        case Op::Sin: unary([](Complex a) { return std::sin(a); }); break;
-        case Op::Cos: unary([](Complex a) { return std::cos(a); }); break;
-        case Op::Tan: unary([](Complex a) { return std::tan(a); }); break;
+        case Op::Sin:
+            if (vectorTranscendentalMode != 0)
+                vectorSinCos(false);
+            else
+                unary([](Complex a) { return std::sin(a); });
+            break;
+        case Op::Cos:
+            if (vectorTranscendentalMode != 0)
+                vectorSinCos(true);
+            else
+                unary([](Complex a) { return std::cos(a); });
+            break;
+        case Op::Tan:
+            if (vectorTranscendentalMode != 0)
+                vectorTan();
+            else
+                unary([](Complex a) { return std::tan(a); });
+            break;
         case Op::Sinh: unary([](Complex a) { return std::sinh(a); }); break;
         case Op::Cosh: unary([](Complex a) { return std::cosh(a); }); break;
         case Op::Tanh: unary([](Complex a) { return std::tanh(a); }); break;

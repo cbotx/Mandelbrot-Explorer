@@ -81,7 +81,7 @@ class ExpressionProgram {
     Complex evaluate(const ExpressionContext& context) const;
     Complex evaluate(const ExpressionContext& context, Complex* stack, size_t capacity) const;
     bool evaluate4(const ExpressionContext* contexts, Complex* outputs) const;
-    bool evaluate4Hybrid(const ExpressionContext* contexts, Complex* outputs) const;
+    bool evaluate4Hybrid(const ExpressionContext* contexts, Complex* outputs, int vectorTranscendentalMode = 0) const;
     bool evaluateWithDerivative(const ExpressionContext& context, const ExpressionDerivativeSeed& seed, Complex& value, Complex& derivative) const;
 
     bool valid() const { return _valid; }
@@ -161,7 +161,7 @@ class ExpressionProgram {
     static Complex evaluateBinary(Op op, Complex left, Complex right);
     Complex evaluatePrepared(const ExpressionContext& context, const Complex* invariants, size_t invariantCount, Complex* stack, size_t capacity) const;
     bool evaluate4Prepared(const ExpressionContext* contexts, const Complex* const* invariants, size_t invariantCount, Complex* outputs) const;
-    bool evaluate4HybridPrepared(const ExpressionContext* contexts, const Complex* const* invariants, size_t invariantCount, Complex* outputs) const;
+    bool evaluate4HybridPrepared(const ExpressionContext* contexts, const Complex* const* invariants, size_t invariantCount, Complex* outputs, int vectorTranscendentalMode = 0) const;
 
     friend class ExpressionParser;
     friend class ExpressionOracle;
@@ -212,7 +212,7 @@ class ExpressionOrbitPlan {
     Complex evaluate(const ExpressionContext& context, const Prepared& prepared) const;
     Complex evaluate(const ExpressionContext& context, const Prepared& prepared, Complex* stack, size_t capacity) const;
     bool evaluate4(const ExpressionContext* contexts, const Prepared* prepared, Complex* outputs) const;
-    bool evaluate4Hybrid(const ExpressionContext* contexts, const Prepared* prepared, Complex* outputs) const;
+    bool evaluate4Hybrid(const ExpressionContext* contexts, const Prepared* prepared, Complex* outputs, int vectorTranscendentalMode = 0) const;
 
   private:
     ExpressionProgram _body;

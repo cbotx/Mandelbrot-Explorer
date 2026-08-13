@@ -289,7 +289,7 @@ struct HybridPreparedState<true> {
 };
 
 template <bool UsePlan, bool Colored>
-bool solveExpressionHybridRow(double startRe, double dx, double pixelIm, int count, const formula::ExpressionProgram& program, const formula::ExpressionOrbitPlan* plan, const formula::ExpressionContext& fixed, FormulaParameter pixelParameter, int mxit, double bailout, formula::ExpressionColoring coloring, int integerPower, float* output, const std::atomic_bool* halt) {
+bool solveExpressionHybridRow(double startRe, double dx, double pixelIm, int count, const formula::ExpressionProgram& program, const formula::ExpressionOrbitPlan* plan, const formula::ExpressionContext& fixed, FormulaParameter pixelParameter, int mxit, double bailout, formula::ExpressionColoring coloring, int integerPower, int vectorTranscendentalMode, float* output, const std::atomic_bool* halt) {
     formula::ExpressionContext contexts[4] = {fixed, fixed, fixed, fixed};
     formula::Complex nextValues[4]{};
     HybridPreparedState<UsePlan> prepared;
@@ -342,9 +342,9 @@ bool solveExpressionHybridRow(double startRe, double dx, double pixelIm, int cou
         for (int lane = 0; lane < 4; ++lane) contexts[lane].iteration = laneIteration[lane];
         bool evaluated;
         if constexpr (UsePlan) {
-            evaluated = plan->avx2Compatible() ? plan->evaluate4(contexts, prepared.values, nextValues) : plan->evaluate4Hybrid(contexts, prepared.values, nextValues);
+            evaluated = plan->avx2Compatible() ? plan->evaluate4(contexts, prepared.values, nextValues) : plan->evaluate4Hybrid(contexts, prepared.values, nextValues, vectorTranscendentalMode);
         } else {
-            evaluated = program.evaluate4Hybrid(contexts, nextValues);
+            evaluated = program.evaluate4Hybrid(contexts, nextValues, vectorTranscendentalMode);
         }
         if (!evaluated) return false;
         for (int lane = 0; lane < 4; ++lane) {
@@ -474,7 +474,7 @@ bool solveExpressionJitRow(double startRe, double dx, double pixelIm, int count,
 }
 #endif
 
-bool solveExpressionColoredFixedBatchRow(double startRe, double dx, double pixelIm, int count, const formula::ExpressionProgram& program, const formula::ExpressionOrbitPlan* plan, const formula::ExpressionJit4* jit, bool effectiveAvx2, const formula::ExpressionContext& fixed, FormulaParameter pixelParameter, int mxit, double bailout, formula::ExpressionColoring coloring, float* output, const std::atomic_bool* halt) {
+bool solveExpressionColoredFixedBatchRow(double startRe, double dx, double pixelIm, int count, const formula::ExpressionProgram& program, const formula::ExpressionOrbitPlan* plan, const formula::ExpressionJit4* jit, bool effectiveAvx2, const formula::ExpressionContext& fixed, FormulaParameter pixelParameter, int mxit, double bailout, formula::ExpressionColoring coloring, int vectorTranscendentalMode, float* output, const std::atomic_bool* halt) {
     std::unique_ptr<formula::ExpressionOrbitPlan::Prepared[]> prepared = plan ? std::make_unique<formula::ExpressionOrbitPlan::Prepared[]>(4) : nullptr;
     for (int pixelBase = 0; pixelBase < count; pixelBase += 4) {
         if (*halt) return false;
@@ -519,7 +519,7 @@ bool solveExpressionColoredFixedBatchRow(double startRe, double dx, double pixel
 #else
             (void)jit;
 #endif
-            if (!evaluated) { evaluated = plan ? (effectiveAvx2 ? plan->evaluate4(contexts, prepared.get(), nextValues) : plan->evaluate4Hybrid(contexts, prepared.get(), nextValues)) : (program.avx2Compatible() ? program.evaluate4(contexts, nextValues) : program.evaluate4Hybrid(contexts, nextValues)); }
+            if (!evaluated) { evaluated = plan ? (effectiveAvx2 ? plan->evaluate4(contexts, prepared.get(), nextValues) : plan->evaluate4Hybrid(contexts, prepared.get(), nextValues, vectorTranscendentalMode)) : (program.avx2Compatible() ? program.evaluate4(contexts, nextValues) : program.evaluate4Hybrid(contexts, nextValues, vectorTranscendentalMode)); }
             if (!evaluated) return false;
             for (int lane = 0; lane < lanes; ++lane) {
                 if (!active[lane]) continue;
@@ -636,8 +636,10 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale, co
     const char* powerSimdSetting = std::getenv("MANDEL_EXPR_POWER_SIMD");
     const char* vectorSetting = std::getenv("MANDEL_EXPR_VECTOR");
     const char* hybridRefillSetting = std::getenv("MANDEL_EXPR_HYBRID_REFILL");
+    const char* vectorTranscendentalSetting = std::getenv("MANDEL_EXPR_VECTOR_TRANSCENDENTALS");
     const bool vectorEnabled = !vectorSetting || std::atoi(vectorSetting) != 0;
     const bool hybridRefill = !hybridRefillSetting || std::atoi(hybridRefillSetting) != 0;
+    const int vectorTranscendentalMode = !vectorTranscendentalSetting || std::atoi(vectorTranscendentalSetting) != 0 ? 1 : 0;
     const double bailoutSquared = bailout * bailout;
     const bool powerSimd = integerPower >= 2 && integerPower <= 8 && bailoutSquared >= DBL_MIN && std::isfinite(bailoutSquared) && (!powerSimdSetting || std::atoi(powerSimdSetting) != 0);
     if ((coloring == formula::ExpressionColoring::Smooth || coloring == formula::ExpressionColoring::Distance) && (integerPower < 2 || bailout < 1.0)) coloring = formula::ExpressionColoring::Raw;
@@ -661,9 +663,9 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale, co
                 } else
 #endif
                     if (!effectiveAvx2 && hybridRefill) {
-                    rowCompleted = orbitPlan ? solveExpressionHybridRow<true, true>(startRe, dx, pixelIm, _w, program, orbitPlan, fixed, pixelParameter, mxit, bailout, coloring, 0, _iter + (size_t)i * _w, &_flag_halt) : solveExpressionHybridRow<false, true>(startRe, dx, pixelIm, _w, program, nullptr, fixed, pixelParameter, mxit, bailout, coloring, 0, _iter + (size_t)i * _w, &_flag_halt);
+                    rowCompleted = orbitPlan ? solveExpressionHybridRow<true, true>(startRe, dx, pixelIm, _w, program, orbitPlan, fixed, pixelParameter, mxit, bailout, coloring, 0, vectorTranscendentalMode, _iter + (size_t)i * _w, &_flag_halt) : solveExpressionHybridRow<false, true>(startRe, dx, pixelIm, _w, program, nullptr, fixed, pixelParameter, mxit, bailout, coloring, 0, vectorTranscendentalMode, _iter + (size_t)i * _w, &_flag_halt);
                 } else {
-                    rowCompleted = solveExpressionColoredFixedBatchRow(startRe, dx, pixelIm, _w, program, orbitPlan, jit, effectiveAvx2, fixed, pixelParameter, mxit, bailout, coloring, _iter + (size_t)i * _w, &_flag_halt);
+                    rowCompleted = solveExpressionColoredFixedBatchRow(startRe, dx, pixelIm, _w, program, orbitPlan, jit, effectiveAvx2, fixed, pixelParameter, mxit, bailout, coloring, vectorTranscendentalMode, _iter + (size_t)i * _w, &_flag_halt);
                 }
             } else {
                 rowCompleted = solveExpressionColoredScalarRow(startRe, dx, pixelIm, _w, program, orbitPlan, fixed, pixelParameter, mxit, bailout, coloring, 0, _iter + (size_t)i * _w, &_flag_halt);
@@ -685,7 +687,7 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale, co
             }
 #endif
             if (!effectiveAvx2 && hybridRefill) {
-                rowCompleted = orbitPlan ? solveExpressionHybridRow<true, false>(startRe, dx, pixelIm, _w, program, orbitPlan, fixed, pixelParameter, mxit, bailout, coloring, 0, _iter + (size_t)i * _w, &_flag_halt) : solveExpressionHybridRow<false, false>(startRe, dx, pixelIm, _w, program, nullptr, fixed, pixelParameter, mxit, bailout, coloring, 0, _iter + (size_t)i * _w, &_flag_halt);
+                rowCompleted = orbitPlan ? solveExpressionHybridRow<true, false>(startRe, dx, pixelIm, _w, program, orbitPlan, fixed, pixelParameter, mxit, bailout, coloring, 0, vectorTranscendentalMode, _iter + (size_t)i * _w, &_flag_halt) : solveExpressionHybridRow<false, false>(startRe, dx, pixelIm, _w, program, nullptr, fixed, pixelParameter, mxit, bailout, coloring, 0, vectorTranscendentalMode, _iter + (size_t)i * _w, &_flag_halt);
                 if (rowCompleted) progressAdvance();
                 continue;
             }
@@ -739,7 +741,7 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale, co
                         break;
                     }
                     for (int lane = 0; lane < 4; ++lane) contexts[lane].iteration = n;
-                    bool evaluated = orbitPlan ? (effectiveAvx2 ? orbitPlan->evaluate4(contexts, batchPrepared.get(), outputs) : orbitPlan->evaluate4Hybrid(contexts, batchPrepared.get(), outputs)) : (program.avx2Compatible() ? program.evaluate4(contexts, outputs) : program.evaluate4Hybrid(contexts, outputs));
+                    bool evaluated = orbitPlan ? (effectiveAvx2 ? orbitPlan->evaluate4(contexts, batchPrepared.get(), outputs) : orbitPlan->evaluate4Hybrid(contexts, batchPrepared.get(), outputs, vectorTranscendentalMode)) : (program.avx2Compatible() ? program.evaluate4(contexts, outputs) : program.evaluate4Hybrid(contexts, outputs, vectorTranscendentalMode));
                     if (!evaluated) {
                         rowCompleted = false;
                         break;

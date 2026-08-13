@@ -469,6 +469,10 @@ static int runExpressionCoreCase() {
         return aa == bb;
     };
     auto sameComplexBits = [&](Complex a, Complex b) { return sameDoubleBits(a.real(), b.real()) && sameDoubleBits(a.imag(), b.imag()); };
+    auto sameComplexResult = [&](Complex a, Complex b) {
+        const auto sameComponent = [&](double left, double right) { return sameDoubleBits(left, right) || (std::isnan(left) && std::isnan(right)); };
+        return sameComponent(a.real(), b.real()) && sameComponent(a.imag(), b.imag());
+    };
     auto compile = [&](ExpressionProgram& program, const char* source) {
         ExpressionError error;
         if (!program.compile(source, &error)) {
@@ -907,8 +911,12 @@ static int runExpressionCoreCase() {
                 ++orbitPlanFailures;
                 continue;
             }
-            for (int lane = 0; lane < 4; ++lane)
-                if (!sameComplexBits(expected[lane], actual[lane])) ++orbitPlanBatchMismatches;
+            for (int lane = 0; lane < 4; ++lane) {
+                if (!sameComplexResult(expected[lane], actual[lane])) {
+                    if (orbitPlanBatchMismatches == 0) printf("  first orbit-plan batch mismatch source=%s sample=%zu lane=%d expected=(%.17g,%.17g) actual=(%.17g,%.17g)\n", test.source, first, lane, expected[lane].real(), expected[lane].imag(), actual[lane].real(), actual[lane].imag());
+                    ++orbitPlanBatchMismatches;
+                }
+            }
 
             formula::ExpressionJit4 planJit;
             bool compiled = VERIFY_JIT && planJit.compile(plan);
@@ -923,7 +931,10 @@ static int runExpressionCoreCase() {
                 planJit.evaluate(input, &invariantInput, output);
                 for (int lane = 0; lane < 4; ++lane) {
                     Complex jitValue{output.re[lane], output.im[lane]};
-                    if (!sameComplexBits(expected[lane], jitValue)) ++orbitPlanJitMismatches;
+                    if (!sameComplexResult(expected[lane], jitValue)) {
+                        if (orbitPlanJitMismatches == 0) printf("  first orbit-plan JIT mismatch source=%s sample=%zu lane=%d expected=(%.17g,%.17g) actual=(%.17g,%.17g)\n", test.source, first, lane, expected[lane].real(), expected[lane].imag(), jitValue.real(), jitValue.imag());
+                        ++orbitPlanJitMismatches;
+                    }
                 }
                 Complex rejected[4];
                 if (!planJit.supports(plan) || planJit.evaluate(lanes, rejected)) ++orbitPlanFailures;
@@ -1032,6 +1043,62 @@ static int runExpressionCoreCase() {
             checkHybridLanes(test.name, program, lanes);
         }
     }
+    int vectorTranscendentalMismatch = 0;
+    double vectorTranscendentalMaxRelativeError = 0.0;
+    for (const char* source : {"sin(z)", "cos(z)", "tan(z)"}) {
+        ExpressionProgram program;
+        if (!compile(program, source)) {
+            ++vectorTranscendentalMismatch;
+            continue;
+        }
+        for (int group = 0; group < 256; ++group) {
+            ExpressionContext lanes[4];
+            for (int lane = 0; lane < 4; ++lane) {
+                lanes[lane] = context;
+                lanes[lane].z = {randomComponent(), randomComponent()};
+            }
+            Complex batch[4];
+            if (!program.evaluate4Hybrid(lanes, batch, 1)) {
+                ++vectorTranscendentalMismatch;
+                continue;
+            }
+            for (int lane = 0; lane < 4; ++lane) {
+                const Complex scalar = program.evaluate(lanes[lane]);
+                const double scale = std::max(1.0, std::abs(scalar));
+                const double relativeError = std::abs(batch[lane] - scalar) / scale;
+                vectorTranscendentalMaxRelativeError = std::max(vectorTranscendentalMaxRelativeError, relativeError);
+                if (!std::isfinite(relativeError) || relativeError > 5e-14) ++vectorTranscendentalMismatch;
+            }
+        }
+        ExpressionContext signedZeroLanes[4] = {context, context, context, context};
+        signedZeroLanes[0].z = {0.0, 0.0};
+        signedZeroLanes[1].z = {-0.0, 0.0};
+        signedZeroLanes[2].z = {0.0, -0.0};
+        signedZeroLanes[3].z = {-0.0, -0.0};
+        Complex signedZeroBatch[4];
+        if (!program.evaluate4Hybrid(signedZeroLanes, signedZeroBatch, 1)) {
+            ++vectorTranscendentalMismatch;
+        } else {
+            for (int lane = 0; lane < 4; ++lane)
+                if (!sameComplexBits(program.evaluate(signedZeroLanes[lane]), signedZeroBatch[lane])) ++vectorTranscendentalMismatch;
+        }
+        if (std::strcmp(source, "tan(z)") == 0) {
+            constexpr double Pi = 3.141592653589793238462643383279502884;
+            ExpressionContext poleLanes[4] = {context, context, context, context};
+            poleLanes[0].z = {0.5 * Pi, 8e-7};
+            poleLanes[1].z = {-0.5 * Pi, 8e-7};
+            poleLanes[2].z = {0.5 * Pi, -8e-7};
+            poleLanes[3].z = {1.5 * Pi, 1e-6};
+            Complex poleBatch[4];
+            if (!program.evaluate4Hybrid(poleLanes, poleBatch, 1)) {
+                ++vectorTranscendentalMismatch;
+            } else {
+                for (int lane = 0; lane < 4; ++lane)
+                    if (!sameComplexBits(program.evaluate(poleLanes[lane]), poleBatch[lane])) ++vectorTranscendentalMismatch;
+            }
+        }
+    }
+    failures += vectorTranscendentalMismatch;
     {
         ExpressionProgram polarDomain;
         if (compile(polarDomain, "polar(z,p0)")) {
@@ -1467,7 +1534,7 @@ static int runExpressionCoreCase() {
     printf("=== arbitrary expression core\n");
     printf("  quadratic instructions=%zu stack=%zu\n", quadratic.instructionCount(), quadratic.stackDepth());
     printf("  parallel failures=%d   classification mismatch=%d   render mismatch=%d\n", parallelFailures.load(), classificationMismatch, renderMismatch);
-    printf("  hybrid opcode programs=%d lane mismatches=%d\n", hybridProgramsTested, hybridMismatch);
+    printf("  hybrid opcode programs=%d lane mismatches=%d vector-transcendental mismatches=%d max-relative=%.3g\n", hybridProgramsTested, hybridMismatch, vectorTranscendentalMismatch, vectorTranscendentalMaxRelativeError);
     printf("  specialization folds=%d failures=%d scalar-bit mismatches=%d frame-bit mismatches=%d\n", specializationFoldCases, specializationFailures, specializationParityMismatches, specializationFrameMismatch);
     printf("  orbit plan failures=%d scalar/AVX-Hybrid/JIT mismatches=%d/%d/%d\n", orbitPlanFailures, orbitPlanScalarMismatches, orbitPlanBatchMismatches, orbitPlanJitMismatches);
     printf("  evaluator AVX2/JIT-wrapper/JIT-raw: %.3f / %.3f / %.3f ms  raw speedup %.2fx\n", avxMs, jitMs, jitRawMs, jitRawMs > 0.0 ? avxMs / jitRawMs : 0.0);
@@ -7198,19 +7265,23 @@ static int runGenericFormulaProfile() {
         bool orbitStage = false;
         bool expectOrbitInvariant = false;
     };
-    const ProfileCase cases[] = {{"arithmetic", "z*z+c+p0*z", {}, {0.1, -0.05}, 4.0, 1200}, {"iteration", "z*z+c+0.0001*n", {}, {}, 4.0, 800}, {"components", "sqr(complex(real(z),imag(z)))+c+p0", {}, {0.02, -0.01}, 4.0, 800}, {"sine", "sin(z)+c", {}, {}, 8.0, 400}, {"branch-power", "exp(p0*log(z))+c", {0.3, 0.2}, {2.5, 0.0}, 8.0, 300}, {"invariant-fn", "z*z+c+sin(p0)+exp(p1)", {}, {0.15, -0.2}, 8.0, 800, {-0.35, 0.1}}, {"invariant-components", "z*z+c+complex(real(p0),imag(p1))*z", {}, {0.15, -0.2}, 4.0, 1000, {-0.35, 0.1}}, {"orbit-sin-c", "0.5*z+0.1*sin(c)", {}, {}, 4.0, 800, {}, true, true}, {"orbit-sin-c-cse", "0.5*z+0.1*(sin(c)+sin(c))", {}, {}, 4.0, 800, {}, true, true}, {"orbit-control-z-n", "0.5*z+0.1*sin(z)+0.000001*n+c", {}, {}, 4.0, 500, {}, true, false}};
+    const ProfileCase cases[] = {{"arithmetic", "z*z+c+p0*z", {}, {0.1, -0.05}, 4.0, 1200}, {"iteration", "z*z+c+0.0001*n", {}, {}, 4.0, 800}, {"components", "sqr(complex(real(z),imag(z)))+c+p0", {}, {0.02, -0.01}, 4.0, 800}, {"sine", "sin(z)+c+complex(1e-100,-1e-101)", {}, {}, 8.0, 400}, {"nested-sine", "sin(sin(z))+c+complex(1e-100,-1e-101)", {}, {}, 100.0, 400}, {"nested-cosine", "cos(cos(z))+c+complex(1e-100,-1e-101)", {}, {}, 100.0, 400}, {"nested-tangent", "tan(tan(z))+c+complex(1e-100,-1e-101)", {}, {}, 100.0, 400}, {"branch-power", "exp(p0*log(z))+c", {0.3, 0.2}, {2.5, 0.0}, 8.0, 300}, {"invariant-fn", "z*z+c+sin(p0)+exp(p1)", {}, {0.15, -0.2}, 8.0, 800, {-0.35, 0.1}}, {"invariant-components", "z*z+c+complex(real(p0),imag(p1))*z", {}, {0.15, -0.2}, 4.0, 1000, {-0.35, 0.1}}, {"orbit-sin-c", "0.5*z+0.1*sin(c)", {}, {}, 4.0, 800, {}, true, true}, {"orbit-sin-c-cse", "0.5*z+0.1*(sin(c)+sin(c))", {}, {}, 4.0, 800, {}, true, true}, {"orbit-control-z-n", "0.5*z+0.1*sin(z)+0.000001*n+c", {}, {}, 4.0, 500, {}, true, false}};
     constexpr int W = 322, H = 216, SAMPLES = 7, PAIR_REPEATS = 5;
     int failures = 0;
     int exactHybridCases = 0;
     int hybridNoRegressionCases = 0;
     int refillNoRegressionCases = 0;
     int unaffectedOrbitExact = 0;
+    int unaffectedOrbitQuality = 0;
     int unaffectedOrbitNoRegression = 0;
     int orbitInvariantExact = 0;
     int orbitInvariantImproved = 0;
     int orbitControlExact = 0;
     int orbitControlNoRegression = 0;
     printf("=== generic formula full-frame profile (%dx%d)\n", W, H);
+    const char* vectorTranscendentalBenchmark = getenv("MANDEL_FORMULA_BENCH_VECTOR_TRANSCENDENTALS");
+    const char* vectorTranscendentalSetting = vectorTranscendentalBenchmark ? vectorTranscendentalBenchmark : "1";
+    const bool vectorTranscendentalsEnabled = std::atoi(vectorTranscendentalSetting) != 0;
 
     for (const ProfileCase& test : cases) {
         formula::ExpressionProgram program;
@@ -7249,6 +7320,7 @@ static int runGenericFormulaProfile() {
             mpf_init_set_ui(scale, 1);
             _putenv_s("MANDEL_EXPR_VECTOR", vector ? "1" : "0");
             _putenv_s("MANDEL_EXPR_HYBRID_REFILL", refill ? "1" : "0");
+            _putenv_s("MANDEL_EXPR_VECTOR_TRANSCENDENTALS", vectorTranscendentalSetting);
             auto begin = Clock::now();
             bool okay = renderer.ComputeExpression(centerRe, centerIm, scale, activeProgram, fixed, FormulaParameter::C, test.mxit, test.bailout, formula::ExpressionColoring::Raw, activeJit, activePlan);
             elapsed = std::chrono::duration<double>(Clock::now() - begin).count();
@@ -7330,6 +7402,7 @@ static int runGenericFormulaProfile() {
         }
         _putenv_s("MANDEL_EXPR_VECTOR", "");
         _putenv_s("MANDEL_EXPR_HYBRID_REFILL", "");
+        _putenv_s("MANDEL_EXPR_VECTOR_TRANSCENDENTALS", "");
         auto median = [](std::vector<double>& values) {
             std::sort(values.begin(), values.end());
             return values.empty() ? 0.0 : values[values.size() / 2];
@@ -7372,7 +7445,48 @@ static int runGenericFormulaProfile() {
                 if (std::memcmp(&scalar[i], &specializedOutput[i], sizeof(float)) != 0) ++specializedMismatches;
             }
         }
-        if (!batchExact || !jitExact || !refillExact || !specializedExact) ++failures;
+        struct Accuracy {
+            int classMismatch = 0;
+            double maxDifference = 0.0;
+            double meanDifference = 0.0;
+            double p99Difference = 0.0;
+        };
+        auto measureAccuracy = [&](const std::vector<float>& candidate) {
+            Accuracy accuracy;
+            double sumDifference = 0.0;
+            std::vector<double> differences;
+            const size_t count = std::min(candidate.size(), scalar.size());
+            for (size_t index = 0; index < count; ++index) {
+                const bool scalarInterior = isInterior(scalar[index]);
+                const bool candidateInterior = isInterior(candidate[index]);
+                if (scalarInterior != candidateInterior) {
+                    ++accuracy.classMismatch;
+                } else if (!scalarInterior) {
+                    const double difference = std::fabs(static_cast<double>(candidate[index]) - scalar[index]);
+                    accuracy.maxDifference = std::max(accuracy.maxDifference, difference);
+                    sumDifference += difference;
+                    differences.push_back(difference);
+                }
+            }
+            accuracy.classMismatch += static_cast<int>(std::max(candidate.size(), scalar.size()) - count);
+            accuracy.meanDifference = differences.empty() ? 0.0 : sumDifference / differences.size();
+            if (!differences.empty()) {
+                const size_t percentile = static_cast<size_t>(std::ceil(0.99 * differences.size())) - 1;
+                std::nth_element(differences.begin(), differences.begin() + percentile, differences.end());
+                accuracy.p99Difference = differences[percentile];
+            }
+            return accuracy;
+        };
+        const Accuracy batchAccuracy = measureAccuracy(batch);
+        const Accuracy specializedAccuracy = measureAccuracy(specializedOutput);
+        const bool trigonometricCase = std::strstr(test.source, "sin(") || std::strstr(test.source, "cos(") || std::strstr(test.source, "tan(");
+        // This profile compares two chaotic binary64 trajectories, so it is a
+        // coarse drift guard. The persisted 512-bit MPFR suite below supplies
+        // the strict adoption gate for these same generic/nested opcodes.
+        const auto qualityAccepted = [&](const Accuracy& accuracy) { return vectorTranscendentalsEnabled && trigonometricCase && accuracy.classMismatch <= 20 && accuracy.maxDifference <= 150.0 && accuracy.meanDifference <= 0.1 && accuracy.p99Difference == 0.0; };
+        const bool batchAccepted = batchExact || qualityAccepted(batchAccuracy);
+        const bool specializedAccepted = specializedExact || qualityAccepted(specializedAccuracy);
+        if (!batchAccepted || !jitExact || !refillExact || !specializedAccepted) ++failures;
         bool noRegression = specializationRatio > 0.0 && specializationRatio <= 1.02;
         bool improved = specializationRatio > 0.0 && specializationRatio < 1.0;
         if (test.orbitStage) {
@@ -7389,7 +7503,8 @@ static int runGenericFormulaProfile() {
         } else {
             if (orbitPlan.profitable()) ++failures;
             if (specializedExact) ++unaffectedOrbitExact;
-            if (specializedExact && noRegression) ++unaffectedOrbitNoRegression;
+            if (specializedAccepted) ++unaffectedOrbitQuality;
+            if (specializedAccepted && noRegression) ++unaffectedOrbitNoRegression;
         }
         bool acceptanceCase = std::strcmp(test.name, "sine") == 0 || std::strcmp(test.name, "branch-power") == 0;
         if (acceptanceCase && program.batchCompatible() && batchExact && batchTime > 0.0) {
@@ -7408,7 +7523,7 @@ static int runGenericFormulaProfile() {
         else
             printf(" JIT=n/a");
         printf(" default=%.4fs orbit-%s=%.4fs(%.2fx)", defaultTime, (orbitJitAvailable || specializedJitAvailable) ? "JIT" : (specializedProgram.avx2Compatible() ? "AVX2" : "Hybrid"), specializedTime, specializationRatio > 0.0 ? 1.0 / specializationRatio : 0.0);
-        printf(" memcmp=%s/%s/%s/%s mismatch=%d/%d/%d/%d\n", batchExact ? "exact" : "FAIL", jitExact ? "exact" : "FAIL", refillExact ? "exact" : "FAIL", specializedExact ? "exact" : "FAIL", batchMismatches, jitMismatches, refillMismatches, specializedMismatches);
+        printf(" memcmp=%s/%s/%s/%s mismatch=%d/%d/%d/%d quality=%d/%.0f/%.3g/%.0f\n", batchExact ? "exact" : (batchAccepted ? "quality" : "FAIL"), jitExact ? "exact" : "FAIL", refillExact ? "exact" : "FAIL", specializedExact ? "exact" : (specializedAccepted ? "quality" : "FAIL"), batchMismatches, jitMismatches, refillMismatches, specializedMismatches, specializedAccuracy.classMismatch, specializedAccuracy.maxDifference, specializedAccuracy.meanDifference, specializedAccuracy.p99Difference);
         if (test.orbitStage) printf("    orbit invariants=%zu invariant-ops=%zu body-ops=%zu profitable=%d\n", orbitPlan.invariantCount(), orbitPlan.invariantOperationCount(), orbitPlan.bodyOperationCount(), orbitPlan.profitable() ? 1 : 0);
     }
     bool hybridDefaultGate = exactHybridCases == 2 && hybridNoRegressionCases == 2;
@@ -7416,8 +7531,8 @@ static int runGenericFormulaProfile() {
     printf("  hybrid default gate: exact=%d/2 non-regression=%d/2\n", exactHybridCases, hybridNoRegressionCases);
     if (refillNoRegressionCases != 2) ++failures;
     printf("  hybrid refill non-regression=%d/2\n", refillNoRegressionCases);
-    if (unaffectedOrbitExact != 7 || unaffectedOrbitNoRegression != 7) ++failures;
-    printf("  unaffected orbit-plan gate: exact=%d/7 non-regression=%d/7\n", unaffectedOrbitExact, unaffectedOrbitNoRegression);
+    if (unaffectedOrbitExact < 8 || unaffectedOrbitQuality != 10 || unaffectedOrbitNoRegression != 10) ++failures;
+    printf("  unaffected orbit-plan gate: exact=%d/10 quality=%d/10 non-regression=%d/10\n", unaffectedOrbitExact, unaffectedOrbitQuality, unaffectedOrbitNoRegression);
     if (orbitInvariantExact != 2 || orbitInvariantImproved < 1 || orbitControlExact != 1 || orbitControlNoRegression != 1) ++failures;
     printf("  orbit-plan gate: invariant exact=%d/2 improved=%d/2; control exact=%d/1 non-regression=%d/1\n", orbitInvariantExact, orbitInvariantImproved, orbitControlExact, orbitControlNoRegression);
     {
@@ -7560,6 +7675,8 @@ static int runFormulaRegressionCase(const FormulaRegressionCase& test, bool upda
     int classMismatch = 0, exteriorBoth = 0, emptyPixels = 0;
     double maxDiff = 0.0, sumDiff = 0.0;
     std::vector<double> differences;
+    int diagnosticCount = 0;
+    const bool diagnostics = getenv("MANDEL_FORMULA_DIAGNOSTICS") != nullptr;
     for (size_t i = 0; i < engine.size(); ++i) {
         if (engine[i] == EMPTYPIXEL || golden[i] == EMPTYPIXEL) {
             ++emptyPixels;
@@ -7569,6 +7686,7 @@ static int runFormulaRegressionCase(const FormulaRegressionCase& test, bool upda
         bool goldenInterior = isInterior(golden[i]);
         if (engineInterior != goldenInterior) {
             ++classMismatch;
+            if (diagnostics && diagnosticCount++ < 16) printf("  mismatch pixel=%zu (%zu,%zu) engine=%.9g GT=%.9g class\n", i, i % static_cast<size_t>(test.width), i / static_cast<size_t>(test.width), engine[i], golden[i]);
             continue;
         }
         if (!engineInterior) {
@@ -7577,6 +7695,7 @@ static int runFormulaRegressionCase(const FormulaRegressionCase& test, bool upda
             maxDiff = std::max(maxDiff, difference);
             sumDiff += difference;
             differences.push_back(difference);
+            if (diagnostics && difference != 0.0 && diagnosticCount++ < 16) printf("  mismatch pixel=%zu (%zu,%zu) engine=%.9g GT=%.9g diff=%.9g\n", i, i % static_cast<size_t>(test.width), i / static_cast<size_t>(test.width), engine[i], golden[i], difference);
         }
     }
     double meanDiff = exteriorBoth ? sumDiff / exteriorBoth : 0.0;
@@ -7634,6 +7753,44 @@ static int runFormulaRegressionSuite() {
     sine.mxit = 200;
     sine.goldenPath = "tests/golden/formula_sine_c.f32";
     cases.push_back(sine);
+    FormulaRegressionCase genericSine = sine;
+    genericSine.name = "generic-sine-constant";
+    genericSine.source = "sin(z)+c+complex(1e-100,-1e-101)";
+    genericSine.centerRe = -0.5;
+    genericSine.bailout = 100.0;
+    genericSine.mxit = 2000;
+    genericSine.goldenPath = "tests/golden/formula_generic_sine_constant.f32";
+    genericSine.maxClassMismatch = 1;
+    genericSine.maxDiff = 100.0;
+    genericSine.maxMeanDiff = 0.3;
+    cases.push_back(genericSine);
+    FormulaRegressionCase nestedSine = genericSine;
+    nestedSine.name = "generic-nested-sine";
+    nestedSine.source = "sin(sin(z))+c+complex(1e-100,-1e-101)";
+    nestedSine.mxit = 500;
+    nestedSine.goldenPath = "tests/golden/formula_generic_nested_sine.f32";
+    nestedSine.maxClassMismatch = 0;
+    nestedSine.maxDiff = 50.0;
+    nestedSine.maxMeanDiff = 0.1;
+    cases.push_back(nestedSine);
+    FormulaRegressionCase nestedCosine = genericSine;
+    nestedCosine.name = "generic-nested-cosine";
+    nestedCosine.source = "cos(cos(z))+c+complex(1e-100,-1e-101)";
+    nestedCosine.mxit = 500;
+    nestedCosine.goldenPath = "tests/golden/formula_generic_nested_cosine.f32";
+    nestedCosine.maxClassMismatch = 0;
+    nestedCosine.maxDiff = 50.0;
+    nestedCosine.maxMeanDiff = 0.1;
+    cases.push_back(nestedCosine);
+    FormulaRegressionCase nestedTangent = genericSine;
+    nestedTangent.name = "generic-nested-tangent";
+    nestedTangent.source = "tan(tan(z))+c+complex(1e-100,-1e-101)";
+    nestedTangent.mxit = 500;
+    nestedTangent.goldenPath = "tests/golden/formula_generic_nested_tangent.f32";
+    nestedTangent.maxClassMismatch = 0;
+    nestedTangent.maxDiff = 0.0;
+    nestedTangent.maxMeanDiff = 0.0;
+    cases.push_back(nestedTangent);
     FormulaRegressionCase parameter = quadratic;
     parameter.name = "parameter-polynomial";
     parameter.source = "z*z+c+p0*z";
@@ -7656,8 +7813,11 @@ static int runFormulaRegressionSuite() {
     cases.push_back(iteration);
 
     bool update = getenv("MANDEL_UPDATE_FORMULA_GOLDENS") != nullptr;
+    const char* selectedCase = getenv("MANDEL_FORMULA_CASE");
     int result = 0;
-    for (const FormulaRegressionCase& test : cases) result |= runFormulaRegressionCase(test, update);
+    for (const FormulaRegressionCase& test : cases) {
+        if (!selectedCase || std::strcmp(test.name, selectedCase) == 0) result |= runFormulaRegressionCase(test, update);
+    }
     return result;
 }
 
