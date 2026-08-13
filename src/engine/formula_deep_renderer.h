@@ -138,6 +138,8 @@ struct ExpressionDeepRenderRequest {
     bool forceMpfrFallbackForVerification = false;
     // Verification-only generic bytecode-oracle baseline.
     bool disableSpecializedPiecewiseMpfrForVerification = false;
+    // Verification-only specialized-MPFR baseline without BigFixed.
+    bool disablePiecewiseBigFixedForVerification = false;
     // Verification-only outward inflation of every certification radius.
     int verificationErrorInflationBits = 0;
     // Verification-only deterministic exception injection. Production callers
@@ -199,6 +201,9 @@ struct ExpressionDeepRenderResult {
     uint64_t specializedPiecewiseMpfrPixelCount = 0;
     uint64_t specializedPiecewiseMpfrIterationCount = 0;
     uint64_t specializedPiecewiseMpfrPeriodicPixelCount = 0;
+    bool usedPiecewiseBigFixed = false;
+    uint64_t piecewiseBigFixedPixelCount = 0;
+    uint64_t piecewiseBigFixedIterationCount = 0;
     bool taylorAttempted = false;
     bool taylorAccepted = false;
     int taylorOrder = 0;

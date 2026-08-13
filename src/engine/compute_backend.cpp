@@ -221,6 +221,7 @@ class CpuComputeBackend final : public IComputeBackend {
             _genericInfo.preflightAttempted = deepResult.preflightAttempted;
             _genericInfo.preflightRejectedFast = deepResult.preflightRejectedFast;
             _genericInfo.specializedPiecewiseMpfr = deepResult.usedSpecializedPiecewiseMpfr;
+            _genericInfo.piecewiseBigFixed = deepResult.usedPiecewiseBigFixed;
             _genericInfo.status = formula::expressionDeepRenderStatusName(deepResult.status);
             _genericInfo.predictedPath = formula::expressionDeepPreflightDecisionName(deepResult.preflightDecision);
             _genericInfo.error = deepResult.error;
@@ -240,6 +241,8 @@ class CpuComputeBackend final : public IComputeBackend {
             _genericInfo.specializedPiecewiseMpfrPixelCount = deepResult.specializedPiecewiseMpfrPixelCount;
             _genericInfo.specializedPiecewiseMpfrIterationCount = deepResult.specializedPiecewiseMpfrIterationCount;
             _genericInfo.specializedPiecewiseMpfrPeriodicPixelCount = deepResult.specializedPiecewiseMpfrPeriodicPixelCount;
+            _genericInfo.piecewiseBigFixedPixelCount = deepResult.piecewiseBigFixedPixelCount;
+            _genericInfo.piecewiseBigFixedIterationCount = deepResult.piecewiseBigFixedIterationCount;
             _genericInfo.selectedPrecision = static_cast<uint64_t>(deepResult.selectedPrecision);
             _genericInfo.fallbackPrecision = static_cast<uint64_t>(deepResult.fallbackPrecision);
             _genericInfo.totalSeconds = totalSeconds;

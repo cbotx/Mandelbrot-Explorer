@@ -5576,10 +5576,10 @@ static int runExpressionDeepRenderCase() {
             }
 
             const uint64_t pixels = static_cast<uint64_t>(production.size());
-            okay = okay && production == threaded && production == genericMpfr && productionResult.preflightAttempted && productionResult.preflightRejectedFast && productionResult.preflightFallbackCount == productionResult.preflightSampleCount && productionResult.preflightSampleCount == 16 && productionResult.fastPixelCount == 0 && productionResult.fallbackPixelCount == pixels && !productionResult.taylorAttempted && productionResult.usedSpecializedPiecewiseMpfr && productionResult.preflightFallbackReasonCounts[static_cast<size_t>(ExpressionDeepFallbackReason::BranchSensitive)] == 16 && productionResult.preflightFirstUncertainHistogram[6] == 16 && productionResult.preflightMinimumFirstUncertainIteration >= productionRequest.preflight.earlyRejectMinimumFirstUncertainIteration && threadedResult.preflightRejectedFast && threadedResult.preflightFallbackCount == productionResult.preflightFallbackCount &&
+            okay = okay && production == threaded && production == genericMpfr && productionResult.preflightAttempted && productionResult.preflightRejectedFast && productionResult.preflightFallbackCount == productionResult.preflightSampleCount && productionResult.preflightSampleCount == 16 && productionResult.fastPixelCount == 0 && productionResult.fallbackPixelCount == pixels && !productionResult.taylorAttempted && productionResult.usedPiecewiseBigFixed && !productionResult.usedSpecializedPiecewiseMpfr && productionResult.preflightFallbackReasonCounts[static_cast<size_t>(ExpressionDeepFallbackReason::BranchSensitive)] == 16 && productionResult.preflightFirstUncertainHistogram[6] == 16 && productionResult.preflightMinimumFirstUncertainIteration >= productionRequest.preflight.earlyRejectMinimumFirstUncertainIteration && threadedResult.preflightRejectedFast && threadedResult.usedPiecewiseBigFixed && threadedResult.preflightFallbackCount == productionResult.preflightFallbackCount &&
                    threadedResult.preflightFirstUncertainHistogram == productionResult.preflightFirstUncertainHistogram && genericResult.fastPixelCount == 0 && genericResult.fallbackPixelCount == pixels && !genericResult.usedSpecializedPiecewiseMpfr && genericProductionOkay;
             if (!okay) {
-                printf("  reported diffabs regression failed production=%llu/%llu preflight=%llu/%llu Taylor=%d specialized=%d min-uncertain=%u generic=%llu/%llu\n", (unsigned long long)productionResult.fastPixelCount, (unsigned long long)productionResult.fallbackPixelCount, (unsigned long long)productionResult.preflightFallbackCount, (unsigned long long)productionResult.preflightSampleCount, productionResult.taylorAttempted ? 1 : 0, productionResult.usedSpecializedPiecewiseMpfr ? 1 : 0, productionResult.preflightMinimumFirstUncertainIteration, (unsigned long long)genericResult.fastPixelCount, (unsigned long long)genericResult.fallbackPixelCount);
+                printf("  reported diffabs regression failed production=%llu/%llu preflight=%llu/%llu Taylor=%d specialized=%d bigfixed=%d min-uncertain=%u generic=%llu/%llu\n", (unsigned long long)productionResult.fastPixelCount, (unsigned long long)productionResult.fallbackPixelCount, (unsigned long long)productionResult.preflightFallbackCount, (unsigned long long)productionResult.preflightSampleCount, productionResult.taylorAttempted ? 1 : 0, productionResult.usedSpecializedPiecewiseMpfr ? 1 : 0, productionResult.usedPiecewiseBigFixed ? 1 : 0, productionResult.preflightMinimumFirstUncertainIteration, (unsigned long long)genericResult.fastPixelCount, (unsigned long long)genericResult.fallbackPixelCount);
                 ++failures;
             } else {
                 ++exactFrames;
@@ -5622,6 +5622,92 @@ static int runExpressionDeepRenderCase() {
                 ExpressionDeepRenderResult expectedResult;
                 if (!formula::renderExpressionDeepFrame(actualRequest, actualResult) || !formula::renderExpressionDeepFrame(expectedRequest, expectedResult) || actual != expected) {
                     printf("  reported diffabs nearby parity failed zoom=%s\n", view.zoom);
+                    ++failures;
+                }
+            }
+
+            for (double escape : {2.1, 4194304.0}) {
+                std::vector<float> actual, expected;
+                ExpressionDeepRenderRequest actualRequest = makeRequest(pair, transcendentalFixed, FormulaParameter::C, centerReal, centerImaginary, 9, 7, 64, actual);
+                actualRequest.scale.decimal = scale;
+                actualRequest.bailout = escape;
+                actualRequest.forceMpfrFallbackForVerification = true;
+                ExpressionDeepRenderResult actualResult;
+                ExpressionDeepRenderRequest expectedRequest = actualRequest;
+                expected.assign(actual.size(), formula::ExpressionDeepEmptyPixel);
+                expectedRequest.output = expected.data();
+                expectedRequest.outputCount = expected.size();
+                expectedRequest.preflight.enable = false;
+                expectedRequest.taylor.enableTaylor = false;
+                expectedRequest.forceMpfrFallbackForVerification = true;
+                expectedRequest.disableSpecializedPiecewiseMpfrForVerification = true;
+                ExpressionDeepRenderResult expectedResult;
+                if (!formula::renderExpressionDeepFrame(actualRequest, actualResult) || !formula::renderExpressionDeepFrame(expectedRequest, expectedResult) || actual != expected || actualResult.usedPiecewiseBigFixed || !actualResult.usedSpecializedPiecewiseMpfr) {
+                    printf("  BigFixed piecewise range gate failed bailout=%.17g status=%s/%s bigfixed=%d specialized=%d equal=%d\n", escape, formula::expressionDeepRenderStatusName(actualResult.status), formula::expressionDeepRenderStatusName(expectedResult.status), actualResult.usedPiecewiseBigFixed ? 1 : 0, actualResult.usedSpecializedPiecewiseMpfr ? 1 : 0, actual == expected ? 1 : 0);
+                    ++failures;
+                }
+            }
+
+            {
+                std::vector<float> actual, expected;
+                ExpressionDeepRenderRequest actualRequest = makeRequest(pair, transcendentalFixed, FormulaParameter::C, centerReal, centerImaginary, 9, 7, 5000, actual);
+                actualRequest.scale.decimal = scale;
+                actualRequest.bailout = 100.0;
+                actualRequest.precision.minimumBits = 53;
+                actualRequest.precision.guardBits = 0;
+                actualRequest.memory.fallbackGuardBits = 0;
+                actualRequest.forceMpfrFallbackForVerification = true;
+                ExpressionDeepRenderResult actualResult;
+                ExpressionDeepRenderRequest expectedRequest = actualRequest;
+                expected.assign(actual.size(), formula::ExpressionDeepEmptyPixel);
+                expectedRequest.output = expected.data();
+                expectedRequest.outputCount = expected.size();
+                expectedRequest.disableSpecializedPiecewiseMpfrForVerification = true;
+                ExpressionDeepRenderResult expectedResult;
+                if (!formula::renderExpressionDeepFrame(actualRequest, actualResult) || !formula::renderExpressionDeepFrame(expectedRequest, expectedResult) || actual != expected || actualResult.usedPiecewiseBigFixed || !actualResult.usedSpecializedPiecewiseMpfr) {
+                    printf("  BigFixed piecewise low-precision gate failed\n");
+                    ++failures;
+                }
+            }
+
+            {
+                ExpressionContext tinyInitial = transcendentalFixed;
+                tinyInitial.z0 = {1e-150, 1e-150};
+                std::vector<float> actual, expected;
+                ExpressionDeepRenderRequest actualRequest = makeRequest(pair, tinyInitial, FormulaParameter::C, "-2", "0", 5, 3, 500, actual);
+                actualRequest.scale.decimal = "1e12";
+                actualRequest.bailout = 2.0;
+                actualRequest.forceMpfrFallbackForVerification = true;
+                ExpressionDeepRenderResult actualResult;
+                ExpressionDeepRenderRequest expectedRequest = actualRequest;
+                expected.assign(actual.size(), formula::ExpressionDeepEmptyPixel);
+                expectedRequest.output = expected.data();
+                expectedRequest.outputCount = expected.size();
+                expectedRequest.disableSpecializedPiecewiseMpfrForVerification = true;
+                ExpressionDeepRenderResult expectedResult;
+                if (!formula::renderExpressionDeepFrame(actualRequest, actualResult) || !formula::renderExpressionDeepFrame(expectedRequest, expectedResult) || actual != expected || actualResult.usedPiecewiseBigFixed || !actualResult.usedSpecializedPiecewiseMpfr) {
+                    printf("  BigFixed piecewise underflow fallback failed\n");
+                    ++failures;
+                }
+            }
+
+            {
+                ExpressionContext boundaryInitial = transcendentalFixed;
+                boundaryInitial.z0 = {2.0, std::ldexp(1.0, -160)};
+                std::vector<float> actual, expected;
+                ExpressionDeepRenderRequest actualRequest = makeRequest(pair, boundaryInitial, FormulaParameter::C, "0", "0", 3, 3, 4, actual);
+                actualRequest.scale.decimal = "1e12";
+                actualRequest.bailout = 2.0;
+                actualRequest.forceMpfrFallbackForVerification = true;
+                ExpressionDeepRenderResult actualResult;
+                ExpressionDeepRenderRequest expectedRequest = actualRequest;
+                expected.assign(actual.size(), formula::ExpressionDeepEmptyPixel);
+                expectedRequest.output = expected.data();
+                expectedRequest.outputCount = expected.size();
+                expectedRequest.disableSpecializedPiecewiseMpfrForVerification = true;
+                ExpressionDeepRenderResult expectedResult;
+                if (!formula::renderExpressionDeepFrame(actualRequest, actualResult) || !formula::renderExpressionDeepFrame(expectedRequest, expectedResult) || actual != expected || actualResult.specializedPiecewiseMpfrPixelCount == 0) {
+                    printf("  BigFixed piecewise bailout-boundary fallback failed\n");
                     ++failures;
                 }
             }
@@ -9925,6 +10011,307 @@ static std::string pow10(int n) {
     return s;
 }
 
+struct DoubleDouble {
+    double high = 0.0;
+    double low = 0.0;
+};
+
+static DoubleDouble normalizeDoubleDouble(double high, double low) {
+    const double sum = high + low;
+    return {sum, low - (sum - high)};
+}
+
+static DoubleDouble twoSumDoubleDouble(double left, double right) {
+    const double sum = left + right;
+    const double virtualRight = sum - left;
+    return {sum, (left - (sum - virtualRight)) + (right - virtualRight)};
+}
+
+static DoubleDouble addDoubleDouble(DoubleDouble left, DoubleDouble right) {
+    DoubleDouble high = twoSumDoubleDouble(left.high, right.high);
+    const DoubleDouble low = twoSumDoubleDouble(left.low, right.low);
+    high.low += low.high;
+    high = normalizeDoubleDouble(high.high, high.low);
+    high.low += low.low;
+    return normalizeDoubleDouble(high.high, high.low);
+}
+
+static DoubleDouble negateDoubleDouble(DoubleDouble value) {
+    return {-value.high, -value.low};
+}
+
+static DoubleDouble subtractDoubleDouble(DoubleDouble left, DoubleDouble right) {
+    return addDoubleDouble(left, negateDoubleDouble(right));
+}
+
+static DoubleDouble multiplyDoubleDouble(DoubleDouble left, DoubleDouble right) {
+    const double product = left.high * right.high;
+    double error = std::fma(left.high, right.high, -product);
+    error += left.high * right.low + left.low * right.high;
+    DoubleDouble result = normalizeDoubleDouble(product, error);
+    result.low += left.low * right.low;
+    return normalizeDoubleDouble(result.high, result.low);
+}
+
+static DoubleDouble multiplyDoubleDouble(DoubleDouble value, double scalar) {
+    const double product = value.high * scalar;
+    const double error = std::fma(value.high, scalar, -product) + value.low * scalar;
+    return normalizeDoubleDouble(product, error);
+}
+
+static DoubleDouble absoluteDoubleDouble(DoubleDouble value) {
+    return value.high < 0.0 || (value.high == 0.0 && value.low < 0.0) ? negateDoubleDouble(value) : value;
+}
+
+static bool greaterDoubleDouble(DoubleDouble left, double right) {
+    return left.high > right || (left.high == right && left.low > 0.0);
+}
+
+static DoubleDouble splitMpfr(mpfr_srcptr value, mpfr_ptr temporary) {
+    DoubleDouble result;
+    result.high = mpfr_get_d(value, MPFR_RNDN);
+    mpfr_set_d(temporary, result.high, MPFR_RNDN);
+    mpfr_sub(temporary, value, temporary, MPFR_RNDN);
+    result.low = mpfr_get_d(temporary, MPFR_RNDN);
+    return result;
+}
+
+static bool renderBurningShipDoubleDouble(const char* centerReal, const char* centerImaginary, const char* scaleText, int width, int height, int maxIterations, double bailout, std::vector<float>& output, double& seconds) {
+    constexpr mpfr_prec_t precision = 512;
+    mpfr_t centerRe, centerIm, scale, dxHalf, dyHalf, temporary, coordinate;
+    mpfr_inits2(precision, centerRe, centerIm, scale, dxHalf, dyHalf, temporary, coordinate, (mpfr_ptr)0);
+    const bool parsed = mpfr_set_str(centerRe, centerReal, 10, MPFR_RNDN) == 0 && mpfr_set_str(centerIm, centerImaginary, 10, MPFR_RNDN) == 0 && mpfr_set_str(scale, scaleText, 10, MPFR_RNDN) == 0 && mpfr_sgn(scale) > 0;
+    if (!parsed) {
+        mpfr_clears(centerRe, centerIm, scale, dxHalf, dyHalf, temporary, coordinate, (mpfr_ptr)0);
+        return false;
+    }
+    mpfr_mul_ui(temporary, scale, static_cast<unsigned long>(width - 1), MPFR_RNDN);
+    mpfr_ui_div(dxHalf, 2, temporary, MPFR_RNDN);
+    mpfr_mul_ui(temporary, scale, static_cast<unsigned long>(width), MPFR_RNDN);
+    mpfr_mul_ui(temporary, temporary, static_cast<unsigned long>(height - 1), MPFR_RNDN);
+    mpfr_ui_div(dyHalf, static_cast<unsigned long>(height), temporary, MPFR_RNDN);
+    mpfr_mul_ui(dyHalf, dyHalf, 2, MPFR_RNDN);
+
+    std::vector<DoubleDouble> realCoordinates(static_cast<size_t>(width));
+    std::vector<DoubleDouble> imaginaryCoordinates(static_cast<size_t>(height));
+    for (int x = 0; x < width; ++x) {
+        const long centered = static_cast<long>(2LL * x - (width - 1LL));
+        mpfr_mul_si(coordinate, dxHalf, centered, MPFR_RNDN);
+        mpfr_add(coordinate, coordinate, centerRe, MPFR_RNDN);
+        realCoordinates[static_cast<size_t>(x)] = splitMpfr(coordinate, temporary);
+    }
+    for (int y = 0; y < height; ++y) {
+        const long centered = static_cast<long>(2LL * y - (height - 1LL));
+        mpfr_mul_si(coordinate, dyHalf, centered, MPFR_RNDN);
+        mpfr_add(coordinate, coordinate, centerIm, MPFR_RNDN);
+        imaginaryCoordinates[static_cast<size_t>(y)] = splitMpfr(coordinate, temporary);
+    }
+    mpfr_clears(centerRe, centerIm, scale, dxHalf, dyHalf, temporary, coordinate, (mpfr_ptr)0);
+
+    output.assign(static_cast<size_t>(width) * height, formula::ExpressionDeepInteriorPixel);
+    const double bailoutSquared = bailout * bailout;
+    const Clock::time_point start = Clock::now();
+#pragma omp parallel for schedule(dynamic, 8)
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            DoubleDouble real{};
+            DoubleDouble imaginary{};
+            const DoubleDouble constantReal = realCoordinates[static_cast<size_t>(x)];
+            const DoubleDouble constantImaginary = imaginaryCoordinates[static_cast<size_t>(y)];
+            float result = formula::ExpressionDeepInteriorPixel;
+            for (int iteration = 0; iteration < maxIterations; ++iteration) {
+                const DoubleDouble absoluteReal = absoluteDoubleDouble(real);
+                const DoubleDouble absoluteImaginary = absoluteDoubleDouble(imaginary);
+                const DoubleDouble realSquared = multiplyDoubleDouble(absoluteReal, absoluteReal);
+                const DoubleDouble imaginarySquared = multiplyDoubleDouble(absoluteImaginary, absoluteImaginary);
+                const DoubleDouble product = multiplyDoubleDouble(absoluteReal, absoluteImaginary);
+                real = addDoubleDouble(subtractDoubleDouble(realSquared, imaginarySquared), constantReal);
+                imaginary = addDoubleDouble(multiplyDoubleDouble(product, 2.0), constantImaginary);
+                const DoubleDouble magnitudeSquared = addDoubleDouble(multiplyDoubleDouble(real, real), multiplyDoubleDouble(imaginary, imaginary));
+                if (greaterDoubleDouble(magnitudeSquared, bailoutSquared)) {
+                    result = static_cast<float>(iteration + 1);
+                    break;
+                }
+            }
+            output[static_cast<size_t>(y) * width + x] = result;
+        }
+    }
+    seconds = since(start);
+    return true;
+}
+
+static bool renderBurningShipMpf(const char* centerReal, const char* centerImaginary, const char* scaleText, int width, int height, int maxIterations, double bailout, mp_bitcnt_t precision, std::vector<float>& output, double& seconds) {
+    mpf_t centerRe, centerIm, scale, dxHalf, dyHalf, temporary;
+    mpf_init2(centerRe, precision);
+    mpf_init2(centerIm, precision);
+    mpf_init2(scale, precision);
+    mpf_init2(dxHalf, precision);
+    mpf_init2(dyHalf, precision);
+    mpf_init2(temporary, precision);
+    const bool parsed = mpf_set_str(centerRe, centerReal, 10) == 0 && mpf_set_str(centerIm, centerImaginary, 10) == 0 && mpf_set_str(scale, scaleText, 10) == 0 && mpf_sgn(scale) > 0;
+    if (!parsed) {
+        mpf_clears(centerRe, centerIm, scale, dxHalf, dyHalf, temporary, (mpf_ptr)0);
+        return false;
+    }
+    mpf_mul_ui(temporary, scale, static_cast<unsigned long>(width - 1));
+    mpf_ui_div(dxHalf, 2, temporary);
+    mpf_mul_ui(temporary, scale, static_cast<unsigned long>(width));
+    mpf_mul_ui(temporary, temporary, static_cast<unsigned long>(height - 1));
+    mpf_ui_div(dyHalf, static_cast<unsigned long>(height), temporary);
+    mpf_mul_ui(dyHalf, dyHalf, 2);
+
+    output.assign(static_cast<size_t>(width) * height, formula::ExpressionDeepInteriorPixel);
+    const double bailoutSquared = bailout * bailout;
+    const Clock::time_point start = Clock::now();
+#pragma omp parallel
+    {
+        mpf_t constantRe, constantIm, real, imaginary, absoluteReal, absoluteImaginary, realSquared, imaginarySquared, product, nextReal, nextImaginary, magnitudeSquared, coordinate;
+        mpf_init2(constantRe, precision);
+        mpf_init2(constantIm, precision);
+        mpf_init2(real, precision);
+        mpf_init2(imaginary, precision);
+        mpf_init2(absoluteReal, precision);
+        mpf_init2(absoluteImaginary, precision);
+        mpf_init2(realSquared, precision);
+        mpf_init2(imaginarySquared, precision);
+        mpf_init2(product, precision);
+        mpf_init2(nextReal, precision);
+        mpf_init2(nextImaginary, precision);
+        mpf_init2(magnitudeSquared, precision);
+        mpf_init2(coordinate, precision);
+#pragma omp for schedule(dynamic, 8)
+        for (int y = 0; y < height; ++y) {
+            const long centeredY = static_cast<long>(2LL * y - (height - 1LL));
+            mpf_mul_ui(coordinate, dyHalf, static_cast<unsigned long>(std::labs(centeredY)));
+            if (centeredY < 0) mpf_neg(coordinate, coordinate);
+            mpf_add(constantIm, coordinate, centerIm);
+            for (int x = 0; x < width; ++x) {
+                const long centeredX = static_cast<long>(2LL * x - (width - 1LL));
+                mpf_mul_ui(coordinate, dxHalf, static_cast<unsigned long>(std::labs(centeredX)));
+                if (centeredX < 0) mpf_neg(coordinate, coordinate);
+                mpf_add(constantRe, coordinate, centerRe);
+                mpf_set_ui(real, 0);
+                mpf_set_ui(imaginary, 0);
+                float result = formula::ExpressionDeepInteriorPixel;
+                for (int iteration = 0; iteration < maxIterations; ++iteration) {
+                    mpf_abs(absoluteReal, real);
+                    mpf_abs(absoluteImaginary, imaginary);
+                    mpf_mul(realSquared, absoluteReal, absoluteReal);
+                    mpf_mul(imaginarySquared, absoluteImaginary, absoluteImaginary);
+                    mpf_sub(nextReal, realSquared, imaginarySquared);
+                    mpf_add(nextReal, nextReal, constantRe);
+                    mpf_mul(product, absoluteReal, absoluteImaginary);
+                    mpf_mul_ui(nextImaginary, product, 2);
+                    mpf_add(nextImaginary, nextImaginary, constantIm);
+                    mpf_set(real, nextReal);
+                    mpf_set(imaginary, nextImaginary);
+                    mpf_mul(realSquared, real, real);
+                    mpf_mul(imaginarySquared, imaginary, imaginary);
+                    mpf_add(magnitudeSquared, realSquared, imaginarySquared);
+                    if (mpf_cmp_d(magnitudeSquared, bailoutSquared) > 0) {
+                        result = static_cast<float>(iteration + 1);
+                        break;
+                    }
+                }
+                output[static_cast<size_t>(y) * width + x] = result;
+            }
+        }
+        mpf_clears(constantRe, constantIm, real, imaginary, absoluteReal, absoluteImaginary, realSquared, imaginarySquared, product, nextReal, nextImaginary, magnitudeSquared, coordinate, (mpf_ptr)0);
+    }
+    seconds = since(start);
+    mpf_clears(centerRe, centerIm, scale, dxHalf, dyHalf, temporary, (mpf_ptr)0);
+    return true;
+}
+
+static bool renderBurningShipBigFixed(const char* centerReal, const char* centerImaginary, const char* scaleText, int width, int height, int maxIterations, double bailout, int limbs, std::vector<float>& output, double& seconds) {
+    const mp_bitcnt_t conversionPrecision = std::max<mp_bitcnt_t>(512, static_cast<mp_bitcnt_t>(64 * (limbs + 2)));
+    mpf_t centerRe, centerIm, scale, dxHalf, dyHalf, temporary, coordinate;
+    mpf_init2(centerRe, conversionPrecision);
+    mpf_init2(centerIm, conversionPrecision);
+    mpf_init2(scale, conversionPrecision);
+    mpf_init2(dxHalf, conversionPrecision);
+    mpf_init2(dyHalf, conversionPrecision);
+    mpf_init2(temporary, conversionPrecision);
+    mpf_init2(coordinate, conversionPrecision);
+    const bool parsed = mpf_set_str(centerRe, centerReal, 10) == 0 && mpf_set_str(centerIm, centerImaginary, 10) == 0 && mpf_set_str(scale, scaleText, 10) == 0 && mpf_sgn(scale) > 0;
+    if (!parsed) {
+        mpf_clears(centerRe, centerIm, scale, dxHalf, dyHalf, temporary, coordinate, (mpf_ptr)0);
+        return false;
+    }
+    mpf_mul_ui(temporary, scale, static_cast<unsigned long>(width - 1));
+    mpf_ui_div(dxHalf, 2, temporary);
+    mpf_mul_ui(temporary, scale, static_cast<unsigned long>(width));
+    mpf_mul_ui(temporary, temporary, static_cast<unsigned long>(height - 1));
+    mpf_ui_div(dyHalf, static_cast<unsigned long>(height), temporary);
+    mpf_mul_ui(dyHalf, dyHalf, 2);
+
+    std::vector<BigFixed> realCoordinates;
+    std::vector<BigFixed> imaginaryCoordinates;
+    realCoordinates.reserve(static_cast<size_t>(width));
+    imaginaryCoordinates.reserve(static_cast<size_t>(height));
+    for (int x = 0; x < width; ++x) {
+        const long centered = static_cast<long>(2LL * x - (width - 1LL));
+        mpf_mul_ui(coordinate, dxHalf, static_cast<unsigned long>(std::labs(centered)));
+        if (centered < 0) mpf_neg(coordinate, coordinate);
+        mpf_add(coordinate, coordinate, centerRe);
+        realCoordinates.emplace_back(limbs);
+        bf_from_mpf(realCoordinates.back(), coordinate, limbs);
+    }
+    for (int y = 0; y < height; ++y) {
+        const long centered = static_cast<long>(2LL * y - (height - 1LL));
+        mpf_mul_ui(coordinate, dyHalf, static_cast<unsigned long>(std::labs(centered)));
+        if (centered < 0) mpf_neg(coordinate, coordinate);
+        mpf_add(coordinate, coordinate, centerIm);
+        imaginaryCoordinates.emplace_back(limbs);
+        bf_from_mpf(imaginaryCoordinates.back(), coordinate, limbs);
+    }
+    mpf_clears(centerRe, centerIm, scale, dxHalf, dyHalf, temporary, coordinate, (mpf_ptr)0);
+
+    output.assign(static_cast<size_t>(width) * height, formula::ExpressionDeepInteriorPixel);
+    const unsigned long long bailoutSquaredInteger = static_cast<unsigned long long>(std::ceil(bailout * bailout));
+    const Clock::time_point start = Clock::now();
+#pragma omp parallel
+    {
+        std::vector<uint64_t> scratch(static_cast<size_t>(2 * limbs));
+        BigFixed real(limbs), imaginary(limbs), realSquare(limbs), imaginarySquare(limbs), product(limbs), realPart(limbs), imaginaryPart(limbs), nextReal(limbs), nextImaginary(limbs), magnitudeSquared(limbs), threshold(limbs);
+        threshold.setInt(static_cast<long long>(bailoutSquaredInteger));
+#pragma omp for schedule(dynamic, 8)
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                real.setZero();
+                imaginary.setZero();
+                realSquare.setZero();
+                imaginarySquare.setZero();
+                const BigFixed& constantReal = realCoordinates[static_cast<size_t>(x)];
+                const BigFixed& constantImaginary = imaginaryCoordinates[static_cast<size_t>(y)];
+                float result = formula::ExpressionDeepInteriorPixel;
+                for (int iteration = 0; iteration < maxIterations; ++iteration) {
+                    bf_sub(realPart, realSquare, imaginarySquare);
+                    bf_mul(product, real, imaginary, scratch.data());
+                    if (!product.isZero()) product.sign = 1;
+                    bf_add(imaginaryPart, product, product);
+                    bf_add(nextReal, realPart, constantReal);
+                    bf_add(nextImaginary, imaginaryPart, constantImaginary);
+                    bf_sqr(realSquare, nextReal, scratch.data());
+                    bf_sqr(imaginarySquare, nextImaginary, scratch.data());
+                    bf_add(magnitudeSquared, realSquare, imaginarySquare);
+                    real.m.swap(nextReal.m);
+                    real.sign = nextReal.sign;
+                    imaginary.m.swap(nextImaginary.m);
+                    imaginary.sign = nextImaginary.sign;
+                    if (bf_mag_cmp(magnitudeSquared.m.data(), threshold.m.data(), limbs) > 0) {
+                        result = static_cast<float>(iteration + 1);
+                        break;
+                    }
+                }
+                output[static_cast<size_t>(y) * width + x] = result;
+            }
+        }
+    }
+    seconds = since(start);
+    return true;
+}
+
 static int runCustomSlowdownCase(int width, int height) {
     using formula::ExpressionContext;
     using formula::ExpressionDeepFallbackReason;
@@ -9958,6 +10345,8 @@ static int runCustomSlowdownCase(int width, int height) {
         return 1;
     }
     printf("  formula source=%s instructions=%zu piecewise=%d\n", source, runtime.instructionCount(), runtime.piecewiseQuadraticKind() == formula::ExpressionPiecewiseQuadraticKind::BurningShip ? 1 : 0);
+    const bool burningShipResearchEligible = runtime.piecewiseQuadraticKind() == formula::ExpressionPiecewiseQuadraticKind::BurningShip;
+    if (!burningShipResearchEligible && (getenv("MANDEL_CUSTOM_SLOW_DD") || getenv("MANDEL_CUSTOM_SLOW_MPF_BITS") || getenv("MANDEL_CUSTOM_SLOW_BF_LIMBS"))) printf("  DD/mpf/BigFixed research lanes SKIP: configured formula is not exact Burning Ship\n");
 
     const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
     auto makeRequest = [&](std::vector<float>& output) {
@@ -9991,8 +10380,8 @@ static int runCustomSlowdownCase(int width, int height) {
         const Clock::time_point start = Clock::now();
         const bool okay = formula::renderExpressionDeepFrame(request, result);
         seconds = since(start);
-        printf("  %-20s %.3f s fast/fallback=%llu/%llu preflight=%llu/%llu %s Taylor=%llu/%llu preflight iter/ops/folds=%llu/%llu/%llu fast iter/ops/folds=%llu/%llu/%llu total_iter=%llu precision=%lld/%lld specialized=%d mpfr pixels/iter/periodic=%llu/%llu/%llu\n", name, seconds, (unsigned long long)result.fastPixelCount, (unsigned long long)result.fallbackPixelCount, (unsigned long long)result.preflightFallbackCount, (unsigned long long)result.preflightSampleCount, formula::expressionDeepPreflightDecisionName(result.preflightDecision), (unsigned long long)result.taylorAcceptedJetCount, (unsigned long long)result.taylorAttemptedJetCount, (unsigned long long)result.preflightIterationCount, (unsigned long long)result.preflightOperationCount, (unsigned long long)result.preflightFoldOperationCount, (unsigned long long)result.fastIterationCount, (unsigned long long)result.fastOperationCount, (unsigned long long)result.fastFoldOperationCount, (unsigned long long)result.totalIterations,
-               (long long)result.selectedPrecision, (long long)result.fallbackPrecision, result.usedSpecializedPiecewiseMpfr ? 1 : 0, (unsigned long long)result.specializedPiecewiseMpfrPixelCount, (unsigned long long)result.specializedPiecewiseMpfrIterationCount, (unsigned long long)result.specializedPiecewiseMpfrPeriodicPixelCount);
+        printf("  %-20s %.3f s fast/fallback=%llu/%llu preflight=%llu/%llu %s Taylor=%llu/%llu preflight iter/ops/folds=%llu/%llu/%llu fast iter/ops/folds=%llu/%llu/%llu total_iter=%llu precision=%lld/%lld specialized=%d bigfixed=%d mpfr pixels/iter/periodic=%llu/%llu/%llu bf pixels/iter=%llu/%llu\n", name, seconds, (unsigned long long)result.fastPixelCount, (unsigned long long)result.fallbackPixelCount, (unsigned long long)result.preflightFallbackCount, (unsigned long long)result.preflightSampleCount, formula::expressionDeepPreflightDecisionName(result.preflightDecision), (unsigned long long)result.taylorAcceptedJetCount, (unsigned long long)result.taylorAttemptedJetCount, (unsigned long long)result.preflightIterationCount, (unsigned long long)result.preflightOperationCount, (unsigned long long)result.preflightFoldOperationCount, (unsigned long long)result.fastIterationCount, (unsigned long long)result.fastOperationCount, (unsigned long long)result.fastFoldOperationCount, (unsigned long long)result.totalIterations,
+               (long long)result.selectedPrecision, (long long)result.fallbackPrecision, result.usedSpecializedPiecewiseMpfr ? 1 : 0, result.usedPiecewiseBigFixed ? 1 : 0, (unsigned long long)result.specializedPiecewiseMpfrPixelCount, (unsigned long long)result.specializedPiecewiseMpfrIterationCount, (unsigned long long)result.specializedPiecewiseMpfrPeriodicPixelCount, (unsigned long long)result.piecewiseBigFixedPixelCount, (unsigned long long)result.piecewiseBigFixedIterationCount);
         printf("    first uncertain preflight:");
         for (size_t bin = 0; bin < result.preflightFirstUncertainHistogram.size(); ++bin)
             if (result.preflightFirstUncertainHistogram[bin]) printf(" b%zu=%llu", bin, (unsigned long long)result.preflightFirstUncertainHistogram[bin]);
@@ -10022,6 +10411,7 @@ static int runCustomSlowdownCase(int width, int height) {
     specializedRequest.preflight.enable = false;
     specializedRequest.taylor.enableTaylor = false;
     specializedRequest.forceMpfrFallbackForVerification = true;
+    specializedRequest.disablePiecewiseBigFixedForVerification = true;
     ExpressionDeepRenderResult specializedResult;
     double specializedSeconds = 0.0;
     okay = render("all-MPFR specialized", specializedRequest, specializedResult, specializedSeconds) && okay;
@@ -10073,6 +10463,113 @@ static int runCustomSlowdownCase(int width, int height) {
             p99Difference = differences[percentileIndex];
         }
         printf("  low-vs-high GT class=%zu max/mean/p99=%.3f/%.3f/%.3f low/high=%.3f/%.3f s\n", classMismatch, maxDifference, meanDifference, p99Difference, genericSeconds, highSeconds);
+    }
+
+    if (getenv("MANDEL_CUSTOM_SLOW_DD") && burningShipResearchEligible) {
+        std::vector<float> doubleDouble;
+        double doubleDoubleSeconds = 0.0;
+        if (!renderBurningShipDoubleDouble(centerReal, centerImaginary, scaleText, width, height, maxIterations, bailout, doubleDouble, doubleDoubleSeconds)) {
+            printf("  double-double render failed\n");
+            okay = false;
+        } else {
+            size_t classMismatch = 0;
+            double maxDifference = 0.0;
+            double sumDifference = 0.0;
+            std::vector<double> differences;
+            differences.reserve(pixelCount);
+            for (size_t index = 0; index < pixelCount; ++index) {
+                const bool candidateInterior = doubleDouble[index] < 0.0f;
+                const bool oracleInterior = generic[index] < 0.0f;
+                if (candidateInterior != oracleInterior) {
+                    ++classMismatch;
+                } else if (!candidateInterior) {
+                    const double difference = std::fabs(static_cast<double>(doubleDouble[index]) - static_cast<double>(generic[index]));
+                    maxDifference = std::max(maxDifference, difference);
+                    sumDifference += difference;
+                    differences.push_back(difference);
+                }
+            }
+            const double meanDifference = differences.empty() ? 0.0 : sumDifference / differences.size();
+            double p99Difference = 0.0;
+            if (!differences.empty()) {
+                const size_t percentileIndex = static_cast<size_t>(std::ceil(0.99 * differences.size())) - 1;
+                std::nth_element(differences.begin(), differences.begin() + percentileIndex, differences.end());
+                p99Difference = differences[percentileIndex];
+            }
+            printf("  double-double GT class=%zu max/mean/p99=%.3f/%.3f/%.3f time=%.3f s\n", classMismatch, maxDifference, meanDifference, p99Difference, doubleDoubleSeconds);
+        }
+    }
+
+    if (const char* mpfBits = getenv("MANDEL_CUSTOM_SLOW_MPF_BITS"); mpfBits && burningShipResearchEligible) {
+        const mp_bitcnt_t precision = static_cast<mp_bitcnt_t>(std::clamp<unsigned long long>(strtoull(mpfBits, nullptr, 10), 64, 4096));
+        std::vector<float> mpfOutput;
+        double mpfSeconds = 0.0;
+        if (!renderBurningShipMpf(centerReal, centerImaginary, scaleText, width, height, maxIterations, bailout, precision, mpfOutput, mpfSeconds)) {
+            printf("  fixed-mpf render failed\n");
+            okay = false;
+        } else {
+            size_t classMismatch = 0;
+            double maxDifference = 0.0;
+            double sumDifference = 0.0;
+            std::vector<double> differences;
+            differences.reserve(pixelCount);
+            for (size_t index = 0; index < pixelCount; ++index) {
+                const bool candidateInterior = mpfOutput[index] < 0.0f;
+                const bool oracleInterior = generic[index] < 0.0f;
+                if (candidateInterior != oracleInterior) {
+                    ++classMismatch;
+                } else if (!candidateInterior) {
+                    const double difference = std::fabs(static_cast<double>(mpfOutput[index]) - static_cast<double>(generic[index]));
+                    maxDifference = std::max(maxDifference, difference);
+                    sumDifference += difference;
+                    differences.push_back(difference);
+                }
+            }
+            const double meanDifference = differences.empty() ? 0.0 : sumDifference / differences.size();
+            double p99Difference = 0.0;
+            if (!differences.empty()) {
+                const size_t percentileIndex = static_cast<size_t>(std::ceil(0.99 * differences.size())) - 1;
+                std::nth_element(differences.begin(), differences.begin() + percentileIndex, differences.end());
+                p99Difference = differences[percentileIndex];
+            }
+            printf("  fixed-mpf %llu-bit GT class=%zu max/mean/p99=%.3f/%.3f/%.3f time=%.3f s\n", static_cast<unsigned long long>(precision), classMismatch, maxDifference, meanDifference, p99Difference, mpfSeconds);
+        }
+    }
+
+    if (const char* limbText = getenv("MANDEL_CUSTOM_SLOW_BF_LIMBS"); limbText && burningShipResearchEligible) {
+        const int limbs = std::clamp(atoi(limbText), 3, 32);
+        std::vector<float> fixedOutput;
+        double fixedSeconds = 0.0;
+        if (!renderBurningShipBigFixed(centerReal, centerImaginary, scaleText, width, height, maxIterations, bailout, limbs, fixedOutput, fixedSeconds)) {
+            printf("  BigFixed render failed\n");
+            okay = false;
+        } else {
+            size_t classMismatch = 0;
+            double maxDifference = 0.0;
+            double sumDifference = 0.0;
+            std::vector<double> differences;
+            differences.reserve(pixelCount);
+            for (size_t index = 0; index < pixelCount; ++index) {
+                const bool candidateInterior = fixedOutput[index] < 0.0f;
+                const bool oracleInterior = generic[index] < 0.0f;
+                if (candidateInterior != oracleInterior) {
+                    ++classMismatch;
+                } else if (!candidateInterior) {
+                    const double difference = std::fabs(static_cast<double>(fixedOutput[index]) - static_cast<double>(generic[index]));
+                    maxDifference = std::max(maxDifference, difference);
+                    sumDifference += difference;
+                    differences.push_back(difference);
+                }
+            }
+            const double meanDifference = differences.empty() ? 0.0 : sumDifference / differences.size();
+            double p99Difference = 0.0;
+            if (!differences.empty()) {
+                const size_t percentileIndex = static_cast<size_t>(std::ceil(0.99 * differences.size())) - 1;
+                std::nth_element(differences.begin(), differences.begin() + percentileIndex, differences.end());
+                p99Difference = differences[percentileIndex];
+            }
+            printf("  BigFixed L=%d GT class=%zu max/mean/p99=%.3f/%.3f/%.3f time=%.3f s\n", limbs, classMismatch, maxDifference, meanDifference, p99Difference, fixedSeconds);
+        }
     }
 
     if (production != generic || specialized != generic) {

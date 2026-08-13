@@ -63,6 +63,7 @@ struct GenericDeepInfo {
     bool preflightAttempted = false;
     bool preflightRejectedFast = false;
     bool specializedPiecewiseMpfr = false;
+    bool piecewiseBigFixed = false;
     std::string status;
     std::string error;
     std::string phase;
@@ -83,6 +84,8 @@ struct GenericDeepInfo {
     uint64_t specializedPiecewiseMpfrPixelCount = 0;
     uint64_t specializedPiecewiseMpfrIterationCount = 0;
     uint64_t specializedPiecewiseMpfrPeriodicPixelCount = 0;
+    uint64_t piecewiseBigFixedPixelCount = 0;
+    uint64_t piecewiseBigFixedIterationCount = 0;
     uint64_t selectedPrecision = 0;
     uint64_t fallbackPrecision = 0;
     double totalSeconds = 0.0;

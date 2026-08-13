@@ -1,4 +1,5 @@
 #include "formula_deep_renderer.h"
+#include "bigfixed.h"
 
 #include <algorithm>
 #include <array>
@@ -6,6 +7,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -184,6 +186,182 @@ struct FallbackWorkerWorkspace {
     mpfr_t piecewiseBailoutSquared;
     mpfr_exp_t piecewiseInsideSquareExponent = 0;
 };
+
+struct BigFixedPixelWorkspace {
+    BigFixedPixelWorkspace(int limbCount, double bailout, mpfr_prec_t fallbackPrecision)
+        : limbs(limbCount), mpfrPrecision(fallbackPrecision), fractionalBits(64LL * (limbs - 1)), bailoutSquared(bailout * bailout), real(limbs), imaginary(limbs), constantReal(limbs), constantImaginary(limbs), realSquared(limbs), imaginarySquared(limbs), product(limbs), realPart(limbs), imaginaryPart(limbs), nextReal(limbs), nextImaginary(limbs), scratch(static_cast<size_t>(2 * limbs)), limbScales(static_cast<size_t>(limbs)) {
+        mpf_init2(bridge, static_cast<mp_bitcnt_t>(64 * (limbs + 1)));
+        for (int limb = 0; limb < limbs; ++limb) limbScales[static_cast<size_t>(limb)] = std::ldexp(1.0, 64 * (limb - (limbs - 1)));
+    }
+
+    ~BigFixedPixelWorkspace() { mpf_clear(bridge); }
+
+    bool set(BigFixed& output, mpfr_srcptr value) {
+        if (!mpfr_number_p(value) || mpfr_cmpabs_ui(value, 1UL << 30) > 0) return false;
+        mpfr_get_f(bridge, value, MPFR_RNDN);
+        bf_from_mpf(output, bridge, limbs);
+        if (!mpfr_zero_p(value) && std::none_of(output.m.begin(), output.m.end(), [](uint64_t limb) { return limb != 0; })) return false;
+        return true;
+    }
+
+    int limbs;
+    mpfr_prec_t mpfrPrecision;
+    int64_t fractionalBits;
+    double bailoutSquared;
+    BigFixed real, imaginary, constantReal, constantImaginary;
+    BigFixed realSquared, imaginarySquared, product, realPart, imaginaryPart;
+    BigFixed nextReal, nextImaginary;
+    std::vector<uint64_t> scratch;
+    std::vector<double> limbScales;
+    mpf_t bridge;
+    double fixedUnit = 0.0;
+    double orbitError = 0.0;
+    double realMagnitude = 0.0;
+    double imaginaryMagnitude = 0.0;
+    double constantRealMagnitude = 0.0;
+    double constantImaginaryMagnitude = 0.0;
+};
+
+enum class BigFixedPixelStatus : uint8_t {
+    Success,
+    Cancelled,
+    Unavailable
+};
+
+enum class BigFixedBailoutDecision : uint8_t {
+    Inside,
+    Outside,
+    Ambiguous
+};
+
+double inflatePositiveDouble(double value, uint64_t ulps = 1) {
+    if (value == 0.0 || !std::isfinite(value)) return value;
+    uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    constexpr uint64_t InfinityBits = 0x7ff0000000000000ULL;
+    bits = bits >= InfinityBits - ulps ? InfinityBits : bits + ulps;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+double deflatePositiveDouble(double value, uint64_t ulps = 1) {
+    if (value == 0.0) return 0.0;
+    if (!std::isfinite(value)) return value;
+    uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    bits = bits > ulps ? bits - ulps : 0;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+double positiveBigFixedUpper(const BigFixedPixelWorkspace& workspace, const BigFixed& value) {
+    int top = workspace.limbs - 1;
+    while (top >= 0 && value.m[static_cast<size_t>(top)] == 0) --top;
+    if (top < 0) return 0.0;
+    double magnitude = static_cast<double>(value.m[static_cast<size_t>(top)]) * workspace.limbScales[static_cast<size_t>(top)];
+    if (top > 0) magnitude += static_cast<double>(value.m[static_cast<size_t>(top - 1)]) * workspace.limbScales[static_cast<size_t>(top - 1)];
+    return inflatePositiveDouble(magnitude, 8);
+}
+
+void updateBigFixedMagnitudes(BigFixedPixelWorkspace& workspace) {
+    workspace.realMagnitude = positiveBigFixedUpper(workspace, workspace.real);
+    workspace.imaginaryMagnitude = positiveBigFixedUpper(workspace, workspace.imaginary);
+}
+
+void initializeBigFixedErrorBounds(BigFixedPixelWorkspace& workspace) {
+    workspace.fixedUnit = std::ldexp(1.0, -static_cast<int>(workspace.fractionalBits));
+    workspace.orbitError = workspace.fixedUnit;
+    workspace.constantRealMagnitude = inflatePositiveDouble(positiveBigFixedUpper(workspace, workspace.constantReal) + workspace.fixedUnit, 8);
+    workspace.constantImaginaryMagnitude = inflatePositiveDouble(positiveBigFixedUpper(workspace, workspace.constantImaginary) + workspace.fixedUnit, 8);
+    updateBigFixedMagnitudes(workspace);
+}
+
+void advanceBigFixedErrorBounds(BigFixedPixelWorkspace& workspace) {
+    const double realWithError = workspace.realMagnitude + workspace.orbitError;
+    const double imaginaryWithError = workspace.imaginaryMagnitude + workspace.orbitError;
+    const double fixedLocalError = 2.0 * workspace.fixedUnit;
+    const double realOperationMagnitude = realWithError * realWithError + imaginaryWithError * imaginaryWithError + workspace.constantRealMagnitude;
+    const double imaginaryOperationMagnitude = 2.0 * realWithError * imaginaryWithError + workspace.constantImaginaryMagnitude;
+    const double propagation = 2.0 * (workspace.realMagnitude + workspace.imaginaryMagnitude) * workspace.orbitError + 2.0 * workspace.orbitError * workspace.orbitError;
+    const double operationMagnitude = std::max(realOperationMagnitude, imaginaryOperationMagnitude);
+    const double nextError = propagation + fixedLocalError + std::ldexp(operationMagnitude, 4 - static_cast<int>(workspace.mpfrPrecision));
+
+    // All terms are nonnegative. Sixty-four ulps cover the rounding of the
+    // short scalar expressions above while remaining negligible beside the
+    // deliberately conservative MPFR operation allowance.
+    workspace.orbitError = inflatePositiveDouble(nextError, 64);
+}
+
+bool bigFixedComponentInterval(double magnitude, double error, double& lower, double& upper) {
+    if (!std::isfinite(magnitude)) return false;
+    const double upwardSpacing = std::nextafter(magnitude, std::numeric_limits<double>::infinity()) - magnitude;
+    const double downwardSpacing = magnitude - std::nextafter(magnitude, -std::numeric_limits<double>::infinity());
+    const double conversionError = 16.0 * std::max(upwardSpacing, downwardSpacing);
+    const double totalError = inflatePositiveDouble(error + conversionError, 8);
+    if (!std::isfinite(totalError)) return false;
+    lower = deflatePositiveDouble(std::max(0.0, magnitude - totalError), 8);
+    upper = inflatePositiveDouble(magnitude + totalError, 8);
+    return std::isfinite(upper);
+}
+
+BigFixedBailoutDecision decideBigFixedBailout(const BigFixedPixelWorkspace& workspace) {
+    double realLower = 0.0;
+    double realUpper = 0.0;
+    double imaginaryLower = 0.0;
+    double imaginaryUpper = 0.0;
+    if (!bigFixedComponentInterval(workspace.realMagnitude, workspace.orbitError, realLower, realUpper) || !bigFixedComponentInterval(workspace.imaginaryMagnitude, workspace.orbitError, imaginaryLower, imaginaryUpper)) return BigFixedBailoutDecision::Ambiguous;
+
+    const double lowerRealSquared = deflatePositiveDouble(realLower * realLower, 8);
+    const double lowerImaginarySquared = deflatePositiveDouble(imaginaryLower * imaginaryLower, 8);
+    const double lowerMagnitudeSquared = deflatePositiveDouble(lowerRealSquared + lowerImaginarySquared, 8);
+    if (lowerMagnitudeSquared > workspace.bailoutSquared) return BigFixedBailoutDecision::Outside;
+
+    const double upperRealSquared = inflatePositiveDouble(realUpper * realUpper, 8);
+    const double upperImaginarySquared = inflatePositiveDouble(imaginaryUpper * imaginaryUpper, 8);
+    const double upperMagnitudeSquared = inflatePositiveDouble(upperRealSquared + upperImaginarySquared, 8);
+    if (upperMagnitudeSquared <= workspace.bailoutSquared) return BigFixedBailoutDecision::Inside;
+    return BigFixedBailoutDecision::Ambiguous;
+}
+
+template <typename Cancel>
+BigFixedPixelStatus evaluateBurningShipBigFixedPixel(const ExpressionDeepRenderRequest& request, const ExpressionOracleContext& context, BigFixedPixelWorkspace& workspace, float& output, uint64_t& iterations, Cancel&& shouldCancel) {
+    if (!workspace.set(workspace.real, context.z.re) || !workspace.set(workspace.imaginary, context.z.im) || !workspace.set(workspace.constantReal, context.c.re) || !workspace.set(workspace.constantImaginary, context.c.im)) return BigFixedPixelStatus::Unavailable;
+    initializeBigFixedErrorBounds(workspace);
+    bf_sqr(workspace.realSquared, workspace.real, workspace.scratch.data());
+    bf_sqr(workspace.imaginarySquared, workspace.imaginary, workspace.scratch.data());
+    const BigFixedBailoutDecision initialDecision = decideBigFixedBailout(workspace);
+    if (initialDecision == BigFixedBailoutDecision::Ambiguous) return BigFixedPixelStatus::Unavailable;
+    if (initialDecision == BigFixedBailoutDecision::Outside) {
+        output = 0.0f;
+        return BigFixedPixelStatus::Success;
+    }
+    output = ExpressionDeepInteriorPixel;
+    for (int iteration = 0; iteration < request.maxIterations; ++iteration) {
+        if ((iteration & 15) == 0 && shouldCancel()) return BigFixedPixelStatus::Cancelled;
+        advanceBigFixedErrorBounds(workspace);
+        bf_sub(workspace.realPart, workspace.realSquared, workspace.imaginarySquared);
+        bf_mul(workspace.product, workspace.real, workspace.imaginary, workspace.scratch.data());
+        if (!workspace.product.isZero()) workspace.product.sign = 1;
+        bf_add(workspace.imaginaryPart, workspace.product, workspace.product);
+        bf_add(workspace.nextReal, workspace.realPart, workspace.constantReal);
+        bf_add(workspace.nextImaginary, workspace.imaginaryPart, workspace.constantImaginary);
+        bf_sqr(workspace.realSquared, workspace.nextReal, workspace.scratch.data());
+        bf_sqr(workspace.imaginarySquared, workspace.nextImaginary, workspace.scratch.data());
+        workspace.real.m.swap(workspace.nextReal.m);
+        workspace.real.sign = workspace.nextReal.sign;
+        workspace.imaginary.m.swap(workspace.nextImaginary.m);
+        workspace.imaginary.sign = workspace.nextImaginary.sign;
+        updateBigFixedMagnitudes(workspace);
+        ++iterations;
+        const BigFixedBailoutDecision decision = decideBigFixedBailout(workspace);
+        if (decision == BigFixedBailoutDecision::Ambiguous) return BigFixedPixelStatus::Unavailable;
+        if (decision == BigFixedBailoutDecision::Outside) {
+            output = static_cast<float>(iteration + 1);
+            return BigFixedPixelStatus::Success;
+        }
+    }
+    return BigFixedPixelStatus::Success;
+}
 
 bool evaluatePiecewiseQuadraticMpfr(ExpressionPiecewiseQuadraticKind kind, const ExpressionOracleContext& context, const MpfrComplex& componentSquares, MpfrComplex& output, mpfr_t (&scratch)[5]) {
     if (kind != ExpressionPiecewiseQuadraticKind::BurningShip) return false;
@@ -1916,6 +2094,13 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
 
         if (cancelled.load(std::memory_order_acquire)) return fail(ExpressionDeepRenderStatus::Cancelled, "render cancelled during the fast pass");
 
+        const ExpressionPiecewiseQuadraticKind piecewiseQuadraticKind = request.disableSpecializedPiecewiseMpfrForVerification ? ExpressionPiecewiseQuadraticKind::None : request.runtimeProgram->piecewiseQuadraticKind();
+        const bool useBigFixedPiecewise = [] {
+            const char* value = std::getenv("MANDEL_DEEP_BIGFIXED_PIXELS");
+            return !value || atoi(value) != 0;
+        }() && piecewiseQuadraticKind == ExpressionPiecewiseQuadraticKind::BurningShip &&
+                                          !request.disablePiecewiseBigFixedForVerification && result.fallbackPrecision >= 257 && result.fallbackPrecision <= 960 && request.bailout >= 2.0 && request.bailout <= 0x1p14 && std::floor(request.bailout) == request.bailout;
+        const int bigFixedLimbCount = std::max(3, static_cast<int>((result.fallbackPrecision + 63) / 64 + 1));
         if (!fallbackQueue.empty()) {
             if (result.selectedPrecision > MPFR_PREC_MAX - request.memory.fallbackGuardBits) return fail(ExpressionDeepRenderStatus::PrecisionOutOfRange, "fallback precision overflow");
             result.fallbackPrecision = result.selectedPrecision + request.memory.fallbackGuardBits;
@@ -1930,6 +2115,7 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
             if (!checkedAddSize(mpfrValuesPerThread, request.runtimeProgram->stackDepth(), 2)) return fail(ExpressionDeepRenderStatus::ResourceLimit, "oracle stack calculation overflow");
             size_t fallbackThreadBytes = 0;
             if (!checkedAddSize(fallbackThreadBytes, mpfrValuesPerThread, mpfrValueBytes)) return fail(ExpressionDeepRenderStatus::ResourceLimit, "fallback workspace calculation overflow");
+            if (useBigFixedPiecewise && !checkedAddSize(fallbackThreadBytes, 1, 2048 + static_cast<size_t>(bigFixedLimbCount) * 16 * sizeof(uint64_t))) return fail(ExpressionDeepRenderStatus::ResourceLimit, "BigFixed fallback workspace calculation overflow");
             size_t fallbackThreadBytesTotal = 0;
             if (!checkedAddSize(fallbackThreadBytesTotal, static_cast<size_t>(threadCount), fallbackThreadBytes)) return fail(ExpressionDeepRenderStatus::ResourceLimit, "fallback workspace multiplication overflow");
             size_t fallbackRendererBytes = rendererBaseBytes;
@@ -1946,17 +2132,20 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
         std::atomic<uint64_t> specializedPiecewisePixels{0};
         std::atomic<uint64_t> specializedPiecewiseIterations{0};
         std::atomic<uint64_t> specializedPiecewisePeriodicPixels{0};
+        std::atomic<uint64_t> piecewiseBigFixedPixels{0};
+        std::atomic<uint64_t> piecewiseBigFixedIterations{0};
         std::atomic_bool fallbackResourceError{false};
         std::atomic_bool fallbackInternalError{false};
         std::atomic_bool fallbackIterationFaultInjected{false};
-        const ExpressionPiecewiseQuadraticKind piecewiseQuadraticKind = request.disableSpecializedPiecewiseMpfrForVerification ? ExpressionPiecewiseQuadraticKind::None : request.runtimeProgram->piecewiseQuadraticKind();
         if (!fallbackQueue.empty()) {
 #pragma omp parallel num_threads(threadCount)
             {
                 std::unique_ptr<FallbackWorkerWorkspace> workspace;
+                std::unique_ptr<BigFixedPixelWorkspace> bigFixedWorkspace;
                 try {
                     if (request.verificationFault == ExpressionDeepVerificationFault::FallbackWorkerAllocation) throw std::bad_alloc();
                     workspace = std::make_unique<FallbackWorkerWorkspace>(result.fallbackPrecision, request);
+                    if (useBigFixedPiecewise) bigFixedWorkspace = std::make_unique<BigFixedPixelWorkspace>(bigFixedLimbCount, request.bailout, result.fallbackPrecision);
                     if (!workspace->geometryReady) fallbackInternalError.store(true, std::memory_order_release);
                 } catch (const std::bad_alloc&) { fallbackResourceError.store(true, std::memory_order_release); } catch (const std::length_error&) {
                     fallbackResourceError.store(true, std::memory_order_release);
@@ -1965,6 +2154,8 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
                 uint64_t localSpecializedPixels = 0;
                 uint64_t localSpecializedIterations = 0;
                 uint64_t localSpecializedPeriodicPixels = 0;
+                uint64_t localBigFixedPixels = 0;
+                uint64_t localBigFixedIterations = 0;
 #pragma omp for schedule(dynamic, 8)
                 for (long long queueIndex = 0; queueIndex < static_cast<long long>(fallbackQueue.size()); ++queueIndex) {
                     try {
@@ -1996,7 +2187,22 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
                         uint64_t periodicPower = 1;
                         uint64_t periodicLength = 0;
                         bool periodicReady = false;
-                        if (!undefined) {
+                        bool usedBigFixed = false;
+                        if (!undefined && bigFixedWorkspace) {
+                            uint64_t bigFixedIterations = 0;
+                            const BigFixedPixelStatus bigFixedStatus = evaluateBurningShipBigFixedPixel(request, context, *bigFixedWorkspace, output, bigFixedIterations, pollCancellation);
+                            if (bigFixedStatus == BigFixedPixelStatus::Success) {
+                                localIterations += bigFixedIterations;
+                                localBigFixedIterations += bigFixedIterations;
+                                ++localBigFixedPixels;
+                                usedBigFixed = true;
+                                decided = true;
+                            } else if (bigFixedStatus == BigFixedPixelStatus::Cancelled) {
+                                cancelled.store(true, std::memory_order_release);
+                                continue;
+                            }
+                        }
+                        if (!undefined && !decided) {
                             if (mpfr_nan_p(context.z.re) || mpfr_nan_p(context.z.im)) {
                                 undefined = true;
                             } else if (mpfr_inf_p(context.z.re) || mpfr_inf_p(context.z.im)) {
@@ -2093,7 +2299,7 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
                                 if (cancelled.load()) request.output[outputIndex] = ExpressionDeepEmptyPixel;
                             }
                         }
-                        if (specializedPiecewise) ++localSpecializedPixels;
+                        if (specializedPiecewise && !usedBigFixed) ++localSpecializedPixels;
                         const uint64_t completed = fallbackCompleted.fetch_add(1, std::memory_order_relaxed) + 1;
                         if ((completed & 31) == 0) notifyProgress(ExpressionDeepRenderPhase::Fallback, completed, static_cast<uint64_t>(fallbackQueue.size()));
                     } catch (const std::bad_alloc&) { fallbackResourceError.store(true, std::memory_order_release); } catch (const std::length_error&) {
@@ -2104,6 +2310,8 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
                 specializedPiecewisePixels.fetch_add(localSpecializedPixels, std::memory_order_relaxed);
                 specializedPiecewiseIterations.fetch_add(localSpecializedIterations, std::memory_order_relaxed);
                 specializedPiecewisePeriodicPixels.fetch_add(localSpecializedPeriodicPixels, std::memory_order_relaxed);
+                piecewiseBigFixedPixels.fetch_add(localBigFixedPixels, std::memory_order_relaxed);
+                piecewiseBigFixedIterations.fetch_add(localBigFixedIterations, std::memory_order_relaxed);
                 ExpressionOracle::releaseThreadWorkspace();
             }
         }
@@ -2114,6 +2322,9 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
         result.specializedPiecewiseMpfrIterationCount = specializedPiecewiseIterations.load(std::memory_order_relaxed);
         result.specializedPiecewiseMpfrPeriodicPixelCount = specializedPiecewisePeriodicPixels.load(std::memory_order_relaxed);
         result.usedSpecializedPiecewiseMpfr = result.specializedPiecewiseMpfrPixelCount != 0;
+        result.piecewiseBigFixedPixelCount = piecewiseBigFixedPixels.load(std::memory_order_relaxed);
+        result.piecewiseBigFixedIterationCount = piecewiseBigFixedIterations.load(std::memory_order_relaxed);
+        result.usedPiecewiseBigFixed = result.piecewiseBigFixedPixelCount != 0;
         if (fallbackResourceError.load(std::memory_order_acquire)) return fail(ExpressionDeepRenderStatus::ResourceLimit, "fallback worker allocation failed");
         if (fallbackInternalError.load(std::memory_order_acquire)) return fail(ExpressionDeepRenderStatus::InternalError, "fallback geometry initialization failed");
         if (cancelled.load(std::memory_order_acquire)) return fail(ExpressionDeepRenderStatus::Cancelled, "render cancelled during MPFR fallback");
