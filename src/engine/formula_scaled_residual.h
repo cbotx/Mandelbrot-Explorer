@@ -137,7 +137,7 @@ class ExpressionScaledResidualEvaluator {
     void reset();
 
     bool ready() const { return _ready; }
-    size_t workspaceBytes() const { return _states.capacity() * sizeof(NodeState) + _layoutStack.capacity() * sizeof(uint16_t) + _sampleExponentRangeUnsafe.capacity() * sizeof(uint8_t) + _sampleUndefinedStatus.capacity() * sizeof(uint8_t) + _nodeExponentRangeUnsafe.capacity() * sizeof(uint8_t); }
+    size_t workspaceBytes() const { return _states.capacity() * sizeof(NodeState) + _layoutStack.capacity() * sizeof(uint16_t) + _sampleExponentRangeUnsafe.capacity() * sizeof(uint8_t) + _sampleUndefinedStatus.capacity() * sizeof(uint8_t) + _nodeExponentRangeUnsafe.capacity() * sizeof(uint8_t) + (_nodeBases.capacity() + _nodeAuxiliaries.capacity()) * sizeof(ScaledComplexValue) + _nodeBaseMagnitudes.capacity() * sizeof(ScaledRealValue); }
     ExpressionScaledResidualStatus preparationStatus() const { return _preparationStatus; }
     const std::string& error() const { return _error; }
 
@@ -158,6 +158,9 @@ class ExpressionScaledResidualEvaluator {
     std::vector<uint8_t> _sampleExponentRangeUnsafe;
     std::vector<uint8_t> _sampleUndefinedStatus;
     std::vector<uint8_t> _nodeExponentRangeUnsafe;
+    std::vector<ScaledComplexValue> _nodeBases;
+    std::vector<ScaledComplexValue> _nodeAuxiliaries;
+    std::vector<ScaledRealValue> _nodeBaseMagnitudes;
     ExpressionScaledResidualStatus _preparationStatus = ExpressionScaledResidualStatus::InvalidTape;
     std::string _error;
     int64_t _mpfrSafeMinimum = 0;

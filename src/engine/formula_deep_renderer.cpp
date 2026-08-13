@@ -1123,7 +1123,13 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
         size_t rendererBaseBytes = 0;
         if ((runFast && (!checkedAddSize(rendererBaseBytes, request.width, sizeof(ScaledOffset)) || !checkedAddSize(rendererBaseBytes, request.height, sizeof(ScaledOffset)) || (request.preflight.enable && piecewisePerStepEligible && !checkedAddSize(rendererBaseBytes, request.preflight.maximumSamples, sizeof(size_t))))) || !checkedAddSize(rendererBaseBytes, pixelCount, sizeof(uint8_t)) || !checkedAddSize(rendererBaseBytes, pixelCount, sizeof(size_t))) return fail(ExpressionDeepRenderStatus::ResourceLimit, "renderer memory calculation overflow");
         size_t fastThreadBytes = 2048;
-        if (runFast && !checkedAddSize(fastThreadBytes, request.runtimeProgram->instructionCount(), sizeof(ScaledComplexValue) + sizeof(ScaledRealValue) + sizeof(uint16_t))) return fail(ExpressionDeepRenderStatus::ResourceLimit, "thread workspace calculation overflow");
+        if (runFast) {
+            const size_t instructionCount = request.runtimeProgram->instructionCount();
+            if (!checkedAddSize(fastThreadBytes, instructionCount, sizeof(ScaledComplexValue) + sizeof(ScaledRealValue) + sizeof(uint16_t) + 16) || !checkedAddSize(fastThreadBytes, static_cast<size_t>(request.maxIterations), 2 * sizeof(uint8_t))) return fail(ExpressionDeepRenderStatus::ResourceLimit, "thread workspace calculation overflow");
+            if (instructionCount != 0 && static_cast<size_t>(request.maxIterations) > std::numeric_limits<size_t>::max() / instructionCount) return fail(ExpressionDeepRenderStatus::ResourceLimit, "reference tape workspace multiplication overflow");
+            const size_t maximumTapeNodes = static_cast<size_t>(request.maxIterations) * instructionCount;
+            if (!checkedAddSize(fastThreadBytes, maximumTapeNodes, 2 * sizeof(ScaledComplexValue) + sizeof(ScaledRealValue) + sizeof(uint8_t))) return fail(ExpressionDeepRenderStatus::ResourceLimit, "reference tape workspace calculation overflow");
+        }
         size_t fastThreadBytesTotal = 0;
         if (runFast && !checkedAddSize(fastThreadBytesTotal, static_cast<size_t>(threadCount), fastThreadBytes)) return fail(ExpressionDeepRenderStatus::ResourceLimit, "thread workspace multiplication overflow");
         size_t rendererBytes = rendererBaseBytes;
