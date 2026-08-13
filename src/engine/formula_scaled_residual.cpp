@@ -9,6 +9,8 @@ namespace formula {
 
 namespace {
 
+constexpr size_t ReferenceCacheLimitBytes = size_t{8} << 20;
+
 bool checkedAddExponent(int64_t left, int64_t right, int64_t& output) {
     if ((right > 0 && left > std::numeric_limits<int64_t>::max() - right) || (right < 0 && left < std::numeric_limits<int64_t>::min() - right)) return false;
     output = left + right;
@@ -891,7 +893,16 @@ bool ExpressionScaledResidualEvaluator::estimateWorkspaceBytes(const ExpressionP
         bytes += count * elementSize;
         return true;
     };
-    return add(program.instructionCount(), sizeof(NodeState)) && add(program.stackDepth(), sizeof(uint16_t)) && add(reference.samples.size(), sizeof(uint8_t)) && add(reference.samples.size(), sizeof(uint8_t)) && add(reference.tape.size(), sizeof(uint8_t)) && add(reference.tape.size(), sizeof(ScaledComplexValue)) && add(reference.tape.size(), sizeof(ScaledComplexValue)) && add(reference.tape.size(), sizeof(ScaledRealValue));
+    size_t cacheBytes = 0;
+    return estimateReferenceCacheBytes(reference.tape.size(), cacheBytes) && add(program.instructionCount(), sizeof(NodeState)) && add(program.stackDepth(), sizeof(uint16_t)) && add(reference.samples.size(), sizeof(uint8_t)) && add(reference.samples.size(), sizeof(uint8_t)) && add(reference.tape.size(), sizeof(uint8_t)) && add(1, cacheBytes);
+}
+
+bool ExpressionScaledResidualEvaluator::estimateReferenceCacheBytes(size_t tapeNodeCount, size_t& bytes) {
+    constexpr size_t BytesPerNode = 2 * sizeof(ScaledComplexValue) + sizeof(ScaledRealValue);
+    if (tapeNodeCount > std::numeric_limits<size_t>::max() / BytesPerNode) return false;
+    const size_t requested = tapeNodeCount * BytesPerNode;
+    bytes = requested <= ReferenceCacheLimitBytes ? requested : 0;
+    return true;
 }
 
 bool ExpressionScaledResidualEvaluator::prepare(const ExpressionProgram& program, const ExpressionReferenceOrbitResult& reference) {
@@ -917,9 +928,13 @@ bool ExpressionScaledResidualEvaluator::prepare(const ExpressionProgram& program
     _sampleExponentRangeUnsafe.assign(reference.samples.size(), 0);
     _sampleUndefinedStatus.assign(reference.samples.size(), 0);
     _nodeExponentRangeUnsafe.assign(reference.tape.size(), 0);
-    _nodeBases.assign(reference.tape.size(), {});
-    _nodeAuxiliaries.assign(reference.tape.size(), {});
-    _nodeBaseMagnitudes.assign(reference.tape.size(), {});
+    size_t referenceCacheBytes = 0;
+    if (!estimateReferenceCacheBytes(reference.tape.size(), referenceCacheBytes)) return fail("reference cache size overflow");
+    if (referenceCacheBytes != 0) {
+        _nodeBases.assign(reference.tape.size(), {});
+        _nodeAuxiliaries.assign(reference.tape.size(), {});
+        _nodeBaseMagnitudes.assign(reference.tape.size(), {});
+    }
     auto radiusRangeUnsafe = [&](const ScaledRealValue& radius) { return certifyMpfrExponentRange(radius, _mpfrSafeMinimum, _mpfrSafeMaximum) != ScaledArithmeticStatus::Success; };
     auto compactRangeUnsafe = [&](const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, const ScaledRealValue& radius, ScaledComplexValue* cached = nullptr) {
         if (!finiteShadow(primary) || !finiteShadow(defect)) return false;
@@ -1005,8 +1020,10 @@ bool ExpressionScaledResidualEvaluator::prepare(const ExpressionProgram& program
             if ((node.flags & OracleTraceUndefined) && _sampleUndefinedStatus[sampleIndex] == 0) { _sampleUndefinedStatus[sampleIndex] = (node.flags & OracleTraceSingularPoint) ? 1 : (node.flags & OracleTraceBranchSensitive) ? 2
                                                                                                                                                                                                                                  : 3; }
             const size_t tapeIndex = static_cast<size_t>(sample.tapeOffset) + instructionIndex;
-            _nodeExponentRangeUnsafe[tapeIndex] = compactRangeUnsafe(node.output, node.outputDefect, node.outputError, &_nodeBases[tapeIndex]) || (hasAuxiliary && compactRangeUnsafe(node.auxiliary, node.auxiliaryDefect, node.auxiliaryError, &_nodeAuxiliaries[tapeIndex]));
-            if (!_nodeExponentRangeUnsafe[tapeIndex] && maxComponentMagnitude(_nodeBases[tapeIndex], _nodeBaseMagnitudes[tapeIndex]) != ScaledArithmeticStatus::Success) _nodeExponentRangeUnsafe[tapeIndex] = 1;
+            ScaledComplexValue* cachedBase = _nodeBases.empty() ? nullptr : &_nodeBases[tapeIndex];
+            ScaledComplexValue* cachedAuxiliary = _nodeAuxiliaries.empty() ? nullptr : &_nodeAuxiliaries[tapeIndex];
+            _nodeExponentRangeUnsafe[tapeIndex] = compactRangeUnsafe(node.output, node.outputDefect, node.outputError, cachedBase) || (hasAuxiliary && compactRangeUnsafe(node.auxiliary, node.auxiliaryDefect, node.auxiliaryError, cachedAuxiliary));
+            if (!_nodeExponentRangeUnsafe[tapeIndex] && !_nodeBases.empty() && maxComponentMagnitude(_nodeBases[tapeIndex], _nodeBaseMagnitudes[tapeIndex]) != ScaledArithmeticStatus::Success) _nodeExponentRangeUnsafe[tapeIndex] = 1;
             _layoutStack.push_back(static_cast<uint16_t>(instructionIndex));
         }
         if (_layoutStack.size() != 1 || sample.rootNode != _layoutStack.back()) return fail("reference tape root mismatch");
@@ -1063,9 +1080,14 @@ ExpressionScaledResidualResult ExpressionScaledResidualEvaluator::evaluate(size_
     };
     auto nodeBase = [&](uint16_t localNode, ScaledComplexValue& output) {
         const size_t tapeIndex = offset + localNode;
-        if (tapeIndex >= _nodeBases.size() || _nodeExponentRangeUnsafe[tapeIndex]) return ScaledArithmeticStatus::ExponentRange;
-        output = _nodeBases[tapeIndex];
-        return ScaledArithmeticStatus::Success;
+        if (tapeIndex >= _reference->tape.size() || _nodeExponentRangeUnsafe[tapeIndex]) return ScaledArithmeticStatus::ExponentRange;
+        if (!_nodeBases.empty()) {
+            output = _nodeBases[tapeIndex];
+            return ScaledArithmeticStatus::Success;
+        }
+        const ExpressionReferenceTapeNode& node = _reference->tape[tapeIndex];
+        ScaledArithmeticStatus status = makeScaledComplexValue(node.output, node.outputDefect, output);
+        return status == ScaledArithmeticStatus::Success ? certifyScaledMpfrExponentRange(output) : status;
     };
     auto addOutputError = [&](const ExpressionReferenceTapeNode& node, ScaledRealValue& radius) {
         ScaledArithmeticStatus status = scaledAddUp(radius, node.outputError, radius);
@@ -1138,13 +1160,24 @@ ExpressionScaledResidualResult ExpressionScaledResidualEvaluator::evaluate(size_
         ScaledArithmeticStatus status = ScaledArithmeticStatus::Success;
         auto nodeMagnitude = [&](uint16_t localNode, ScaledRealValue& output) {
             const size_t tapeIndex = offset + localNode;
-            if (tapeIndex >= _nodeBaseMagnitudes.size() || _nodeExponentRangeUnsafe[tapeIndex]) return ScaledArithmeticStatus::ExponentRange;
-            const ScaledRealValue& baseMagnitude = _nodeBaseMagnitudes[tapeIndex];
+            if (tapeIndex >= _reference->tape.size() || _nodeExponentRangeUnsafe[tapeIndex]) return ScaledArithmeticStatus::ExponentRange;
+            ScaledRealValue uncachedBaseMagnitude;
+            const ScaledRealValue* baseMagnitude = nullptr;
+            if (!_nodeBaseMagnitudes.empty()) {
+                baseMagnitude = &_nodeBaseMagnitudes[tapeIndex];
+            } else {
+                ScaledComplexValue base;
+                ScaledArithmeticStatus localStatus = nodeBase(localNode, base);
+                if (localStatus != ScaledArithmeticStatus::Success) return localStatus;
+                localStatus = maxComponentMagnitude(base, uncachedBaseMagnitude);
+                if (localStatus != ScaledArithmeticStatus::Success) return localStatus;
+                baseMagnitude = &uncachedBaseMagnitude;
+            }
             ScaledRealValue residualMagnitude;
             ScaledArithmeticStatus localStatus = maxComponentMagnitude(_states[localNode].residual, residualMagnitude);
             if (localStatus != ScaledArithmeticStatus::Success) return localStatus;
             ScaledRealValue midpointMagnitude;
-            localStatus = scaledAddUp(baseMagnitude, residualMagnitude, midpointMagnitude);
+            localStatus = scaledAddUp(*baseMagnitude, residualMagnitude, midpointMagnitude);
             if (localStatus != ScaledArithmeticStatus::Success) return localStatus;
             localStatus = certifyScaledMpfrExponentRange(midpointMagnitude);
             if (localStatus != ScaledArithmeticStatus::Success) return localStatus;
@@ -1191,9 +1224,24 @@ ExpressionScaledResidualResult ExpressionScaledResidualEvaluator::evaluate(size_
     };
     auto nonlinearResult = [&](size_t tapeIndex, const ExpressionReferenceTapeNode& node, const ScaledComplexValue& delta, ScaledComplexValue& output) {
         SeriesValue first, second;
-        if (tapeIndex >= _nodeBases.size() || _nodeExponentRangeUnsafe[tapeIndex]) return ScaledArithmeticStatus::ExponentRange;
-        const ScaledComplexValue& base = _nodeBases[tapeIndex];
-        const ScaledComplexValue& companion = _nodeAuxiliaries[tapeIndex];
+        if (tapeIndex >= _reference->tape.size() || _nodeExponentRangeUnsafe[tapeIndex]) return ScaledArithmeticStatus::ExponentRange;
+        ScaledComplexValue uncachedBase;
+        ScaledComplexValue uncachedCompanion;
+        const ScaledComplexValue* base = nullptr;
+        const ScaledComplexValue* companion = nullptr;
+        if (!_nodeBases.empty()) {
+            base = &_nodeBases[tapeIndex];
+            companion = &_nodeAuxiliaries[tapeIndex];
+        } else {
+            ScaledArithmeticStatus localStatus = makeScaledComplexValue(node.output, node.outputDefect, uncachedBase);
+            if (localStatus != ScaledArithmeticStatus::Success) return localStatus;
+            base = &uncachedBase;
+            if (node.operation != ExpressionOracleOperation::Exp) {
+                localStatus = makeScaledComplexValue(node.auxiliary, node.auxiliaryDefect, uncachedCompanion);
+                if (localStatus != ScaledArithmeticStatus::Success) return localStatus;
+            }
+            companion = &uncachedCompanion;
+        }
         ScaledArithmeticStatus status = ScaledArithmeticStatus::Success;
 
         ScaledComplexValue left, right;
@@ -1203,9 +1251,9 @@ ExpressionScaledResidualResult ExpressionScaledResidualEvaluator::evaluate(size_
             status = expMinusOneSeries(delta, first);
             if (status == ScaledArithmeticStatus::Singular) return status;
             if (status != ScaledArithmeticStatus::Success) return status;
-            status = guardedValueMultiply(base, first.value, output);
+            status = guardedValueMultiply(*base, first.value, output);
             if (status != ScaledArithmeticStatus::Success) return status;
-            status = combineRemainder(base, first.remainder, leftRemainder);
+            status = combineRemainder(*base, first.remainder, leftRemainder);
             if (status == ScaledArithmeticStatus::Success) updateRemainder(leftRemainder);
             break;
         case ExpressionOracleOperation::Sin:
@@ -1214,9 +1262,9 @@ ExpressionScaledResidualResult ExpressionScaledResidualEvaluator::evaluate(size_
             if (status != ScaledArithmeticStatus::Success) return status;
             status = oddSeries(delta, false, second);
             if (status != ScaledArithmeticStatus::Success) return status;
-            status = guardedValueMultiply(base, first.value, left);
+            status = guardedValueMultiply(*base, first.value, left);
             if (status != ScaledArithmeticStatus::Success) return status;
-            status = guardedValueMultiply(companion, second.value, right);
+            status = guardedValueMultiply(*companion, second.value, right);
             if (status != ScaledArithmeticStatus::Success) return status;
             if (node.operation == ExpressionOracleOperation::Cos) {
                 status = scaledNegate(right, right);
@@ -1226,9 +1274,9 @@ ExpressionScaledResidualResult ExpressionScaledResidualEvaluator::evaluate(size_
             if (status != ScaledArithmeticStatus::Success) return status;
             status = certifyScaledMpfrExponentRange(output);
             if (status != ScaledArithmeticStatus::Success) return status;
-            status = combineRemainder(base, first.remainder, leftRemainder);
+            status = combineRemainder(*base, first.remainder, leftRemainder);
             if (status != ScaledArithmeticStatus::Success) return status;
-            status = combineRemainder(companion, second.remainder, rightRemainder);
+            status = combineRemainder(*companion, second.remainder, rightRemainder);
             if (status != ScaledArithmeticStatus::Success) return status;
             status = addRemainders(leftRemainder, rightRemainder, leftRemainder);
             if (status == ScaledArithmeticStatus::Success) updateRemainder(leftRemainder);
@@ -1239,17 +1287,17 @@ ExpressionScaledResidualResult ExpressionScaledResidualEvaluator::evaluate(size_
             if (status != ScaledArithmeticStatus::Success) return status;
             status = oddSeries(delta, true, second);
             if (status != ScaledArithmeticStatus::Success) return status;
-            status = guardedValueMultiply(base, first.value, left);
+            status = guardedValueMultiply(*base, first.value, left);
             if (status != ScaledArithmeticStatus::Success) return status;
-            status = guardedValueMultiply(companion, second.value, right);
+            status = guardedValueMultiply(*companion, second.value, right);
             if (status != ScaledArithmeticStatus::Success) return status;
             status = scaledAdd(left, right, output);
             if (status != ScaledArithmeticStatus::Success) return status;
             status = certifyScaledMpfrExponentRange(output);
             if (status != ScaledArithmeticStatus::Success) return status;
-            status = combineRemainder(base, first.remainder, leftRemainder);
+            status = combineRemainder(*base, first.remainder, leftRemainder);
             if (status != ScaledArithmeticStatus::Success) return status;
-            status = combineRemainder(companion, second.remainder, rightRemainder);
+            status = combineRemainder(*companion, second.remainder, rightRemainder);
             if (status != ScaledArithmeticStatus::Success) return status;
             status = addRemainders(leftRemainder, rightRemainder, leftRemainder);
             if (status == ScaledArithmeticStatus::Success) updateRemainder(leftRemainder);

@@ -134,6 +134,7 @@ class ExpressionScaledResidualEvaluator {
     // reuses internal node storage and is intentionally not thread-safe.
     bool prepare(const ExpressionProgram& program, const ExpressionReferenceOrbitResult& reference);
     static bool estimateWorkspaceBytes(const ExpressionProgram& program, const ExpressionReferenceOrbitResult& reference, size_t& bytes);
+    static bool estimateReferenceCacheBytes(size_t tapeNodeCount, size_t& bytes);
     void reset();
 
     bool ready() const { return _ready; }

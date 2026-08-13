@@ -225,48 +225,49 @@ bool logarithm(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
     return true;
 }
 
+void hyperbolicPair(mpfr_ptr sinhValue, mpfr_ptr coshValue, mpfr_srcptr input) {
+    if (mpfr_zero_p(input) || mpfr_get_exp(input) <= -16) {
+        mpfr_sinh(sinhValue, input, RND);
+        mpfr_cosh(coshValue, input, RND);
+    } else {
+        mpfr_sinh_cosh(sinhValue, coshValue, input, RND);
+    }
+}
+
 void sine(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
-    mpfr_sin(s.values[0], a.re, RND);
-    mpfr_cosh(s.values[1], a.im, RND);
-    mpfr_mul(s.values[2], s.values[0], s.values[1], RND);
-    mpfr_cos(s.values[0], a.re, RND);
-    mpfr_sinh(s.values[1], a.im, RND);
-    mpfr_mul(s.values[3], s.values[0], s.values[1], RND);
-    mpfr_set(out.re, s.values[2], RND);
-    mpfr_set(out.im, s.values[3], RND);
+    mpfr_sin_cos(s.values[0], s.values[1], a.re, RND);
+    hyperbolicPair(s.values[2], s.values[3], a.im);
+    mpfr_mul(s.values[4], s.values[0], s.values[3], RND);
+    mpfr_mul(s.values[5], s.values[1], s.values[2], RND);
+    mpfr_set(out.re, s.values[4], RND);
+    mpfr_set(out.im, s.values[5], RND);
 }
 
 void cosine(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
-    mpfr_cos(s.values[0], a.re, RND);
-    mpfr_cosh(s.values[1], a.im, RND);
-    mpfr_mul(s.values[2], s.values[0], s.values[1], RND);
-    mpfr_sin(s.values[0], a.re, RND);
-    mpfr_sinh(s.values[1], a.im, RND);
-    mpfr_mul(s.values[3], s.values[0], s.values[1], RND);
-    mpfr_set(out.re, s.values[2], RND);
-    mpfr_neg(out.im, s.values[3], RND);
+    mpfr_sin_cos(s.values[0], s.values[1], a.re, RND);
+    hyperbolicPair(s.values[2], s.values[3], a.im);
+    mpfr_mul(s.values[4], s.values[1], s.values[3], RND);
+    mpfr_mul(s.values[5], s.values[0], s.values[2], RND);
+    mpfr_set(out.re, s.values[4], RND);
+    mpfr_neg(out.im, s.values[5], RND);
 }
 
 void hyperbolicSine(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
-    mpfr_sinh(s.values[0], a.re, RND);
-    mpfr_cos(s.values[1], a.im, RND);
-    mpfr_mul(s.values[2], s.values[0], s.values[1], RND);
-    mpfr_cosh(s.values[0], a.re, RND);
-    mpfr_sin(s.values[1], a.im, RND);
-    mpfr_mul(s.values[3], s.values[0], s.values[1], RND);
-    mpfr_set(out.re, s.values[2], RND);
-    mpfr_set(out.im, s.values[3], RND);
+    hyperbolicPair(s.values[0], s.values[1], a.re);
+    mpfr_sin_cos(s.values[2], s.values[3], a.im, RND);
+    mpfr_mul(s.values[4], s.values[0], s.values[3], RND);
+    mpfr_mul(s.values[5], s.values[1], s.values[2], RND);
+    mpfr_set(out.re, s.values[4], RND);
+    mpfr_set(out.im, s.values[5], RND);
 }
 
 void hyperbolicCosine(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {
-    mpfr_cosh(s.values[0], a.re, RND);
-    mpfr_cos(s.values[1], a.im, RND);
-    mpfr_mul(s.values[2], s.values[0], s.values[1], RND);
-    mpfr_sinh(s.values[0], a.re, RND);
-    mpfr_sin(s.values[1], a.im, RND);
-    mpfr_mul(s.values[3], s.values[0], s.values[1], RND);
-    mpfr_set(out.re, s.values[2], RND);
-    mpfr_set(out.im, s.values[3], RND);
+    hyperbolicPair(s.values[0], s.values[1], a.re);
+    mpfr_sin_cos(s.values[2], s.values[3], a.im, RND);
+    mpfr_mul(s.values[4], s.values[1], s.values[3], RND);
+    mpfr_mul(s.values[5], s.values[0], s.values[2], RND);
+    mpfr_set(out.re, s.values[4], RND);
+    mpfr_set(out.im, s.values[5], RND);
 }
 
 bool squareRoot(MpfrComplex& out, const MpfrComplex& a, Scratch& s) {

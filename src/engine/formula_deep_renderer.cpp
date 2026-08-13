@@ -1132,7 +1132,8 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
             if (!checkedAddSize(fastThreadBytes, instructionCount, sizeof(ScaledComplexValue) + sizeof(ScaledRealValue) + sizeof(uint16_t) + 16) || !checkedAddSize(fastThreadBytes, static_cast<size_t>(request.maxIterations), 2 * sizeof(uint8_t))) return fail(ExpressionDeepRenderStatus::ResourceLimit, "thread workspace calculation overflow");
             if (instructionCount != 0 && static_cast<size_t>(request.maxIterations) > std::numeric_limits<size_t>::max() / instructionCount) return fail(ExpressionDeepRenderStatus::ResourceLimit, "reference tape workspace multiplication overflow");
             const size_t maximumTapeNodes = static_cast<size_t>(request.maxIterations) * instructionCount;
-            if (!checkedAddSize(fastThreadBytes, maximumTapeNodes, 2 * sizeof(ScaledComplexValue) + sizeof(ScaledRealValue) + sizeof(uint8_t))) return fail(ExpressionDeepRenderStatus::ResourceLimit, "reference tape workspace calculation overflow");
+            size_t referenceCacheBytes = 0;
+            if (!ExpressionScaledResidualEvaluator::estimateReferenceCacheBytes(maximumTapeNodes, referenceCacheBytes) || !checkedAddSize(fastThreadBytes, maximumTapeNodes, sizeof(uint8_t)) || !checkedAddSize(fastThreadBytes, 1, referenceCacheBytes)) return fail(ExpressionDeepRenderStatus::ResourceLimit, "reference tape workspace calculation overflow");
         }
         size_t fastThreadBytesTotal = 0;
         if (runFast && !checkedAddSize(fastThreadBytesTotal, static_cast<size_t>(threadCount), fastThreadBytes)) return fail(ExpressionDeepRenderStatus::ResourceLimit, "thread workspace multiplication overflow");

@@ -10140,7 +10140,7 @@ static int runGenericDeepBackendCase() {
     ExpressionProgram cancelCanonical;
     ExpressionProgram cancelRuntime;
     ExpressionContext cancelFixed;
-    const bool cancelReady = cancelCanonical.compile("z*z+c+0", &genericError) && cancelCanonical.specialize(cancelFixed, FormulaParameter::C, cancelRuntime, &genericError);
+    const bool cancelReady = cancelCanonical.compile("z*z+c+0.000001*n", &genericError) && cancelCanonical.specialize(cancelFixed, FormulaParameter::C, cancelRuntime, &genericError);
     constexpr int CW = 9;
     constexpr int CH = 7;
     constexpr int CMAX = 1000000;
