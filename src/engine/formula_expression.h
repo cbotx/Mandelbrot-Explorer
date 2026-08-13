@@ -91,6 +91,7 @@ class ExpressionProgram {
     uint64_t semanticHash() const;
     bool semanticallyEquivalent(const ExpressionProgram& other) const;
     bool containsOrbitInvariant() const;
+    bool iterationDependent() const;
     FastPath fastPath() const { return _fastPath; }
     int fastIntegerPower() const { return _fastIntegerPower; }
     bool isCanonicalQuadraticPlusC() const;

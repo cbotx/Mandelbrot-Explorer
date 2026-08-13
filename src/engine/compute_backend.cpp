@@ -241,6 +241,7 @@ class CpuComputeBackend final : public IComputeBackend {
             _genericInfo.specializedPiecewiseMpfrPixelCount = deepResult.specializedPiecewiseMpfrPixelCount;
             _genericInfo.specializedPiecewiseMpfrIterationCount = deepResult.specializedPiecewiseMpfrIterationCount;
             _genericInfo.specializedPiecewiseMpfrPeriodicPixelCount = deepResult.specializedPiecewiseMpfrPeriodicPixelCount;
+            _genericInfo.genericMpfrPeriodicPixelCount = deepResult.genericMpfrPeriodicPixelCount;
             _genericInfo.piecewiseBigFixedPixelCount = deepResult.piecewiseBigFixedPixelCount;
             _genericInfo.piecewiseBigFixedIterationCount = deepResult.piecewiseBigFixedIterationCount;
             _genericInfo.selectedPrecision = static_cast<uint64_t>(deepResult.selectedPrecision);

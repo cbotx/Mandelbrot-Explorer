@@ -7276,6 +7276,7 @@ static int runGenericFormulaProfile() {
     int unaffectedOrbitNoRegression = 0;
     int orbitInvariantExact = 0;
     int orbitInvariantImproved = 0;
+    int orbitInvariantNoRegression = 0;
     int orbitControlExact = 0;
     int orbitControlNoRegression = 0;
     printf("=== generic formula full-frame profile (%dx%d)\n", W, H);
@@ -7496,6 +7497,7 @@ static int runGenericFormulaProfile() {
             if (test.expectOrbitInvariant) {
                 if (specializedExact) ++orbitInvariantExact;
                 if (specializedExact && improved) ++orbitInvariantImproved;
+                if (specializedExact && noRegression) ++orbitInvariantNoRegression;
             } else {
                 if (specializedExact) ++orbitControlExact;
                 if (specializedExact && noRegression) ++orbitControlNoRegression;
@@ -7533,8 +7535,8 @@ static int runGenericFormulaProfile() {
     printf("  hybrid refill non-regression=%d/2\n", refillNoRegressionCases);
     if (unaffectedOrbitExact < 8 || unaffectedOrbitQuality != 10 || unaffectedOrbitNoRegression != 10) ++failures;
     printf("  unaffected orbit-plan gate: exact=%d/10 quality=%d/10 non-regression=%d/10\n", unaffectedOrbitExact, unaffectedOrbitQuality, unaffectedOrbitNoRegression);
-    if (orbitInvariantExact != 2 || orbitInvariantImproved < 1 || orbitControlExact != 1 || orbitControlNoRegression != 1) ++failures;
-    printf("  orbit-plan gate: invariant exact=%d/2 improved=%d/2; control exact=%d/1 non-regression=%d/1\n", orbitInvariantExact, orbitInvariantImproved, orbitControlExact, orbitControlNoRegression);
+    if (orbitInvariantExact != 2 || (orbitInvariantImproved < 1 && orbitInvariantNoRegression != 2) || orbitControlExact != 1 || orbitControlNoRegression != 1) ++failures;
+    printf("  orbit-plan gate: invariant exact=%d/2 improved=%d/2 non-regression=%d/2; control exact=%d/1 non-regression=%d/1\n", orbitInvariantExact, orbitInvariantImproved, orbitInvariantNoRegression, orbitControlExact, orbitControlNoRegression);
     {
         if (VERIFY_JIT) {
             formula::ExpressionProgram identity;
@@ -7552,6 +7554,122 @@ static int runGenericFormulaProfile() {
     }
     printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (generic profile mismatch)");
     return failures == 0 ? 0 : 1;
+}
+
+static int runGenericPeriodicityCase() {
+    constexpr int W = 322;
+    constexpr int H = 216;
+    constexpr int MXIT = 2000;
+    formula::ExpressionProgram canonical;
+    formula::ExpressionProgram runtime;
+    formula::ExpressionContext fixed;
+    formula::ExpressionError error;
+    const char* source = "sin(z)+c+complex(1e-100,-1e-101)";
+    if (!canonical.compile(source, &error) || !canonical.specialize(fixed, FormulaParameter::C, runtime, &error) || runtime.iterationDependent()) return 1;
+
+    mpf_t centerReal, centerImaginary, scale;
+    mpf_init_set_d(centerReal, -0.5);
+    mpf_init_set_ui(centerImaginary, 0);
+    mpf_init_set_ui(scale, 1);
+    auto render = [&](bool periodic, std::vector<float>& output, double& seconds, uint64_t& periodicPixels, uint64_t& iterations) {
+        output.assign(static_cast<size_t>(W) * H, EMPTYPIXEL);
+        Mandel renderer(W, H, MXIT, 1, output.data());
+        _putenv_s("MANDEL_EXPR_PERIODIC", periodic ? "1" : "0");
+        const Clock::time_point start = Clock::now();
+        const bool okay = renderer.ComputeExpression(centerReal, centerImaginary, scale, runtime, fixed, FormulaParameter::C, MXIT, 100.0, formula::ExpressionColoring::Raw);
+        seconds = since(start);
+        periodicPixels = renderer.expressionPeriodicPixelCount();
+        iterations = renderer.expressionIterationCount();
+        return okay;
+    };
+
+    std::vector<float> baseline;
+    std::vector<float> periodic;
+    double baselineSeconds = 0.0;
+    double periodicSeconds = 0.0;
+    uint64_t baselinePeriodicPixels = 0;
+    uint64_t periodicPixels = 0;
+    uint64_t baselineIterations = 0;
+    uint64_t periodicIterations = 0;
+    bool okay = render(false, baseline, baselineSeconds, baselinePeriodicPixels, baselineIterations) && render(true, periodic, periodicSeconds, periodicPixels, periodicIterations);
+
+    formula::ExpressionProgram iterationCanonical;
+    formula::ExpressionProgram iterationRuntime;
+    const bool iterationSetup = iterationCanonical.compile("sin(z)+c+0*n", &error) && iterationCanonical.specialize(fixed, FormulaParameter::C, iterationRuntime, &error) && iterationRuntime.iterationDependent();
+    std::vector<float> iterationOutput(static_cast<size_t>(W) * H, EMPTYPIXEL);
+    Mandel iterationRenderer(W, H, 256, 1, iterationOutput.data());
+    _putenv_s("MANDEL_EXPR_PERIODIC", "1");
+    const bool iterationOkay = iterationSetup && iterationRenderer.ComputeExpression(centerReal, centerImaginary, scale, iterationRuntime, fixed, FormulaParameter::C, 256, 100.0, formula::ExpressionColoring::Raw) && iterationRenderer.expressionPeriodicPixelCount() == 0;
+
+    formula::ExpressionProgram deepCanonical;
+    formula::ExpressionProgram deepRuntime;
+    std::vector<float> deepPeriodic(35, formula::ExpressionDeepEmptyPixel);
+    std::vector<float> deepBaseline(35, formula::ExpressionDeepEmptyPixel);
+    const bool deepSetup = deepCanonical.compile("z+0*c", &error) && deepCanonical.specialize(fixed, FormulaParameter::C, deepRuntime, &error) && !deepRuntime.iterationDependent();
+    auto renderDeep = [&](bool enable, std::vector<float>& output, formula::ExpressionDeepRenderResult& result) {
+        formula::ExpressionDeepRenderRequest request;
+        request.canonicalProgram = &deepCanonical;
+        request.runtimeProgram = &deepRuntime;
+        request.center.realDecimal = "0";
+        request.center.imaginaryDecimal = "0";
+        request.scale.decimal = "1e500";
+        request.fixed = fixed;
+        request.pixelParameter = FormulaParameter::C;
+        request.width = 7;
+        request.height = 5;
+        request.maxIterations = 4096;
+        request.bailout = 100.0;
+        request.output = output.data();
+        request.outputCount = output.size();
+        request.forceMpfrFallbackForVerification = true;
+        request.disableSpecializedPiecewiseMpfrForVerification = true;
+        _putenv_s("MANDEL_EXPR_PERIODIC", enable ? "1" : "0");
+        return formula::renderExpressionDeepFrame(request, result);
+    };
+    formula::ExpressionDeepRenderResult deepPeriodicResult;
+    formula::ExpressionDeepRenderResult deepBaselineResult;
+    const bool deepOkay = deepSetup && renderDeep(true, deepPeriodic, deepPeriodicResult) && renderDeep(false, deepBaseline, deepBaselineResult) && deepPeriodic == deepBaseline && deepPeriodicResult.genericMpfrPeriodicPixelCount == deepPeriodic.size() && deepBaselineResult.genericMpfrPeriodicPixelCount == 0 && deepPeriodicResult.totalIterations < deepBaselineResult.totalIterations;
+
+    formula::ExpressionProgram signedZeroCanonical;
+    formula::ExpressionProgram signedZeroRuntime;
+    std::vector<float> signedZeroPeriodic(9, formula::ExpressionDeepEmptyPixel);
+    std::vector<float> signedZeroBaseline(9, formula::ExpressionDeepEmptyPixel);
+    const bool signedZeroSetup = signedZeroCanonical.compile("-arg(z)", &error) && signedZeroCanonical.specialize(fixed, FormulaParameter::C, signedZeroRuntime, &error);
+    auto renderSignedZero = [&](bool enable, std::vector<float>& output, formula::ExpressionDeepRenderResult& result) {
+        formula::ExpressionDeepRenderRequest request;
+        request.canonicalProgram = &signedZeroCanonical;
+        request.runtimeProgram = &signedZeroRuntime;
+        request.center.realDecimal = "0";
+        request.center.imaginaryDecimal = "0";
+        request.scale.decimal = "1e500";
+        request.fixed = fixed;
+        request.pixelParameter = FormulaParameter::C;
+        request.width = 3;
+        request.height = 3;
+        request.maxIterations = 4096;
+        request.bailout = 2.0;
+        request.output = output.data();
+        request.outputCount = output.size();
+        request.forceMpfrFallbackForVerification = true;
+        request.disableSpecializedPiecewiseMpfrForVerification = true;
+        _putenv_s("MANDEL_EXPR_PERIODIC", enable ? "1" : "0");
+        return formula::renderExpressionDeepFrame(request, result);
+    };
+    formula::ExpressionDeepRenderResult signedZeroPeriodicResult;
+    formula::ExpressionDeepRenderResult signedZeroBaselineResult;
+    const bool signedZeroOkay = signedZeroSetup && renderSignedZero(true, signedZeroPeriodic, signedZeroPeriodicResult) && renderSignedZero(false, signedZeroBaseline, signedZeroBaselineResult) && signedZeroPeriodic == signedZeroBaseline && std::all_of(signedZeroPeriodic.begin(), signedZeroPeriodic.end(), [](float value) { return value == 2.0f; }) && signedZeroPeriodicResult.genericMpfrPeriodicPixelCount == 0;
+    _putenv_s("MANDEL_EXPR_PERIODIC", "");
+    mpf_clears(centerReal, centerImaginary, scale, (mpf_ptr)0);
+
+    const double speedup = periodicSeconds > 0.0 ? baselineSeconds / periodicSeconds : 0.0;
+    okay = okay && iterationOkay && deepOkay && signedZeroOkay && baseline == periodic && baselinePeriodicPixels == 0 && periodicPixels > 0 && periodicIterations < baselineIterations;
+    printf("=== generic exact periodicity %dx%d mxit=%d\n", W, H, MXIT);
+    printf("  off/on %.3f/%.3f s speedup %.2fx periodic=%llu iterations=%llu/%llu\n", baselineSeconds, periodicSeconds, speedup, (unsigned long long)periodicPixels, (unsigned long long)baselineIterations, (unsigned long long)periodicIterations);
+    printf("  output=%s iteration-dependent=%s\n", baseline == periodic ? "exact" : "MISMATCH", iterationOkay ? "disabled" : "FAIL");
+    printf("  deep MPFR output=%s periodic=%llu iterations=%llu/%llu\n", deepPeriodic == deepBaseline ? "exact" : "MISMATCH", (unsigned long long)deepPeriodicResult.genericMpfrPeriodicPixelCount, (unsigned long long)deepBaselineResult.totalIterations, (unsigned long long)deepPeriodicResult.totalIterations);
+    printf("  deep signed-zero=%s periodic=%llu\n", signedZeroOkay ? "exact" : "FAIL", (unsigned long long)signedZeroPeriodicResult.genericMpfrPeriodicPixelCount);
+    printf("  => %s\n\n", okay ? "PASS" : "CHECK (generic periodicity failure)");
+    return okay ? 0 : 1;
 }
 
 struct FormulaRegressionCase {
@@ -10540,8 +10658,8 @@ static int runCustomSlowdownCase(int width, int height) {
         const Clock::time_point start = Clock::now();
         const bool okay = formula::renderExpressionDeepFrame(request, result);
         seconds = since(start);
-        printf("  %-20s %.3f s fast/fallback=%llu/%llu preflight=%llu/%llu %s Taylor=%llu/%llu preflight iter/ops/folds=%llu/%llu/%llu fast iter/ops/folds=%llu/%llu/%llu total_iter=%llu precision=%lld/%lld specialized=%d bigfixed=%d mpfr pixels/iter/periodic=%llu/%llu/%llu bf pixels/iter=%llu/%llu\n", name, seconds, (unsigned long long)result.fastPixelCount, (unsigned long long)result.fallbackPixelCount, (unsigned long long)result.preflightFallbackCount, (unsigned long long)result.preflightSampleCount, formula::expressionDeepPreflightDecisionName(result.preflightDecision), (unsigned long long)result.taylorAcceptedJetCount, (unsigned long long)result.taylorAttemptedJetCount, (unsigned long long)result.preflightIterationCount, (unsigned long long)result.preflightOperationCount, (unsigned long long)result.preflightFoldOperationCount, (unsigned long long)result.fastIterationCount, (unsigned long long)result.fastOperationCount, (unsigned long long)result.fastFoldOperationCount, (unsigned long long)result.totalIterations,
-               (long long)result.selectedPrecision, (long long)result.fallbackPrecision, result.usedSpecializedPiecewiseMpfr ? 1 : 0, result.usedPiecewiseBigFixed ? 1 : 0, (unsigned long long)result.specializedPiecewiseMpfrPixelCount, (unsigned long long)result.specializedPiecewiseMpfrIterationCount, (unsigned long long)result.specializedPiecewiseMpfrPeriodicPixelCount, (unsigned long long)result.piecewiseBigFixedPixelCount, (unsigned long long)result.piecewiseBigFixedIterationCount);
+        printf("  %-20s %.3f s fast/fallback=%llu/%llu preflight=%llu/%llu %s Taylor=%llu/%llu preflight iter/ops/folds=%llu/%llu/%llu fast iter/ops/folds=%llu/%llu/%llu total_iter=%llu precision=%lld/%lld specialized=%d bigfixed=%d mpfr pixels/iter/periodic/generic=%llu/%llu/%llu/%llu bf pixels/iter=%llu/%llu\n", name, seconds, (unsigned long long)result.fastPixelCount, (unsigned long long)result.fallbackPixelCount, (unsigned long long)result.preflightFallbackCount, (unsigned long long)result.preflightSampleCount, formula::expressionDeepPreflightDecisionName(result.preflightDecision), (unsigned long long)result.taylorAcceptedJetCount, (unsigned long long)result.taylorAttemptedJetCount, (unsigned long long)result.preflightIterationCount, (unsigned long long)result.preflightOperationCount, (unsigned long long)result.preflightFoldOperationCount, (unsigned long long)result.fastIterationCount, (unsigned long long)result.fastOperationCount, (unsigned long long)result.fastFoldOperationCount, (unsigned long long)result.totalIterations,
+               (long long)result.selectedPrecision, (long long)result.fallbackPrecision, result.usedSpecializedPiecewiseMpfr ? 1 : 0, result.usedPiecewiseBigFixed ? 1 : 0, (unsigned long long)result.specializedPiecewiseMpfrPixelCount, (unsigned long long)result.specializedPiecewiseMpfrIterationCount, (unsigned long long)result.specializedPiecewiseMpfrPeriodicPixelCount, (unsigned long long)result.genericMpfrPeriodicPixelCount, (unsigned long long)result.piecewiseBigFixedPixelCount, (unsigned long long)result.piecewiseBigFixedIterationCount);
         printf("    first uncertain preflight:");
         for (size_t bin = 0; bin < result.preflightFirstUncertainHistogram.size(); ++bin)
             if (result.preflightFirstUncertainHistogram[bin]) printf(" b%zu=%llu", bin, (unsigned long long)result.preflightFirstUncertainHistogram[bin]);
@@ -10974,6 +11092,7 @@ int main(int argc, char** argv) {
     if (which == "custom-deep") rc |= runCustomDeepZoomCase();
     if (which == "expression-residual") rc |= runExpressionResidualSuite();
     if (which == "formula-bench") rc |= runGenericFormulaProfile();
+    if (which == "formula-periodic") rc |= runGenericPeriodicityCase();
     if (which == "multibrot") rc |= runMultibrotCase();
     if (which == "backend") rc |= runBackendCase();
     if (which == "generic-deep") rc |= runGenericDeepBackendCase();

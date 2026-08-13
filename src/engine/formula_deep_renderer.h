@@ -201,6 +201,7 @@ struct ExpressionDeepRenderResult {
     uint64_t specializedPiecewiseMpfrPixelCount = 0;
     uint64_t specializedPiecewiseMpfrIterationCount = 0;
     uint64_t specializedPiecewiseMpfrPeriodicPixelCount = 0;
+    uint64_t genericMpfrPeriodicPixelCount = 0;
     bool usedPiecewiseBigFixed = false;
     uint64_t piecewiseBigFixedPixelCount = 0;
     uint64_t piecewiseBigFixedIterationCount = 0;

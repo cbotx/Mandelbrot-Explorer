@@ -82,6 +82,8 @@ class Mandel {
     // bytecode/bindings. Raw, stripe-average and orbit-trap coloring are
     // universal; recognized integer powers additionally support Smooth/EDE.
     bool ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale, const formula::ExpressionProgram& program, const formula::ExpressionContext& fixed, FormulaParameter pixelParameter, int mxit, double bailout = 4.0, formula::ExpressionColoring coloring = formula::ExpressionColoring::Raw, const formula::ExpressionJit4* jit = nullptr, const formula::ExpressionOrbitPlan* plan = nullptr);
+    uint64_t expressionPeriodicPixelCount() const { return _expressionPeriodicPixels.load(std::memory_order_relaxed); }
+    uint64_t expressionIterationCount() const { return _expressionIterations.load(std::memory_order_relaxed); }
     // Exact residual perturbation prototype:
     // dz' = F(Z + dz, pixel parameters) - Z'. Falls back to the direct
     // expression renderer when the center reference escapes before mxit.
@@ -272,6 +274,8 @@ class Mandel {
     std::atomic<float>* _progress = nullptr;
     std::atomic<int> _progress_done{0};
     std::atomic<long long> _deepGmpFallbackPixels{0};
+    std::atomic<uint64_t> _expressionPeriodicPixels{0};
+    std::atomic<uint64_t> _expressionIterations{0};
     int _progress_total = 0, _progress_report_step = 1;
     double _progress_offset = 0.0, _progress_scale = 1.0;
     double _progress_begin = 0.0, _progress_span = 1.0;

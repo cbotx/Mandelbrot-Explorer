@@ -923,6 +923,10 @@ bool ExpressionProgram::containsOrbitInvariant() const {
     return std::any_of(_code.begin(), _code.end(), [](const Instruction& instruction) { return instruction.op == Op::OrbitInvariant; });
 }
 
+bool ExpressionProgram::iterationDependent() const {
+    return std::any_of(_code.begin(), _code.end(), [](const Instruction& instruction) { return instruction.op == Op::Iteration; });
+}
+
 ExpressionProgram::ExpressionProgram() : _identity(allocateProgramIdentity()) {
 }
 

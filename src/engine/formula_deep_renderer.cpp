@@ -34,6 +34,10 @@ bool finiteComplex(Complex value) {
     return std::isfinite(value.real()) && std::isfinite(value.imag());
 }
 
+bool sameMpfrStateComponent(mpfr_srcptr left, mpfr_srcptr right) {
+    return mpfr_equal_p(left, right) && (!mpfr_zero_p(left) || mpfr_signbit(left) == mpfr_signbit(right));
+}
+
 bool decimalSignificandIsNonzero(const std::string& text) {
     size_t end = text.find_first_of("eE");
     if (end == std::string::npos) end = text.size();
@@ -2101,6 +2105,8 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
         if (cancelled.load(std::memory_order_acquire)) return fail(ExpressionDeepRenderStatus::Cancelled, "render cancelled during the fast pass");
 
         const ExpressionPiecewiseQuadraticKind piecewiseQuadraticKind = request.disableSpecializedPiecewiseMpfrForVerification ? ExpressionPiecewiseQuadraticKind::None : request.runtimeProgram->piecewiseQuadraticKind();
+        const char* periodicSetting = std::getenv("MANDEL_EXPR_PERIODIC");
+        const bool fallbackPeriodicEnabled = (!periodicSetting || std::atoi(periodicSetting) != 0) && request.maxIterations >= 4096 && !request.runtimeProgram->iterationDependent();
         const bool useBigFixedPiecewise = [] {
             const char* value = std::getenv("MANDEL_DEEP_BIGFIXED_PIXELS");
             return !value || atoi(value) != 0;
@@ -2138,6 +2144,7 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
         std::atomic<uint64_t> specializedPiecewisePixels{0};
         std::atomic<uint64_t> specializedPiecewiseIterations{0};
         std::atomic<uint64_t> specializedPiecewisePeriodicPixels{0};
+        std::atomic<uint64_t> genericMpfrPeriodicPixels{0};
         std::atomic<uint64_t> piecewiseBigFixedPixels{0};
         std::atomic<uint64_t> piecewiseBigFixedIterations{0};
         std::atomic_bool fallbackResourceError{false};
@@ -2160,6 +2167,7 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
                 uint64_t localSpecializedPixels = 0;
                 uint64_t localSpecializedIterations = 0;
                 uint64_t localSpecializedPeriodicPixels = 0;
+                uint64_t localGenericPeriodicPixels = 0;
                 uint64_t localBigFixedPixels = 0;
                 uint64_t localBigFixedIterations = 0;
 #pragma omp for schedule(dynamic, 8)
@@ -2232,7 +2240,7 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
                                 }
                             }
                         }
-                        if (!undefined && !decided && specializedPiecewise && request.maxIterations >= 4096) {
+                        if (!undefined && !decided && fallbackPeriodicEnabled) {
                             workspace->periodicState.set(context.z);
                             periodicReady = true;
                         }
@@ -2280,10 +2288,13 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
                             } else {
                                 if (periodicReady) {
                                     ++periodicLength;
-                                    if (mpfr_equal_p(context.z.re, workspace->periodicState.re) && mpfr_equal_p(context.z.im, workspace->periodicState.im)) {
+                                    if (sameMpfrStateComponent(context.z.re, workspace->periodicState.re) && sameMpfrStateComponent(context.z.im, workspace->periodicState.im)) {
                                         output = ExpressionDeepInteriorPixel;
                                         decided = true;
-                                        ++localSpecializedPeriodicPixels;
+                                        if (specializedPiecewise)
+                                            ++localSpecializedPeriodicPixels;
+                                        else
+                                            ++localGenericPeriodicPixels;
                                     } else if (periodicLength == periodicPower) {
                                         workspace->periodicState.set(context.z);
                                         periodicLength = 0;
@@ -2316,6 +2327,7 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
                 specializedPiecewisePixels.fetch_add(localSpecializedPixels, std::memory_order_relaxed);
                 specializedPiecewiseIterations.fetch_add(localSpecializedIterations, std::memory_order_relaxed);
                 specializedPiecewisePeriodicPixels.fetch_add(localSpecializedPeriodicPixels, std::memory_order_relaxed);
+                genericMpfrPeriodicPixels.fetch_add(localGenericPeriodicPixels, std::memory_order_relaxed);
                 piecewiseBigFixedPixels.fetch_add(localBigFixedPixels, std::memory_order_relaxed);
                 piecewiseBigFixedIterations.fetch_add(localBigFixedIterations, std::memory_order_relaxed);
                 ExpressionOracle::releaseThreadWorkspace();
@@ -2327,6 +2339,7 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
         result.specializedPiecewiseMpfrPixelCount = specializedPiecewisePixels.load(std::memory_order_relaxed);
         result.specializedPiecewiseMpfrIterationCount = specializedPiecewiseIterations.load(std::memory_order_relaxed);
         result.specializedPiecewiseMpfrPeriodicPixelCount = specializedPiecewisePeriodicPixels.load(std::memory_order_relaxed);
+        result.genericMpfrPeriodicPixelCount = genericMpfrPeriodicPixels.load(std::memory_order_relaxed);
         result.usedSpecializedPiecewiseMpfr = result.specializedPiecewiseMpfrPixelCount != 0;
         result.piecewiseBigFixedPixelCount = piecewiseBigFixedPixels.load(std::memory_order_relaxed);
         result.piecewiseBigFixedIterationCount = piecewiseBigFixedIterations.load(std::memory_order_relaxed);

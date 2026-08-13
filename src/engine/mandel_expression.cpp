@@ -5,6 +5,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <immintrin.h>
 #include <limits>
 #include <memory>
@@ -115,6 +116,22 @@ inline bool isUniversalColoring(formula::ExpressionColoring coloring) {
 
 inline orbitcolor::FormulaColorMode formulaColorMode(formula::ExpressionColoring coloring) {
     return coloring == formula::ExpressionColoring::OrbitTrap ? orbitcolor::FormulaColorMode::OrbitTrap : orbitcolor::FormulaColorMode::Feather;
+}
+
+bool sameComplexBits(formula::Complex left, formula::Complex right) {
+    uint64_t leftReal = 0;
+    uint64_t leftImaginary = 0;
+    uint64_t rightReal = 0;
+    uint64_t rightImaginary = 0;
+    double component = left.real();
+    std::memcpy(&leftReal, &component, sizeof(component));
+    component = left.imag();
+    std::memcpy(&leftImaginary, &component, sizeof(component));
+    component = right.real();
+    std::memcpy(&rightReal, &component, sizeof(component));
+    component = right.imag();
+    std::memcpy(&rightImaginary, &component, sizeof(component));
+    return leftReal == rightReal && leftImaginary == rightImaginary;
 }
 
 template <bool Enabled>
@@ -289,7 +306,7 @@ struct HybridPreparedState<true> {
 };
 
 template <bool UsePlan, bool Colored>
-bool solveExpressionHybridRow(double startRe, double dx, double pixelIm, int count, const formula::ExpressionProgram& program, const formula::ExpressionOrbitPlan* plan, const formula::ExpressionContext& fixed, FormulaParameter pixelParameter, int mxit, double bailout, formula::ExpressionColoring coloring, int integerPower, int vectorTranscendentalMode, float* output, const std::atomic_bool* halt) {
+bool solveExpressionHybridRow(double startRe, double dx, double pixelIm, int count, const formula::ExpressionProgram& program, const formula::ExpressionOrbitPlan* plan, const formula::ExpressionContext& fixed, FormulaParameter pixelParameter, int mxit, double bailout, formula::ExpressionColoring coloring, int integerPower, int vectorTranscendentalMode, bool periodicEnabled, float* output, const std::atomic_bool* halt, std::atomic<uint64_t>* periodicPixels, std::atomic<uint64_t>* iterationCount) {
     formula::ExpressionContext contexts[4] = {fixed, fixed, fixed, fixed};
     formula::Complex nextValues[4]{};
     HybridPreparedState<UsePlan> prepared;
@@ -297,8 +314,13 @@ bool solveExpressionHybridRow(double startRe, double dx, double pixelIm, int cou
     int laneIteration[4] = {};
     int nextPixel = 0;
     int activeCount = 0;
+    uint64_t localPeriodicPixels = 0;
+    uint64_t localIterations = 0;
     bool preparationFailed = false;
     FormulaColorState<Colored> colorState;
+    formula::Complex periodicState[4]{};
+    uint64_t periodicPower[4] = {1, 1, 1, 1};
+    uint64_t periodicLength[4] = {};
 
     auto loadLane = [&](int lane) {
         lanePixel[lane] = -1;
@@ -312,6 +334,9 @@ bool solveExpressionHybridRow(double startRe, double dx, double pixelIm, int cou
                 contexts[lane].z0 = pixel;
             contexts[lane].z = contexts[lane].z0;
             contexts[lane].iteration = 0;
+            periodicState[lane] = contexts[lane].z;
+            periodicPower[lane] = 1;
+            periodicLength[lane] = 0;
             double magnitude = std::hypot(contexts[lane].z.real(), contexts[lane].z.imag());
             if (!std::isfinite(contexts[lane].z.real()) || !std::isfinite(contexts[lane].z.imag()) || magnitude > bailout) {
                 output[pixelIndex] = 0.0f;
@@ -339,6 +364,7 @@ bool solveExpressionHybridRow(double startRe, double dx, double pixelIm, int cou
     unsigned steps = 0;
     while (activeCount > 0) {
         if ((steps++ & 255u) == 0u && *halt) return false;
+        localIterations += static_cast<uint64_t>(activeCount);
         for (int lane = 0; lane < 4; ++lane) contexts[lane].iteration = laneIteration[lane];
         bool evaluated;
         if constexpr (UsePlan) {
@@ -364,6 +390,25 @@ bool solveExpressionHybridRow(double startRe, double dx, double pixelIm, int cou
                 if (preparationFailed) return false;
                 continue;
             }
+            if (periodicEnabled) {
+                ++periodicLength[lane];
+                if (sameComplexBits(contexts[lane].z, periodicState[lane])) {
+                    if constexpr (Colored)
+                        output[lanePixel[lane]] = colorState.lanes[lane].interior();
+                    else
+                        output[lanePixel[lane]] = -2.0f;
+                    ++localPeriodicPixels;
+                    --activeCount;
+                    loadLane(lane);
+                    if (preparationFailed) return false;
+                    continue;
+                }
+                if (periodicLength[lane] == periodicPower[lane]) {
+                    periodicState[lane] = contexts[lane].z;
+                    periodicLength[lane] = 0;
+                    if (periodicPower[lane] <= std::numeric_limits<uint64_t>::max() / 2) periodicPower[lane] *= 2;
+                }
+            }
             ++laneIteration[lane];
             if (laneIteration[lane] >= mxit) {
                 if constexpr (Colored)
@@ -376,6 +421,8 @@ bool solveExpressionHybridRow(double startRe, double dx, double pixelIm, int cou
             }
         }
     }
+    if (periodicPixels) periodicPixels->fetch_add(localPeriodicPixels, std::memory_order_relaxed);
+    if (iterationCount) iterationCount->fetch_add(localIterations, std::memory_order_relaxed);
     return true;
 }
 
@@ -609,6 +656,8 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale, co
     if (_sub != 1 || !program.valid() || mxit < 1 || !(bailout > 0.0) || !std::isfinite(bailout) || (pixelParameter != FormulaParameter::C && pixelParameter != FormulaParameter::InitialZ)) return false;
 
     if (_flag_halt) return false;
+    _expressionPeriodicPixels.store(0, std::memory_order_relaxed);
+    _expressionIterations.store(0, std::memory_order_relaxed);
     std::fill(_iter, _iter + (size_t)_w * _h, EMPTYPIXEL);
     mpf_set(_scale, scale);
 
@@ -637,9 +686,11 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale, co
     const char* vectorSetting = std::getenv("MANDEL_EXPR_VECTOR");
     const char* hybridRefillSetting = std::getenv("MANDEL_EXPR_HYBRID_REFILL");
     const char* vectorTranscendentalSetting = std::getenv("MANDEL_EXPR_VECTOR_TRANSCENDENTALS");
+    const char* periodicSetting = std::getenv("MANDEL_EXPR_PERIODIC");
     const bool vectorEnabled = !vectorSetting || std::atoi(vectorSetting) != 0;
     const bool hybridRefill = !hybridRefillSetting || std::atoi(hybridRefillSetting) != 0;
     const int vectorTranscendentalMode = !vectorTranscendentalSetting || std::atoi(vectorTranscendentalSetting) != 0 ? 1 : 0;
+    const bool periodicEnabled = (!periodicSetting || std::atoi(periodicSetting) != 0) && mxit >= 128 && !program.iterationDependent() && coloring != formula::ExpressionColoring::OrbitTrap;
     const double bailoutSquared = bailout * bailout;
     const bool powerSimd = integerPower >= 2 && integerPower <= 8 && bailoutSquared >= DBL_MIN && std::isfinite(bailoutSquared) && (!powerSimdSetting || std::atoi(powerSimdSetting) != 0);
     if ((coloring == formula::ExpressionColoring::Smooth || coloring == formula::ExpressionColoring::Distance) && (integerPower < 2 || bailout < 1.0)) coloring = formula::ExpressionColoring::Raw;
@@ -658,12 +709,12 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale, co
                 rowCompleted = solveExpressionColoredScalarRow(startRe, dx, pixelIm, _w, program, nullptr, fixed, pixelParameter, mxit, bailout, coloring, integerPower, _iter + (size_t)i * _w, &_flag_halt);
             } else if (effectiveBatch && vectorEnabled) {
 #if defined(MANDEL_ENABLE_ASMJIT)
-                if (orbitPlan && jit && jit->supports(*orbitPlan)) {
+                if (!periodicEnabled && orbitPlan && jit && jit->supports(*orbitPlan)) {
                     rowCompleted = solveExpressionJitRow<true>(startRe, dx, pixelIm, _w, *jit, orbitPlan, fixed, pixelParameter, mxit, bailout, coloring, 0, _iter + (size_t)i * _w, &_flag_halt);
                 } else
 #endif
-                    if (!effectiveAvx2 && hybridRefill) {
-                    rowCompleted = orbitPlan ? solveExpressionHybridRow<true, true>(startRe, dx, pixelIm, _w, program, orbitPlan, fixed, pixelParameter, mxit, bailout, coloring, 0, vectorTranscendentalMode, _iter + (size_t)i * _w, &_flag_halt) : solveExpressionHybridRow<false, true>(startRe, dx, pixelIm, _w, program, nullptr, fixed, pixelParameter, mxit, bailout, coloring, 0, vectorTranscendentalMode, _iter + (size_t)i * _w, &_flag_halt);
+                    if ((!effectiveAvx2 || periodicEnabled) && hybridRefill) {
+                    rowCompleted = orbitPlan ? solveExpressionHybridRow<true, true>(startRe, dx, pixelIm, _w, program, orbitPlan, fixed, pixelParameter, mxit, bailout, coloring, 0, vectorTranscendentalMode, periodicEnabled, _iter + (size_t)i * _w, &_flag_halt, &_expressionPeriodicPixels, &_expressionIterations) : solveExpressionHybridRow<false, true>(startRe, dx, pixelIm, _w, program, nullptr, fixed, pixelParameter, mxit, bailout, coloring, 0, vectorTranscendentalMode, periodicEnabled, _iter + (size_t)i * _w, &_flag_halt, &_expressionPeriodicPixels, &_expressionIterations);
                 } else {
                     rowCompleted = solveExpressionColoredFixedBatchRow(startRe, dx, pixelIm, _w, program, orbitPlan, jit, effectiveAvx2, fixed, pixelParameter, mxit, bailout, coloring, vectorTranscendentalMode, _iter + (size_t)i * _w, &_flag_halt);
                 }
@@ -680,14 +731,14 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale, co
         }
         if (integerPower == 0 && effectiveBatch && vectorEnabled) {
 #if defined(MANDEL_ENABLE_ASMJIT)
-            if (orbitPlan && jit && jit->supports(*orbitPlan)) {
+            if (!periodicEnabled && orbitPlan && jit && jit->supports(*orbitPlan)) {
                 rowCompleted = solveExpressionJitRow<false>(startRe, dx, pixelIm, _w, *jit, orbitPlan, fixed, pixelParameter, mxit, bailout, coloring, 0, _iter + (size_t)i * _w, &_flag_halt);
                 if (rowCompleted) progressAdvance();
                 continue;
             }
 #endif
-            if (!effectiveAvx2 && hybridRefill) {
-                rowCompleted = orbitPlan ? solveExpressionHybridRow<true, false>(startRe, dx, pixelIm, _w, program, orbitPlan, fixed, pixelParameter, mxit, bailout, coloring, 0, vectorTranscendentalMode, _iter + (size_t)i * _w, &_flag_halt) : solveExpressionHybridRow<false, false>(startRe, dx, pixelIm, _w, program, nullptr, fixed, pixelParameter, mxit, bailout, coloring, 0, vectorTranscendentalMode, _iter + (size_t)i * _w, &_flag_halt);
+            if ((!effectiveAvx2 || periodicEnabled) && hybridRefill) {
+                rowCompleted = orbitPlan ? solveExpressionHybridRow<true, false>(startRe, dx, pixelIm, _w, program, orbitPlan, fixed, pixelParameter, mxit, bailout, coloring, 0, vectorTranscendentalMode, periodicEnabled, _iter + (size_t)i * _w, &_flag_halt, &_expressionPeriodicPixels, &_expressionIterations) : solveExpressionHybridRow<false, false>(startRe, dx, pixelIm, _w, program, nullptr, fixed, pixelParameter, mxit, bailout, coloring, 0, vectorTranscendentalMode, periodicEnabled, _iter + (size_t)i * _w, &_flag_halt, &_expressionPeriodicPixels, &_expressionIterations);
                 if (rowCompleted) progressAdvance();
                 continue;
             }
