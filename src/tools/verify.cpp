@@ -3489,7 +3489,7 @@ static int runExpressionScaledCase() {
         request.center.imaginaryDecimal = "0.1";
         request.bailout = 100.0;
         request.maxIterations = 1;
-        request.precision.requestedBits = 384;
+        request.precision.requestedBits = 512;
         request.precision.minimumBits = 53;
         request.precision.guardBits = 0;
         ExpressionReferenceOrbitResult reference;
@@ -10668,7 +10668,86 @@ struct CenteredCheckpoint {
     formula::Complex residual;
 };
 
+static bool findExpressionCenteredReference(const formula::ExpressionProgram& canonical, const formula::ExpressionProgram& runtime, const formula::ExpressionContext& fixed, const char* centerReal, const char* centerImaginary, const char* scaleText, int width, int height, int maxIterations, double bailout, int& referenceX, int& referenceY, size_t& attemptedCandidates, double& seconds) {
+    constexpr mp_bitcnt_t Precision = 512;
+    mpf_t centerRe, centerIm, scale, temporary, dxHalf, dyHalf, pixelRe, pixelIm;
+    mpf_init2(centerRe, Precision);
+    mpf_init2(centerIm, Precision);
+    mpf_init2(scale, Precision);
+    mpf_init2(temporary, Precision);
+    mpf_init2(dxHalf, Precision);
+    mpf_init2(dyHalf, Precision);
+    mpf_init2(pixelRe, Precision);
+    mpf_init2(pixelIm, Precision);
+    bool ready = mpf_set_str(centerRe, centerReal, 10) == 0 && mpf_set_str(centerIm, centerImaginary, 10) == 0 && mpf_set_str(scale, scaleText, 10) == 0 && mpf_sgn(scale) > 0;
+    if (ready) {
+        mpf_mul_ui(temporary, scale, static_cast<unsigned long>(width - 1));
+        mpf_ui_div(dxHalf, 2, temporary);
+        mpf_mul_ui(temporary, scale, static_cast<unsigned long>(width));
+        mpf_mul_ui(temporary, temporary, static_cast<unsigned long>(height - 1));
+        mpf_ui_div(dyHalf, static_cast<unsigned long>(height), temporary);
+        mpf_mul_ui(dyHalf, dyHalf, 2);
+    }
+
+    std::vector<std::pair<long long, std::pair<int, int>>> candidates;
+    constexpr int GridWidth = 9;
+    constexpr int GridHeight = 9;
+    for (int gridY = 0; gridY < GridHeight; ++gridY) {
+        const int y = static_cast<int>(static_cast<long long>(gridY) * (height - 1) / (GridHeight - 1));
+        for (int gridX = 0; gridX < GridWidth; ++gridX) {
+            const int x = static_cast<int>(static_cast<long long>(gridX) * (width - 1) / (GridWidth - 1));
+            const long long dx = 2LL * x - (width - 1LL);
+            const long long dy = 2LL * y - (height - 1LL);
+            candidates.push_back({dx * dx + dy * dy, {x, y}});
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) { return left.first < right.first || (left.first == right.first && left.second < right.second); });
+    candidates.erase(std::unique(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) { return left.second == right.second; }), candidates.end());
+
+    attemptedCandidates = 0;
+    referenceX = referenceY = -1;
+    const Clock::time_point start = Clock::now();
+    for (const auto& candidate : candidates) {
+        if (!ready) break;
+        const int x = candidate.second.first;
+        const int y = candidate.second.second;
+        const long centeredX = static_cast<long>(2LL * x - (width - 1LL));
+        const long centeredY = static_cast<long>(2LL * y - (height - 1LL));
+        mpf_mul_ui(temporary, dxHalf, static_cast<unsigned long>(std::labs(centeredX)));
+        if (centeredX < 0) mpf_neg(temporary, temporary);
+        mpf_add(pixelRe, centerRe, temporary);
+        mpf_mul_ui(temporary, dyHalf, static_cast<unsigned long>(std::labs(centeredY)));
+        if (centeredY < 0) mpf_neg(temporary, temporary);
+        mpf_add(pixelIm, centerIm, temporary);
+
+        formula::ExpressionReferenceBuildRequest request;
+        request.canonicalProgram = &canonical;
+        request.runtimeProgram = &runtime;
+        request.pixelParameter = FormulaParameter::C;
+        request.center.realMpf = pixelRe;
+        request.center.imaginaryMpf = pixelIm;
+        request.fixed = fixed;
+        request.maxIterations = maxIterations;
+        request.bailout = bailout;
+        request.precision.requestedBits = 512;
+        request.precision.minimumBits = 53;
+        request.precision.guardBits = 0;
+        request.precision.maximumBits = 4096;
+        formula::ExpressionReferenceOrbitResult result;
+        ++attemptedCandidates;
+        if (formula::buildExpressionReferenceOrbit(request, result) && result.valid && !result.escaped && !result.undefined && result.samples.size() == static_cast<size_t>(maxIterations)) {
+            referenceX = x;
+            referenceY = y;
+            break;
+        }
+    }
+    seconds = since(start);
+    mpf_clears(centerRe, centerIm, scale, temporary, dxHalf, dyHalf, pixelRe, pixelIm, (mpf_ptr)0);
+    return referenceX >= 0 && referenceY >= 0;
+}
+
 static bool renderExpressionCentered4(const formula::ExpressionProgram& canonical, const formula::ExpressionProgram& runtime, const formula::ExpressionContext& fixed, const char* centerReal, const char* centerImaginary, const char* scaleText, int width, int height, int referenceX, int referenceY, int maxIterations, double bailout, int checkpointIteration, std::vector<CenteredCheckpoint>* checkpoints, std::vector<double>* errorEstimates, std::vector<float>& output, double& seconds, size_t& failedPixels) {
+    const Clock::time_point start = Clock::now();
     formula::ExpressionReferenceBuildRequest referenceRequest;
     referenceRequest.canonicalProgram = &canonical;
     referenceRequest.runtimeProgram = &runtime;
@@ -10765,7 +10844,6 @@ static bool renderExpressionCentered4(const formula::ExpressionProgram& canonica
     }
     if (errorEstimates) errorEstimates->assign(output.size(), 0.0);
     std::atomic<size_t> failures{0};
-    const Clock::time_point start = Clock::now();
 #pragma omp parallel for schedule(dynamic, 1)
     for (int y = 0; y < height; ++y) {
         formula::ExpressionContext referenceContext = fixed;
@@ -11105,7 +11183,13 @@ static int runCustomSlowdownCase(int width, int height) {
     okay = render("all-MPFR generic", genericRequest, genericResult, genericSeconds) && okay;
     size_t centeredReference = pixelCount;
     std::vector<size_t> centeredReferences;
+    int sparseReferenceX = -1;
+    int sparseReferenceY = -1;
+    size_t sparseReferenceAttempts = 0;
+    double sparseReferenceSeconds = 0.0;
     if (getenv("MANDEL_CUSTOM_SLOW_CENTERED4")) {
+        const bool sparseReferenceFound = findExpressionCenteredReference(canonical, runtime, fixed, centerReal, centerImaginary, scaleText, width, height, maxIterations, bailout, sparseReferenceX, sparseReferenceY, sparseReferenceAttempts, sparseReferenceSeconds);
+        printf("  sparse reference=%s pixel=(%d,%d) attempts=%zu time=%.3f s\n", sparseReferenceFound ? "bounded" : "none", sparseReferenceX, sparseReferenceY, sparseReferenceAttempts, sparseReferenceSeconds);
         std::vector<std::pair<long long, size_t>> interiorCandidates;
         long long nearestDistance = std::numeric_limits<long long>::max();
         for (int y = 0; y < height; ++y) {
@@ -11180,9 +11264,9 @@ static int runCustomSlowdownCase(int width, int height) {
         }();
         double centeredSeconds = 0.0;
         size_t failedPixels = 0;
-        if (centeredReference == pixelCount) {
+        if (sparseReferenceX < 0 || sparseReferenceY < 0) {
             printf("  centered VM4 SKIP: frame has no bounded reference candidate\n");
-        } else if (!renderExpressionCentered4(canonical, runtime, fixed, centerReal, centerImaginary, scaleText, width, height, static_cast<int>(centeredReference % static_cast<size_t>(width)), static_cast<int>(centeredReference / static_cast<size_t>(width)), maxIterations, bailout, centeredCheckpointIteration, &centeredCheckpoints, &centeredErrors, centered, centeredSeconds, failedPixels)) {
+        } else if (!renderExpressionCentered4(canonical, runtime, fixed, centerReal, centerImaginary, scaleText, width, height, sparseReferenceX, sparseReferenceY, maxIterations, bailout, centeredCheckpointIteration, &centeredCheckpoints, &centeredErrors, centered, centeredSeconds, failedPixels)) {
             printf("  centered VM4 render failed\n");
             okay = false;
         } else {
@@ -11301,12 +11385,14 @@ static int runCustomSlowdownCase(int width, int height) {
                 const char* value = getenv("MANDEL_CUSTOM_SLOW_CENTERED_ERROR");
                 return value ? std::max(0.0, std::strtod(value, nullptr)) : 1e8;
             }();
-            if (renderExpressionSelectedMpfr(runtime, fixed, centerReal, centerImaginary, scaleText, width, height, maxIterations, bailout, genericResult.fallbackPrecision, centeredErrors, selectiveThreshold, centered, selective, selectiveSeconds, selectiveFallbackPixels, selectiveFallbackIterations)) {
+            constexpr mpfr_prec_t SelectiveFallbackPrecision = 384;
+            if (renderExpressionSelectedMpfr(runtime, fixed, centerReal, centerImaginary, scaleText, width, height, maxIterations, bailout, SelectiveFallbackPrecision, centeredErrors, selectiveThreshold, centered, selective, selectiveSeconds, selectiveFallbackPixels, selectiveFallbackIterations)) {
                 size_t selectiveMismatch = 0;
                 for (size_t index = 0; index < pixelCount; ++index)
                     if (selective[index] != generic[index]) ++selectiveMismatch;
                 if (selectiveMismatch != 0) okay = false;
-                printf("    selective MPFR exact=%d mismatch=%zu fallback=%zu iterations=%llu VM4/MPFR/total=%.3f/%.3f/%.3f s speedup=%.2fx\n", selectiveMismatch == 0 ? 1 : 0, selectiveMismatch, selectiveFallbackPixels, (unsigned long long)selectiveFallbackIterations, centeredSeconds, selectiveSeconds, centeredSeconds + selectiveSeconds, centeredSeconds + selectiveSeconds > 0.0 ? genericSeconds / (centeredSeconds + selectiveSeconds) : 0.0);
+                const double selectiveTotalSeconds = sparseReferenceSeconds + centeredSeconds + selectiveSeconds;
+                printf("    selective MPFR exact=%d mismatch=%zu fallback=%zu iterations=%llu search/VM4/MPFR/total=%.3f/%.3f/%.3f/%.3f s speedup=%.2fx\n", selectiveMismatch == 0 ? 1 : 0, selectiveMismatch, selectiveFallbackPixels, (unsigned long long)selectiveFallbackIterations, sparseReferenceSeconds, centeredSeconds, selectiveSeconds, selectiveTotalSeconds, selectiveTotalSeconds > 0.0 ? genericSeconds / selectiveTotalSeconds : 0.0);
             } else {
                 printf("    selective MPFR failed\n");
             }

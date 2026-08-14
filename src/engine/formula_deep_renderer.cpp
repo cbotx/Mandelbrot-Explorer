@@ -1,5 +1,6 @@
 #include "formula_deep_renderer.h"
 #include "bigfixed.h"
+#include "formula_expression_centered.h"
 
 #include <algorithm>
 #include <array>
@@ -1010,6 +1011,439 @@ ExpressionDeepRenderStatus mapReferenceStatus(ExpressionReferenceBuildStatus sta
     case ExpressionReferenceBuildStatus::CompactionOutOfRange: return ExpressionDeepRenderStatus::ReferenceFailure;
     }
     return ExpressionDeepRenderStatus::ReferenceFailure;
+}
+
+enum class Centered4ExperimentalStatus : uint8_t {
+    NotApplicable,
+    Success,
+    Cancelled,
+    ResourceLimit,
+    UndefinedPixel,
+    Failed
+};
+
+template <typename Cancel, typename Progress>
+Centered4ExperimentalStatus renderCentered4Experimental(const ExpressionDeepRenderRequest& request, ExpressionDeepRenderResult& result, mpfr_prec_t selectedPrecision, mpfr_prec_t fallbackPrecision, int threadCount, size_t outerLiveBytes, Cancel&& shouldCancel, Progress&& progress, std::string& error) {
+    struct OracleWorkspaceRelease {
+        ~OracleWorkspaceRelease() { ExpressionOracle::releaseThreadWorkspace(); }
+    } callerOracleWorkspaceRelease;
+    const char* setting = std::getenv("MANDEL_DEEP_CENTERED4");
+    const ExpressionScaledResidualCapability capability = request.runtimeProgram->scaledResidualCapability();
+    const bool analyticCapability = capability == ExpressionScaledResidualCapability::ExactCenteredArithmetic || capability == ExpressionScaledResidualCapability::CertifiedEntireCandidate;
+    if (!setting || std::atoi(setting) == 0 || request.forceMpfrFallbackForVerification || request.pixelParameter != FormulaParameter::C || !request.runtimeProgram->derivativeCompatible() || !analyticCapability || selectedPrecision > 512 || selectedPrecision > MPFR_PREC_MAX - request.memory.fallbackGuardBits || fallbackPrecision > request.precision.maximumBits || fallbackPrecision > ExpressionReferencePrecisionPolicy::ApplicationMaximumBits) return Centered4ExperimentalStatus::NotApplicable;
+    if (request.memory.memoryLimitBytes != 0 && outerLiveBytes >= request.memory.memoryLimitBytes) return Centered4ExperimentalStatus::NotApplicable;
+    const size_t centeredMemoryBudget = request.memory.memoryLimitBytes == 0 ? 0 : request.memory.memoryLimitBytes - outerLiveBytes;
+    constexpr mpfr_prec_t ReferencePrecision = 512;
+    const size_t pixelCount = static_cast<size_t>(request.width) * request.height;
+    ExactGeometry geometry(ReferencePrecision);
+    if (!geometry.initialize(request)) {
+        error = "centered4 geometry initialization failed";
+        return Centered4ExperimentalStatus::Failed;
+    }
+
+    struct Candidate {
+        long long distance = 0;
+        int x = 0;
+        int y = 0;
+    };
+    std::vector<Candidate> candidates;
+    constexpr int GridWidth = 9;
+    constexpr int GridHeight = 9;
+    for (int gridY = 0; gridY < GridHeight; ++gridY) {
+        const int y = static_cast<int>(static_cast<long long>(gridY) * (request.height - 1) / (GridHeight - 1));
+        for (int gridX = 0; gridX < GridWidth; ++gridX) {
+            const int x = static_cast<int>(static_cast<long long>(gridX) * (request.width - 1) / (GridWidth - 1));
+            const long long dx = 2LL * x - (request.width - 1LL);
+            const long long dy = 2LL * y - (request.height - 1LL);
+            candidates.push_back({dx * dx + dy * dy, x, y});
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& left, const Candidate& right) { return left.distance < right.distance || (left.distance == right.distance && (left.y < right.y || (left.y == right.y && left.x < right.x))); });
+    candidates.erase(std::unique(candidates.begin(), candidates.end(), [](const Candidate& left, const Candidate& right) { return left.x == right.x && left.y == right.y; }), candidates.end());
+
+    const Clock::time_point referenceStart = Clock::now();
+    ExpressionReferenceOrbitResult reference;
+    int referenceX = -1;
+    int referenceY = -1;
+    MpfrComplex candidatePixel(ReferencePrecision);
+    mpf_t candidateReal;
+    mpf_t candidateImaginary;
+    mpf_init2(candidateReal, ReferencePrecision);
+    mpf_init2(candidateImaginary, ReferencePrecision);
+    for (const Candidate& candidate : candidates) {
+        if (shouldCancel()) {
+            mpf_clears(candidateReal, candidateImaginary, (mpf_ptr)0);
+            return Centered4ExperimentalStatus::Cancelled;
+        }
+        if (!geometry.coordinate(candidate.x, candidate.y, request, candidatePixel)) continue;
+        mpfr_get_f(candidateReal, candidatePixel.re, MPFR_RNDN);
+        mpfr_get_f(candidateImaginary, candidatePixel.im, MPFR_RNDN);
+        ExpressionReferenceBuildRequest referenceRequest;
+        referenceRequest.canonicalProgram = request.canonicalProgram;
+        referenceRequest.runtimeProgram = request.runtimeProgram;
+        referenceRequest.pixelParameter = request.pixelParameter;
+        referenceRequest.center.realMpf = candidateReal;
+        referenceRequest.center.imaginaryMpf = candidateImaginary;
+        referenceRequest.fixed = request.fixed;
+        referenceRequest.bailout = request.bailout;
+        referenceRequest.maxIterations = request.maxIterations;
+        referenceRequest.precision.requestedBits = ReferencePrecision;
+        referenceRequest.precision.minimumBits = 53;
+        referenceRequest.precision.guardBits = 0;
+        referenceRequest.precision.maximumBits = request.precision.maximumBits;
+        referenceRequest.memoryLimitBytes = centeredMemoryBudget;
+        referenceRequest.shouldCancel = shouldCancel;
+        ExpressionReferenceOrbitResult candidateReference;
+        if (!buildExpressionReferenceOrbit(referenceRequest, candidateReference)) {
+            if (candidateReference.cancelled) {
+                mpf_clears(candidateReal, candidateImaginary, (mpf_ptr)0);
+                return Centered4ExperimentalStatus::Cancelled;
+            }
+            continue;
+        }
+        if (candidateReference.valid && !candidateReference.escaped && !candidateReference.undefined && candidateReference.samples.size() == static_cast<size_t>(request.maxIterations)) {
+            reference = std::move(candidateReference);
+            referenceX = candidate.x;
+            referenceY = candidate.y;
+            break;
+        }
+    }
+    mpf_clears(candidateReal, candidateImaginary, (mpf_ptr)0);
+    const double centeredReferenceSeconds = secondsSince(referenceStart);
+    ExpressionOracle::releaseThreadWorkspace();
+    if (referenceX < 0 || referenceY < 0) return Centered4ExperimentalStatus::NotApplicable;
+
+    size_t rendererBytes = 0;
+    if (!checkedAddSize(rendererBytes, pixelCount, sizeof(double) + sizeof(size_t) + sizeof(uint8_t)) || !checkedAddSize(rendererBytes, static_cast<size_t>(request.width + request.height), sizeof(double)) || !checkedAddSize(rendererBytes, reference.samples.size(), sizeof(Complex)) || !checkedAddSize(rendererBytes, reference.tape.size(), sizeof(Complex))) {
+        error = "centered4 workspace size overflow";
+        return Centered4ExperimentalStatus::ResourceLimit;
+    }
+    const size_t limbs = (static_cast<size_t>(fallbackPrecision) + GMP_NUMB_BITS - 1) / GMP_NUMB_BITS;
+    size_t mpfrValueBytes = sizeof(__mpfr_struct);
+    if (!checkedAddSize(mpfrValueBytes, limbs, sizeof(mp_limb_t))) {
+        error = "centered4 MPFR workspace size overflow";
+        return Centered4ExperimentalStatus::ResourceLimit;
+    }
+    size_t mpfrValuesPerThread = 62;
+    if (!checkedAddSize(mpfrValuesPerThread, request.runtimeProgram->stackDepth(), 2)) {
+        error = "centered4 oracle stack size overflow";
+        return Centered4ExperimentalStatus::ResourceLimit;
+    }
+    size_t fallbackThreadBytes = 0;
+    if (!checkedAddSize(fallbackThreadBytes, mpfrValuesPerThread, mpfrValueBytes)) {
+        error = "centered4 fallback workspace size overflow";
+        return Centered4ExperimentalStatus::ResourceLimit;
+    }
+    size_t fallbackThreadBytesTotal = 0;
+    if (!checkedAddSize(fallbackThreadBytesTotal, static_cast<size_t>(threadCount), fallbackThreadBytes) || !checkedAddSize(rendererBytes, 1, fallbackThreadBytesTotal)) {
+        error = "centered4 fallback workspace multiplication overflow";
+        return Centered4ExperimentalStatus::ResourceLimit;
+    }
+    if (!checkedAddSize(rendererBytes, static_cast<size_t>(threadCount), size_t{64} << 10)) {
+        error = "centered4 VM thread workspace multiplication overflow";
+        return Centered4ExperimentalStatus::ResourceLimit;
+    }
+    if (request.memory.memoryLimitBytes != 0 && (outerLiveBytes > request.memory.memoryLimitBytes || reference.memoryBytes > request.memory.memoryLimitBytes - outerLiveBytes || rendererBytes > request.memory.memoryLimitBytes - outerLiveBytes - reference.memoryBytes)) {
+        return Centered4ExperimentalStatus::NotApplicable;
+    }
+    auto reconstruct = [](const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, Complex& output) {
+        ScaledComplexValue scaled;
+        return makeScaledComplexValue(primary, defect, scaled) == ScaledArithmeticStatus::Success && scaledValueToDouble(scaled, output);
+    };
+    Complex referenceC;
+    Complex referenceZ0;
+    if (!reconstruct(reference.c, reference.cDefect, referenceC) || !reconstruct(reference.z0, reference.z0Defect, referenceZ0)) return Centered4ExperimentalStatus::NotApplicable;
+    std::vector<Complex> referenceZ(reference.samples.size());
+    std::vector<Complex> referenceNodes(reference.tape.size());
+    for (size_t index = 0; index < reference.tape.size(); ++index)
+        if (!reconstruct(reference.tape[index].output, reference.tape[index].outputDefect, referenceNodes[index])) return Centered4ExperimentalStatus::NotApplicable;
+    for (size_t iteration = 0; iteration < reference.samples.size(); ++iteration)
+        if (!reconstruct(reference.samples[iteration].z, reference.samples[iteration].zDefect, referenceZ[iteration])) return Centered4ExperimentalStatus::NotApplicable;
+
+    MpfrComplex referencePixel(ReferencePrecision);
+    if (!geometry.coordinate(referenceX, referenceY, request, referencePixel)) return Centered4ExperimentalStatus::NotApplicable;
+    std::vector<double> xOffsets(static_cast<size_t>(request.width));
+    std::vector<double> yOffsets(static_cast<size_t>(request.height));
+    MpfrComplex coordinate(ReferencePrecision);
+    for (int x = 0; x < request.width; ++x) {
+        if (!geometry.coordinate(x, referenceY, request, coordinate)) return Centered4ExperimentalStatus::NotApplicable;
+        mpfr_sub(coordinate.re, coordinate.re, referencePixel.re, MPFR_RNDN);
+        const double offset = mpfr_get_d(coordinate.re, MPFR_RNDN);
+        if (!std::isfinite(offset) || (!mpfr_zero_p(coordinate.re) && offset == 0.0)) return Centered4ExperimentalStatus::NotApplicable;
+        xOffsets[static_cast<size_t>(x)] = offset;
+    }
+    for (int y = 0; y < request.height; ++y) {
+        if (!geometry.coordinate(referenceX, y, request, coordinate)) return Centered4ExperimentalStatus::NotApplicable;
+        mpfr_sub(coordinate.im, coordinate.im, referencePixel.im, MPFR_RNDN);
+        const double offset = mpfr_get_d(coordinate.im, MPFR_RNDN);
+        if (!std::isfinite(offset) || (!mpfr_zero_p(coordinate.im) && offset == 0.0)) return Centered4ExperimentalStatus::NotApplicable;
+        yOffsets[static_cast<size_t>(y)] = offset;
+    }
+    result.referenceSeconds += centeredReferenceSeconds;
+    result.referenceBytes += reference.memoryBytes;
+    result.rendererBytes += rendererBytes;
+
+    double errorThreshold = 1e5;
+    if (const char* value = std::getenv("MANDEL_DEEP_CENTERED4_ERROR")) {
+        const double parsed = std::strtod(value, nullptr);
+        if (std::isfinite(parsed) && parsed >= 0.0) errorThreshold = parsed;
+    }
+    std::vector<double> errors(pixelCount, 0.0);
+    std::atomic<uint64_t> vmIterations{0};
+    progress(ExpressionDeepRenderPhase::Fast, 0, pixelCount);
+    const Clock::time_point fastStart = Clock::now();
+#pragma omp parallel for num_threads(threadCount) schedule(dynamic, 1)
+    for (int y = 0; y < request.height; ++y) {
+        if (shouldCancel()) continue;
+        ExpressionContext referenceContext = request.fixed;
+        referenceContext.c = referenceC;
+        referenceContext.z0 = referenceZ0;
+        uint64_t localIterations = 0;
+        for (int xBase = 0; xBase < request.width; xBase += 4) {
+            const int lanes = std::min(4, request.width - xBase);
+            std::array<ExpressionDeltaContext, 4> deltas{};
+            std::array<Complex, 4> stateDelta{};
+            std::array<double, 4> stateError{};
+            std::array<bool, 4> active{};
+            std::array<size_t, 4> outputIndices{};
+            int activeCount = lanes;
+            for (int lane = 0; lane < lanes; ++lane) {
+                const int x = xBase + lane;
+                outputIndices[lane] = static_cast<size_t>(y) * request.width + x;
+                deltas[lane].c = {xOffsets[static_cast<size_t>(x)], yOffsets[static_cast<size_t>(y)]};
+                stateError[lane] = 1e-15;
+                active[lane] = true;
+                request.output[outputIndices[lane]] = ExpressionDeepInteriorPixel;
+            }
+            for (int iteration = 0; iteration < request.maxIterations && activeCount > 0; ++iteration) {
+                if ((iteration & 63) == 0 && shouldCancel()) break;
+                referenceContext.iteration = iteration;
+                referenceContext.z = referenceZ[static_cast<size_t>(iteration)];
+                for (int lane = 0; lane < 4; ++lane) deltas[lane].z = stateDelta[lane];
+                const ExpressionReferenceSample& sample = reference.samples[static_cast<size_t>(iteration)];
+                const Complex* nodeBases = referenceNodes.data() + static_cast<size_t>(sample.tapeOffset);
+                ExpressionCenteredResult evaluated[4];
+                if (!ExpressionCenteredEvaluator::evaluate4WithNodeBases(*request.runtimeProgram, referenceContext, nodeBases, deltas.data(), evaluated)) {
+                    for (int lane = 0; lane < lanes; ++lane)
+                        if (active[lane]) {
+                            errors[outputIndices[lane]] = std::numeric_limits<double>::infinity();
+                            active[lane] = false;
+                            --activeCount;
+                        }
+                    break;
+                }
+                const Complex nextReference = nodeBases[sample.rootNode];
+                for (int lane = 0; lane < lanes; ++lane) {
+                    if (!active[lane]) continue;
+                    ++localIterations;
+                    if (!evaluated[lane].success()) {
+                        errors[outputIndices[lane]] = std::numeric_limits<double>::infinity();
+                        active[lane] = false;
+                        --activeCount;
+                        continue;
+                    }
+                    const Complex currentActual = referenceZ[static_cast<size_t>(iteration)] + stateDelta[lane];
+                    const Complex outputDelta = evaluated[lane].delta;
+                    const Complex actual = nextReference + outputDelta;
+                    stateDelta[lane] = iteration + 1 < request.maxIterations ? outputDelta + (nextReference - referenceZ[static_cast<size_t>(iteration + 1)]) : outputDelta;
+                    ExpressionContext actualContext = request.fixed;
+                    actualContext.z = currentActual;
+                    actualContext.c = referenceC + deltas[lane].c;
+                    actualContext.iteration = iteration;
+                    ExpressionDerivativeSeed seed;
+                    seed.z = {1.0, 0.0};
+                    Complex value;
+                    Complex derivative;
+                    if (request.runtimeProgram->evaluateWithDerivative(actualContext, seed, value, derivative) && finiteComplex(derivative)) {
+                        stateError[lane] = std::abs(derivative) * stateError[lane] + 64.0 * std::numeric_limits<double>::epsilon() * std::max(1.0, std::abs(actual));
+                    } else {
+                        stateError[lane] = std::numeric_limits<double>::infinity();
+                    }
+                    errors[outputIndices[lane]] = stateError[lane];
+                    if (!std::isfinite(stateError[lane]) || stateError[lane] > errorThreshold) {
+                        active[lane] = false;
+                        --activeCount;
+                        continue;
+                    }
+                    const double magnitude = std::hypot(actual.real(), actual.imag());
+                    const double magnitudeError = 2.0 * stateError[lane];
+                    if (!finiteComplex(actual)) {
+                        errors[outputIndices[lane]] = std::numeric_limits<double>::infinity();
+                        active[lane] = false;
+                        --activeCount;
+                    } else if (magnitude > request.bailout && magnitude - magnitudeError > request.bailout) {
+                        request.output[outputIndices[lane]] = static_cast<float>(iteration + 1);
+                        active[lane] = false;
+                        --activeCount;
+                    } else if (magnitude + magnitudeError >= request.bailout) {
+                        errors[outputIndices[lane]] = std::numeric_limits<double>::infinity();
+                        active[lane] = false;
+                        --activeCount;
+                    }
+                }
+            }
+        }
+        vmIterations.fetch_add(localIterations, std::memory_order_relaxed);
+    }
+    result.fastSeconds += secondsSince(fastStart);
+    if (shouldCancel()) return Centered4ExperimentalStatus::Cancelled;
+
+    std::vector<size_t> fallback;
+    std::vector<uint8_t> fallbackMask;
+    try {
+        fallback.reserve(pixelCount);
+        for (size_t index = 0; index < pixelCount; ++index)
+            if (!std::isfinite(errors[index]) || errors[index] > errorThreshold) fallback.push_back(index);
+        fallbackMask.assign(pixelCount, 0);
+    } catch (const std::bad_alloc&) {
+        error = "centered4 fallback queue allocation failed";
+        return Centered4ExperimentalStatus::ResourceLimit;
+    } catch (const std::length_error&) {
+        error = "centered4 fallback queue length overflow";
+        return Centered4ExperimentalStatus::ResourceLimit;
+    }
+    result.fastPixelCount = static_cast<uint64_t>(pixelCount - fallback.size());
+    result.fallbackPixelCount = static_cast<uint64_t>(fallback.size());
+    result.fallbackReasonCounts.fill(0);
+    result.uncertainPixelCount = 0;
+    result.maxFallbackReasonCount = 0;
+    result.fallbackTileCount = 0;
+    result.maxTileFallbackRate = 0.0;
+    result.undefinedPixelCount = 0;
+    result.fallbackReasonCounts[static_cast<size_t>(ExpressionDeepFallbackReason::CertificationFailure)] = result.fallbackPixelCount;
+    result.maxFallbackReasonCount = result.fallbackPixelCount;
+    result.uncertainPixelCount = result.fallbackPixelCount;
+    for (size_t index : fallback) fallbackMask[index] = 1;
+    const int tilesX = (request.width + request.threading.tileWidth - 1) / request.threading.tileWidth;
+    const int tilesY = (request.height + request.threading.tileHeight - 1) / request.threading.tileHeight;
+    for (int tileY = 0; tileY < tilesY; ++tileY) {
+        for (int tileX = 0; tileX < tilesX; ++tileX) {
+            const int xBegin = tileX * request.threading.tileWidth;
+            const int yBegin = tileY * request.threading.tileHeight;
+            const int xEnd = std::min(request.width, xBegin + request.threading.tileWidth);
+            const int yEnd = std::min(request.height, yBegin + request.threading.tileHeight);
+            uint64_t fallbackInTile = 0;
+            for (int y = yBegin; y < yEnd; ++y)
+                for (int x = xBegin; x < xEnd; ++x) fallbackInTile += fallbackMask[static_cast<size_t>(y) * request.width + x];
+            if (fallbackInTile == 0) continue;
+            ++result.fallbackTileCount;
+            const uint64_t pixelsInTile = static_cast<uint64_t>(xEnd - xBegin) * static_cast<uint64_t>(yEnd - yBegin);
+            result.maxTileFallbackRate = std::max(result.maxTileFallbackRate, static_cast<double>(fallbackInTile) / pixelsInTile);
+        }
+    }
+
+    progress(ExpressionDeepRenderPhase::Fallback, 0, fallback.size());
+    const Clock::time_point fallbackStart = Clock::now();
+    std::atomic<uint64_t> fallbackIterations{0};
+    std::atomic<uint64_t> undefinedPixels{0};
+    std::atomic_bool resourceError{false};
+    std::atomic_bool internalError{false};
+#pragma omp parallel num_threads(threadCount)
+    {
+        OracleWorkspaceRelease workerOracleWorkspaceRelease;
+        std::unique_ptr<FallbackWorkerWorkspace> workspace;
+        try {
+            workspace = std::make_unique<FallbackWorkerWorkspace>(fallbackPrecision, request);
+            if (!workspace->geometryReady) internalError.store(true, std::memory_order_relaxed);
+        } catch (const std::bad_alloc&) {
+            resourceError.store(true, std::memory_order_relaxed);
+        } catch (const std::length_error&) {
+            resourceError.store(true, std::memory_order_relaxed);
+        } catch (...) {
+            internalError.store(true, std::memory_order_relaxed);
+        }
+        uint64_t localIterations = 0;
+#pragma omp for schedule(dynamic, 8)
+        for (long long rawIndex = 0; rawIndex < static_cast<long long>(fallback.size()); ++rawIndex) {
+            try {
+                if (shouldCancel() || !workspace || resourceError.load(std::memory_order_relaxed) || internalError.load(std::memory_order_relaxed)) continue;
+                const size_t outputIndex = fallback[static_cast<size_t>(rawIndex)];
+                const int y = static_cast<int>(outputIndex / static_cast<size_t>(request.width));
+                const int x = static_cast<int>(outputIndex % static_cast<size_t>(request.width));
+                configureFixed(request.fixed, workspace->context);
+                if (!workspace->geometry.coordinate(x, y, request, workspace->pixel)) {
+                    request.output[outputIndex] = ExpressionDeepEmptyPixel;
+                    undefinedPixels.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                workspace->context.c.set(workspace->pixel);
+                workspace->context.z.set(workspace->context.z0);
+                bool outside = false;
+                if (!piecewiseOutsideBailout(workspace->context.z, workspace->piecewiseBailoutSquared, request.bailout, workspace->magnitudeStorage.re, workspace->piecewiseSquares, workspace->piecewiseInsideSquareExponent, workspace->piecewiseScratch, outside)) {
+                    request.output[outputIndex] = ExpressionDeepEmptyPixel;
+                    undefinedPixels.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                if (outside) {
+                    request.output[outputIndex] = 0.0f;
+                    continue;
+                }
+                request.output[outputIndex] = ExpressionDeepInteriorPixel;
+                for (int iteration = 0; iteration < request.maxIterations; ++iteration) {
+                    if ((iteration & 15) == 0 && shouldCancel()) break;
+                    workspace->context.iteration = iteration;
+                    const bool defined = ExpressionOracle::evaluateOrbitStep(*request.runtimeProgram, workspace->context, workspace->next, &workspace->piecewiseSquares, nullptr);
+                    if (mpfr_nan_p(workspace->next.re) || mpfr_nan_p(workspace->next.im)) {
+                        request.output[outputIndex] = ExpressionDeepEmptyPixel;
+                        undefinedPixels.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    }
+                    ++localIterations;
+                    if (mpfr_inf_p(workspace->next.re) || mpfr_inf_p(workspace->next.im)) {
+                        request.output[outputIndex] = static_cast<float>(iteration + 1);
+                        break;
+                    }
+                    if (!defined || !mpfr_number_p(workspace->next.re) || !mpfr_number_p(workspace->next.im)) {
+                        request.output[outputIndex] = ExpressionDeepEmptyPixel;
+                        undefinedPixels.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    }
+                    mpfr_swap(workspace->context.z.re, workspace->next.re);
+                    mpfr_swap(workspace->context.z.im, workspace->next.im);
+                    if (!piecewiseOutsideBailout(workspace->context.z, workspace->piecewiseBailoutSquared, request.bailout, workspace->magnitudeStorage.re, workspace->piecewiseSquares, workspace->piecewiseInsideSquareExponent, workspace->piecewiseScratch, outside)) {
+                        request.output[outputIndex] = ExpressionDeepEmptyPixel;
+                        undefinedPixels.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    }
+                    if (outside) {
+                        request.output[outputIndex] = static_cast<float>(iteration + 1);
+                        break;
+                    }
+                }
+            } catch (const std::bad_alloc&) {
+                resourceError.store(true, std::memory_order_relaxed);
+            } catch (const std::length_error&) {
+                resourceError.store(true, std::memory_order_relaxed);
+            } catch (...) {
+                internalError.store(true, std::memory_order_relaxed);
+            }
+        }
+        fallbackIterations.fetch_add(localIterations, std::memory_order_relaxed);
+    }
+    result.fallbackSeconds += secondsSince(fallbackStart);
+    if (shouldCancel()) return Centered4ExperimentalStatus::Cancelled;
+    if (resourceError.load(std::memory_order_relaxed)) {
+        error = "centered4 fallback allocation failed";
+        return Centered4ExperimentalStatus::ResourceLimit;
+    }
+    if (internalError.load(std::memory_order_relaxed)) {
+        error = "centered4 fallback workspace initialization failed";
+        return Centered4ExperimentalStatus::Failed;
+    }
+    result.undefinedPixelCount = undefinedPixels.load(std::memory_order_relaxed);
+    if (result.undefinedPixelCount != 0) {
+        error = "centered4 fallback produced an undefined pixel";
+        return Centered4ExperimentalStatus::UndefinedPixel;
+    }
+    const uint64_t centeredFastIterations = vmIterations.load(std::memory_order_relaxed);
+    result.fastIterationCount = saturatingAdd(result.fastIterationCount, centeredFastIterations);
+    result.totalIterations = saturatingAdd(result.totalIterations, saturatingAdd(centeredFastIterations, fallbackIterations.load(std::memory_order_relaxed)));
+    result.selectedPrecision = selectedPrecision;
+    result.fallbackPrecision = fallbackPrecision;
+    result.status = ExpressionDeepRenderStatus::Success;
+    result.success = true;
+    progress(ExpressionDeepRenderPhase::Complete, pixelCount, pixelCount);
+    return Centered4ExperimentalStatus::Success;
 }
 
 } // namespace
@@ -2104,6 +2538,26 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
         }
 
         if (cancelled.load(std::memory_order_acquire)) return fail(ExpressionDeepRenderStatus::Cancelled, "render cancelled during the fast pass");
+        if (result.fastPixelCount == 0 && result.fallbackPixelCount == pixelCount64) {
+            size_t centered4OuterLiveBytes = result.rendererBytes;
+            if (!checkedAddSize(centered4OuterLiveBytes, 1, result.referenceBytes)) return fail(ExpressionDeepRenderStatus::ResourceLimit, "centered4 outer workspace size overflow");
+            std::string centered4Error;
+            const Centered4ExperimentalStatus centered4Status = renderCentered4Experimental(request, result, result.selectedPrecision, result.fallbackPrecision, threadCount, centered4OuterLiveBytes, pollCancellation, notifyProgress, centered4Error);
+            if (centered4Status == Centered4ExperimentalStatus::Success) return true;
+            if (centered4Status == Centered4ExperimentalStatus::Cancelled) {
+                std::fill(request.output, request.output + pixelCount, ExpressionDeepEmptyPixel);
+                return fail(ExpressionDeepRenderStatus::Cancelled, "render cancelled during centered4 experiment");
+            }
+            if (centered4Status == Centered4ExperimentalStatus::ResourceLimit) {
+                std::fill(request.output, request.output + pixelCount, ExpressionDeepEmptyPixel);
+                return fail(ExpressionDeepRenderStatus::ResourceLimit, centered4Error.empty() ? "centered4 resource limit" : centered4Error);
+            }
+            if (centered4Status == Centered4ExperimentalStatus::UndefinedPixel) return fail(ExpressionDeepRenderStatus::UndefinedPixel, centered4Error.empty() ? "one or more centered4 pixel orbits are undefined" : centered4Error);
+            if (centered4Status == Centered4ExperimentalStatus::Failed) {
+                std::fill(request.output, request.output + pixelCount, ExpressionDeepEmptyPixel);
+                return fail(ExpressionDeepRenderStatus::InternalError, centered4Error.empty() ? "centered4 experiment failed" : centered4Error);
+            }
+        }
 
         const ExpressionPiecewiseQuadraticKind piecewiseQuadraticKind = request.disableSpecializedPiecewiseMpfrForVerification ? ExpressionPiecewiseQuadraticKind::None : request.runtimeProgram->piecewiseQuadraticKind();
         const char* periodicSetting = std::getenv("MANDEL_EXPR_PERIODIC");
