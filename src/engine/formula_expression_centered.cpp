@@ -599,6 +599,185 @@ ExpressionCenteredResult ExpressionCenteredEvaluator::evaluate(const ExpressionP
     return {stack[0].base, stack[0].delta, stack[0].status};
 }
 
+bool ExpressionCenteredEvaluator::evaluate4(const ExpressionProgram& program, const ExpressionContext& reference, const ExpressionDeltaContext* inputDeltas, ExpressionCenteredResult* results) {
+    return evaluate4WithNodeBases(program, reference, nullptr, inputDeltas, results);
+}
+
+bool ExpressionCenteredEvaluator::evaluate4WithNodeBases(const ExpressionProgram& program, const ExpressionContext& reference, const Complex* nodeBases, const ExpressionDeltaContext* inputDeltas, ExpressionCenteredResult* results) {
+    if (!program._valid || !inputDeltas || !results) return false;
+    struct BatchValue {
+        Complex base{};
+        std::array<Complex, 4> delta{};
+        std::array<Complex, 4> endpoint{};
+        std::array<ExpressionCenteredStatus, 4> status{};
+    };
+    std::array<BatchValue, ExpressionProgram::MAX_STACK> stack;
+    size_t top = 0;
+    auto pushUnchanged = [&](Complex value) {
+        BatchValue& output = stack[top++];
+        output.base = value;
+        for (int lane = 0; lane < 4; ++lane) {
+            output.delta[lane] = {};
+            output.endpoint[lane] = value;
+            output.status[lane] = finite(value) ? ExpressionCenteredStatus::Success : ExpressionCenteredStatus::NonFinite;
+        }
+    };
+    auto pushPerturbed = [&](Complex base, auto deltaGetter) {
+        BatchValue& output = stack[top++];
+        output.base = base;
+        for (int lane = 0; lane < 4; ++lane) {
+            output.delta[lane] = deltaGetter(inputDeltas[lane]);
+            output.endpoint[lane] = base + output.delta[lane];
+            output.status[lane] = finite(base) && finite(output.delta[lane]) && finite(output.endpoint[lane]) ? ExpressionCenteredStatus::Success : ExpressionCenteredStatus::NonFinite;
+        }
+    };
+    auto unary = [&](const ExpressionProgram::Instruction& instruction, Complex sharedBase) {
+        BatchValue input = stack[top - 1];
+        BatchValue& output = stack[top - 1];
+        output.base = sharedBase;
+        for (int lane = 0; lane < 4; ++lane) {
+            output.endpoint[lane] = ExpressionProgram::evaluateUnary(instruction.op, input.endpoint[lane]);
+            ExpressionCenteredStatus status = input.status[lane];
+            Complex delta;
+            if (status == ExpressionCenteredStatus::Success) {
+                switch (instruction.op) {
+                case ExpressionProgram::Op::Negate: delta = -input.delta[lane]; break;
+                case ExpressionProgram::Op::Square: delta = centeredSquare(input.base, input.delta[lane]); break;
+                case ExpressionProgram::Op::Sin: delta = centeredSine(input.base, input.delta[lane]); break;
+                case ExpressionProgram::Op::Cos: delta = centeredCosine(input.base, input.delta[lane]); break;
+                case ExpressionProgram::Op::Tan: status = centeredTangent(input.base, input.delta[lane], input.endpoint[lane], output.base, output.endpoint[lane], delta); break;
+                case ExpressionProgram::Op::Sinh: delta = centeredHyperbolicSine(input.base, input.delta[lane]); break;
+                case ExpressionProgram::Op::Cosh: delta = centeredHyperbolicCosine(input.base, input.delta[lane]); break;
+                case ExpressionProgram::Op::Tanh: status = centeredHyperbolicTangent(input.base, input.delta[lane], input.endpoint[lane], output.base, output.endpoint[lane], delta); break;
+                case ExpressionProgram::Op::Exp:
+                    if (!finite(output.base) || !finite(output.endpoint[lane]))
+                        status = ExpressionCenteredStatus::NonFinite;
+                    else
+                        delta = relativeExponentialDelta(output.base, output.endpoint[lane], input.delta[lane]);
+                    break;
+                case ExpressionProgram::Op::Log: status = centeredLogarithm(input.base, input.delta[lane], input.endpoint[lane], delta); break;
+                case ExpressionProgram::Op::Log10:
+                    status = centeredLogarithm(input.base, input.delta[lane], input.endpoint[lane], delta);
+                    if (status == ExpressionCenteredStatus::Success) delta /= std::log(10.0);
+                    break;
+                case ExpressionProgram::Op::Sqrt: status = centeredSquareRoot(input.base, input.delta[lane], input.endpoint[lane], output.base, output.endpoint[lane], delta); break;
+                case ExpressionProgram::Op::Abs: status = centeredAbsolute(input.base, input.delta[lane], input.endpoint[lane], delta); break;
+                case ExpressionProgram::Op::Norm: delta = centeredNormDelta(input.base, input.delta[lane]); break;
+                case ExpressionProgram::Op::Arg:
+                    status = centeredLogarithm(input.base, input.delta[lane], input.endpoint[lane], delta);
+                    if (status == ExpressionCenteredStatus::Success) delta = {delta.imag(), 0.0};
+                    break;
+                case ExpressionProgram::Op::Conjugate: delta = std::conj(input.delta[lane]); break;
+                case ExpressionProgram::Op::Real: delta = {input.delta[lane].real(), 0.0}; break;
+                case ExpressionProgram::Op::Imaginary: delta = {input.delta[lane].imag(), 0.0}; break;
+                default:
+                    status = ExpressionCenteredStatus::Unsupported;
+                    delta = nanComplex();
+                    break;
+                }
+            } else {
+                delta = nanComplex();
+            }
+            CenteredValue finished = finish(output.base, delta, output.endpoint[lane], status);
+            output.delta[lane] = finished.delta;
+            output.endpoint[lane] = finished.endpoint;
+            output.status[lane] = finished.status;
+        }
+    };
+    auto binary = [&](const ExpressionProgram::Instruction& instruction, Complex sharedBase) {
+        BatchValue right = stack[--top];
+        BatchValue left = stack[top - 1];
+        BatchValue& output = stack[top - 1];
+        output.base = sharedBase;
+        for (int lane = 0; lane < 4; ++lane) {
+            output.endpoint[lane] = ExpressionProgram::evaluateBinary(instruction.op, left.endpoint[lane], right.endpoint[lane]);
+            ExpressionCenteredStatus status = combine(left.status[lane], right.status[lane]);
+            Complex delta;
+            if (status == ExpressionCenteredStatus::Success) {
+                switch (instruction.op) {
+                case ExpressionProgram::Op::Add: delta = left.delta[lane] + right.delta[lane]; break;
+                case ExpressionProgram::Op::Subtract: delta = left.delta[lane] - right.delta[lane]; break;
+                case ExpressionProgram::Op::Multiply: delta = centeredMultiply(left.base, left.delta[lane], right.base, right.delta[lane]); break;
+                case ExpressionProgram::Op::Divide: status = centeredDivisionDelta(left.delta[lane], right.base, right.delta[lane], right.endpoint[lane], output.base, delta, true); break;
+                case ExpressionProgram::Op::Power: status = centeredPower(left.base, left.delta[lane], left.endpoint[lane], right.base, right.delta[lane], right.endpoint[lane], output.base, output.endpoint[lane], delta); break;
+                case ExpressionProgram::Op::MakeComplex: delta = {left.delta[lane].real(), right.delta[lane].real()}; break;
+                case ExpressionProgram::Op::Polar: {
+                    CenteredValue leftValue = finish(left.base, left.delta[lane], left.endpoint[lane], left.status[lane]);
+                    CenteredValue rightValue = finish(right.base, right.delta[lane], right.endpoint[lane], right.status[lane]);
+                    status = centeredPolar(leftValue, rightValue, output.base, output.endpoint[lane], delta);
+                    break;
+                }
+                default:
+                    status = ExpressionCenteredStatus::Unsupported;
+                    delta = nanComplex();
+                    break;
+                }
+            } else {
+                delta = nanComplex();
+            }
+            CenteredValue finished = finish(output.base, delta, output.endpoint[lane], status);
+            output.delta[lane] = finished.delta;
+            output.endpoint[lane] = finished.endpoint;
+            output.status[lane] = finished.status;
+        }
+    };
+
+    for (size_t instructionIndex = 0; instructionIndex < program._code.size(); ++instructionIndex) {
+        const ExpressionProgram::Instruction& instruction = program._code[instructionIndex];
+        const Complex sharedBase = nodeBases ? nodeBases[instructionIndex] : Complex{};
+        switch (instruction.op) {
+        case ExpressionProgram::Op::Constant: pushUnchanged(nodeBases ? sharedBase : instruction.value); break;
+        case ExpressionProgram::Op::Z: pushPerturbed(nodeBases ? sharedBase : reference.z, [](const ExpressionDeltaContext& delta) { return delta.z; }); break;
+        case ExpressionProgram::Op::C: pushPerturbed(nodeBases ? sharedBase : reference.c, [](const ExpressionDeltaContext& delta) { return delta.c; }); break;
+        case ExpressionProgram::Op::Z0: pushPerturbed(nodeBases ? sharedBase : reference.z0, [](const ExpressionDeltaContext& delta) { return delta.z0; }); break;
+        case ExpressionProgram::Op::Iteration: pushUnchanged(nodeBases ? sharedBase : Complex{(double)reference.iteration, 0.0}); break;
+        case ExpressionProgram::Op::Parameter: {
+            const int parameter = instruction.argument;
+            pushPerturbed(nodeBases ? sharedBase : reference.parameters[parameter], [parameter](const ExpressionDeltaContext& delta) { return delta.parameters[parameter]; });
+            break;
+        }
+        case ExpressionProgram::Op::OrbitInvariant: {
+            BatchValue& output = stack[top++];
+            output.base = nodeBases ? sharedBase : nanComplex();
+            for (int lane = 0; lane < 4; ++lane) {
+                output.delta[lane] = nanComplex();
+                output.endpoint[lane] = output.base;
+                output.status[lane] = ExpressionCenteredStatus::Unsupported;
+            }
+            break;
+        }
+        case ExpressionProgram::Op::Negate:
+        case ExpressionProgram::Op::Square:
+        case ExpressionProgram::Op::Sin:
+        case ExpressionProgram::Op::Cos:
+        case ExpressionProgram::Op::Tan:
+        case ExpressionProgram::Op::Sinh:
+        case ExpressionProgram::Op::Cosh:
+        case ExpressionProgram::Op::Tanh:
+        case ExpressionProgram::Op::Exp:
+        case ExpressionProgram::Op::Log:
+        case ExpressionProgram::Op::Log10:
+        case ExpressionProgram::Op::Sqrt:
+        case ExpressionProgram::Op::Abs:
+        case ExpressionProgram::Op::Norm:
+        case ExpressionProgram::Op::Arg:
+        case ExpressionProgram::Op::Conjugate:
+        case ExpressionProgram::Op::Real:
+        case ExpressionProgram::Op::Imaginary: unary(instruction, nodeBases ? sharedBase : ExpressionProgram::evaluateUnary(instruction.op, stack[top - 1].base)); break;
+        case ExpressionProgram::Op::Add:
+        case ExpressionProgram::Op::Subtract:
+        case ExpressionProgram::Op::Multiply:
+        case ExpressionProgram::Op::Divide:
+        case ExpressionProgram::Op::Power:
+        case ExpressionProgram::Op::MakeComplex:
+        case ExpressionProgram::Op::Polar: binary(instruction, nodeBases ? sharedBase : ExpressionProgram::evaluateBinary(instruction.op, stack[top - 2].base, stack[top - 1].base)); break;
+        }
+    }
+    if (top != 1) return false;
+    for (int lane = 0; lane < 4; ++lane) results[lane] = {stack[0].base, stack[0].delta[lane], stack[0].status[lane]};
+    return true;
+}
+
 } // namespace formula
 
 #ifdef _MSC_VER

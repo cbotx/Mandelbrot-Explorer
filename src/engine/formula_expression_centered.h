@@ -38,6 +38,8 @@ class ExpressionCenteredEvaluator {
     // A non-success status is an explicit request to re-reference or use a
     // higher-precision fallback; this evaluator never substitutes one.
     static ExpressionCenteredResult evaluate(const ExpressionProgram& program, const ExpressionContext& reference, const ExpressionDeltaContext& delta);
+    static bool evaluate4(const ExpressionProgram& program, const ExpressionContext& reference, const ExpressionDeltaContext* deltas, ExpressionCenteredResult* results);
+    static bool evaluate4WithNodeBases(const ExpressionProgram& program, const ExpressionContext& reference, const Complex* nodeBases, const ExpressionDeltaContext* deltas, ExpressionCenteredResult* results);
 };
 
 } // namespace formula

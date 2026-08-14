@@ -1948,8 +1948,58 @@ static int runExpressionCenteredCase() {
         }
     }
 
+    int batchChecks = 0;
+    int batchMismatches = 0;
+    const char* batchSources[] = {"z+c", "z-c", "z*c", "z/c", "pow(z,p0)", "sqr(z)", "sin(z)", "cos(z)", "tan(z)", "sinh(z)", "cosh(z)", "tanh(z)", "exp(z)", "log(z)", "log10(z)", "sqrt(z)", "abs(z)", "norm(z)", "arg(z)", "conj(z)", "real(z)", "imag(z)", "complex(real(z),imag(c))", "polar(real(p1),real(p2))", "sin(z*z+c)+exp(p0*z)/(2+z)"};
+    std::array<ExpressionDeltaContext, 4> batchDeltas;
+    batchDeltas[0].z = {1e-12, -2e-12};
+    batchDeltas[0].c = {-1e-13, 2e-13};
+    batchDeltas[0].parameters[0] = {1e-13, -1e-13};
+    batchDeltas[1] = batchDeltas[0];
+    batchDeltas[1].z *= -0.5;
+    batchDeltas[1].c *= 2.0;
+    batchDeltas[2] = batchDeltas[0];
+    batchDeltas[2].z *= Complex{0.25, -0.75};
+    batchDeltas[2].parameters[0] *= -1.0;
+    batchDeltas[3] = {};
+    for (const char* source : batchSources) {
+        ExpressionProgram program;
+        if (!compile(program, source)) continue;
+        ExpressionCenteredResult batchResults[4];
+        if (!ExpressionCenteredEvaluator::evaluate4(program, nominal, batchDeltas.data(), batchResults)) {
+            ++batchMismatches;
+            continue;
+        }
+        for (int lane = 0; lane < 4; ++lane) {
+            const ExpressionCenteredResult scalar = ExpressionCenteredEvaluator::evaluate(program, nominal, batchDeltas[static_cast<size_t>(lane)]);
+            ++batchChecks;
+            if (scalar.status != batchResults[lane].status || !sameComplexBits(scalar.base, batchResults[lane].base) || !sameComplexBits(scalar.delta, batchResults[lane].delta)) ++batchMismatches;
+        }
+    }
+    {
+        ExpressionProgram canonical;
+        ExpressionProgram runtime;
+        formula::ExpressionOrbitPlan plan;
+        ExpressionError error;
+        if (!canonical.compile("sin(c)+z", &error) || !canonical.specialize(nominal, FormulaParameter::C, runtime, &error) || !plan.build(runtime, &error) || !plan.profitable()) {
+            ++batchMismatches;
+        } else {
+            ExpressionCenteredResult batchResults[4];
+            if (!ExpressionCenteredEvaluator::evaluate4(plan.bodyProgram(), nominal, batchDeltas.data(), batchResults)) {
+                ++batchMismatches;
+            } else {
+                for (int lane = 0; lane < 4; ++lane) {
+                    ++batchChecks;
+                    const ExpressionCenteredResult scalar = ExpressionCenteredEvaluator::evaluate(plan.bodyProgram(), nominal, batchDeltas[static_cast<size_t>(lane)]);
+                    if (scalar.status != ExpressionCenteredStatus::Unsupported || batchResults[lane].status != scalar.status) ++batchMismatches;
+                }
+            }
+        }
+    }
+    failures += batchMismatches;
+
     ExpressionProgram benchmarkProgram;
-    double scalarMs = 0.0, centeredMs = 0.0;
+    double scalarMs = 0.0, centeredMs = 0.0, scalar4Ms = 0.0, batch4Ms = 0.0;
     if (compile(benchmarkProgram, "sin(z*z+c)+exp(p0*z)/(2+z)")) {
         ExpressionContext context = nominal;
         ExpressionDeltaContext delta;
@@ -1971,6 +2021,27 @@ static int runExpressionCenteredCase() {
             centeredSink += result.base + result.delta;
         }
         centeredMs = since(begin) * 1000.0;
+        std::array<ExpressionDeltaContext, 4> deltas = batchDeltas;
+        begin = Clock::now();
+        for (int i = 0; i < repetitions; ++i) {
+            context.iteration = i;
+            for (int lane = 0; lane < 4; ++lane) {
+                ExpressionCenteredResult result = ExpressionCenteredEvaluator::evaluate(benchmarkProgram, context, deltas[static_cast<size_t>(lane)]);
+                centeredSink += result.base + result.delta;
+            }
+        }
+        scalar4Ms = since(begin) * 1000.0;
+        begin = Clock::now();
+        for (int i = 0; i < repetitions; ++i) {
+            context.iteration = i;
+            ExpressionCenteredResult batch[4];
+            if (!ExpressionCenteredEvaluator::evaluate4(benchmarkProgram, context, deltas.data(), batch)) {
+                ++failures;
+                break;
+            }
+            for (const ExpressionCenteredResult& result : batch) centeredSink += result.base + result.delta;
+        }
+        batch4Ms = since(begin) * 1000.0;
         if (!std::isfinite(scalarSink.real()) || !std::isfinite(centeredSink.real())) ++failures;
     }
 
@@ -1979,9 +2050,11 @@ static int runExpressionCenteredCase() {
            " recurrence=%d fallback=%d signed-zero=%d\n",
            opcodeChecks, oracleChecks, tinyChecks, recurrenceChecks, fallbackChecks, signedZeroChecks);
     printf("  direct subtraction zero while centered nonzero=%d/%zu\n", directZeroDemonstrations, std::size(tinyCases));
+    printf("  centered batch parity=%d mismatch=%d\n", batchChecks, batchMismatches);
     printf("  scalar/centered %.3f/%.3f ms overhead %.2fx"
            " (informational)\n",
            scalarMs, centeredMs, scalarMs > 0.0 ? centeredMs / scalarMs : 0.0);
+    printf("  centered scalar4/batch4 %.3f/%.3f ms speedup %.2fx\n", scalar4Ms, batch4Ms, batch4Ms > 0.0 ? scalar4Ms / batch4Ms : 0.0);
     printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (centered expression failure)");
     return failures == 0 ? 0 : 1;
 }
@@ -10590,6 +10663,158 @@ static bool renderBurningShipBigFixed(const char* centerReal, const char* center
     return true;
 }
 
+static bool renderExpressionCentered4(const formula::ExpressionProgram& canonical, const formula::ExpressionProgram& runtime, const formula::ExpressionContext& fixed, const char* centerReal, const char* centerImaginary, const char* scaleText, int width, int height, int referenceX, int referenceY, int maxIterations, double bailout, std::vector<float>& output, double& seconds, size_t& failedPixels) {
+    formula::ExpressionReferenceBuildRequest referenceRequest;
+    referenceRequest.canonicalProgram = &canonical;
+    referenceRequest.runtimeProgram = &runtime;
+    referenceRequest.pixelParameter = FormulaParameter::C;
+    mpf_t referenceReal, referenceImaginary, referenceScale, referenceTemporary, referenceDxHalf, referenceDyHalf;
+    mpf_init2(referenceReal, 512);
+    mpf_init2(referenceImaginary, 512);
+    mpf_init2(referenceScale, 512);
+    mpf_init2(referenceTemporary, 512);
+    mpf_init2(referenceDxHalf, 512);
+    mpf_init2(referenceDyHalf, 512);
+    bool referenceParsed = mpf_set_str(referenceReal, centerReal, 10) == 0 && mpf_set_str(referenceImaginary, centerImaginary, 10) == 0 && mpf_set_str(referenceScale, scaleText, 10) == 0 && mpf_sgn(referenceScale) > 0;
+    if (referenceParsed) {
+        mpf_mul_ui(referenceTemporary, referenceScale, static_cast<unsigned long>(width - 1));
+        mpf_ui_div(referenceDxHalf, 2, referenceTemporary);
+        mpf_mul_ui(referenceTemporary, referenceScale, static_cast<unsigned long>(width));
+        mpf_mul_ui(referenceTemporary, referenceTemporary, static_cast<unsigned long>(height - 1));
+        mpf_ui_div(referenceDyHalf, static_cast<unsigned long>(height), referenceTemporary);
+        mpf_mul_ui(referenceDyHalf, referenceDyHalf, 2);
+        const long centeredX = static_cast<long>(2LL * referenceX - (width - 1LL));
+        const long centeredY = static_cast<long>(2LL * referenceY - (height - 1LL));
+        mpf_mul_ui(referenceTemporary, referenceDxHalf, static_cast<unsigned long>(std::labs(centeredX)));
+        if (centeredX < 0) mpf_neg(referenceTemporary, referenceTemporary);
+        mpf_add(referenceReal, referenceReal, referenceTemporary);
+        mpf_mul_ui(referenceTemporary, referenceDyHalf, static_cast<unsigned long>(std::labs(centeredY)));
+        if (centeredY < 0) mpf_neg(referenceTemporary, referenceTemporary);
+        mpf_add(referenceImaginary, referenceImaginary, referenceTemporary);
+        referenceRequest.center.realMpf = referenceReal;
+        referenceRequest.center.imaginaryMpf = referenceImaginary;
+    }
+    referenceRequest.fixed = fixed;
+    referenceRequest.maxIterations = maxIterations;
+    referenceRequest.bailout = bailout;
+    referenceRequest.precision.requestedBits = 512;
+    referenceRequest.precision.minimumBits = 53;
+    referenceRequest.precision.guardBits = 0;
+    referenceRequest.precision.maximumBits = 4096;
+    formula::ExpressionReferenceOrbitResult reference;
+    const bool referenceBuilt = referenceParsed && formula::buildExpressionReferenceOrbit(referenceRequest, reference);
+    mpf_clears(referenceReal, referenceImaginary, referenceScale, referenceTemporary, referenceDxHalf, referenceDyHalf, (mpf_ptr)0);
+    if (!referenceBuilt || !reference.valid || reference.samples.size() != static_cast<size_t>(maxIterations) || reference.escaped || reference.undefined) {
+        printf("  centered VM4 reference invalid samples=%zu escaped=%d undefined=%d error=%s\n", reference.samples.size(), reference.escaped ? 1 : 0, reference.undefined ? 1 : 0, reference.error.c_str());
+        return false;
+    }
+
+    auto reconstruct = [](const formula::ScaledComplexShadow& primary, const formula::ScaledComplexShadow& defect, formula::Complex& outputValue) {
+        formula::ScaledComplexValue scaled;
+        return formula::makeScaledComplexValue(primary, defect, scaled) == formula::ScaledArithmeticStatus::Success && formula::scaledValueToDouble(scaled, outputValue);
+    };
+    formula::Complex referenceC;
+    formula::Complex referenceZ0;
+    if (!reconstruct(reference.c, reference.cDefect, referenceC) || !reconstruct(reference.z0, reference.z0Defect, referenceZ0)) return false;
+    std::vector<formula::Complex> referenceZ(static_cast<size_t>(maxIterations));
+    std::vector<formula::Complex> referenceNodes(reference.tape.size());
+    for (size_t node = 0; node < reference.tape.size(); ++node)
+        if (!reconstruct(reference.tape[node].output, reference.tape[node].outputDefect, referenceNodes[node])) return false;
+    for (int iteration = 0; iteration < maxIterations; ++iteration) {
+        const formula::ExpressionReferenceSample& sample = reference.samples[static_cast<size_t>(iteration)];
+        if (!reconstruct(sample.z, sample.zDefect, referenceZ[static_cast<size_t>(iteration)])) return false;
+    }
+
+    constexpr mpfr_prec_t GeometryPrecision = 512;
+    mpfr_t scale, temporary, dxHalf, dyHalf, coordinate;
+    mpfr_inits2(GeometryPrecision, scale, temporary, dxHalf, dyHalf, coordinate, (mpfr_ptr)0);
+    const bool parsed = mpfr_set_str(scale, scaleText, 10, MPFR_RNDN) == 0 && mpfr_sgn(scale) > 0;
+    if (!parsed) {
+        mpfr_clears(scale, temporary, dxHalf, dyHalf, coordinate, (mpfr_ptr)0);
+        return false;
+    }
+    mpfr_mul_ui(temporary, scale, static_cast<unsigned long>(width - 1), MPFR_RNDN);
+    mpfr_ui_div(dxHalf, 2, temporary, MPFR_RNDN);
+    mpfr_mul_ui(temporary, scale, static_cast<unsigned long>(width), MPFR_RNDN);
+    mpfr_mul_ui(temporary, temporary, static_cast<unsigned long>(height - 1), MPFR_RNDN);
+    mpfr_ui_div(dyHalf, static_cast<unsigned long>(height), temporary, MPFR_RNDN);
+    mpfr_mul_ui(dyHalf, dyHalf, 2, MPFR_RNDN);
+    std::vector<double> xOffsets(static_cast<size_t>(width));
+    std::vector<double> yOffsets(static_cast<size_t>(height));
+    for (int x = 0; x < width; ++x) {
+        const long centered = static_cast<long>(2LL * x - (width - 1LL));
+        mpfr_mul_si(coordinate, dxHalf, centered, MPFR_RNDN);
+        xOffsets[static_cast<size_t>(x)] = mpfr_get_d(coordinate, MPFR_RNDN);
+    }
+    for (int y = 0; y < height; ++y) {
+        const long centered = static_cast<long>(2LL * y - (height - 1LL));
+        mpfr_mul_si(coordinate, dyHalf, centered, MPFR_RNDN);
+        yOffsets[static_cast<size_t>(y)] = mpfr_get_d(coordinate, MPFR_RNDN);
+    }
+    mpfr_clears(scale, temporary, dxHalf, dyHalf, coordinate, (mpfr_ptr)0);
+
+    output.assign(static_cast<size_t>(width) * height, formula::ExpressionDeepInteriorPixel);
+    std::atomic<size_t> failures{0};
+    const Clock::time_point start = Clock::now();
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int y = 0; y < height; ++y) {
+        formula::ExpressionContext referenceContext = fixed;
+        referenceContext.c = referenceC;
+        referenceContext.z0 = referenceZ0;
+        for (int xBase = 0; xBase < width; xBase += 4) {
+            const int lanes = std::min(4, width - xBase);
+            std::array<formula::ExpressionDeltaContext, 4> deltas{};
+            std::array<formula::Complex, 4> stateDelta{};
+            std::array<bool, 4> active{};
+            std::array<int, 4> pixelIndices{};
+            for (int lane = 0; lane < lanes; ++lane) {
+                const int x = xBase + lane;
+                pixelIndices[lane] = y * width + x;
+                deltas[lane].c = {xOffsets[static_cast<size_t>(x)] - xOffsets[static_cast<size_t>(referenceX)], yOffsets[static_cast<size_t>(y)] - yOffsets[static_cast<size_t>(referenceY)]};
+                active[lane] = true;
+            }
+            int activeCount = lanes;
+            for (int iteration = 0; iteration < maxIterations && activeCount > 0; ++iteration) {
+                referenceContext.iteration = iteration;
+                referenceContext.z = referenceZ[static_cast<size_t>(iteration)];
+                for (int lane = 0; lane < 4; ++lane) deltas[lane].z = stateDelta[lane];
+                formula::ExpressionCenteredResult evaluated[4];
+                const formula::ExpressionReferenceSample& sample = reference.samples[static_cast<size_t>(iteration)];
+                const formula::Complex* nodeBases = referenceNodes.data() + static_cast<size_t>(sample.tapeOffset);
+                if (!formula::ExpressionCenteredEvaluator::evaluate4WithNodeBases(runtime, referenceContext, nodeBases, deltas.data(), evaluated)) {
+                    for (int lane = 0; lane < lanes; ++lane)
+                        if (active[lane]) {
+                            active[lane] = false;
+                            ++failures;
+                            --activeCount;
+                        }
+                    break;
+                }
+                const formula::Complex nextReference = nodeBases[sample.rootNode];
+                for (int lane = 0; lane < lanes; ++lane) {
+                    if (!active[lane]) continue;
+                    if (!evaluated[lane].success()) {
+                        active[lane] = false;
+                        ++failures;
+                        --activeCount;
+                        continue;
+                    }
+                    stateDelta[lane] = evaluated[lane].delta;
+                    const formula::Complex actual = nextReference + stateDelta[lane];
+                    if (!std::isfinite(actual.real()) || !std::isfinite(actual.imag()) || std::hypot(actual.real(), actual.imag()) > bailout) {
+                        output[static_cast<size_t>(pixelIndices[lane])] = static_cast<float>(iteration + 1);
+                        active[lane] = false;
+                        --activeCount;
+                    }
+                }
+            }
+        }
+    }
+    seconds = since(start);
+    failedPixels = failures.load(std::memory_order_relaxed);
+    return true;
+}
+
 static int runCustomSlowdownCase(int width, int height) {
     using formula::ExpressionContext;
     using formula::ExpressionDeepFallbackReason;
@@ -10703,6 +10928,30 @@ static int runCustomSlowdownCase(int width, int height) {
     ExpressionDeepRenderResult genericResult;
     double genericSeconds = 0.0;
     okay = render("all-MPFR generic", genericRequest, genericResult, genericSeconds) && okay;
+    size_t centeredReference = pixelCount;
+    if (getenv("MANDEL_CUSTOM_SLOW_CENTERED4")) {
+        std::vector<std::pair<long long, size_t>> interiorCandidates;
+        long long nearestDistance = std::numeric_limits<long long>::max();
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const size_t index = static_cast<size_t>(y) * width + x;
+                if (generic[index] >= 0.0f) continue;
+                const long long dx = 2LL * x - (width - 1LL);
+                const long long dy = 2LL * y - (height - 1LL);
+                const long long distance = dx * dx + dy * dy;
+                interiorCandidates.emplace_back(distance, index);
+                if (distance < nearestDistance) {
+                    centeredReference = index;
+                    nearestDistance = distance;
+                }
+            }
+        }
+        std::sort(interiorCandidates.begin(), interiorCandidates.end());
+        printf("  interior candidates:");
+        for (size_t candidate = 0; candidate < std::min<size_t>(interiorCandidates.size(), 12); ++candidate) printf(" (%zu,%zu)", interiorCandidates[candidate].second % static_cast<size_t>(width), interiorCandidates[candidate].second / static_cast<size_t>(width));
+        printf("\n");
+        if (centeredReference != pixelCount) printf("  nearest interior pixel=(%zu,%zu)\n", centeredReference % static_cast<size_t>(width), centeredReference / static_cast<size_t>(width));
+    }
 
     if (getenv("MANDEL_CUSTOM_SLOW_GUARD") || getenv("MANDEL_CUSTOM_SLOW_FALLBACK_GUARD")) {
         std::vector<float> highPrecision(pixelCount, formula::ExpressionDeepEmptyPixel);
@@ -10741,6 +10990,83 @@ static int runCustomSlowdownCase(int width, int height) {
             p99Difference = differences[percentileIndex];
         }
         printf("  low-vs-high GT class=%zu max/mean/p99=%.3f/%.3f/%.3f low/high=%.3f/%.3f s\n", classMismatch, maxDifference, meanDifference, p99Difference, genericSeconds, highSeconds);
+    }
+
+    if (getenv("MANDEL_CUSTOM_SLOW_CENTERED4")) {
+        std::vector<float> centered;
+        double centeredSeconds = 0.0;
+        size_t failedPixels = 0;
+        if (centeredReference == pixelCount) {
+            printf("  centered VM4 SKIP: frame has no bounded reference candidate\n");
+        } else if (!renderExpressionCentered4(canonical, runtime, fixed, centerReal, centerImaginary, scaleText, width, height, static_cast<int>(centeredReference % static_cast<size_t>(width)), static_cast<int>(centeredReference / static_cast<size_t>(width)), maxIterations, bailout, centered, centeredSeconds, failedPixels)) {
+            printf("  centered VM4 render failed\n");
+            okay = false;
+        } else {
+            size_t classMismatch = 0;
+            double maxDifference = 0.0;
+            double sumDifference = 0.0;
+            std::vector<double> differences;
+            differences.reserve(pixelCount);
+            int diagnostics = 0;
+            for (size_t index = 0; index < pixelCount; ++index) {
+                const bool candidateInterior = centered[index] < 0.0f;
+                const bool oracleInterior = generic[index] < 0.0f;
+                if (candidateInterior != oracleInterior) {
+                    ++classMismatch;
+                    if (diagnostics++ < 16) printf("    centered mismatch (%zu,%zu) candidate=%.9g GT=%.9g class\n", index % static_cast<size_t>(width), index / static_cast<size_t>(width), centered[index], generic[index]);
+                } else if (!candidateInterior) {
+                    const double difference = std::fabs(static_cast<double>(centered[index]) - static_cast<double>(generic[index]));
+                    maxDifference = std::max(maxDifference, difference);
+                    sumDifference += difference;
+                    differences.push_back(difference);
+                    if (difference != 0.0 && diagnostics++ < 16) printf("    centered mismatch (%zu,%zu) candidate=%.9g GT=%.9g diff=%.9g\n", index % static_cast<size_t>(width), index / static_cast<size_t>(width), centered[index], generic[index], difference);
+                }
+            }
+            const double meanDifference = differences.empty() ? 0.0 : sumDifference / differences.size();
+            double p99Difference = 0.0;
+            if (!differences.empty()) {
+                const size_t percentileIndex = static_cast<size_t>(std::ceil(0.99 * differences.size())) - 1;
+                std::nth_element(differences.begin(), differences.begin() + percentileIndex, differences.end());
+                p99Difference = differences[percentileIndex];
+            }
+            printf("  centered VM4 GT class=%zu max/mean/p99=%.3f/%.3f/%.3f failed=%zu time=%.3f s\n", classMismatch, maxDifference, meanDifference, p99Difference, failedPixels, centeredSeconds);
+            for (int threshold : {512, 768, 900, 1024}) {
+                uint64_t fallbackIterations = 0;
+                size_t fallbackCount = 0;
+                size_t selectiveClassMismatch = 0;
+                double selectiveMaxDifference = 0.0;
+                double selectiveSumDifference = 0.0;
+                std::vector<double> selectiveDifferences;
+                for (size_t index = 0; index < pixelCount; ++index) {
+                    const float candidate = centered[index];
+                    const bool fallback = candidate < 0.0f || candidate >= static_cast<float>(threshold);
+                    const int oracleIterations = generic[index] < 0.0f ? maxIterations : static_cast<int>(generic[index]);
+                    if (fallback) {
+                        ++fallbackCount;
+                        fallbackIterations += static_cast<uint64_t>(oracleIterations);
+                    } else {
+                        const bool candidateInterior = candidate < 0.0f;
+                        const bool oracleInterior = generic[index] < 0.0f;
+                        if (candidateInterior != oracleInterior) {
+                            ++selectiveClassMismatch;
+                        } else if (!candidateInterior) {
+                            const double difference = std::fabs(static_cast<double>(candidate) - generic[index]);
+                            selectiveMaxDifference = std::max(selectiveMaxDifference, difference);
+                            selectiveSumDifference += difference;
+                            selectiveDifferences.push_back(difference);
+                        }
+                    }
+                }
+                const double selectiveMeanDifference = selectiveDifferences.empty() ? 0.0 : selectiveSumDifference / selectiveDifferences.size();
+                double selectiveP99Difference = 0.0;
+                if (!selectiveDifferences.empty()) {
+                    const size_t percentile = static_cast<size_t>(std::ceil(0.99 * selectiveDifferences.size())) - 1;
+                    std::nth_element(selectiveDifferences.begin(), selectiveDifferences.begin() + percentile, selectiveDifferences.end());
+                    selectiveP99Difference = selectiveDifferences[percentile];
+                }
+                printf("    threshold=%d fallback=%zu/%zu MPFR-iterations=%llu/%llu (%.1f%%) quality=%zu/%.0f/%.3f/%.0f\n", threshold, fallbackCount, pixelCount, (unsigned long long)fallbackIterations, (unsigned long long)genericResult.totalIterations, genericResult.totalIterations ? 100.0 * fallbackIterations / genericResult.totalIterations : 0.0, selectiveClassMismatch, selectiveMaxDifference, selectiveMeanDifference, selectiveP99Difference);
+            }
+        }
     }
 
     if (getenv("MANDEL_CUSTOM_SLOW_DD") && burningShipResearchEligible) {
