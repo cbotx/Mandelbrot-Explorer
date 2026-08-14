@@ -10663,7 +10663,12 @@ static bool renderBurningShipBigFixed(const char* centerReal, const char* center
     return true;
 }
 
-static bool renderExpressionCentered4(const formula::ExpressionProgram& canonical, const formula::ExpressionProgram& runtime, const formula::ExpressionContext& fixed, const char* centerReal, const char* centerImaginary, const char* scaleText, int width, int height, int referenceX, int referenceY, int maxIterations, double bailout, std::vector<float>& output, double& seconds, size_t& failedPixels) {
+struct CenteredCheckpoint {
+    formula::Complex reference;
+    formula::Complex residual;
+};
+
+static bool renderExpressionCentered4(const formula::ExpressionProgram& canonical, const formula::ExpressionProgram& runtime, const formula::ExpressionContext& fixed, const char* centerReal, const char* centerImaginary, const char* scaleText, int width, int height, int referenceX, int referenceY, int maxIterations, double bailout, int checkpointIteration, std::vector<CenteredCheckpoint>* checkpoints, std::vector<double>* errorEstimates, std::vector<float>& output, double& seconds, size_t& failedPixels) {
     formula::ExpressionReferenceBuildRequest referenceRequest;
     referenceRequest.canonicalProgram = &canonical;
     referenceRequest.runtimeProgram = &runtime;
@@ -10754,6 +10759,11 @@ static bool renderExpressionCentered4(const formula::ExpressionProgram& canonica
     mpfr_clears(scale, temporary, dxHalf, dyHalf, coordinate, (mpfr_ptr)0);
 
     output.assign(static_cast<size_t>(width) * height, formula::ExpressionDeepInteriorPixel);
+    if (checkpoints) {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        checkpoints->assign(output.size(), {{nan, nan}, {nan, nan}});
+    }
+    if (errorEstimates) errorEstimates->assign(output.size(), 0.0);
     std::atomic<size_t> failures{0};
     const Clock::time_point start = Clock::now();
 #pragma omp parallel for schedule(dynamic, 1)
@@ -10765,6 +10775,7 @@ static bool renderExpressionCentered4(const formula::ExpressionProgram& canonica
             const int lanes = std::min(4, width - xBase);
             std::array<formula::ExpressionDeltaContext, 4> deltas{};
             std::array<formula::Complex, 4> stateDelta{};
+            std::array<double, 4> stateError{};
             std::array<bool, 4> active{};
             std::array<int, 4> pixelIndices{};
             for (int lane = 0; lane < lanes; ++lane) {
@@ -10772,6 +10783,7 @@ static bool renderExpressionCentered4(const formula::ExpressionProgram& canonica
                 pixelIndices[lane] = y * width + x;
                 deltas[lane].c = {xOffsets[static_cast<size_t>(x)] - xOffsets[static_cast<size_t>(referenceX)], yOffsets[static_cast<size_t>(y)] - yOffsets[static_cast<size_t>(referenceY)]};
                 active[lane] = true;
+                stateError[lane] = 1e-15;
             }
             int activeCount = lanes;
             for (int iteration = 0; iteration < maxIterations && activeCount > 0; ++iteration) {
@@ -10799,12 +10811,31 @@ static bool renderExpressionCentered4(const formula::ExpressionProgram& canonica
                         --activeCount;
                         continue;
                     }
+                    const formula::Complex currentActual = referenceZ[static_cast<size_t>(iteration)] + stateDelta[lane];
                     stateDelta[lane] = evaluated[lane].delta;
                     const formula::Complex actual = nextReference + stateDelta[lane];
+                    if (errorEstimates) {
+                        formula::ExpressionContext actualContext = fixed;
+                        actualContext.z = currentActual;
+                        actualContext.c = referenceC + deltas[lane].c;
+                        actualContext.iteration = iteration;
+                        formula::ExpressionDerivativeSeed seed;
+                        seed.z = {1.0, 0.0};
+                        formula::Complex value;
+                        formula::Complex derivative;
+                        if (runtime.evaluateWithDerivative(actualContext, seed, value, derivative) && std::isfinite(derivative.real()) && std::isfinite(derivative.imag())) {
+                            stateError[lane] = std::abs(derivative) * stateError[lane] + 64.0 * std::numeric_limits<double>::epsilon() * std::max(1.0, std::abs(actual));
+                        } else {
+                            stateError[lane] = std::numeric_limits<double>::infinity();
+                        }
+                        (*errorEstimates)[static_cast<size_t>(pixelIndices[lane])] = stateError[lane];
+                    }
                     if (!std::isfinite(actual.real()) || !std::isfinite(actual.imag()) || std::hypot(actual.real(), actual.imag()) > bailout) {
                         output[static_cast<size_t>(pixelIndices[lane])] = static_cast<float>(iteration + 1);
                         active[lane] = false;
                         --activeCount;
+                    } else if (checkpoints && iteration + 1 == checkpointIteration) {
+                        (*checkpoints)[static_cast<size_t>(pixelIndices[lane])] = {nextReference, stateDelta[lane]};
                     }
                 }
             }
@@ -10813,6 +10844,77 @@ static bool renderExpressionCentered4(const formula::ExpressionProgram& canonica
     seconds = since(start);
     failedPixels = failures.load(std::memory_order_relaxed);
     return true;
+}
+
+static bool continueExpressionFromCheckpointsMpfr(const formula::ExpressionProgram& runtime, const formula::ExpressionContext& fixed, const char* centerReal, const char* centerImaginary, const char* scaleText, int width, int height, int checkpointIteration, int maxIterations, double bailout, mpfr_prec_t precision, const std::vector<CenteredCheckpoint>& checkpoints, const std::vector<float>& candidate, std::vector<float>& output, double& seconds, size_t& continuedPixels) {
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    if (checkpoints.size() != pixelCount || candidate.size() != pixelCount) return false;
+    output = candidate;
+    std::atomic<size_t> continued{0};
+    std::atomic_bool failed{false};
+    const Clock::time_point start = Clock::now();
+#pragma omp parallel
+    {
+        mpfr_t centerRe, centerIm, scale, temporary, dxHalf, dyHalf, coordinate;
+        mpfr_inits2(precision, centerRe, centerIm, scale, temporary, dxHalf, dyHalf, coordinate, (mpfr_ptr)0);
+        bool ready = mpfr_set_str(centerRe, centerReal, 10, MPFR_RNDN) == 0 && mpfr_set_str(centerIm, centerImaginary, 10, MPFR_RNDN) == 0 && mpfr_set_str(scale, scaleText, 10, MPFR_RNDN) == 0 && mpfr_sgn(scale) > 0;
+        if (ready) {
+            mpfr_mul_ui(temporary, scale, static_cast<unsigned long>(width - 1), MPFR_RNDN);
+            mpfr_ui_div(dxHalf, 2, temporary, MPFR_RNDN);
+            mpfr_mul_ui(temporary, scale, static_cast<unsigned long>(width), MPFR_RNDN);
+            mpfr_mul_ui(temporary, temporary, static_cast<unsigned long>(height - 1), MPFR_RNDN);
+            mpfr_ui_div(dyHalf, static_cast<unsigned long>(height), temporary, MPFR_RNDN);
+            mpfr_mul_ui(dyHalf, dyHalf, 2, MPFR_RNDN);
+        }
+        formula::ExpressionOracleContext context(precision);
+        context.z0.set(fixed.z0.real(), fixed.z0.imag());
+        context.c.set(fixed.c.real(), fixed.c.imag());
+        for (size_t parameter = 0; parameter < fixed.parameters.size(); ++parameter) context.parameters[parameter].set(fixed.parameters[parameter].real(), fixed.parameters[parameter].imag());
+        formula::MpfrComplex next(precision);
+        mpfr_t magnitude;
+        mpfr_init2(magnitude, precision);
+#pragma omp for schedule(dynamic, 8)
+        for (long long rawIndex = 0; rawIndex < static_cast<long long>(pixelCount); ++rawIndex) {
+            if (!ready || failed.load(std::memory_order_relaxed)) continue;
+            const size_t index = static_cast<size_t>(rawIndex);
+            if (!(candidate[index] < 0.0f || candidate[index] > static_cast<float>(checkpointIteration))) continue;
+            const CenteredCheckpoint& checkpoint = checkpoints[index];
+            if (!std::isfinite(checkpoint.reference.real()) || !std::isfinite(checkpoint.reference.imag()) || !std::isfinite(checkpoint.residual.real()) || !std::isfinite(checkpoint.residual.imag())) continue;
+            const int x = static_cast<int>(index % static_cast<size_t>(width));
+            const int y = static_cast<int>(index / static_cast<size_t>(width));
+            const long centeredX = static_cast<long>(2LL * x - (width - 1LL));
+            const long centeredY = static_cast<long>(2LL * y - (height - 1LL));
+            mpfr_mul_si(context.c.re, dxHalf, centeredX, MPFR_RNDN);
+            mpfr_add(context.c.re, context.c.re, centerRe, MPFR_RNDN);
+            mpfr_mul_si(context.c.im, dyHalf, centeredY, MPFR_RNDN);
+            mpfr_add(context.c.im, context.c.im, centerIm, MPFR_RNDN);
+            mpfr_set_d(context.z.re, checkpoint.reference.real(), MPFR_RNDN);
+            mpfr_add_d(context.z.re, context.z.re, checkpoint.residual.real(), MPFR_RNDN);
+            mpfr_set_d(context.z.im, checkpoint.reference.imag(), MPFR_RNDN);
+            mpfr_add_d(context.z.im, context.z.im, checkpoint.residual.imag(), MPFR_RNDN);
+            output[index] = formula::ExpressionDeepInteriorPixel;
+            for (int iteration = checkpointIteration; iteration < maxIterations; ++iteration) {
+                context.iteration = iteration;
+                std::string oracleError;
+                if (!formula::ExpressionOracle::evaluate(runtime, context, next, &oracleError)) {
+                    failed.store(true, std::memory_order_relaxed);
+                    break;
+                }
+                context.z.set(next);
+                mpfr_hypot(magnitude, context.z.re, context.z.im, MPFR_RNDN);
+                if (mpfr_cmp_d(magnitude, bailout) > 0) {
+                    output[index] = static_cast<float>(iteration + 1);
+                    break;
+                }
+            }
+            continued.fetch_add(1, std::memory_order_relaxed);
+        }
+        mpfr_clear(magnitude);
+        mpfr_clears(centerRe, centerIm, scale, temporary, dxHalf, dyHalf, coordinate, (mpfr_ptr)0);
+    }
+    seconds = since(start);
+    continuedPixels = continued.load(std::memory_order_relaxed);
+    return !failed.load(std::memory_order_relaxed);
 }
 
 static int runCustomSlowdownCase(int width, int height) {
@@ -10929,6 +11031,7 @@ static int runCustomSlowdownCase(int width, int height) {
     double genericSeconds = 0.0;
     okay = render("all-MPFR generic", genericRequest, genericResult, genericSeconds) && okay;
     size_t centeredReference = pixelCount;
+    std::vector<size_t> centeredReferences;
     if (getenv("MANDEL_CUSTOM_SLOW_CENTERED4")) {
         std::vector<std::pair<long long, size_t>> interiorCandidates;
         long long nearestDistance = std::numeric_limits<long long>::max();
@@ -10947,6 +11050,8 @@ static int runCustomSlowdownCase(int width, int height) {
             }
         }
         std::sort(interiorCandidates.begin(), interiorCandidates.end());
+        centeredReferences.reserve(interiorCandidates.size());
+        for (const auto& candidate : interiorCandidates) centeredReferences.push_back(candidate.second);
         printf("  interior candidates:");
         for (size_t candidate = 0; candidate < std::min<size_t>(interiorCandidates.size(), 12); ++candidate) printf(" (%zu,%zu)", interiorCandidates[candidate].second % static_cast<size_t>(width), interiorCandidates[candidate].second / static_cast<size_t>(width));
         printf("\n");
@@ -10994,11 +11099,17 @@ static int runCustomSlowdownCase(int width, int height) {
 
     if (getenv("MANDEL_CUSTOM_SLOW_CENTERED4")) {
         std::vector<float> centered;
+        std::vector<CenteredCheckpoint> centeredCheckpoints;
+        std::vector<double> centeredErrors;
+        const int centeredCheckpointIteration = [] {
+            const char* value = getenv("MANDEL_CUSTOM_SLOW_CENTERED_CHECKPOINT");
+            return value ? std::clamp(atoi(value), 1, 2000000) : 900;
+        }();
         double centeredSeconds = 0.0;
         size_t failedPixels = 0;
         if (centeredReference == pixelCount) {
             printf("  centered VM4 SKIP: frame has no bounded reference candidate\n");
-        } else if (!renderExpressionCentered4(canonical, runtime, fixed, centerReal, centerImaginary, scaleText, width, height, static_cast<int>(centeredReference % static_cast<size_t>(width)), static_cast<int>(centeredReference / static_cast<size_t>(width)), maxIterations, bailout, centered, centeredSeconds, failedPixels)) {
+        } else if (!renderExpressionCentered4(canonical, runtime, fixed, centerReal, centerImaginary, scaleText, width, height, static_cast<int>(centeredReference % static_cast<size_t>(width)), static_cast<int>(centeredReference / static_cast<size_t>(width)), maxIterations, bailout, centeredCheckpointIteration, &centeredCheckpoints, &centeredErrors, centered, centeredSeconds, failedPixels)) {
             printf("  centered VM4 render failed\n");
             okay = false;
         } else {
@@ -11065,6 +11176,122 @@ static int runCustomSlowdownCase(int width, int height) {
                     selectiveP99Difference = selectiveDifferences[percentile];
                 }
                 printf("    threshold=%d fallback=%zu/%zu MPFR-iterations=%llu/%llu (%.1f%%) quality=%zu/%.0f/%.3f/%.0f\n", threshold, fallbackCount, pixelCount, (unsigned long long)fallbackIterations, (unsigned long long)genericResult.totalIterations, genericResult.totalIterations ? 100.0 * fallbackIterations / genericResult.totalIterations : 0.0, selectiveClassMismatch, selectiveMaxDifference, selectiveMeanDifference, selectiveP99Difference);
+            }
+            for (double errorThreshold : {1e-12, 1e-9, 1e-6, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 1e2, 1e4, 1e8, 1e12, 1e16, 1e32, 1e100}) {
+                size_t fallbackCount = 0;
+                uint64_t fallbackIterations = 0;
+                size_t errorClassMismatch = 0;
+                double errorMaxDifference = 0.0;
+                double errorSumDifference = 0.0;
+                std::vector<double> errorDifferences;
+                for (size_t index = 0; index < pixelCount; ++index) {
+                    if (!std::isfinite(centeredErrors[index]) || centeredErrors[index] > errorThreshold) {
+                        ++fallbackCount;
+                        fallbackIterations += static_cast<uint64_t>(generic[index] < 0.0f ? maxIterations : static_cast<int>(generic[index]));
+                        continue;
+                    }
+                    const bool candidateInterior = centered[index] < 0.0f;
+                    const bool oracleInterior = generic[index] < 0.0f;
+                    if (candidateInterior != oracleInterior) {
+                        ++errorClassMismatch;
+                    } else if (!candidateInterior) {
+                        const double difference = std::fabs(static_cast<double>(centered[index]) - generic[index]);
+                        errorMaxDifference = std::max(errorMaxDifference, difference);
+                        errorSumDifference += difference;
+                        errorDifferences.push_back(difference);
+                    }
+                }
+                const double errorMeanDifference = errorDifferences.empty() ? 0.0 : errorSumDifference / errorDifferences.size();
+                double errorP99Difference = 0.0;
+                if (!errorDifferences.empty()) {
+                    const size_t percentile = static_cast<size_t>(std::ceil(0.99 * errorDifferences.size())) - 1;
+                    std::nth_element(errorDifferences.begin(), errorDifferences.begin() + percentile, errorDifferences.end());
+                    errorP99Difference = errorDifferences[percentile];
+                }
+                printf("    error<=%.0e fallback=%zu/%zu MPFR-iterations=%llu/%llu quality=%zu/%.0f/%.3f/%.0f\n", errorThreshold, fallbackCount, pixelCount, (unsigned long long)fallbackIterations, (unsigned long long)genericResult.totalIterations, errorClassMismatch, errorMaxDifference, errorMeanDifference, errorP99Difference);
+            }
+            if (centeredReferences.size() > 1) {
+                std::vector<std::vector<float>> comparisonOutputs;
+                double comparisonSeconds = centeredSeconds;
+                const std::array<size_t, 4> candidatePositions = {1, centeredReferences.size() / 3, 2 * centeredReferences.size() / 3, centeredReferences.size() - 1};
+                std::set<size_t> uniquePositions(candidatePositions.begin(), candidatePositions.end());
+                uniquePositions.erase(0);
+                for (size_t position : uniquePositions) {
+                    if (position >= centeredReferences.size()) continue;
+                    const size_t referenceIndex = centeredReferences[position];
+                    std::vector<float> comparison;
+                    double localSeconds = 0.0;
+                    size_t localFailedPixels = 0;
+                    if (renderExpressionCentered4(canonical, runtime, fixed, centerReal, centerImaginary, scaleText, width, height, static_cast<int>(referenceIndex % static_cast<size_t>(width)), static_cast<int>(referenceIndex / static_cast<size_t>(width)), maxIterations, bailout, centeredCheckpointIteration, nullptr, nullptr, comparison, localSeconds, localFailedPixels)) {
+                        comparisonSeconds += localSeconds;
+                        comparisonOutputs.push_back(std::move(comparison));
+                    }
+                }
+                if (!comparisonOutputs.empty()) {
+                    size_t agreementClassMismatch = 0;
+                    double agreementMaxDifference = 0.0;
+                    double agreementSumDifference = 0.0;
+                    std::vector<double> agreementDifferences;
+                    size_t disagreementPixels = 0;
+                    uint64_t disagreementIterations = 0;
+                    for (size_t index = 0; index < pixelCount; ++index) {
+                        const bool agrees = std::all_of(comparisonOutputs.begin(), comparisonOutputs.end(), [&](const std::vector<float>& comparison) { return comparison[index] == centered[index]; });
+                        if (!agrees) {
+                            ++disagreementPixels;
+                            disagreementIterations += static_cast<uint64_t>(generic[index] < 0.0f ? maxIterations : static_cast<int>(generic[index]));
+                            continue;
+                        }
+                        const bool candidateInterior = centered[index] < 0.0f;
+                        const bool oracleInterior = generic[index] < 0.0f;
+                        if (candidateInterior != oracleInterior) {
+                            ++agreementClassMismatch;
+                        } else if (!candidateInterior) {
+                            const double difference = std::fabs(static_cast<double>(centered[index]) - generic[index]);
+                            agreementMaxDifference = std::max(agreementMaxDifference, difference);
+                            agreementSumDifference += difference;
+                            agreementDifferences.push_back(difference);
+                        }
+                    }
+                    const double agreementMeanDifference = agreementDifferences.empty() ? 0.0 : agreementSumDifference / agreementDifferences.size();
+                    double agreementP99Difference = 0.0;
+                    if (!agreementDifferences.empty()) {
+                        const size_t percentile = static_cast<size_t>(std::ceil(0.99 * agreementDifferences.size())) - 1;
+                        std::nth_element(agreementDifferences.begin(), agreementDifferences.begin() + percentile, agreementDifferences.end());
+                        agreementP99Difference = agreementDifferences[percentile];
+                    }
+                    printf("    multi-reference agreement refs=%zu fallback=%zu/%zu MPFR-iterations=%llu/%llu quality=%zu/%.0f/%.3f/%.0f time=%.3f s\n", comparisonOutputs.size() + 1, disagreementPixels, pixelCount, (unsigned long long)disagreementIterations, (unsigned long long)genericResult.totalIterations, agreementClassMismatch, agreementMaxDifference, agreementMeanDifference, agreementP99Difference, comparisonSeconds);
+                }
+            }
+            std::vector<float> continued;
+            double continuationSeconds = 0.0;
+            size_t continuedPixels = 0;
+            if (continueExpressionFromCheckpointsMpfr(runtime, fixed, centerReal, centerImaginary, scaleText, width, height, centeredCheckpointIteration, maxIterations, bailout, genericResult.fallbackPrecision, centeredCheckpoints, centered, continued, continuationSeconds, continuedPixels)) {
+                size_t continuationClassMismatch = 0;
+                double continuationMaxDifference = 0.0;
+                double continuationSumDifference = 0.0;
+                std::vector<double> continuationDifferences;
+                for (size_t index = 0; index < pixelCount; ++index) {
+                    const bool candidateInterior = continued[index] < 0.0f;
+                    const bool oracleInterior = generic[index] < 0.0f;
+                    if (candidateInterior != oracleInterior) {
+                        ++continuationClassMismatch;
+                    } else if (!candidateInterior) {
+                        const double difference = std::fabs(static_cast<double>(continued[index]) - generic[index]);
+                        continuationMaxDifference = std::max(continuationMaxDifference, difference);
+                        continuationSumDifference += difference;
+                        continuationDifferences.push_back(difference);
+                    }
+                }
+                const double continuationMeanDifference = continuationDifferences.empty() ? 0.0 : continuationSumDifference / continuationDifferences.size();
+                double continuationP99Difference = 0.0;
+                if (!continuationDifferences.empty()) {
+                    const size_t percentile = static_cast<size_t>(std::ceil(0.99 * continuationDifferences.size())) - 1;
+                    std::nth_element(continuationDifferences.begin(), continuationDifferences.begin() + percentile, continuationDifferences.end());
+                    continuationP99Difference = continuationDifferences[percentile];
+                }
+                printf("    checkpoint continuation class=%zu max/mean/p99=%.0f/%.3f/%.0f pixels=%zu time=%.3f s\n", continuationClassMismatch, continuationMaxDifference, continuationMeanDifference, continuationP99Difference, continuedPixels, continuationSeconds);
+            } else {
+                printf("    checkpoint continuation failed\n");
             }
         }
     }
