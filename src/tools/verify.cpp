@@ -10796,6 +10796,7 @@ static bool renderExpressionCentered4(const formula::ExpressionProgram& canonica
                 if (!formula::ExpressionCenteredEvaluator::evaluate4WithNodeBases(runtime, referenceContext, nodeBases, deltas.data(), evaluated)) {
                     for (int lane = 0; lane < lanes; ++lane)
                         if (active[lane]) {
+                            if (errorEstimates) (*errorEstimates)[static_cast<size_t>(pixelIndices[lane])] = std::numeric_limits<double>::infinity();
                             active[lane] = false;
                             ++failures;
                             --activeCount;
@@ -10806,14 +10807,16 @@ static bool renderExpressionCentered4(const formula::ExpressionProgram& canonica
                 for (int lane = 0; lane < lanes; ++lane) {
                     if (!active[lane]) continue;
                     if (!evaluated[lane].success()) {
+                        if (errorEstimates) (*errorEstimates)[static_cast<size_t>(pixelIndices[lane])] = std::numeric_limits<double>::infinity();
                         active[lane] = false;
                         ++failures;
                         --activeCount;
                         continue;
                     }
                     const formula::Complex currentActual = referenceZ[static_cast<size_t>(iteration)] + stateDelta[lane];
-                    stateDelta[lane] = evaluated[lane].delta;
-                    const formula::Complex actual = nextReference + stateDelta[lane];
+                    const formula::Complex outputDelta = evaluated[lane].delta;
+                    const formula::Complex actual = nextReference + outputDelta;
+                    stateDelta[lane] = iteration + 1 < maxIterations ? outputDelta + (nextReference - referenceZ[static_cast<size_t>(iteration + 1)]) : outputDelta;
                     if (errorEstimates) {
                         formula::ExpressionContext actualContext = fixed;
                         actualContext.z = currentActual;
@@ -10914,6 +10917,76 @@ static bool continueExpressionFromCheckpointsMpfr(const formula::ExpressionProgr
     }
     seconds = since(start);
     continuedPixels = continued.load(std::memory_order_relaxed);
+    return !failed.load(std::memory_order_relaxed);
+}
+
+static bool renderExpressionSelectedMpfr(const formula::ExpressionProgram& runtime, const formula::ExpressionContext& fixed, const char* centerReal, const char* centerImaginary, const char* scaleText, int width, int height, int maxIterations, double bailout, mpfr_prec_t precision, const std::vector<double>& errorEstimates, double errorThreshold, const std::vector<float>& candidate, std::vector<float>& output, double& seconds, size_t& fallbackPixels, uint64_t& fallbackIterations) {
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    if (errorEstimates.size() != pixelCount || candidate.size() != pixelCount) return false;
+    output = candidate;
+    std::atomic<size_t> selectedPixels{0};
+    std::atomic<uint64_t> selectedIterations{0};
+    std::atomic_bool failed{false};
+    const Clock::time_point start = Clock::now();
+#pragma omp parallel
+    {
+        mpfr_t centerRe, centerIm, scale, temporary, dxHalf, dyHalf, coordinate;
+        mpfr_inits2(precision, centerRe, centerIm, scale, temporary, dxHalf, dyHalf, coordinate, (mpfr_ptr)0);
+        bool ready = mpfr_set_str(centerRe, centerReal, 10, MPFR_RNDN) == 0 && mpfr_set_str(centerIm, centerImaginary, 10, MPFR_RNDN) == 0 && mpfr_set_str(scale, scaleText, 10, MPFR_RNDN) == 0 && mpfr_sgn(scale) > 0;
+        if (ready) {
+            mpfr_mul_ui(temporary, scale, static_cast<unsigned long>(width - 1), MPFR_RNDN);
+            mpfr_ui_div(dxHalf, 2, temporary, MPFR_RNDN);
+            mpfr_mul_ui(temporary, scale, static_cast<unsigned long>(width), MPFR_RNDN);
+            mpfr_mul_ui(temporary, temporary, static_cast<unsigned long>(height - 1), MPFR_RNDN);
+            mpfr_ui_div(dyHalf, static_cast<unsigned long>(height), temporary, MPFR_RNDN);
+            mpfr_mul_ui(dyHalf, dyHalf, 2, MPFR_RNDN);
+        }
+        formula::ExpressionOracleContext context(precision);
+        context.z0.set(fixed.z0.real(), fixed.z0.imag());
+        for (size_t parameter = 0; parameter < fixed.parameters.size(); ++parameter) context.parameters[parameter].set(fixed.parameters[parameter].real(), fixed.parameters[parameter].imag());
+        formula::MpfrComplex next(precision);
+        mpfr_t magnitude;
+        mpfr_init2(magnitude, precision);
+#pragma omp for schedule(dynamic, 8)
+        for (long long rawIndex = 0; rawIndex < static_cast<long long>(pixelCount); ++rawIndex) {
+            if (!ready || failed.load(std::memory_order_relaxed)) continue;
+            const size_t index = static_cast<size_t>(rawIndex);
+            if (std::isfinite(errorEstimates[index]) && errorEstimates[index] <= errorThreshold) continue;
+            const int x = static_cast<int>(index % static_cast<size_t>(width));
+            const int y = static_cast<int>(index / static_cast<size_t>(width));
+            const long centeredX = static_cast<long>(2LL * x - (width - 1LL));
+            const long centeredY = static_cast<long>(2LL * y - (height - 1LL));
+            mpfr_mul_si(context.c.re, dxHalf, centeredX, MPFR_RNDN);
+            mpfr_add(context.c.re, context.c.re, centerRe, MPFR_RNDN);
+            mpfr_mul_si(context.c.im, dyHalf, centeredY, MPFR_RNDN);
+            mpfr_add(context.c.im, context.c.im, centerIm, MPFR_RNDN);
+            context.z.set(context.z0);
+            output[index] = formula::ExpressionDeepInteriorPixel;
+            uint64_t iterations = 0;
+            for (int iteration = 0; iteration < maxIterations; ++iteration) {
+                context.iteration = iteration;
+                std::string oracleError;
+                if (!formula::ExpressionOracle::evaluate(runtime, context, next, &oracleError)) {
+                    failed.store(true, std::memory_order_relaxed);
+                    break;
+                }
+                ++iterations;
+                context.z.set(next);
+                mpfr_hypot(magnitude, context.z.re, context.z.im, MPFR_RNDN);
+                if (mpfr_cmp_d(magnitude, bailout) > 0) {
+                    output[index] = static_cast<float>(iteration + 1);
+                    break;
+                }
+            }
+            selectedIterations.fetch_add(iterations, std::memory_order_relaxed);
+            selectedPixels.fetch_add(1, std::memory_order_relaxed);
+        }
+        mpfr_clear(magnitude);
+        mpfr_clears(centerRe, centerIm, scale, temporary, dxHalf, dyHalf, coordinate, (mpfr_ptr)0);
+    }
+    seconds = since(start);
+    fallbackPixels = selectedPixels.load(std::memory_order_relaxed);
+    fallbackIterations = selectedIterations.load(std::memory_order_relaxed);
     return !failed.load(std::memory_order_relaxed);
 }
 
@@ -11141,6 +11214,16 @@ static int runCustomSlowdownCase(int width, int height) {
                 p99Difference = differences[percentileIndex];
             }
             printf("  centered VM4 GT class=%zu max/mean/p99=%.3f/%.3f/%.3f failed=%zu time=%.3f s\n", classMismatch, maxDifference, meanDifference, p99Difference, failedPixels, centeredSeconds);
+            size_t finiteRadiusCount = 0;
+            double minimumRadius = std::numeric_limits<double>::infinity();
+            double maximumRadius = 0.0;
+            for (double radius : centeredErrors) {
+                if (!std::isfinite(radius)) continue;
+                ++finiteRadiusCount;
+                minimumRadius = std::min(minimumRadius, radius);
+                maximumRadius = std::max(maximumRadius, radius);
+            }
+            printf("    outward radius finite=%zu/%zu min/max=%.3g/%.3g\n", finiteRadiusCount, pixelCount, minimumRadius, maximumRadius);
             for (int threshold : {512, 768, 900, 1024}) {
                 uint64_t fallbackIterations = 0;
                 size_t fallbackCount = 0;
@@ -11177,7 +11260,7 @@ static int runCustomSlowdownCase(int width, int height) {
                 }
                 printf("    threshold=%d fallback=%zu/%zu MPFR-iterations=%llu/%llu (%.1f%%) quality=%zu/%.0f/%.3f/%.0f\n", threshold, fallbackCount, pixelCount, (unsigned long long)fallbackIterations, (unsigned long long)genericResult.totalIterations, genericResult.totalIterations ? 100.0 * fallbackIterations / genericResult.totalIterations : 0.0, selectiveClassMismatch, selectiveMaxDifference, selectiveMeanDifference, selectiveP99Difference);
             }
-            for (double errorThreshold : {1e-12, 1e-9, 1e-6, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 1e2, 1e4, 1e8, 1e12, 1e16, 1e32, 1e100}) {
+            for (double errorThreshold : {1e-12, 1e-9, 1e-6, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 1e2, 1e4, 1e5, 1e6, 1e7, 1e8, 1e12, 1e16, 1e32, 1e100}) {
                 size_t fallbackCount = 0;
                 uint64_t fallbackIterations = 0;
                 size_t errorClassMismatch = 0;
@@ -11209,6 +11292,23 @@ static int runCustomSlowdownCase(int width, int height) {
                     errorP99Difference = errorDifferences[percentile];
                 }
                 printf("    error<=%.0e fallback=%zu/%zu MPFR-iterations=%llu/%llu quality=%zu/%.0f/%.3f/%.0f\n", errorThreshold, fallbackCount, pixelCount, (unsigned long long)fallbackIterations, (unsigned long long)genericResult.totalIterations, errorClassMismatch, errorMaxDifference, errorMeanDifference, errorP99Difference);
+            }
+            std::vector<float> selective;
+            double selectiveSeconds = 0.0;
+            size_t selectiveFallbackPixels = 0;
+            uint64_t selectiveFallbackIterations = 0;
+            const double selectiveThreshold = [] {
+                const char* value = getenv("MANDEL_CUSTOM_SLOW_CENTERED_ERROR");
+                return value ? std::max(0.0, std::strtod(value, nullptr)) : 1e8;
+            }();
+            if (renderExpressionSelectedMpfr(runtime, fixed, centerReal, centerImaginary, scaleText, width, height, maxIterations, bailout, genericResult.fallbackPrecision, centeredErrors, selectiveThreshold, centered, selective, selectiveSeconds, selectiveFallbackPixels, selectiveFallbackIterations)) {
+                size_t selectiveMismatch = 0;
+                for (size_t index = 0; index < pixelCount; ++index)
+                    if (selective[index] != generic[index]) ++selectiveMismatch;
+                if (selectiveMismatch != 0) okay = false;
+                printf("    selective MPFR exact=%d mismatch=%zu fallback=%zu iterations=%llu VM4/MPFR/total=%.3f/%.3f/%.3f s speedup=%.2fx\n", selectiveMismatch == 0 ? 1 : 0, selectiveMismatch, selectiveFallbackPixels, (unsigned long long)selectiveFallbackIterations, centeredSeconds, selectiveSeconds, centeredSeconds + selectiveSeconds, centeredSeconds + selectiveSeconds > 0.0 ? genericSeconds / (centeredSeconds + selectiveSeconds) : 0.0);
+            } else {
+                printf("    selective MPFR failed\n");
             }
             if (centeredReferences.size() > 1) {
                 std::vector<std::vector<float>> comparisonOutputs;
