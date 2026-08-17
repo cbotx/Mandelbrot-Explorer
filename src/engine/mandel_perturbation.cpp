@@ -26,12 +26,13 @@
 // BLA profiling: per-thread padded counters (no false sharing / contention).
 // [tid][0]=iterations skipped, [1]=BLA applies, [2]=normal steps.
 static long long g_bla_stat[64][8];
-static int g_bla_noescape = -1;          // env MANDEL_BLA_NOESCAPE: force-skip the escape check (timing only)
-static long long g_fe_stat[64][3];       // [tid] 0=BLA skip-iters 1=BLA applies 2=normal steps (MANDEL_PROFILE)
-static long long g_blafe_safe[64] = {0}; // [tid] tryBLAfe overflow-safe floatexp fallbacks
-static int g_int_rep = -2;               // env MANDEL_INT_REP: exact state-repetition interior detection (default on; -2=unread)
-static int g_bigfixed = -2;              // env MANDEL_BIGFIXED: -2 unparsed, -1 auto (on for floatexp), 0 off, >=1 force on
-static int g_fused_perturb = -1;         // env MANDEL_FUSED_PERTURB: fused rescaled step (default on, 0 restores expanded form)
+static int g_bla_noescape = -1;                            // env MANDEL_BLA_NOESCAPE: force-skip the escape check (timing only)
+static long long g_fe_stat[64][3];                         // [tid] 0=BLA skip-iters 1=BLA applies 2=normal steps (MANDEL_PROFILE)
+static long long g_blafe_safe[64] = {0};                   // [tid] tryBLAfe overflow-safe floatexp fallbacks
+static std::atomic<long long> g_blafe_underflow_reject{0}; // non-periodic nonzero landings whose |w'|^2 underflows
+static int g_int_rep = -2;                                 // env MANDEL_INT_REP: exact state-repetition interior detection (default on; -2=unread)
+static int g_bigfixed = -2;                                // env MANDEL_BIGFIXED: -2 unparsed, -1 auto (on for floatexp), 0 off, >=1 force on
+static int g_fused_perturb = -1;                           // env MANDEL_FUSED_PERTURB: fused rescaled step (default on, 0 restores expanded form)
 
 // Monotonic seconds, for the MANDEL_PROFILE phase timers.
 static inline double nowSec() {
@@ -1372,7 +1373,7 @@ int Mandel::buildReferenceOrbit(std::set<std::array<int, 4>>& s, mpf_t scale, in
                     break;
                 }
             }
-            if (profile && _ref_deep_zero) fprintf(stderr, "  [profile] full reference crosses a deep zero: disabling BLA\n");
+            if (profile && _ref_deep_zero) fprintf(stderr, "  [profile] full reference crosses a deep zero: rejecting unrepresentable BLA landings\n");
         }
     }
     return ref_it;
@@ -1569,6 +1570,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         }
         _deepGmpFallbackPixels.store(0, std::memory_order_relaxed);
         memset(g_blafe_safe, 0, sizeof(g_blafe_safe));
+        g_blafe_underflow_reject.store(0, std::memory_order_relaxed);
         _fe_cutoff_sensitive = false;
         if (g_int_rep == -2) {
             const char* e = getenv("MANDEL_INT_REP");
@@ -1616,9 +1618,9 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
         // Sub-pixel nucleus: the BLA skip damps the near-nucleus atom-domain divergence
         // and paints a false-interior body (the true frame is all-exterior save the
         // single nucleus pixel). Disabling BLA lets those pixels iterate to their real
-        // escape. A full escaping reference whose FloatExp orbit crosses below double
-        // also cannot use the double-shadow BLA safely; its rescaled AVX2 path is exact.
-        if (_ref_subpixel || _ref_deep_zero) _use_bla = false;
+        // escape. Non-periodic deep-zero references can retain BLA: tryBLAfe rejects
+        // only the rare landing whose nonzero unit residual cannot be re-scaled.
+        if (_ref_subpixel) _use_bla = false;
         if (_use_bla) {
             tk = now();
             buildBLA(ref_it, (c_method & (ColoringMethod::EXTERIOR_DIST_EST | ColoringMethod::NORMAL_MAP | ColoringMethod::DE_OVERLAY)) != 0);
@@ -1772,6 +1774,7 @@ void Mandel::Compute(mpf_t c_re, mpf_t c_im, mpf_t scale, int mxit, int c_method
                 long long safe = 0;
                 for (int t = 0; t < 64; ++t) safe += g_blafe_safe[t];
                 fprintf(stderr, "  [profile] FE-BLA overflow-safe fallbacks=%lld\n", safe);
+                fprintf(stderr, "  [profile] FE-BLA underflow landing rejects=%lld\n", g_blafe_underflow_reject.load(std::memory_order_relaxed));
             }
         }
         if (profile) memset(g_bla_stat, 0, sizeof(g_bla_stat)); // profile adaptive-SS work separately below
@@ -2916,8 +2919,8 @@ int Mandel::tryBLAfe(int s, FloatExp& S, FloatExp S2, double& wr, double& wi, do
                 if (_ref_period > 0)
                     blaReRescaleUnderflow(S, wr, wi, nwr, nwi);
                 else {
-                    S = FloatExp{1.0, 0};
-                    wr = wi = 0.0;
+                    g_blafe_underflow_reject.fetch_add(1, std::memory_order_relaxed);
+                    return 0;
                 }
             } else {
                 double wmag = std::sqrt(wm2);
