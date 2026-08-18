@@ -18,6 +18,16 @@
 #include "formula_spec.h"
 #include "float_math.h"
 
+struct MandelExportSnapshot {
+    ComputeMode mode = ComputeMode::Mandelbrot;
+    formula::ExpressionProgram expressionSource;
+    formula::ExpressionProgram expressionRuntime;
+    formula::ExpressionContext expressionFixed;
+    FormulaParameter expressionPixel = FormulaParameter::C;
+    double expressionBailout = 4.0;
+    bool expressionSupportsDistance = false;
+};
+
 class MandelNavigator : public Navigator {
   private:
     FormulaContext _formula = quadraticMandelbrot();
@@ -102,6 +112,8 @@ class MandelNavigator : public Navigator {
 
     void SetMxit(int mxit);
     int GetMxit() const { return _mxit; }
+    int GetViewWidth() const { return _w; }
+    int GetViewHeight() const { return _h; }
     const ComputeBackendInfo& GetBackendInfo() const { return _backend->info(); }
     bool LastComputeUsedGpuPath() const { return _backend->lastComputeUsedGpuPath(); }
     bool LastComputeUsedCustomDeepPath() const { return _backend->lastComputeUsedCustomDeepPath(); }
@@ -119,6 +131,7 @@ class MandelNavigator : public Navigator {
     std::shared_ptr<const formula::ExpressionOrbitSnapshot> GetExpressionOrbitSnapshot() const { return IsExpression() ? _expressionOrbitSnapshot : nullptr; }
     bool ExpressionSupportsDistance() const { return IsExpression() && _expressionProgram.fastIntegerPower() >= 2 && _expressionBailout >= 1.0; }
     formula::CustomDeepZoomPlan GetCustomDeepZoomPlan() const;
+    MandelExportSnapshot GetExportSnapshot() const;
     std::string GetExpressionAccelerationText() const;
     void SetJuliaMode(bool enabled);
     bool SetExpressionFormula(const std::string& source, FormulaParameter pixel, std::complex<double> fixedZ0, std::complex<double> fixedC, const std::array<std::complex<double>, 8>& parameters, double bailout, formula::ExpressionError* error = nullptr);

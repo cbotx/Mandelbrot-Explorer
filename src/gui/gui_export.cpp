@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -39,16 +40,17 @@ struct ExportState {
     std::atomic<bool> cancel{false};
     std::atomic<bool> done{false};
     std::atomic<bool> ok{false};
-    std::atomic<Mandel*> cur{nullptr}; // current strip's engine, for cancel
-    std::mutex curMx;                  // guards cur while the UI calls SetHalt
+    // curMx keeps the backend alive while the UI forwards cancellation.
+    std::atomic<IComputeBackend*> cur{nullptr};
+    std::mutex curMx;
 };
 
 // Match the on-screen coordinate rectangle: identical if the export aspect
 // equals the view's (RENDER_W:RENDER_H), otherwise keep the centre and expand
 // the short side outward. scale_out = scale_view / max(1, aspect / (W0/H0)).
-static void exportScale(mpf_t scale_view, int W, int H, mpf_t scale_out) {
+static void exportScale(mpf_t scale_view, int viewW, int viewH, int W, int H, mpf_t scale_out) {
     double a = (double)W / (double)H;
-    double factor = a / ((double)RENDER_W / (double)RENDER_H);
+    double factor = a / ((double)viewW / (double)viewH);
     if (factor < 1.0) factor = 1.0;
     mpf_set_prec(scale_out, mpf_get_prec(scale_view));
     if (factor <= 1.0) {
@@ -61,25 +63,43 @@ static void exportScale(mpf_t scale_view, int W, int H, mpf_t scale_out) {
     mpf_clear(f);
 }
 
-static void exportRender(mpf_t cx, mpf_t cy, mpf_t scale_view, int W, int H, int ss, int mxit, int cmethod, std::vector<uint8_t>& out, ExportState* st) {
+static void exportRender(mpf_t cx, mpf_t cy, mpf_t scale_view, int viewW, int viewH, const MandelExportSnapshot& snapshot, mpf_t juliaCRe, mpf_t juliaCIm, int W, int H, int ss, int mxit, int cmethod, std::vector<uint8_t>& out, ExportState* st, long stripBudget = 200L * 1024 * 1024) {
     ensureSrgbLut();
     out.assign((size_t)W * H * 3, 0);
     unsigned long prec = mpf_get_prec(scale_view);
     mpf_t scale_e;
     mpf_init2(scale_e, prec);
-    exportScale(scale_view, W, H, scale_e);
+    exportScale(scale_view, viewW, viewH, W, H, scale_e);
 
     const int Wss = W * ss, Hss = H * ss;
     // strip height (output rows), bounded so the strip buffer stays ~<=200 MB.
-    long budget = 200L * 1024 * 1024;
-    int sh = (int)std::max<long>(1, budget / ((long)Wss * ss * 5));
+    int sh = (int)std::max<long>(1, stripBudget / ((long)Wss * ss * 5));
     sh = std::clamp(sh, 1, H);
     const int nstrips = (H + sh - 1) / sh;
 
+    formula::ExpressionOrbitPlan expressionPlan;
+    if (snapshot.mode == ComputeMode::Expression && !expressionPlan.build(snapshot.expressionRuntime)) {
+        mpf_clear(scale_e);
+        st->done = true;
+        return;
+    }
     std::vector<float> ibuf((size_t)Wss * sh * ss, EMPTYPIXEL);
-    Mandel mandel(Wss, sh * ss, mxit, 1, ibuf.data());
-    mandel.setPrecision(prec);
-    st->cur = &mandel;
+    std::vector<float> normbuf;
+    std::unique_ptr<IComputeBackend> backend = createComputeBackend("cpu");
+    if (!backend) {
+        mpf_clear(scale_e);
+        st->done = true;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(st->curMx);
+        if (st->cancel) {
+            mpf_clear(scale_e);
+            st->done = true;
+            return;
+        }
+        st->cur = backend.get();
+    }
 
     // Relief needs neighbouring output pixels for the slope; strips break vertical
     // neighbours, so accumulate a full-image height field and post-shade at the end.
@@ -90,10 +110,9 @@ static void exportRender(mpf_t cx, mpf_t cy, mpf_t scale_view, int W, int H, int
     // buffer (normal angle, or the pixel-normalized distance estimate).
     const bool normal = normal_light_on != 0;
     const bool deovl = de_overlay_on != 0;
-    std::vector<float> normbuf, nfield;
+    std::vector<float> nfield;
     if (normal || deovl) {
         normbuf.assign((size_t)Wss * sh * ss, 0.0f);
-        mandel.setNormalBuffer(normbuf.data());
         nfield.assign((size_t)W * H, std::numeric_limits<float>::quiet_NaN());
     }
 
@@ -101,10 +120,37 @@ static void exportRender(mpf_t cx, mpf_t cy, mpf_t scale_view, int W, int H, int
         int obase = s * sh;
         int oh = std::min(sh, H - obase);
         std::fill(ibuf.begin(), ibuf.end(), (float)EMPTYPIXEL);
+        Mandel mandel(Wss, oh * ss, mxit, 1, ibuf.data());
+        mandel.setPrecision(prec);
+        if (!normbuf.empty()) mandel.setNormalBuffer(normbuf.data());
         mandel.SetHalt(false);
         mandel.SetProgress(&st->progress, (float)s / nstrips, 0.95f / nstrips);
-        mandel.Compute(cx, cy, scale_e, mxit, cmethod, Hss, obase * ss);
+        ComputeRequest request;
+        request.mode = snapshot.mode;
+        request.cpuEngine = &mandel;
+        request.width = Wss;
+        request.height = oh * ss;
+        request.fullHeight = Hss;
+        request.rowBase = obase * ss;
+        request.centerRe = cx;
+        request.centerIm = cy;
+        request.scale = scale_e;
+        request.maxIterations = mxit;
+        request.coloringMethod = cmethod;
+        request.fixedCRe = juliaCRe;
+        request.fixedCIm = juliaCIm;
+        request.iterations = ibuf.data();
+        request.normal = normbuf.empty() ? nullptr : normbuf.data();
+        request.expressionSource = &snapshot.expressionSource;
+        request.expression = &snapshot.expressionRuntime;
+        request.expressionFixed = &snapshot.expressionFixed;
+        request.expressionPixel = snapshot.expressionPixel;
+        request.expressionBailout = snapshot.expressionBailout;
+        request.expressionPlan = expressionPlan.profitable() ? &expressionPlan : nullptr;
+        request.expressionColoring = expressionColoringFromMethod(cmethod, snapshot.expressionSupportsDistance);
+        bool computeOk = backend->compute(request);
         mandel.SetProgress(nullptr);
+        if (!computeOk) break;
         if (st->cancel) break;
 #pragma omp parallel for schedule(dynamic, 4)
         for (int oi = 0; oi < oh; ++oi) {
@@ -148,7 +194,7 @@ static void exportRender(mpf_t cx, mpf_t cy, mpf_t scale_view, int W, int H, int
         st->cur = nullptr;
     }
     mpf_clear(scale_e);
-    st->ok = !st->cancel;
+    st->ok = !st->cancel && st->progress >= 1.0f;
     st->done = true;
 }
 
@@ -198,6 +244,187 @@ bool writeExportPNG(const wchar_t* path, const std::vector<uint8_t>& rgb, int W,
     return ok;
 }
 
+static bool inspectExportPNG(const wchar_t* path, int expectedWidth, int expectedHeight) {
+    bool comInit = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+    bool ok = false;
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* converter = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) && SUCCEEDED(factory->CreateDecoderFromFilename(path, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder)) && SUCCEEDED(decoder->GetFrame(0, &frame))) {
+        UINT width = 0, height = 0;
+        if (SUCCEEDED(frame->GetSize(&width, &height)) && width == static_cast<UINT>(expectedWidth) && height == static_cast<UINT>(expectedHeight) && SUCCEEDED(factory->CreateFormatConverter(&converter)) && SUCCEEDED(converter->Initialize(frame, GUID_WICPixelFormat24bppRGB, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
+            std::vector<uint8_t> pixels((size_t)width * height * 3);
+            if (SUCCEEDED(converter->CopyPixels(nullptr, width * 3, static_cast<UINT>(pixels.size()), pixels.data())) && !pixels.empty()) {
+                auto range = std::minmax_element(pixels.begin(), pixels.end());
+                ok = *range.first != *range.second;
+            }
+        }
+    }
+    if (converter) converter->Release();
+    if (frame) frame->Release();
+    if (decoder) decoder->Release();
+    if (factory) factory->Release();
+    if (comInit) CoUninitialize();
+    return ok;
+}
+
+bool runExportSelfTest(const wchar_t* resultPath) {
+    constexpr int WIDTH = 64;
+    constexpr int HEIGHT = 37;
+    constexpr int SS = 2;
+    constexpr int MXIT = 160;
+    constexpr long STRIP_BUDGET = 64L * SS * 5 * 9;
+
+    mpf_t centerRe, centerIm, scale, juliaCRe, juliaCIm;
+    mpf_init2(centerRe, 256);
+    mpf_init2(centerIm, 256);
+    mpf_init2(scale, 256);
+    mpf_init2(juliaCRe, 256);
+    mpf_init2(juliaCIm, 256);
+    mpf_set_d(centerRe, -0.5);
+    mpf_set_ui(centerIm, 0);
+    mpf_set_ui(scale, 1);
+    mpf_set_d(juliaCRe, -0.8);
+    mpf_set_d(juliaCIm, 0.156);
+
+    MandelExportSnapshot mandelbrot;
+    MandelExportSnapshot julia;
+    julia.mode = ComputeMode::Julia;
+    MandelExportSnapshot genericExpression;
+    MandelExportSnapshot powerExpression;
+    genericExpression.mode = ComputeMode::Expression;
+    powerExpression.mode = ComputeMode::Expression;
+    formula::ExpressionError expressionError;
+    bool setup = genericExpression.expressionSource.compile("sin(z)+c+complex(1e-8,-2e-8)", &expressionError) && genericExpression.expressionSource.specialize(genericExpression.expressionFixed, FormulaParameter::C, genericExpression.expressionRuntime, &expressionError) && powerExpression.expressionSource.compile("z*z+c", &expressionError) && powerExpression.expressionSource.specialize(powerExpression.expressionFixed, FormulaParameter::C, powerExpression.expressionRuntime, &expressionError);
+    genericExpression.expressionPixel = FormulaParameter::C;
+    genericExpression.expressionBailout = 4.0;
+    genericExpression.expressionSupportsDistance = false;
+    powerExpression.expressionPixel = FormulaParameter::C;
+    powerExpression.expressionBailout = 4.0;
+    powerExpression.expressionSupportsDistance = powerExpression.expressionSource.fastIntegerPower() >= 2;
+
+    std::vector<float> savedPalette(3 * colP);
+    for (int channel = 0; channel < 3; ++channel)
+        std::copy(color_map[channel], color_map[channel] + colP, savedPalette.begin() + channel * colP);
+    for (int i = 0; i < colP; ++i) {
+        double phase = 6.283185307179586 * i / colP;
+        color_map[0][i] = static_cast<float>(127.5 + 127.5 * std::sin(phase));
+        color_map[1][i] = static_cast<float>(127.5 + 127.5 * std::sin(phase + 2.0943951023931953));
+        color_map[2][i] = static_cast<float>(127.5 + 127.5 * std::sin(phase + 4.1887902047863905));
+    }
+
+    struct SmokeCase {
+        const char* name;
+        const MandelExportSnapshot* snapshot;
+        int method;
+        int relief;
+        int normal;
+        int overlay;
+    };
+    const SmokeCase cases[] = {
+        {"mandelbrot-smooth", &mandelbrot, 0, 0, 0, 0},
+        {"mandelbrot-ede", &mandelbrot, ColoringMethod::EXTERIOR_DIST_EST, 0, 0, 0},
+        {"mandelbrot-feather", &mandelbrot, ColoringMethod::STRIPE_AVERAGE, 0, 0, 0},
+        {"mandelbrot-relief", &mandelbrot, 0, 1, 0, 0},
+        {"mandelbrot-normal", &mandelbrot, ColoringMethod::NORMAL_MAP, 0, 1, 0},
+        {"mandelbrot-trap", &mandelbrot, ColoringMethod::ORBIT_TRAP, 0, 0, 0},
+        {"mandelbrot-de-overlay", &mandelbrot, ColoringMethod::DE_OVERLAY, 0, 0, 1},
+        {"julia-smooth", &julia, 0, 0, 0, 0},
+        {"julia-ede", &julia, ColoringMethod::EXTERIOR_DIST_EST, 0, 0, 0},
+        {"expression-raw", &genericExpression, 0, 0, 0, 0},
+        {"expression-feather", &genericExpression, ColoringMethod::STRIPE_AVERAGE, 0, 0, 0},
+        {"expression-trap", &genericExpression, ColoringMethod::ORBIT_TRAP, 0, 0, 0},
+        {"expression-smooth", &powerExpression, 0, 0, 0, 0},
+        {"expression-ede", &powerExpression, ColoringMethod::EXTERIOR_DIST_EST, 0, 0, 0},
+    };
+
+    int oldRelief = relief_on;
+    int oldNormal = normal_light_on;
+    int oldOverlay = de_overlay_on;
+    int failures = setup ? 0 : 1;
+    std::string report;
+    std::vector<uint8_t> pngPixels;
+    for (const SmokeCase& test : cases) {
+        relief_on = test.relief;
+        normal_light_on = test.normal;
+        de_overlay_on = test.overlay;
+        ExportState state;
+        std::vector<uint8_t> pixels;
+        exportRender(centerRe, centerIm, scale, 701, 413, *test.snapshot, juliaCRe, juliaCIm, WIDTH, HEIGHT, SS, MXIT, test.method, pixels, &state, STRIP_BUDGET);
+        bool varied = false;
+        if (!pixels.empty()) {
+            auto range = std::minmax_element(pixels.begin(), pixels.end());
+            varied = *range.first != *range.second;
+        }
+        bool okay = setup && state.done && state.ok && state.progress == 1.0f && pixels.size() == (size_t)WIDTH * HEIGHT * 3 && varied;
+        report += std::string(test.name) + "=" + (okay ? "PASS\n" : "FAIL\n");
+        if (!okay) ++failures;
+        if (strcmp(test.name, "mandelbrot-smooth") == 0) pngPixels = std::move(pixels);
+    }
+
+    mpf_set_str(scale, "1e500", 10);
+    ExportState deepState;
+    std::vector<uint8_t> deepPixels;
+    exportRender(centerRe, centerIm, scale, 701, 413, genericExpression, juliaCRe, juliaCIm, 12, 7, 1, 24, 0, deepPixels, &deepState, 12L * 5 * 2);
+    bool deepOkay = deepState.done && deepState.ok && deepState.progress == 1.0f && deepPixels.size() == 12U * 7U * 3U;
+    report += std::string("expression-generic-deep=") + (deepOkay ? "PASS\n" : "FAIL\n");
+    if (!deepOkay) ++failures;
+    mpf_set_ui(scale, 1);
+
+    relief_on = oldRelief;
+    normal_light_on = oldNormal;
+    de_overlay_on = oldOverlay;
+
+    ExportState cancelled;
+    cancelled.cancel = true;
+    std::vector<uint8_t> cancelledPixels;
+    exportRender(centerRe, centerIm, scale, 701, 413, mandelbrot, juliaCRe, juliaCIm, WIDTH, HEIGHT, SS, MXIT, 0, cancelledPixels, &cancelled, STRIP_BUDGET);
+    bool cancelOkay = cancelled.done && !cancelled.ok;
+    report += std::string("cancel=") + (cancelOkay ? "PASS\n" : "FAIL\n");
+    if (!cancelOkay) ++failures;
+
+    ExportState activeCancel;
+    std::vector<uint8_t> activeCancelPixels;
+    auto cancelStart = std::chrono::steady_clock::now();
+    std::thread cancelThread([&]() { exportRender(centerRe, centerIm, scale, 701, 413, mandelbrot, juliaCRe, juliaCIm, 512, 257, 1, 100000, ColoringMethod::ORBIT_TRAP, activeCancelPixels, &activeCancel); });
+    auto cancelDeadline = cancelStart + std::chrono::seconds(2);
+    while (!activeCancel.cur.load(std::memory_order_acquire) && !activeCancel.done && std::chrono::steady_clock::now() < cancelDeadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    {
+        std::lock_guard<std::mutex> lock(activeCancel.curMx);
+        activeCancel.cancel = true;
+        IComputeBackend* active = activeCancel.cur.load(std::memory_order_acquire);
+        if (active) active->cancel();
+    }
+    cancelThread.join();
+    double cancelSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - cancelStart).count();
+    bool activeCancelOkay = activeCancel.done && !activeCancel.ok && cancelSeconds < 5.0;
+    report += std::string("cancel-active=") + (activeCancelOkay ? "PASS\n" : "FAIL\n");
+    if (!activeCancelOkay) ++failures;
+
+    std::wstring pngPath = resultPath;
+    pngPath += L".png";
+    DeleteFileW(pngPath.c_str());
+    bool pngOkay = !pngPixels.empty() && writeExportPNG(pngPath.c_str(), pngPixels, WIDTH, HEIGHT) && inspectExportPNG(pngPath.c_str(), WIDTH, HEIGHT);
+    report += std::string("png=") + (pngOkay ? "PASS\n" : "FAIL\n");
+    if (!pngOkay) ++failures;
+    DeleteFileW(pngPath.c_str());
+
+    for (int channel = 0; channel < 3; ++channel)
+        std::copy(savedPalette.begin() + channel * colP, savedPalette.begin() + (channel + 1) * colP, color_map[channel]);
+    FILE* result = nullptr;
+    _wfopen_s(&result, resultPath, L"wb");
+    if (result) {
+        fprintf(result, "%sresult=%s\n", report.c_str(), failures == 0 ? "PASS" : "FAIL");
+        fclose(result);
+    } else {
+        ++failures;
+    }
+    printf("=== export self-test\n%s  => %s\n", report.c_str(), failures == 0 ? "PASS" : "FAIL");
+    mpf_clears(centerRe, centerIm, scale, juliaCRe, juliaCIm, (mpf_ptr)0);
+    return failures == 0;
+}
+
 // ---- Export dialog (custom-drawn, matching the main panel's dark theme) ----
 struct ResPreset {
     const wchar_t* name;
@@ -217,7 +444,10 @@ struct ExportDlg {
     HWND hwnd = nullptr, owner = nullptr;
     MandelNavigator* nav = nullptr;
     int cmethod = 0, mxit = 0;
+    int viewW = RENDER_W, viewH = RENDER_H;
     mpf_t cx, cy, scale;
+    mpf_t juliaCRe, juliaCIm;
+    MandelExportSnapshot snapshot;
 
     HFONT fUi = nullptr, fBold = nullptr, fSmall = nullptr;
     int dpi = 96;
@@ -250,20 +480,22 @@ struct ExportDlg {
         mpf_init(cx);
         mpf_init(cy);
         mpf_init(scale);
+        mpf_init(juliaCRe);
+        mpf_init(juliaCIm);
     }
     ~ExportDlg() {
         {
             std::lock_guard<std::mutex> lk(pvState.curMx);
             pvState.cancel = true;
-            Mandel* mm = pvState.cur.load();
-            if (mm) mm->SetHalt(true);
+            IComputeBackend* mm = pvState.cur.load();
+            if (mm) mm->cancel();
         }
         if (pvThread.joinable()) pvThread.join();
         {
             std::lock_guard<std::mutex> lk(exState.curMx);
             exState.cancel = true;
-            Mandel* mm = exState.cur.load();
-            if (mm) mm->SetHalt(true);
+            IComputeBackend* mm = exState.cur.load();
+            if (mm) mm->cancel();
         }
         if (exThread.joinable()) exThread.join();
         if (fUi) DeleteObject(fUi);
@@ -272,6 +504,8 @@ struct ExportDlg {
         mpf_clear(cx);
         mpf_clear(cy);
         mpf_clear(scale);
+        mpf_clear(juliaCRe);
+        mpf_clear(juliaCIm);
     }
     int S(int v) const { return MulDiv(v, dpi, 96); }
     bool custom() const { return resSel >= 0 && resSel < (int)presets.size() && presets[resSel].w == 0; }
@@ -336,8 +570,8 @@ static void startPreview(ExportDlg* d) {
     {
         std::lock_guard<std::mutex> lk(d->pvState.curMx);
         d->pvState.cancel = true;
-        Mandel* mm = d->pvState.cur.load();
-        if (mm) mm->SetHalt(true);
+        IComputeBackend* mm = d->pvState.cur.load();
+        if (mm) mm->cancel();
     }
     if (d->pvThread.joinable()) d->pvThread.join();
     exportGetSize(d);
@@ -347,7 +581,7 @@ static void startPreview(ExportDlg* d) {
     HWND hw = d->hwnd;
     d->pvThread = std::thread([d, pw, ph, gen, hw]() {
         std::vector<uint8_t> rgb;
-        exportRender(d->cx, d->cy, d->scale, pw, ph, 1, d->mxit, d->cmethod, rgb, &d->pvState);
+        exportRender(d->cx, d->cy, d->scale, d->viewW, d->viewH, d->snapshot, d->juliaCRe, d->juliaCIm, pw, ph, 1, d->mxit, d->cmethod, rgb, &d->pvState);
         if (gen != d->pvGen || d->pvState.cancel) return;
         // to BGR top-down for StretchDIBits
         std::vector<uint8_t> bgr((size_t)pw * ph * 3);
@@ -506,7 +740,11 @@ void showExportDialog(HWND owner, MandelNavigator* nav) {
     d->nav = nav;
     d->cmethod = nav->GetCMethod();
     d->mxit = nav->GetMxit();
+    d->viewW = nav->GetViewWidth();
+    d->viewH = nav->GetViewHeight();
+    d->snapshot = nav->GetExportSnapshot();
     nav->GetView(d->cx, d->cy, d->scale);
+    nav->GetJuliaC(d->juliaCRe, d->juliaCIm);
     buildResPresets(d);
     UINT dpi = exWinDpi(owner);
     d->dpi = dpi;
@@ -554,8 +792,8 @@ static void exportDoSave(ExportDlg* d) {
     int W = d->outW, H = d->outH, ss = d->ss;
     if (d->exThread.joinable()) d->exThread.join();
     d->exThread = std::thread([d, W, H, ss, save]() {
-        exportRender(d->cx, d->cy, d->scale, W, H, ss, d->mxit, d->cmethod, d->exImg, &d->exState);
-        if (d->exState.ok) writeExportPNG(save.c_str(), d->exImg, W, H);
+        exportRender(d->cx, d->cy, d->scale, d->viewW, d->viewH, d->snapshot, d->juliaCRe, d->juliaCIm, W, H, ss, d->mxit, d->cmethod, d->exImg, &d->exState);
+        if (d->exState.ok && !writeExportPNG(save.c_str(), d->exImg, W, H)) d->exState.ok = false;
     });
     InvalidateRect(d->hwnd, nullptr, FALSE);
 }
@@ -736,8 +974,8 @@ LRESULT CALLBACK ExportWndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             if (d->exporting) {
                 d->exState.cancel = true;
                 std::lock_guard<std::mutex> lk(d->exState.curMx);
-                Mandel* mm = d->exState.cur.load();
-                if (mm) mm->SetHalt(true);
+                IComputeBackend* mm = d->exState.cur.load();
+                if (mm) mm->cancel();
             } else {
                 DestroyWindow(h);
                 return 0;
@@ -789,7 +1027,10 @@ LRESULT CALLBACK ExportWndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                 bool ok = d->exState.ok;
                 d->exporting = false;
                 InvalidateRect(h, nullptr, FALSE);
-                if (ok) MessageBoxW(h, L"Image saved.", L"Export", MB_OK | MB_ICONINFORMATION);
+                if (ok)
+                    MessageBoxW(h, L"Image saved.", L"Export", MB_OK | MB_ICONINFORMATION);
+                else if (!d->exState.cancel)
+                    MessageBoxW(h, L"Image export failed.", L"Export", MB_OK | MB_ICONERROR);
             }
         }
         return 0;
@@ -814,8 +1055,8 @@ LRESULT CALLBACK ExportWndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         if (d && d->exporting) {
             d->exState.cancel = true;
             std::lock_guard<std::mutex> lk(d->exState.curMx);
-            Mandel* mm = d->exState.cur.load();
-            if (mm) mm->SetHalt(true);
+            IComputeBackend* mm = d->exState.cur.load();
+            if (mm) mm->cancel();
         }
         DestroyWindow(h);
         return 0;

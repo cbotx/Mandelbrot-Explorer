@@ -989,9 +989,11 @@ void Mandel::ComputeDirect(int mxit, float* out, int step, int c_method) {
     }
 }
 
-void Mandel::ComputeJulia(mpf_t z0_re, mpf_t z0_im, mpf_t scale, mpf_t fixed_c_re, mpf_t fixed_c_im, int mxit, int c_method) {
+void Mandel::ComputeJulia(mpf_t z0_re, mpf_t z0_im, mpf_t scale, mpf_t fixed_c_re, mpf_t fixed_c_im, int mxit, int c_method, int full_h, int row_base) {
     assert(_sub == 1);
     assert((c_method & ~ColoringMethod::EXTERIOR_DIST_EST) == 0);
+    if (full_h <= 0) full_h = _h;
+    if (full_h < _h || row_base < 0 || row_base > full_h - _h) return;
     progressSet(0.0);
     std::fill(_iter, _iter + (size_t)_w * _h, EMPTYPIXEL);
     mpf_set(_scale, scale);
@@ -1000,14 +1002,18 @@ void Mandel::ComputeJulia(mpf_t z0_re, mpf_t z0_im, mpf_t scale, mpf_t fixed_c_r
     mpf_init_set_ui(dw, 2);
     mpf_div(dw, dw, scale);
     mpf_init_set(dh, dw);
-    mpf_mul_ui(dh, dh, _h);
+    mpf_mul_ui(dh, dh, full_h);
     mpf_div_ui(dh, dh, _w);
     mpf_sub(_c0_re, z0_re, dw);
     mpf_sub(_c0_im, z0_im, dh);
     mpf_mul_ui(_dx, dw, 2);
     mpf_div_ui(_dx, _dx, _w - 1);
     mpf_mul_ui(_dy, dh, 2);
-    mpf_div_ui(_dy, _dy, _h - 1);
+    mpf_div_ui(_dy, _dy, full_h - 1);
+    if (row_base != 0) {
+        mpf_mul_ui(dw, _dy, static_cast<unsigned long>(row_base));
+        mpf_add(_c0_im, _c0_im, dw);
+    }
     mpf_clear(dw);
     mpf_clear(dh);
 

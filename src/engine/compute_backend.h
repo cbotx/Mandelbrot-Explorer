@@ -30,6 +30,8 @@ struct ComputeRequest {
 
     int width = 0;
     int height = 0;
+    int fullHeight = 0;
+    int rowBase = 0;
     int sub = 1;
     int maxIterations = 0;
     int coloringMethod = 0;

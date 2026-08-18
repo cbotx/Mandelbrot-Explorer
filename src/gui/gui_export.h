@@ -19,5 +19,6 @@ void showExportDialog(HWND owner, MandelNavigator* nav);
 // Helpers reused by the main window's quick-save (S key).
 std::wstring defaultSaveName();
 bool writeExportPNG(const wchar_t* path, const std::vector<uint8_t>& rgb, int W, int H);
+bool runExportSelfTest(const wchar_t* resultPath);
 
 #endif

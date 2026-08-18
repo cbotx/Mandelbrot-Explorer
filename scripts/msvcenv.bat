@@ -46,7 +46,7 @@ if not defined SDKVER ( echo msvcenv: no usable Windows SDK found & exit /b 1 )
 
 set "INCLUDE=%MSVC%\include;%SDKROOT%\Include\%SDKVER%\ucrt;%SDKROOT%\Include\%SDKVER%\shared;%SDKROOT%\Include\%SDKVER%\um;%SDKROOT%\Include\%SDKVER%\winrt"
 set "LIB=%MSVC%\lib\x64;%SDKROOT%\Lib\%SDKVER%\ucrt\x64;%SDKROOT%\Lib\%SDKVER%\um\x64"
-set "PATH=%MSVC%\bin\HostX64\x64;%PATH%"
+set "PATH=%MSVC%\bin\HostX64\x64;%SDKROOT%\bin\%SDKVER%\x64;%PATH%"
 set "VCREDIST=%VSROOT%\VC\Redist\MSVC"
 
 REM ---- vcpkg static triplet (VCPKG_ROOT, then PATH, then common locations) --

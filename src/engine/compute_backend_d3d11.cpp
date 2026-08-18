@@ -380,7 +380,7 @@ class D3D11ComputeBackend final : public IComputeBackend {
         return result;
     }
 
-    static bool eligible(const ComputeRequest& request) { return request.mode == ComputeMode::Mandelbrot && request.cpuEngine && request.centerRe && request.centerIm && request.scale && mpf_sgn(request.scale) > 0 && mpf_cmp_d(request.scale, 1.0e6) <= 0 && request.width >= 2 && request.height >= 2 && request.sub >= 1 && (request.sub & 1) != 0 && request.maxIterations >= 2 && request.maxIterations <= kMaxGpuIterations && request.iterations && request.coloringMethod == 0; }
+    static bool eligible(const ComputeRequest& request) { return request.mode == ComputeMode::Mandelbrot && request.cpuEngine && request.centerRe && request.centerIm && request.scale && mpf_sgn(request.scale) > 0 && mpf_cmp_d(request.scale, 1.0e6) <= 0 && request.width >= 2 && request.height >= 2 && (request.fullHeight <= 0 || request.fullHeight == request.height) && request.rowBase == 0 && request.sub >= 1 && (request.sub & 1) != 0 && request.maxIterations >= 2 && request.maxIterations <= kMaxGpuIterations && request.iterations && request.coloringMethod == 0; }
 
     bool ensureOutput(UINT count) {
         if (_outputBuffer && _outputUav && _stagingBuffer && count <= _outputCapacity) return true;

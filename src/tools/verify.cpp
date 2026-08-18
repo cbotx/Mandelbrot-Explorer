@@ -9711,11 +9711,13 @@ static int runBackendCase() {
     formula::ExpressionJit4 runtimeExpressionJit;
     formula::ExpressionError compileError;
     formula::ExpressionContext fixed;
+    bool expressionReady = false;
     fixed.parameters[0] = {0.15, -0.2};
     fixed.parameters[1] = {-0.35, 0.1};
     if (!expression.compile("0.5*z+0.1*sin(c)", &compileError) || !expression.specialize(fixed, FormulaParameter::C, runtimeExpression, &compileError) || !runtimeExpressionPlan.build(runtimeExpression, &compileError)) {
         ++failures;
     } else {
+        expressionReady = true;
         request.mode = ComputeMode::Expression;
         request.expressionSource = &expression;
         request.expression = &runtimeExpression;
@@ -9732,6 +9734,71 @@ static int runBackendCase() {
             if (!backend->compute(request) || !same(direct, dispatched) || backend->lastComputeUsedCustomDeepPath()) ++failures;
         }
     }
+
+    int stripFailures = 0;
+    auto checkStripParity = [&](ComputeMode mode, int method, formula::ExpressionColoring coloring, const formula::ExpressionProgram& source, const formula::ExpressionProgram& runtime, const formula::ExpressionContext& expressionFixed, const formula::ExpressionOrbitPlan* expressionPlan) {
+        std::vector<float> full((size_t)W * H, EMPTYPIXEL);
+        std::vector<float> strips((size_t)W * H, EMPTYPIXEL);
+        Mandel fullEngine(W, H, MXIT, 1, full.data());
+        ComputeRequest stripRequest;
+        stripRequest.mode = mode;
+        stripRequest.cpuEngine = &fullEngine;
+        stripRequest.centerRe = centerRe;
+        stripRequest.centerIm = centerIm;
+        stripRequest.scale = scale;
+        stripRequest.fixedCRe = fixedCRe;
+        stripRequest.fixedCIm = fixedCIm;
+        stripRequest.width = W;
+        stripRequest.height = H;
+        stripRequest.fullHeight = H;
+        stripRequest.maxIterations = MXIT;
+        stripRequest.coloringMethod = method;
+        stripRequest.iterations = full.data();
+        stripRequest.expressionSource = &source;
+        stripRequest.expression = &runtime;
+        stripRequest.expressionFixed = &expressionFixed;
+        stripRequest.expressionPlan = expressionPlan;
+        stripRequest.expressionPixel = FormulaParameter::C;
+        stripRequest.expressionBailout = 4.0;
+        stripRequest.expressionColoring = coloring;
+        backend->resetCancellation();
+        if (!backend->compute(stripRequest)) return false;
+        constexpr int STRIP_HEIGHT = 7;
+        for (int rowBase = 0; rowBase < H; rowBase += STRIP_HEIGHT) {
+            int stripHeight = std::min(STRIP_HEIGHT, H - rowBase);
+            std::vector<float> part((size_t)W * stripHeight, EMPTYPIXEL);
+            Mandel stripEngine(W, stripHeight, MXIT, 1, part.data());
+            stripRequest.cpuEngine = &stripEngine;
+            stripRequest.height = stripHeight;
+            stripRequest.rowBase = rowBase;
+            stripRequest.iterations = part.data();
+            backend->resetCancellation();
+            if (!backend->compute(stripRequest)) return false;
+            std::copy(part.begin(), part.end(), strips.begin() + (size_t)rowBase * W);
+        }
+        return same(full, strips);
+    };
+    for (int method : std::array<int, 3>{0, ColoringMethod::EXTERIOR_DIST_EST, ColoringMethod::STRIPE_AVERAGE})
+        if (!checkStripParity(ComputeMode::Mandelbrot, method, formula::ExpressionColoring::Raw, expression, runtimeExpression, fixed, nullptr)) ++stripFailures;
+    for (int method : std::array<int, 2>{0, ColoringMethod::EXTERIOR_DIST_EST})
+        if (!checkStripParity(ComputeMode::Julia, method, formula::ExpressionColoring::Raw, expression, runtimeExpression, fixed, nullptr)) ++stripFailures;
+    if (expressionReady) {
+        for (formula::ExpressionColoring coloring : {formula::ExpressionColoring::Raw, formula::ExpressionColoring::Feather, formula::ExpressionColoring::OrbitTrap}) {
+            int method = coloring == formula::ExpressionColoring::Feather ? ColoringMethod::STRIPE_AVERAGE : (coloring == formula::ExpressionColoring::OrbitTrap ? ColoringMethod::ORBIT_TRAP : 0);
+            if (!checkStripParity(ComputeMode::Expression, method, coloring, expression, runtimeExpression, fixed, runtimeExpressionPlan.profitable() ? &runtimeExpressionPlan : nullptr)) ++stripFailures;
+        }
+    }
+    formula::ExpressionProgram quadraticSource, quadraticRuntime;
+    formula::ExpressionOrbitPlan quadraticPlan;
+    if (!quadraticSource.compile("z*z+c", &compileError) || !quadraticSource.specialize(fixed, FormulaParameter::C, quadraticRuntime, &compileError) || !quadraticPlan.build(quadraticRuntime, &compileError)) {
+        ++stripFailures;
+    } else {
+        for (formula::ExpressionColoring coloring : {formula::ExpressionColoring::Smooth, formula::ExpressionColoring::Distance}) {
+            int method = coloring == formula::ExpressionColoring::Distance ? ColoringMethod::EXTERIOR_DIST_EST : 0;
+            if (!checkStripParity(ComputeMode::Expression, method, coloring, quadraticSource, quadraticRuntime, fixed, quadraticPlan.profitable() ? &quadraticPlan : nullptr)) ++stripFailures;
+        }
+    }
+    failures += stripFailures;
 
     ComputeRequest invalid;
     if (backend->compute(invalid)) ++failures;
@@ -9764,6 +9831,7 @@ static int runBackendCase() {
     int gpuWorst = -1;
     float gpuWorstCpu = 0.0f, gpuWorstGpu = 0.0f;
     int gpuStressClass = 0, gpuStressFloor = 0, gpuLayoutMismatch = 0;
+    bool gpuStripFallback = false;
     double gpuStressMaxDifference = 0.0;
     if (!warp || warp->info().fallback || warp->info().name != "D3D11 WARP" || warp->info().hardwareAccelerated) {
         ++failures;
@@ -9800,6 +9868,16 @@ static int runBackendCase() {
             }
         }
         if (gpuEmpty != 0 || gpuClassMismatch != 0 || gpuFloorMismatch != 0 || gpuMaxDifference > 0.01) ++failures;
+
+        directMandel.Compute(centerRe, centerIm, scale, MXIT, 0, H + 2, 1);
+        std::fill(gpu.begin(), gpu.end(), EMPTYPIXEL);
+        request.fullHeight = H + 2;
+        request.rowBase = 1;
+        warp->resetCancellation();
+        gpuStripFallback = warp->compute(request) && !warp->lastComputeUsedGpuPath() && same(direct, gpu);
+        if (!gpuStripFallback) ++failures;
+        request.fullHeight = 0;
+        request.rowBase = 0;
 
         // Precision-limit shallow view (the GPU gate is scale <= 1e6).
         mpf_set_str(centerRe, "-0.743643887037151", 10);
@@ -9980,9 +10058,10 @@ static int runBackendCase() {
     printf("=== compute backend interface\n");
     printf("  backend=%s detail=%s fallback-test=%s\n", backend->info().name.c_str(), backend->info().detail.c_str(), fallback->info().detail.c_str());
     printf("  Mandel/Julia/Expression byte parity; cancel %.3fs empty=%d/%d\n", cancelSeconds, empty, CW * CH);
+    printf("  full-frame/strip parity failures=%d\n", stripFailures);
     printf("  D3D11 WARP: empty=%d class=%d floor=%d max smooth diff=%.6g\n", gpuEmpty, gpuClassMismatch, gpuFloorMismatch, gpuMaxDifference);
     if (gpuWorst >= 0) printf("    worst=(%d,%d) cpu=%.9g gpu=%.9g\n", gpuWorst % W, gpuWorst / W, gpuWorstCpu, gpuWorstGpu);
-    printf("    scale1e6 class=%d floor=%d max diff=%.6g; sub5 layout=%d\n", gpuStressClass, gpuStressFloor, gpuStressMaxDifference, gpuLayoutMismatch);
+    printf("    scale1e6 class=%d floor=%d max diff=%.6g; sub5 layout=%d; strip fallback=%d\n", gpuStressClass, gpuStressFloor, gpuStressMaxDifference, gpuLayoutMismatch, gpuStripFallback ? 1 : 0);
     printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (backend failure)");
 
     mpf_clears(centerRe, centerIm, scale, fixedCRe, fixedCIm, (mpf_ptr)0);
@@ -10057,6 +10136,7 @@ static int runGenericDeepBackendCase() {
         std::vector<float> backendOutput((size_t)W * H, EMPTYPIXEL);
         std::vector<float> directOutput(backendOutput.size(), EMPTYPIXEL);
         std::vector<float> mpfrOutput(backendOutput.size(), EMPTYPIXEL);
+        std::vector<float> stripOutput(backendOutput.size(), EMPTYPIXEL);
         Mandel engine(W, H, MXIT, 1, backendOutput.data());
         engine.setPrecision(2048);
         std::atomic<float> progress{0.0f};
@@ -10092,6 +10172,7 @@ static int runGenericDeepBackendCase() {
         directRequest.pixelParameter = test.pixel;
         directRequest.width = W;
         directRequest.height = H;
+        directRequest.fullHeight = H;
         directRequest.maxIterations = MXIT;
         directRequest.bailout = 4.0;
         directRequest.output = directOutput.data();
@@ -10099,6 +10180,18 @@ static int runGenericDeepBackendCase() {
         directRequest.precision.viewBits = 2048;
         ExpressionDeepRenderResult directResult;
         okay = okay && formula::renderExpressionDeepFrame(directRequest, directResult);
+        for (int rowBase = 0; okay && rowBase < H; rowBase += 2) {
+            int stripHeight = std::min(2, H - rowBase);
+            std::vector<float> part((size_t)W * stripHeight, EMPTYPIXEL);
+            ExpressionDeepRenderRequest stripRequest = directRequest;
+            stripRequest.height = stripHeight;
+            stripRequest.rowBase = rowBase;
+            stripRequest.output = part.data();
+            stripRequest.outputCount = part.size();
+            ExpressionDeepRenderResult stripResult;
+            okay = formula::renderExpressionDeepFrame(stripRequest, stripResult);
+            std::copy(part.begin(), part.end(), stripOutput.begin() + (size_t)rowBase * W);
+        }
 
         ExpressionDeepRenderRequest mpfrRequest = directRequest;
         mpfrRequest.output = mpfrOutput.data();
@@ -10107,7 +10200,7 @@ static int runGenericDeepBackendCase() {
         okay = okay && formula::renderExpressionDeepFrame(mpfrRequest, mpfrResult);
 
         const GenericDeepInfo info = backend->lastGenericDeepInfo();
-        const bool exact = backendOutput == directOutput && backendOutput == mpfrOutput;
+        const bool exact = backendOutput == directOutput && backendOutput == mpfrOutput && backendOutput == stripOutput;
         const bool telemetry = backend->lastComputeUsedGenericDeepPath() && !backend->lastComputeUsedCustomDeepPath() && info.used && info.settled && info.success && info.pixelCount == backendOutput.size() && progress.load(std::memory_order_relaxed) == 1.0f && info.fastPixelCount == directResult.fastPixelCount && info.fallbackPixelCount == directResult.fallbackPixelCount;
         if (!okay || !exact || !telemetry) {
             ++failures;
@@ -11696,7 +11789,14 @@ int main(int argc, char** argv) {
     TestCase shallow{"shallow (whole set)", "-0.5", "0", pow10(0), 5000, 1};
     std::string deep51_scale = "3831277";
     deep51_scale.append(45, '0'); // 3.831277e51
-    TestCase deep{"deep51 (3.8e51 stress, maxit 2M)", testcases::deep51_x, testcases::deep51_y, deep51_scale, 2000000, 32};
+    TestCase deep{"deep51 (3.8e51 stress, maxit 2M)", testcases::deep51_x, testcases::deep51_y, deep51_scale, 2000000, 16};
+    // The perturbation result has been stable since v1.3.1: classification is
+    // exact, while one chaotic exterior sample differs by about 3.68 smooth
+    // iterations. Sample more densely and bound that tail explicitly.
+    deep.maxMisPct = 0.0;
+    deep.maxDiff = 4.0;
+    deep.maxMeanDiff = 0.25;
+    deep.maxP99Diff = 4.0;
     TestCase ticktock{"ticktock (1e141, glitch stress)", testcases::ticktock_x, testcases::ticktock_y, pow10(141), 200000, 12};
     TestCase flake{"flake (1e157, glitch stress)", testcases::flake_x, testcases::flake_y, pow10(157), 200000, 12};
     // Exact Misiurewicz parameter c=i. Its critical orbit enters a repelling

@@ -1,0 +1,40 @@
+#include <windows.h>
+
+#include "resource.h"
+#include "version.h"
+
+IDI_MANDEL ICON "src\\gui\\assets\\mandelbrot.ico"
+1 RT_MANIFEST "src\\gui\\mandel_gui.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION MANDEL_VERSION_COMMA
+ PRODUCTVERSION MANDEL_VERSION_COMMA
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "cbotx\0"
+            VALUE "FileDescription", "Mandelbrot Explorer\0"
+            VALUE "FileVersion", MANDEL_VERSION_STRING ".0\0"
+            VALUE "InternalName", "mandel_gui\0"
+            VALUE "LegalCopyright", "Copyright (c) 2026 cbotx\0"
+            VALUE "OriginalFilename", "mandel_gui.exe\0"
+            VALUE "ProductName", "Mandelbrot Explorer\0"
+            VALUE "ProductVersion", MANDEL_VERSION_STRING "\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

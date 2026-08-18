@@ -127,6 +127,7 @@ class ExactGeometry {
 
     bool initialize(const ExpressionDeepRenderRequest& request) {
         if (!setExactCenter(center, request.center) || !setExactReal(scale, request.scale) || mpfr_sgn(scale) <= 0) return false;
+        const int fullHeight = request.fullHeight > 0 ? request.fullHeight : request.height;
 
         // dx/2 = 2/(scale*(width-1)).
         mpfr_mul_ui(temporary, scale, static_cast<unsigned long>(request.width - 1), RND);
@@ -134,15 +135,17 @@ class ExactGeometry {
 
         // dy/2 = 2*height/(scale*width*(height-1)).
         mpfr_mul_ui(temporary, scale, static_cast<unsigned long>(request.width), RND);
-        mpfr_mul_ui(temporary, temporary, static_cast<unsigned long>(request.height - 1), RND);
-        mpfr_ui_div(dyHalf, static_cast<unsigned long>(request.height), temporary, RND);
+        mpfr_mul_ui(temporary, temporary, static_cast<unsigned long>(fullHeight - 1), RND);
+        mpfr_ui_div(dyHalf, static_cast<unsigned long>(fullHeight), temporary, RND);
         mpfr_mul_ui(dyHalf, dyHalf, 2, RND);
         return mpfr_number_p(dxHalf) && mpfr_number_p(dyHalf) && !mpfr_zero_p(dxHalf) && !mpfr_zero_p(dyHalf);
     }
 
     bool coordinate(int x, int y, const ExpressionDeepRenderRequest& request, MpfrComplex& output) {
+        const int fullHeight = request.fullHeight > 0 ? request.fullHeight : request.height;
+        const int globalY = y + request.rowBase;
         const long centeredX = static_cast<long>(2LL * x - (request.width - 1LL));
-        const long centeredY = static_cast<long>(2LL * y - (request.height - 1LL));
+        const long centeredY = static_cast<long>(2LL * globalY - (fullHeight - 1LL));
         if (centeredX == 0) {
             mpfr_set(output.re, center.re, RND);
         } else {
@@ -447,7 +450,8 @@ bool selectAutomaticViewBits(const ExpressionDeepRenderRequest& request, Express
 
     uint64_t required = 53;
     const mpfr_exp_t scaleExponent = mpfr_get_exp(geometry.scale);
-    if (scaleExponent > 0) { required = std::max<uint64_t>(required, static_cast<uint64_t>(scaleExponent) + ceilLog2(static_cast<uint64_t>(std::max(request.width, request.height))) + 8); }
+    const int fullHeight = request.fullHeight > 0 ? request.fullHeight : request.height;
+    if (scaleExponent > 0) { required = std::max<uint64_t>(required, static_cast<uint64_t>(scaleExponent) + ceilLog2(static_cast<uint64_t>(std::max(request.width, fullHeight))) + 8); }
     auto coverAddition = [&](mpfr_srcptr center, mpfr_srcptr step) {
         if (mpfr_zero_p(center) || mpfr_zero_p(step)) return;
         const mpfr_exp_t difference = mpfr_get_exp(center) - mpfr_get_exp(step);
@@ -1505,7 +1509,8 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
         if (request.canonicalProgram && !request.canonicalProgram->valid()) return fail(ExpressionDeepRenderStatus::InvalidRequest, "canonical program is invalid");
         if (!validCenterRepresentation(request.center) || !validScaleRepresentation(request.scale)) return fail(ExpressionDeepRenderStatus::InvalidRequest, "exact center or scale representation is invalid");
         if (request.pixelParameter != FormulaParameter::C && request.pixelParameter != FormulaParameter::InitialZ) return fail(ExpressionDeepRenderStatus::InvalidRequest, "pixel binding must be c or z0");
-        if (request.width < 2 || request.height < 2 || request.width > (LONG_MAX + 1LL) / 2 || request.height > (LONG_MAX + 1LL) / 2) return fail(ExpressionDeepRenderStatus::InvalidRequest, "frame dimensions are invalid");
+        const int fullHeight = request.fullHeight > 0 ? request.fullHeight : request.height;
+        if (request.width < 2 || request.height < 1 || fullHeight < 2 || request.rowBase < 0 || request.rowBase > fullHeight - request.height || request.width > (LONG_MAX + 1LL) / 2 || fullHeight > (LONG_MAX + 1LL) / 2) return fail(ExpressionDeepRenderStatus::InvalidRequest, "frame dimensions are invalid");
         if (request.maxIterations < 1 || request.maxIterations > (1 << 24)) return fail(ExpressionDeepRenderStatus::InvalidRequest, "iteration count cannot be represented exactly in float output");
         if (!(request.bailout > 0.0) || !std::isfinite(request.bailout)) return fail(ExpressionDeepRenderStatus::InvalidRequest, "bailout must be finite and positive");
         if (!request.output) return fail(ExpressionDeepRenderStatus::InvalidRequest, "output buffer is null");
@@ -1718,7 +1723,7 @@ bool renderExpressionDeepFrame(const ExpressionDeepRenderRequest& request, Expre
                 if (makeScaledRealValue(lowOffset.re, offset.value) != ScaledArithmeticStatus::Success || !certificationGeometry.coordinate(x, 0, request, exactCoordinate) || !componentDiscrepancy(exactCoordinate.re, pixelBase.re, offset.value, certificationGeometry.center.precision(), offset.error) || !inflateRadius(offset.error, request.verificationErrorInflationBits)) return fail(ExpressionDeepRenderStatus::InternalError, "certified x coordinate construction failed");
             }
             for (int y = 0; y < request.height; ++y) {
-                const long centered = static_cast<long>(2LL * y - (request.height - 1LL));
+                const long centered = static_cast<long>(2LL * (y + request.rowBase) - (fullHeight - 1LL));
                 ScaledOffset& offset = yOffsets[static_cast<size_t>(y)];
                 mpfr_mul_si(lowOffset.im, geometry.dyHalf, centered, RND);
                 if (makeScaledRealValue(lowOffset.im, offset.value) != ScaledArithmeticStatus::Success || !certificationGeometry.coordinate(0, y, request, exactCoordinate) || !componentDiscrepancy(exactCoordinate.im, pixelBase.im, offset.value, certificationGeometry.center.precision(), offset.error) || !inflateRadius(offset.error, request.verificationErrorInflationBits)) return fail(ExpressionDeepRenderStatus::InternalError, "certified y coordinate construction failed");

@@ -652,8 +652,10 @@ bool solveExpressionColoredScalarRow(double startRe, double dx, double pixelIm, 
 
 } // namespace
 
-bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale, const formula::ExpressionProgram& program, const formula::ExpressionContext& fixed, FormulaParameter pixelParameter, int mxit, double bailout, formula::ExpressionColoring coloring, const formula::ExpressionJit4* jit, const formula::ExpressionOrbitPlan* plan) {
+bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale, const formula::ExpressionProgram& program, const formula::ExpressionContext& fixed, FormulaParameter pixelParameter, int mxit, double bailout, formula::ExpressionColoring coloring, const formula::ExpressionJit4* jit, const formula::ExpressionOrbitPlan* plan, int full_h, int row_base) {
     if (_sub != 1 || !program.valid() || mxit < 1 || !(bailout > 0.0) || !std::isfinite(bailout) || (pixelParameter != FormulaParameter::C && pixelParameter != FormulaParameter::InitialZ)) return false;
+    if (full_h <= 0) full_h = _h;
+    if (full_h < _h || row_base < 0 || row_base > full_h - _h) return false;
 
     if (_flag_halt) return false;
     _expressionPeriodicPixels.store(0, std::memory_order_relaxed);
@@ -665,14 +667,18 @@ bool Mandel::ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale, co
     mpf_init_set_ui(dw, 2);
     mpf_div(dw, dw, scale);
     mpf_init_set(dh, dw);
-    mpf_mul_ui(dh, dh, _h);
+    mpf_mul_ui(dh, dh, full_h);
     mpf_div_ui(dh, dh, _w);
     mpf_sub(_c0_re, center_re, dw);
     mpf_sub(_c0_im, center_im, dh);
     mpf_mul_ui(_dx, dw, 2);
     mpf_div_ui(_dx, _dx, _w - 1);
     mpf_mul_ui(_dy, dh, 2);
-    mpf_div_ui(_dy, _dy, _h - 1);
+    mpf_div_ui(_dy, _dy, full_h - 1);
+    if (row_base != 0) {
+        mpf_mul_ui(dw, _dy, static_cast<unsigned long>(row_base));
+        mpf_add(_c0_im, _c0_im, dw);
+    }
     mpf_clear(dw);
     mpf_clear(dh);
 

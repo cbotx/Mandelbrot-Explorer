@@ -122,6 +122,8 @@ struct ExpressionDeepRenderRequest {
     FormulaParameter pixelParameter = FormulaParameter::C;
     int width = 0;
     int height = 0;
+    int fullHeight = 0;
+    int rowBase = 0;
     int maxIterations = 0;
     double bailout = 4.0;
     float* output = nullptr;

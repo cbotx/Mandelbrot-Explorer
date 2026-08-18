@@ -673,6 +673,20 @@ void MandelNavigator::GetView(mpf_t re, mpf_t im, mpf_t scale) const {
     mpf_set(scale, _scale);
 }
 
+MandelExportSnapshot MandelNavigator::GetExportSnapshot() const {
+    MandelExportSnapshot snapshot;
+    snapshot.mode = IsExpression() ? ComputeMode::Expression : (IsJulia() ? ComputeMode::Julia : ComputeMode::Mandelbrot);
+    if (IsExpression()) {
+        snapshot.expressionSource = _expressionProgram;
+        snapshot.expressionRuntime = _expressionRuntimeProgram;
+        snapshot.expressionFixed = _expressionFixed;
+        snapshot.expressionPixel = _expressionPixel;
+        snapshot.expressionBailout = _expressionBailout;
+        snapshot.expressionSupportsDistance = ExpressionSupportsDistance();
+    }
+    return snapshot;
+}
+
 void MandelNavigator::GetJuliaC(mpf_t re, mpf_t im) const {
     mpf_set_prec(re, mpf_get_prec(_julia_c_re));
     mpf_set(re, _julia_c_re);

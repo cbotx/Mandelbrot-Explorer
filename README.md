@@ -7,7 +7,8 @@ correct rendering past double's ~1e320 underflow (validated to 1e1000+).
 ## Requirements
 
 - MSVC (x64) with OpenMP and AVX2
-- GMP via vcpkg: `vcpkg install gmp:x64-windows-static`
+- GMP, MPFR, and AsmJit via vcpkg:
+  `vcpkg install gmp:x64-windows-static mpfr:x64-windows-static asmjit:x64-windows-static`
 
 No FreeGLUT / GLEW / OpenGL / libpng / png++ are required: the interactive UI is
 native Win32 (GDI) and PNG export uses the Windows Imaging Component. The build
@@ -35,6 +36,10 @@ Build scripts live in `scripts\` and emit into `build\` (each `cd`s to the repo 
 - `scripts\build_render.bat` — headless BMP renderer -> `build\render.exe`
 - `scripts\build_pbench.bat` — clean-room perturbation/BLA bench -> `build\pbench.exe`
 - `scripts\build_bench.bat` — BigFixed vs GMP micro-bench -> `build\bench_bigfixed.exe`
+- `scripts\package_release.ps1 -Version 1.4.0` — dynamically linked,
+  license-compliant portable Windows x64 ZIP + SHA-256 checksum. Its release
+  build also requires `gmp:x64-windows`, `mpfr:x64-windows`, and
+  `asmjit:x64-windows`.
 
 ## Formatting
 
@@ -48,6 +53,9 @@ Install the development tool with `python -m pip install --user clang-format==22
 ## Run
 
 ### Interactive explorer
+
+Release binaries require 64-bit Windows 10 version 1607 or later and an
+AVX2-capable processor.
 
     build\mandel_gui.exe
 
@@ -63,8 +71,9 @@ Controls:
   field is a native text editor with selection and clipboard shortcuts; presets,
   variable/function insertion buttons, c/z0 plane selection, and a synchronized
   complex-plane picker configure fixed values and p0..p7 parameters.
-- `Export`: high-resolution PNG (monitor-aware resolution presets or custom size,
-  live preview, progress, cancel; coordinate range matches the view).
+- `Export`: high-resolution PNG for Mandelbrot, Julia, and custom Expression
+  views (monitor-aware presets or custom size, live preview, progress, cancel;
+  coordinate range and aspect match the current view).
 
 ### Headless render
 
@@ -77,6 +86,8 @@ Controls:
     build\verify.exe expression-scaled
     build\verify.exe expression-taylor
     build\verify.exe expression-deep-render
+    set MANDEL_EXPORT_SELFTEST=build\export_selftest.txt
+    build\mandel_gui.exe
 
 `expression-scaled` runs the non-GUI MPFR-tape/scaled-residual e500 prototype,
 including exact escape comparisons and the scaled-versus-per-pixel-MPFR timing.
@@ -98,7 +109,8 @@ limits. Scalar-real component absolute values use certified per-pixel branch
 selection (and fixed-cell Taylor only when the entire cell stays on one side
 of the fold); general complex-modulus `abs(z)`, mixed real/transcendental
 formulas, argument, polar, and other unsupported operations default to MPFR.
-The API is not dispatched by the GUI backend yet.
+The CPU GUI backend dispatches eligible deep custom formulas through this
+certified renderer and falls back to exact per-pixel MPFR where required.
 
 ### Compute backend
 

@@ -76,12 +76,12 @@ class Mandel {
     // Quadratic Julia z0-plane: each pixel supplies z0 while fixedC is constant.
     // Phase 1 is a dedicated direct AVX2 kernel (sub==1, Smooth/EDE); advanced
     // perturbation/SA/BLA capabilities remain disabled in quadraticJulia().
-    void ComputeJulia(mpf_t z0_re, mpf_t z0_im, mpf_t scale, mpf_t fixed_c_re, mpf_t fixed_c_im, int mxit, int c_method = 0);
+    void ComputeJulia(mpf_t z0_re, mpf_t z0_im, mpf_t scale, mpf_t fixed_c_re, mpf_t fixed_c_im, int mxit, int c_method = 0, int full_h = 0, int row_base = 0);
     // Generic direct-expression backend. Each pixel can bind either c or z0;
     // other context values/parameters stay fixed. Returns false for invalid
     // bytecode/bindings. Raw, stripe-average and orbit-trap coloring are
     // universal; recognized integer powers additionally support Smooth/EDE.
-    bool ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale, const formula::ExpressionProgram& program, const formula::ExpressionContext& fixed, FormulaParameter pixelParameter, int mxit, double bailout = 4.0, formula::ExpressionColoring coloring = formula::ExpressionColoring::Raw, const formula::ExpressionJit4* jit = nullptr, const formula::ExpressionOrbitPlan* plan = nullptr);
+    bool ComputeExpression(mpf_t center_re, mpf_t center_im, mpf_t scale, const formula::ExpressionProgram& program, const formula::ExpressionContext& fixed, FormulaParameter pixelParameter, int mxit, double bailout = 4.0, formula::ExpressionColoring coloring = formula::ExpressionColoring::Raw, const formula::ExpressionJit4* jit = nullptr, const formula::ExpressionOrbitPlan* plan = nullptr, int full_h = 0, int row_base = 0);
     uint64_t expressionPeriodicPixelCount() const { return _expressionPeriodicPixels.load(std::memory_order_relaxed); }
     uint64_t expressionIterationCount() const { return _expressionIterations.load(std::memory_order_relaxed); }
     // Exact residual perturbation prototype:

@@ -64,11 +64,12 @@ class CpuComputeBackend final : public IComputeBackend {
 
         bool result = true;
         switch (request.mode) {
-        case ComputeMode::Mandelbrot: request.cpuEngine->Compute(request.centerRe, request.centerIm, request.scale, request.maxIterations, request.coloringMethod); break;
-        case ComputeMode::Julia: request.cpuEngine->ComputeJulia(request.centerRe, request.centerIm, request.scale, request.fixedCRe, request.fixedCIm, request.maxIterations, request.coloringMethod); break;
+        case ComputeMode::Mandelbrot: request.cpuEngine->Compute(request.centerRe, request.centerIm, request.scale, request.maxIterations, request.coloringMethod, request.fullHeight, request.rowBase); break;
+        case ComputeMode::Julia: request.cpuEngine->ComputeJulia(request.centerRe, request.centerIm, request.scale, request.fixedCRe, request.fixedCIm, request.maxIterations, request.coloringMethod, request.fullHeight, request.rowBase); break;
         case ComputeMode::Expression: {
             formula::ExpressionProductionPlan productionPlan;
-            if (request.expressionSource) { productionPlan = formula::makeExpressionProductionPlan(*request.expressionSource, *request.expression, *request.expressionFixed, request.expressionPixel, request.expressionBailout, request.expressionColoring, request.scale, request.centerRe, request.centerIm, request.width, request.height); }
+            const int planningHeight = request.fullHeight > 0 ? request.fullHeight : request.height;
+            if (request.expressionSource) { productionPlan = formula::makeExpressionProductionPlan(*request.expressionSource, *request.expression, *request.expressionFixed, request.expressionPixel, request.expressionBailout, request.expressionColoring, request.scale, request.centerRe, request.centerIm, request.width, planningHeight); }
             const bool aboveDirectLimit = mpf_cmp_d(request.scale, formula::CUSTOM_DIRECT_ZOOM_LIMIT) > 0;
             if (productionPlan.usesQuadraticPerturbation()) {
                 const formula::CustomDeepZoomPlan& deepZoom = productionPlan.quadratic;
@@ -85,7 +86,7 @@ class CpuComputeBackend final : public IComputeBackend {
                     result = false;
                     break;
                 }
-                request.cpuEngine->Compute(request.centerRe, request.centerIm, request.scale, request.maxIterations, request.coloringMethod);
+                request.cpuEngine->Compute(request.centerRe, request.centerIm, request.scale, request.maxIterations, request.coloringMethod, request.fullHeight, request.rowBase);
                 _lastCustomDeep.store(true, std::memory_order_release);
                 break;
             }
@@ -103,11 +104,11 @@ class CpuComputeBackend final : public IComputeBackend {
             const char* seriesSetting = std::getenv("MANDEL_EXPR_CUBIC_SA");
             const char* thresholdSetting = std::getenv("MANDEL_CUBIC_RESIDUAL_SCALE");
             double threshold = thresholdSetting ? std::atof(thresholdSetting) : 1e8;
-            bool useCubicResidual = (!cubicSetting || std::atoi(cubicSetting) != 0) && (!residualPowerSetting || std::atoi(residualPowerSetting) != 0) && (!seriesSetting || std::atoi(seriesSetting) != 0) && std::isfinite(threshold) && threshold > 0.0 && request.expression->fastIntegerPower() == 3 && request.expressionPixel == FormulaParameter::C && mpf_cmp_d(request.scale, threshold) >= 0;
+            bool useCubicResidual = request.fullHeight <= 0 && (!cubicSetting || std::atoi(cubicSetting) != 0) && (!residualPowerSetting || std::atoi(residualPowerSetting) != 0) && (!seriesSetting || std::atoi(seriesSetting) != 0) && std::isfinite(threshold) && threshold > 0.0 && request.expression->fastIntegerPower() == 3 && request.expressionPixel == FormulaParameter::C && mpf_cmp_d(request.scale, threshold) >= 0;
             if (useCubicResidual) {
                 result = request.cpuEngine->ComputeExpressionResidual(request.centerRe, request.centerIm, request.scale, *request.expression, *request.expressionFixed, request.expressionPixel, request.maxIterations, request.expressionBailout, nullptr, request.expressionColoring, nullptr, std::max(8, request.maxIterations * 9 / 10));
             } else {
-                result = request.cpuEngine->ComputeExpression(request.centerRe, request.centerIm, request.scale, *request.expression, *request.expressionFixed, request.expressionPixel, request.maxIterations, request.expressionBailout, request.expressionColoring, request.expressionJit, request.expressionPlan);
+                result = request.cpuEngine->ComputeExpression(request.centerRe, request.centerIm, request.scale, *request.expression, *request.expressionFixed, request.expressionPixel, request.maxIterations, request.expressionBailout, request.expressionColoring, request.expressionJit, request.expressionPlan, request.fullHeight, request.rowBase);
             }
             break;
         }
@@ -194,6 +195,8 @@ class CpuComputeBackend final : public IComputeBackend {
         deepRequest.pixelParameter = request.expressionPixel;
         deepRequest.width = request.width;
         deepRequest.height = request.height;
+        deepRequest.fullHeight = request.fullHeight;
+        deepRequest.rowBase = request.rowBase;
         deepRequest.maxIterations = request.maxIterations;
         deepRequest.bailout = request.expressionBailout;
         deepRequest.output = request.iterations;
@@ -258,7 +261,8 @@ class CpuComputeBackend final : public IComputeBackend {
     }
 
     static bool valid(const ComputeRequest& request) {
-        if (!request.cpuEngine || !request.centerRe || !request.centerIm || !request.scale || mpf_sgn(request.scale) <= 0 || request.width < 2 || request.height < 2 || request.sub < 1 || request.maxIterations < 1 || !request.iterations) return false;
+        const int fullHeight = request.fullHeight > 0 ? request.fullHeight : request.height;
+        if (!request.cpuEngine || !request.centerRe || !request.centerIm || !request.scale || mpf_sgn(request.scale) <= 0 || request.width < 2 || request.height < 1 || fullHeight < 2 || request.rowBase < 0 || request.rowBase > fullHeight - request.height || request.sub < 1 || request.maxIterations < 1 || !request.iterations) return false;
         switch (request.mode) {
         case ComputeMode::Mandelbrot: return true;
         case ComputeMode::Julia: return request.sub == 1 && request.fixedCRe && request.fixedCIm && (request.coloringMethod & ~ColoringMethod::EXTERIOR_DIST_EST) == 0;

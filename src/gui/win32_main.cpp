@@ -32,6 +32,7 @@
 #include "color.h"
 #include "gui_theme.h"
 #include "gui_export.h"
+#include "resource.h"
 #include "formula_dialog.h"
 #include "formula_editor_panel.h"
 #include "interpolate.h"
@@ -2835,12 +2836,7 @@ class App {
                     keepLive();
                     break;
                 case H_RENDER: startRender(); break;
-                case H_SAVE:
-                    if (!nav->IsMandelbrot())
-                        saveImage();
-                    else
-                        showExportDialog(hwnd, nav.get());
-                    break;
+                case H_SAVE: showExportDialog(hwnd, nav.get()); break;
                 case H_COPY: copyLocation(); break;
                 case H_PASTE: pasteLocation(); break;
                 case H_SS:
@@ -3083,6 +3079,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     // Per-Monitor-V2 DPI awareness (crisp text + WM_DPICHANGED); fall back on
     // older Windows to system DPI awareness.
     if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) SetProcessDPIAware();
+    wchar_t exportSelfTestPath[MAX_PATH]{};
+    DWORD exportSelfTestLength = GetEnvironmentVariableW(L"MANDEL_EXPORT_SELFTEST", exportSelfTestPath, MAX_PATH);
+    if (exportSelfTestLength > 0) return exportSelfTestLength < MAX_PATH && runExportSelfTest(exportSelfTestPath) ? 0 : 1;
     // Raise the system timer resolution to 1 ms so the 16 ms animation WM_TIMER
     // actually fires at ~60 Hz. At the default ~15.6 ms resolution a 16 ms timer
     // is coalesced to the next tick (~31 ms => ~32 fps, with jitter).
@@ -3092,7 +3091,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     wc.lpfnWndProc = windowProc;
     wc.hInstance = instance;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIcon(instance, MAKEINTRESOURCE(IDI_MANDEL));
+    wc.hIconSm = wc.hIcon;
     wc.hbrBackground = nullptr;
     wc.lpszClassName = L"MandelbrotExplorerNative";
     RegisterClassExW(&wc);
