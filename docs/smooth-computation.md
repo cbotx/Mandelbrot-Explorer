@@ -20,7 +20,7 @@ z_0 = 0,\qquad z_{n+1} = z_n^2 + c .
 $$
 
 A point *escapes* at the first $n$ with $|z_n| > R$, the **escape radius**
-$R = 10^8$ (`_ESCAPE_RADIUS`, `mandel_perturbation.h:176`). Points that never
+$R = 10^8$ (`\_ESCAPE\_RADIUS`, `mandel_perturbation.h:176`). Points that never
 escape within `mxit` iterations are classified *interior* (sentinel `-2`).
 
 Symbols used throughout:
@@ -157,14 +157,14 @@ $$
 in *magnitude* but each individually well-scaled, so `double` arithmetic on the
 delta is accurate — even though $z_n$ itself is far below `double`’s spacing.
 
-The reference $Z_n$ is stored as a low-precision shadow `_zfr[k]/_zfi[k]`
+The reference $Z_n$ is stored as a low-precision shadow `\_zfr[k]/\_zfi[k]`
 (`long double` cast, `:2388–2390`); only the *pixel* uses `double`.
 
 ### 2.3 The reference orbit (GMP), cheaply
 
 `calCoefficient` (`:2368`) advances the reference in GMP with two tricks:
 
-* **Rotating two-buffer orbit.** `_z_re[i&1]` / `_z_re[(i-1)&1]` alternate parity so
+* **Rotating two-buffer orbit.** `\_z\_re[i&1]` / `\_z\_re[(i-1)&1]` alternate parity so
   current and previous are always distinct without copying (`:2376`).
 * **Karatsuba complex square.** $z^2=(a+bi)^2$ needs only **two** big multiplies
   instead of the naive three:
@@ -176,7 +176,7 @@ The reference $Z_n$ is stored as a low-precision shadow `_zfr[k]/_zfi[k]`
   (`:2379–2385`.) The reference build is the only inherently serial per-frame cost
   ($\sim 0.4$ s at $10^{432}$), so its multiply count matters.
 
-Precision is set to $|\text{exp}_2(\text{scale})| + 30$ bits, just enough to resolve
+Precision is set to $|\exp_2(\text{scale})| + 30$ bits, just enough to resolve
 the view.
 
 ---
@@ -189,7 +189,7 @@ For the *first* many iterations, $\delta z_n$ is an analytic function of $\delta
 and can be written as a power series. Evaluating that series lets us **skip** those
 iterations entirely (per pixel) and jump straight to iteration `SA_it`.
 
-Let $\delta = $ `_SA_delta` (the corner delta, a fixed $O(\text{half-view})$ scale,
+Let $\delta = $ `\_SA\_delta` (the corner delta, a fixed $O(\text{half-view})$ scale,
 `:2326–2331`) and $u = \delta c/\delta$. The engine represents
 
 $$
@@ -230,8 +230,8 @@ $$
 
 i.e. the high-order terms are $\ge 2^{80}$ smaller than the retained ones
 (`:2476–2478`). If no such gap exists the series has stopped converging and SA is
-disabled (`_SA_flag=false`). The last valid iteration is `_SA_it`, the truncation
-order `_SA_order`.
+disabled (`\_SA\_flag=false`). The last valid iteration is `\_SA\_it`, the truncation
+order `\_SA\_order`.
 
 ### 3.4 Seeding the delta loop
 
@@ -242,7 +242,7 @@ dz = 0;
 for (x = _SA_order; x >= 0; --x) { dz += _Adf_old[x]; dz *= dc; dz /= _SA_delta; }
 ```
 
-giving $\delta z_{\text{SA\_it}} = \sum_k A_k (\delta c/\delta)^{k+1}$, and the
+giving $\delta z_{\mathrm{SA_{it}}} = \sum_k A_k (\delta c/\delta)^{k+1}$, and the
 iteration then resumes at $j=\texttt{SA\_it}+1$. Under EDE a **second** series
 $B_j$ (the derivative $\mathrm{d}\,\delta z/\mathrm{d}c$) is carried the same way
 (`:2426–2434`).
@@ -294,7 +294,7 @@ pass).
   jump, $|\delta z|^2/|z|^2 > 10^7$, precision is already lost; the pixel is flagged
   and a **new reference** is requested (`:1561–1566`). The next reference is chosen
   glitch-guided as the flagged pixel with the smallest orbit magnitude
-  $|z|^2/|Z_{\text{ref}}|^2$ (`:1588–1595`, `createRef` `:2280`).
+  $|z|^2/|Z_{\mathrm{ref}}|^2$ (`:1588–1595`, `createRef` `:2280`).
 
 ---
 
@@ -338,11 +338,11 @@ corner from the reference, `:1628–1631`), the single-step radius is the
 mathr/Zhuoran bound (`:1642–1645`):
 
 $$
-R = \max\!\Big(0,\ \varepsilon\,\frac{|Z_s| - \texttt{dcmax}}{|2Z_s| + 1}\Big),
+R = \max\!\Big(0,\ \varepsilon\,\frac{|Z_s| - \mathrm{dcmax}}{|2Z_s| + 1}\Big),
 \qquad r^2 = R^2 .
 $$
 
-Merged levels take $R = \min\!\big(R_x,\ (R_y - |B_x|\,\texttt{dcmax})/|A_x|\big)$
+Merged levels take $R = \min\!\big(R_x,\ (R_y - |B_x|\,\mathrm{dcmax})/|A_x|\big)$
 (`:1680–1685`) so the whole run stays valid.
 
 > **`dcmax` must use the actual reference position.** After glitch
@@ -354,10 +354,10 @@ Merged levels take $R = \min\!\big(R_x,\ (R_y - |B_x|\,\texttt{dcmax})/|A_x|\big
 
 `tryBLA` (`:1700`) picks, for the current reference index $s$, the **largest aligned**
 level whose radius contains the current $|\delta z|^2$. Levels start at index
-$1 + i\,2^p$, so $s$ is aligned at levels $0..\text{tz}$ where $\text{tz}$ =
+$1 + i\,2^p$, so $s$ is aligned at levels $0..\mathrm{tz}$ where $\mathrm{tz}$ =
 trailing zeros of $s-1$ — the search starts there, no per-level alignment test
 (`:1705–1713`). It also **never skips past an escape**: it reconstructs
-$z_{\text{land}} = Z_{\text{land}} + (A\delta z + B\delta c)$ and rejects the skip if
+$z_{\mathrm{land}} = Z_{\mathrm{land}} + (A\delta z + B\delta c)$ and rejects the skip if
 that already exceeds the bailout (`:1720–1726`).
 
 BLA is disabled for orbit traps (which need every orbit point) and combined with
@@ -390,7 +390,7 @@ scalar $s = |S|$ in `double`. Substituting $\delta z = Sw$ into the perturbation
 recurrence and dividing by $S$ gives the rescaled step (`pixelRescaled` `:2001–2007`):
 
 $$
-w' = 2 X_m\,w + s\,w^2 + d,\qquad X_m = Z_m\ (\text{double shadow}),
+w' = 2 X_m\,w + s\,w^2 + d,\qquad X_m = Z_m\ \text{(double shadow)},
 $$
 
 with reconstruction $z = X_m + S\,w$ (`:2025`). To keep the mantissa healthy, $w$ is
@@ -417,7 +417,7 @@ $$
 $$
 
 (`pixelRescaled` `:2010–2013`, in its own rescaled floatexp $J=S_J\,(j_r,j_i)$ so it
-survives $|J|\sim 1/\text{dx}$ overflow). On the double path the derivative is tracked
+survives $|J|\sim 1/\mathrm{dx}$ overflow). On the double path the derivative is tracked
 as a **perturbation** $dd = J - D$ of the reference derivative $D$
 ($D_{n+1}=2D_nZ_n+1$, `:2396–2412`):
 
@@ -436,8 +436,8 @@ $\mathrm{dist} = |z_n|\ln|z_n| / |z_n'|$ with $z_n' = J_n$. The engine returns i
 **pixel units** (÷`dx`), `:1509`, `:2030–2034`:
 
 $$
-\mathrm{dist}_{\text{px}} = \frac{|z_n|\,\ln|z_n|^2}{\text{dx}\,\cdot|J_n|}
-= \frac{\sqrt{r}\,\ln r}{\text{dx}\,\sqrt{J_r^2+J_i^2}} .
+\mathrm{dist}_{\mathrm{px}} = \frac{|z_n|\,\ln|z_n|^2}{\mathrm{dx}\,\cdot|J_n|}
+= \frac{\sqrt{r}\,\ln r}{\mathrm{dx}\,\sqrt{J_r^2+J_i^2}} .
 $$
 
 ### 7.3 Normal map / relief
@@ -470,7 +470,7 @@ subtleties make it deep-zoom-clean:
 
 The value blends the windowed average $a_1$ and the average-without-newest $a_2$ by
 the smooth fraction (`:67–76`):
-$\text{value} = a_2 + (a_1-a_2)\,\mathrm{frac}$.
+$\mathrm{value} = a_2 + (a_1-a_2)\,\mathrm{frac}$.
 
 ### 7.5 Orbit trap
 
