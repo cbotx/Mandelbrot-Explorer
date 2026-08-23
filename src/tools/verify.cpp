@@ -15,7 +15,9 @@
 //          expression-taylor | expression-deep-render |
 //          expression-oracle |
 //          oracle | custom-deep | expression-suite | suite |
-//          expression-residual | formula-bench | multibrot | backend | gpu | all
+//          expression-residual | formula-bench | multibrot | backend |
+//          adaptive-phase1 | centered-sweep | centered-mandatory | centered-selector |
+//          centered-full | gpu | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
 
@@ -96,6 +98,14 @@ struct TestCase {
 // exterior smooth as interior, so classify against the sentinel band instead.
 static inline bool isInterior(float v) {
     return v < -1.5f;
+}
+
+static bool isMandatoryCenteredFallback(uint8_t reasonMask) {
+    return (reasonMask & formula::ExpressionDeepCenteredFallbackMandatoryMask) != 0;
+}
+
+static uint8_t lowEligibleCenteredFallbackMask() {
+    return formula::expressionDeepCenteredFallbackReasonMask(formula::ExpressionDeepCenteredFallbackReason::StateDisagreement) | formula::expressionDeepCenteredFallbackReasonMask(formula::ExpressionDeepCenteredFallbackReason::InteriorConservatism);
 }
 
 static uint32_t checksum(const float* v, int n) {
@@ -1555,6 +1565,7 @@ static int runExpressionCenteredCase() {
     using formula::ExpressionCenteredStatus;
     using formula::ExpressionContext;
     using formula::ExpressionDeltaContext;
+    using formula::ExpressionDerivativeSeed;
     using formula::ExpressionError;
     using formula::ExpressionOracle;
     using formula::ExpressionOracleContext;
@@ -1998,6 +2009,353 @@ static int runExpressionCenteredCase() {
     }
     failures += batchMismatches;
 
+    int fastEntireChecks = 0;
+    int fastEntireMismatches = 0;
+    const char* fastEntireSources[] = {"sin(z)", "cos(z)", "sinh(z)", "cosh(z)", "exp(z)", "sin(sinh(z))+exp(c)", "conj(z)", "real(z)", "imag(z)", "norm(z)", "complex(real(z),imag(z))"};
+    std::array<ExpressionDeltaContext, 4> fastEntireDeltas;
+    fastEntireDeltas[0].z = {2e-4, -3e-4};
+    fastEntireDeltas[0].c = {-1e-4, 4e-4};
+    fastEntireDeltas[1] = fastEntireDeltas[0];
+    fastEntireDeltas[1].z *= Complex{-0.75, 0.25};
+    fastEntireDeltas[1].c *= Complex{0.5, -0.5};
+    fastEntireDeltas[2] = fastEntireDeltas[0];
+    fastEntireDeltas[2].z *= Complex{1.5, -0.25};
+    fastEntireDeltas[2].c *= -0.75;
+    fastEntireDeltas[3] = fastEntireDeltas[0];
+    fastEntireDeltas[3].z *= Complex{-0.25, -1.25};
+    fastEntireDeltas[3].c *= Complex{-1.0, 0.5};
+    for (const char* source : fastEntireSources) {
+        ExpressionProgram program;
+        if (!compile(program, source)) continue;
+        ExpressionCenteredResult fast[4];
+        if (!ExpressionCenteredEvaluator::evaluate4FastEntire(program, nominal, fastEntireDeltas.data(), fast)) {
+            ++fastEntireMismatches;
+            continue;
+        }
+        for (int lane = 0; lane < 4; ++lane) {
+            const ExpressionCenteredResult scalar = ExpressionCenteredEvaluator::evaluate(program, nominal, fastEntireDeltas[static_cast<size_t>(lane)]);
+            ++fastEntireChecks;
+            if (fast[lane].status != scalar.status || !sameComplexBits(fast[lane].base, scalar.base) || !residualClose(fast[lane].delta, scalar.delta, 2e-12)) ++fastEntireMismatches;
+        }
+    }
+    for (const char* source : {"sin(z)", "cos(z)", "sinh(z)", "cosh(z)", "exp(z)"}) {
+        ExpressionProgram program;
+        if (!compile(program, source)) continue;
+        std::array<Complex, ExpressionProgram::MAX_INSTRUCTIONS> nodeBases{};
+        std::array<Complex, ExpressionProgram::MAX_INSTRUCTIONS> nodeAuxiliaries{};
+        nodeBases[0] = nominal.z;
+        nodeBases[1] = program.evaluate(nominal);
+        if (std::strcmp(source, "sin(z)") == 0)
+            nodeAuxiliaries[1] = std::cos(nominal.z);
+        else if (std::strcmp(source, "cos(z)") == 0)
+            nodeAuxiliaries[1] = std::sin(nominal.z);
+        else if (std::strcmp(source, "sinh(z)") == 0)
+            nodeAuxiliaries[1] = std::cosh(nominal.z);
+        else if (std::strcmp(source, "cosh(z)") == 0)
+            nodeAuxiliaries[1] = std::sinh(nominal.z);
+        ExpressionCenteredResult fast[4];
+        double derivativeMagnitudes[4];
+        if (!ExpressionCenteredEvaluator::evaluate4WithNodeBasesFastEntireDerivative(program, nominal, nodeBases.data(), nodeAuxiliaries.data(), fastEntireDeltas.data(), fast, derivativeMagnitudes)) {
+            ++fastEntireMismatches;
+            continue;
+        }
+        for (int lane = 0; lane < 4; ++lane) {
+            const ExpressionCenteredResult scalar = ExpressionCenteredEvaluator::evaluate(program, nominal, fastEntireDeltas[static_cast<size_t>(lane)]);
+            ExpressionContext endpoint = nominal;
+            endpoint.z += fastEntireDeltas[static_cast<size_t>(lane)].z;
+            ExpressionDerivativeSeed seed;
+            seed.z = {1.0, 0.0};
+            Complex value;
+            Complex derivative;
+            ++fastEntireChecks;
+            if (fast[lane].status != scalar.status || !sameComplexBits(fast[lane].base, scalar.base) || !residualClose(fast[lane].delta, scalar.delta, 2e-12) || !program.evaluateWithDerivative(endpoint, seed, value, derivative) || std::abs(derivativeMagnitudes[lane] - std::abs(derivative)) > 2e-12 * std::max(1.0, std::abs(derivative))) ++fastEntireMismatches;
+        }
+    }
+    {
+        const char* sources[] = {"conj(z)", "real(z)", "imag(z)", "norm(z)", "complex(real(z),imag(z))"};
+        for (const char* source : sources) {
+            ExpressionProgram program;
+            if (!compile(program, source)) continue;
+            ExpressionOracleContext oracle(256);
+            setOracleContext(oracle, nominal);
+            MpfrComplex output(256);
+            formula::ExpressionOracleTrace trace;
+            std::string traceError;
+            if (!ExpressionOracle::evaluateTrace(program, oracle, output, trace, &traceError) || trace.nodes.size() != program.instructionCount()) {
+                ++fastEntireMismatches;
+                continue;
+            }
+            std::array<Complex, ExpressionProgram::MAX_INSTRUCTIONS> nodeBases{};
+            std::array<Complex, ExpressionProgram::MAX_INSTRUCTIONS> nodeAuxiliaries{};
+            for (size_t node = 0; node < trace.nodes.size(); ++node) {
+                nodeBases[node] = trace.nodes[node].output.toDouble();
+                nodeAuxiliaries[node] = trace.nodes[node].auxiliary.toDouble();
+            }
+            ExpressionCenteredResult fast[4];
+            double jacobianNorms[4];
+            if (!ExpressionCenteredEvaluator::evaluate4WithNodeBasesFastEntireDerivative(program, nominal, nodeBases.data(), nodeAuxiliaries.data(), fastEntireDeltas.data(), fast, jacobianNorms)) {
+                ++fastEntireMismatches;
+                continue;
+            }
+            for (int lane = 0; lane < 4; ++lane) {
+                const ExpressionCenteredResult scalar = ExpressionCenteredEvaluator::evaluate(program, nominal, fastEntireDeltas[static_cast<size_t>(lane)]);
+                const Complex endpoint = nominal.z + fastEntireDeltas[static_cast<size_t>(lane)].z;
+                const double expectedNorm = std::strcmp(source, "norm(z)") == 0 ? 2.0 * std::abs(endpoint) : 1.0;
+                ++fastEntireChecks;
+                if (fast[lane].status != scalar.status || !sameComplexBits(fast[lane].base, scalar.base) || !sameComplexBits(fast[lane].delta, scalar.delta) || std::abs(jacobianNorms[lane] - expectedNorm) > 2e-12 * std::max(1.0, expectedNorm)) ++fastEntireMismatches;
+            }
+        }
+    }
+    {
+        const struct {
+            const char* source;
+            Complex base;
+            Complex delta;
+        } edgeCases[] = {{"sin(z)", {-0.0, 0.25}, {0.0, -0.0}}, {"cos(z)", {0.25, -0.0}, {-0.0, 0.0}}, {"sinh(z)", {-0.0, -0.25}, {0.0, -0.0}}, {"cosh(z)", {-0.25, 0.0}, {-0.0, 0.0}}, {"exp(z)", {0.0, -0.25}, {-0.0, 0.0}}, {"sin(z)", {1.0, 1.0}, {300.0, 0.25}}, {"sinh(z)", {1.0, 1.0}, {50.0, 0.25}}};
+        for (const auto& edge : edgeCases) {
+            ExpressionProgram program;
+            if (!compile(program, edge.source)) continue;
+            ExpressionContext context = nominal;
+            context.z = edge.base;
+            std::array<ExpressionDeltaContext, 4> deltas{};
+            for (ExpressionDeltaContext& delta : deltas) delta.z = edge.delta;
+            ExpressionCenteredResult fast[4];
+            if (!ExpressionCenteredEvaluator::evaluate4FastEntire(program, context, deltas.data(), fast)) {
+                ++fastEntireMismatches;
+                continue;
+            }
+            for (int lane = 0; lane < 4; ++lane) {
+                const ExpressionCenteredResult scalar = ExpressionCenteredEvaluator::evaluate(program, context, deltas[static_cast<size_t>(lane)]);
+                ++fastEntireChecks;
+                if (fast[lane].status != scalar.status || !sameComplexBits(fast[lane].base, scalar.base) || !sameComplexBits(fast[lane].delta, scalar.delta)) ++fastEntireMismatches;
+            }
+        }
+    }
+    int refillChecks = 0;
+    int refillMismatches = 0;
+    int refillCancellationChecks = 0;
+    {
+        struct RefillStep {
+            ExpressionContext context;
+            ExpressionDeltaContext delta;
+            std::array<Complex, ExpressionProgram::MAX_INSTRUCTIONS> nodeBases{};
+            std::array<Complex, ExpressionProgram::MAX_INSTRUCTIONS> nodeAuxiliaries{};
+            ExpressionCenteredResult expected;
+            double expectedDerivative = std::numeric_limits<double>::quiet_NaN();
+        };
+        struct RefillJob {
+            std::vector<RefillStep> steps;
+            size_t nextStep = 0;
+        };
+        auto buildStep = [&](const ExpressionProgram& program, RefillStep& step) {
+            ExpressionOracleContext oracle(256);
+            setOracleContext(oracle, step.context);
+            MpfrComplex output(256);
+            formula::ExpressionOracleTrace trace;
+            std::string traceError;
+            if (!ExpressionOracle::evaluateTrace(program, oracle, output, trace, &traceError) || trace.nodes.size() != program.instructionCount()) return false;
+            for (size_t node = 0; node < trace.nodes.size(); ++node) {
+                step.nodeBases[node] = trace.nodes[node].output.toDouble();
+                step.nodeAuxiliaries[node] = trace.nodes[node].auxiliary.toDouble();
+            }
+            std::array<ExpressionDeltaContext, 4> duplicatedDeltas;
+            duplicatedDeltas.fill(step.delta);
+            ExpressionCenteredResult fixed[4];
+            double fixedDerivatives[4];
+            if (!ExpressionCenteredEvaluator::evaluate4WithNodeBasesFastEntireDerivative(program, step.context, step.nodeBases.data(), step.nodeAuxiliaries.data(), duplicatedDeltas.data(), fixed, fixedDerivatives)) return false;
+            step.expected = fixed[0];
+            step.expectedDerivative = fixedDerivatives[0];
+            return true;
+        };
+        const std::array<int, 9> jobLengths = {1, 7, 2, 9, 4, 6, 3, 8, 5};
+        const std::array<const char*, 5> unaryNames = {"sin", "cos", "sinh", "cosh", "exp"};
+        const std::array<const char*, 5> arithmeticBodies = {"z+c", "z*z+c", "z*c+z0", "sqr(z)+c", "z*(z+c)-c"};
+        for (int programIndex = 0; programIndex < 8; ++programIndex) {
+            const size_t unaryIndex = static_cast<size_t>((randomState >> 7) % unaryNames.size());
+            randomState = randomState * 6364136223846793005ULL + 1;
+            const size_t bodyIndex = static_cast<size_t>((randomState >> 11) % arithmeticBodies.size());
+            randomState = randomState * 6364136223846793005ULL + 1;
+            std::string source = std::string(unaryNames[unaryIndex]) + "(" + arithmeticBodies[bodyIndex] + ")+c";
+            if ((programIndex & 1) != 0) source += "+(n-n)";
+            ExpressionProgram program;
+            if (!compile(program, source.c_str())) {
+                ++refillMismatches;
+                continue;
+            }
+            std::vector<RefillJob> jobs(jobLengths.size());
+            bool prepared = true;
+            for (size_t job = 0; job < jobs.size() && prepared; ++job) {
+                jobs[job].steps.resize(static_cast<size_t>(jobLengths[job]));
+                for (size_t stepIndex = 0; stepIndex < jobs[job].steps.size(); ++stepIndex) {
+                    RefillStep& step = jobs[job].steps[stepIndex];
+                    step.context = nominal;
+                    step.context.iteration = static_cast<int>(stepIndex + 13 * job);
+                    step.context.z = {0.25 + 0.025 * randomSigned(), 0.17 + 0.025 * randomSigned()};
+                    step.context.c = {-0.11 + 0.02 * randomSigned(), 0.07 + 0.02 * randomSigned()};
+                    step.context.z0 = {0.31 + 0.02 * randomSigned(), -0.13 + 0.02 * randomSigned()};
+                    step.delta.z = {2e-6 * randomSigned(), 2e-6 * randomSigned()};
+                    step.delta.c = {2e-7 * randomSigned(), 2e-7 * randomSigned()};
+                    step.delta.z0 = {2e-7 * randomSigned(), 2e-7 * randomSigned()};
+                    prepared = buildStep(program, step);
+                    if (!prepared) break;
+                }
+            }
+            if (!prepared) {
+                ++refillMismatches;
+                continue;
+            }
+
+            std::array<int, 4> laneJobs;
+            laneJobs.fill(-1);
+            size_t nextJob = 0;
+            auto loadJob = [&](int lane) {
+                if (nextJob >= jobs.size()) {
+                    laneJobs[static_cast<size_t>(lane)] = -1;
+                    return;
+                }
+                laneJobs[static_cast<size_t>(lane)] = static_cast<int>(nextJob++);
+            };
+            for (int lane = 0; lane < 4; ++lane) loadJob(lane);
+            size_t completedJobs = 0;
+            while (completedJobs < jobs.size()) {
+                uint8_t activeMask = 0;
+                std::array<const ExpressionContext*, 4> contexts{};
+                std::array<const Complex*, 4> bases{};
+                std::array<const Complex*, 4> auxiliaries{};
+                std::array<const ExpressionDeltaContext*, 4> deltas{};
+                for (int lane = 0; lane < 4; ++lane) {
+                    const int jobIndex = laneJobs[static_cast<size_t>(lane)];
+                    if (jobIndex < 0) continue;
+                    RefillJob& job = jobs[static_cast<size_t>(jobIndex)];
+                    RefillStep& step = job.steps[job.nextStep];
+                    activeMask |= uint8_t{1} << lane;
+                    contexts[lane] = &step.context;
+                    bases[lane] = step.nodeBases.data();
+                    auxiliaries[lane] = step.nodeAuxiliaries.data();
+                    deltas[lane] = &step.delta;
+                }
+                ExpressionCenteredResult actual[4];
+                double actualDerivatives[4];
+                if (!ExpressionCenteredEvaluator::evaluate4WithLaneNodeBasesFastEntireDerivative(program, contexts.data(), bases.data(), auxiliaries.data(), deltas.data(), activeMask, actual, actualDerivatives)) {
+                    ++refillMismatches;
+                    break;
+                }
+                for (int lane = 0; lane < 4; ++lane) {
+                    const int jobIndex = laneJobs[static_cast<size_t>(lane)];
+                    if (jobIndex < 0) {
+                        ++refillChecks;
+                        if (actual[lane].status != ExpressionCenteredStatus::InvalidProgram || !std::isnan(actualDerivatives[lane])) ++refillMismatches;
+                        continue;
+                    }
+                    RefillJob& job = jobs[static_cast<size_t>(jobIndex)];
+                    const RefillStep& step = job.steps[job.nextStep];
+                    ++refillChecks;
+                    if (actual[lane].status != step.expected.status || !sameComplexBits(actual[lane].base, step.expected.base) || !sameComplexBits(actual[lane].delta, step.expected.delta) || !sameDoubleBits(actualDerivatives[lane], step.expectedDerivative)) ++refillMismatches;
+                    ++job.nextStep;
+                    if (job.nextStep == job.steps.size()) {
+                        ++completedJobs;
+                        loadJob(lane);
+                    }
+                }
+            }
+
+            for (RefillJob& job : jobs) job.nextStep = 0;
+            laneJobs.fill(-1);
+            nextJob = 0;
+            for (int lane = 0; lane < 4; ++lane) loadJob(lane);
+            constexpr int CancellationVectorCalls = 4;
+            int vectorCalls = 0;
+            size_t cancelledCompletedJobs = 0;
+            while (cancelledCompletedJobs < jobs.size() && vectorCalls < CancellationVectorCalls) {
+                uint8_t activeMask = 0;
+                std::array<const ExpressionContext*, 4> contexts{};
+                std::array<const Complex*, 4> bases{};
+                std::array<const Complex*, 4> auxiliaries{};
+                std::array<const ExpressionDeltaContext*, 4> deltas{};
+                for (int lane = 0; lane < 4; ++lane) {
+                    const int jobIndex = laneJobs[static_cast<size_t>(lane)];
+                    if (jobIndex < 0) continue;
+                    RefillJob& job = jobs[static_cast<size_t>(jobIndex)];
+                    RefillStep& step = job.steps[job.nextStep];
+                    activeMask |= uint8_t{1} << lane;
+                    contexts[lane] = &step.context;
+                    bases[lane] = step.nodeBases.data();
+                    auxiliaries[lane] = step.nodeAuxiliaries.data();
+                    deltas[lane] = &step.delta;
+                }
+                ExpressionCenteredResult actual[4];
+                if (!ExpressionCenteredEvaluator::evaluate4WithLaneNodeBasesFastEntire(program, contexts.data(), bases.data(), auxiliaries.data(), deltas.data(), activeMask, actual)) {
+                    ++refillMismatches;
+                    break;
+                }
+                ++vectorCalls;
+                for (int lane = 0; lane < 4; ++lane) {
+                    const int jobIndex = laneJobs[static_cast<size_t>(lane)];
+                    if (jobIndex < 0) continue;
+                    RefillJob& job = jobs[static_cast<size_t>(jobIndex)];
+                    ++job.nextStep;
+                    if (job.nextStep == job.steps.size()) {
+                        ++cancelledCompletedJobs;
+                        loadJob(lane);
+                    }
+                }
+            }
+            ++refillCancellationChecks;
+            if (vectorCalls != CancellationVectorCalls || cancelledCompletedJobs == jobs.size()) ++refillMismatches;
+        }
+        {
+            ExpressionProgram program;
+            if (!compile(program, "exp(z)+(n-n)")) {
+                ++refillMismatches;
+            } else {
+                std::array<RefillStep, 3> steps;
+                steps[0].context = nominal;
+                steps[0].context.z = {-0.0, 0.25};
+                steps[0].context.iteration = 3;
+                steps[0].delta.z = {0.0, -0.0};
+                steps[1].context = nominal;
+                steps[1].context.z = {710.0, 0.1};
+                steps[1].context.iteration = 17;
+                steps[1].delta.z = {1e-10, -1e-10};
+                steps[2].context = nominal;
+                steps[2].context.z = {-0.3, -0.0};
+                steps[2].context.iteration = 29;
+                steps[2].delta.z = {-0.0, 0.0};
+                bool prepared = true;
+                for (RefillStep& step : steps) prepared = prepared && buildStep(program, step);
+                if (!prepared) {
+                    ++refillMismatches;
+                } else {
+                    std::array<const ExpressionContext*, 4> contexts{};
+                    std::array<const Complex*, 4> bases{};
+                    std::array<const Complex*, 4> auxiliaries{};
+                    std::array<const ExpressionDeltaContext*, 4> deltas{};
+                    for (int lane = 0; lane < 3; ++lane) {
+                        contexts[lane] = &steps[static_cast<size_t>(lane)].context;
+                        bases[lane] = steps[static_cast<size_t>(lane)].nodeBases.data();
+                        auxiliaries[lane] = steps[static_cast<size_t>(lane)].nodeAuxiliaries.data();
+                        deltas[lane] = &steps[static_cast<size_t>(lane)].delta;
+                    }
+                    ExpressionCenteredResult actual[4];
+                    double actualDerivatives[4];
+                    if (!ExpressionCenteredEvaluator::evaluate4WithLaneNodeBasesFastEntireDerivative(program, contexts.data(), bases.data(), auxiliaries.data(), deltas.data(), 7, actual, actualDerivatives)) {
+                        ++refillMismatches;
+                    } else {
+                        for (int lane = 0; lane < 3; ++lane) {
+                            ++refillChecks;
+                            const RefillStep& step = steps[static_cast<size_t>(lane)];
+                            if (actual[lane].status != step.expected.status || !sameComplexBits(actual[lane].base, step.expected.base) || !sameComplexBits(actual[lane].delta, step.expected.delta) || !sameDoubleBits(actualDerivatives[lane], step.expectedDerivative)) ++refillMismatches;
+                        }
+                        ++refillChecks;
+                        if (actual[3].status != ExpressionCenteredStatus::InvalidProgram || !std::isnan(actualDerivatives[3])) ++refillMismatches;
+                    }
+                }
+            }
+        }
+    }
+    failures += fastEntireMismatches;
+    failures += refillMismatches;
+
     ExpressionProgram benchmarkProgram;
     double scalarMs = 0.0, centeredMs = 0.0, scalar4Ms = 0.0, batch4Ms = 0.0;
     if (compile(benchmarkProgram, "sin(z*z+c)+exp(p0*z)/(2+z)")) {
@@ -2051,6 +2409,7 @@ static int runExpressionCenteredCase() {
            opcodeChecks, oracleChecks, tinyChecks, recurrenceChecks, fallbackChecks, signedZeroChecks);
     printf("  direct subtraction zero while centered nonzero=%d/%zu\n", directZeroDemonstrations, std::size(tinyCases));
     printf("  centered batch parity=%d mismatch=%d\n", batchChecks, batchMismatches);
+    printf("  fast-entire scalar/opcode/edge checks=%d mismatch=%d refill parity/cancel=%d/%d mismatch=%d\n", fastEntireChecks, fastEntireMismatches, refillChecks, refillCancellationChecks, refillMismatches);
     printf("  scalar/centered %.3f/%.3f ms overhead %.2fx"
            " (informational)\n",
            scalarMs, centeredMs, scalarMs > 0.0 ? centeredMs / scalarMs : 0.0);
@@ -2110,6 +2469,657 @@ static bool renderExpressionColorReference(const formula::ExpressionProgram& pro
         }
     }
     return true;
+}
+
+static int runAdaptivePhase1Case() {
+    using formula::ExpressionContext;
+    using formula::ExpressionDeepRenderRequest;
+    using formula::ExpressionDeepRenderResult;
+    using formula::ExpressionError;
+    using formula::ExpressionProgram;
+    using formula::ExpressionScaledResidualCapability;
+
+    struct ProgramPair {
+        ExpressionProgram canonical;
+        ExpressionProgram runtime;
+    };
+    auto compilePair = [](const char* source, FormulaParameter pixel, const ExpressionContext& fixed, ProgramPair& pair) {
+        ExpressionError error;
+        return pair.canonical.compile(source, &error) && pair.canonical.specialize(fixed, pixel, pair.runtime, &error);
+    };
+    auto makeRequest = [](const ProgramPair& pair, const ExpressionContext& fixed, FormulaParameter pixel, const char* centerReal, const char* centerImaginary, const char* scale, int width, int height, int iterations, double bailout, std::vector<float>& output) {
+        output.assign(static_cast<size_t>(width) * height, formula::ExpressionDeepEmptyPixel);
+        ExpressionDeepRenderRequest request;
+        request.canonicalProgram = &pair.canonical;
+        request.runtimeProgram = &pair.runtime;
+        request.center.realDecimal = centerReal;
+        request.center.imaginaryDecimal = centerImaginary;
+        request.scale.decimal = scale;
+        request.fixed = fixed;
+        request.pixelParameter = pixel;
+        request.width = width;
+        request.height = height;
+        request.maxIterations = iterations;
+        request.bailout = bailout;
+        request.output = output.data();
+        request.outputCount = output.size();
+        request.precision.minimumBits = 128;
+        request.precision.guardBits = 64;
+        request.precision.maximumBits = 4096;
+        request.memory.fallbackGuardBits = 128;
+        request.preflight.enable = false;
+        request.taylor.enableTaylor = false;
+        request.centered.enableAdaptiveCandidate = true;
+        return request;
+    };
+    auto differences = [](const std::vector<float>& actual, const std::vector<float>& expected, size_t& empty, size_t& classification, size_t& floor) {
+        empty = classification = floor = 0;
+        for (size_t index = 0; index < actual.size(); ++index) {
+            empty += actual[index] == formula::ExpressionDeepEmptyPixel;
+            const bool actualInterior = actual[index] < 0.0f;
+            const bool expectedInterior = expected[index] < 0.0f;
+            if (actualInterior != expectedInterior)
+                ++classification;
+            else if (!actualInterior && actual[index] != expected[index])
+                ++floor;
+        }
+    };
+
+    struct DenseCase {
+        const char* name;
+        const char* source;
+        FormulaParameter pixel;
+        ExpressionContext fixed;
+        int width;
+        int height;
+        ExpressionScaledResidualCapability capability;
+        bool expectAdaptive;
+    };
+    ExpressionContext cFixed;
+    cFixed.z0 = {0.125, -0.0625};
+    ExpressionContext z0Fixed;
+    z0Fixed.c = {0.05, 0.02};
+    const DenseCase cases[] = {
+        {"z0-entire", "sin(z)+c", FormulaParameter::InitialZ, z0Fixed, 64, 40, ExpressionScaledResidualCapability::CertifiedEntireCandidate, true},
+        {"z0-entire-z0-leaf", "0.5*sin(z)+0.25*z0+c", FormulaParameter::InitialZ, z0Fixed, 64, 40, ExpressionScaledResidualCapability::CertifiedEntireCandidate, true},
+        {"z0-entire-neutral-tail", "sin(z)+c+(n-n)", FormulaParameter::InitialZ, z0Fixed, 129, 97, ExpressionScaledResidualCapability::CertifiedEntireCandidate, true},
+        {"z0-arithmetic", "z*z+c", FormulaParameter::InitialZ, z0Fixed, 65, 41, ExpressionScaledResidualCapability::ExactCenteredArithmetic, false},
+        {"c-conjugate", "0.5*conj(z)+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedRealCandidate, true},
+        {"c-real-neutral", "0.5*real(z)+c+(n-n)", FormulaParameter::C, cFixed, 65, 41, ExpressionScaledResidualCapability::CertifiedRealCandidate, true},
+        {"c-imaginary", "0.5*imag(z)+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedRealCandidate, true},
+        {"c-norm", "0.1*norm(z)+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedRealCandidate, true},
+        {"c-complex-tail", "0.5*complex(real(z),imag(z))+c", FormulaParameter::C, cFixed, 67, 43, ExpressionScaledResidualCapability::CertifiedRealCandidate, true},
+        {"abs-fallback", "abs(z)+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedPiecewiseCandidate, true},
+    };
+
+    int failures = 0;
+    for (const DenseCase& test : cases) {
+        ProgramPair pair;
+        std::vector<float> adaptive;
+        std::vector<float> mpfr;
+        if (!compilePair(test.source, test.pixel, test.fixed, pair) || pair.runtime.scaledResidualCapability() != test.capability) {
+            printf("  adaptive phase1 compile/capability failed [%s]\n", test.name);
+            ++failures;
+            continue;
+        }
+        ExpressionDeepRenderRequest adaptiveRequest = makeRequest(pair, test.fixed, test.pixel, "0", "0", "1.01e12", test.width, test.height, 320, 100.0, adaptive);
+        ExpressionDeepRenderResult adaptiveResult;
+        const bool adaptiveOkay = formula::renderExpressionDeepFrame(adaptiveRequest, adaptiveResult);
+        ExpressionDeepRenderRequest mpfrRequest = makeRequest(pair, test.fixed, test.pixel, "0", "0", "1.01e12", test.width, test.height, 320, 100.0, mpfr);
+        mpfrRequest.forceMpfrFallbackForVerification = true;
+        ExpressionDeepRenderResult mpfrResult;
+        const bool mpfrOkay = formula::renderExpressionDeepFrame(mpfrRequest, mpfrResult);
+        size_t empty = 0;
+        size_t classification = 0;
+        size_t floor = 0;
+        if (adaptiveOkay && mpfrOkay) differences(adaptive, mpfr, empty, classification, floor);
+        const uint64_t pixelCount = static_cast<uint64_t>(test.width) * test.height;
+        const bool pathOkay = test.expectAdaptive                                                  ? adaptiveResult.centeredAttempted && adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount != 0
+                              : test.capability == ExpressionScaledResidualCapability::Unsupported ? !adaptiveResult.centeredAttempted && !adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount == 0 && adaptiveResult.fallbackPixelCount == pixelCount
+                                                                                                   : !adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount == pixelCount && adaptiveResult.fallbackPixelCount == 0;
+        const bool okay = adaptiveOkay && mpfrOkay && empty == 0 && classification == 0 && floor == 0 && pathOkay && mpfrResult.fastPixelCount == 0 && mpfrResult.fallbackPixelCount == pixelCount;
+        printf("  %-23s %dx%d %s/%s adaptive=%d/%d/%d refs=%llu fast/fallback=%llu/%llu EMPTY/class/floor=%zu/%zu/%zu\n",
+               test.name, test.width, test.height, test.pixel == FormulaParameter::InitialZ ? "z0" : "c", test.capability == ExpressionScaledResidualCapability::CertifiedRealCandidate ? "real" : test.capability == ExpressionScaledResidualCapability::CertifiedEntireCandidate ? "entire"
+                                                                                                                                                                                               : test.capability == ExpressionScaledResidualCapability::ExactCenteredArithmetic    ? "arithmetic"
+                                                                                                                                                                                                                                                                                   : "unsupported",
+               adaptiveResult.centeredAttempted ? 1 : 0, adaptiveResult.centeredAccepted ? 1 : 0, adaptiveResult.centeredPreflightRejected ? 1 : 0, (unsigned long long)adaptiveResult.centeredReferenceCount, (unsigned long long)adaptiveResult.fastPixelCount, (unsigned long long)adaptiveResult.fallbackPixelCount, empty, classification, floor);
+        if (!okay) {
+            printf("    status adaptive/MPFR=%s/%s error=%s/%s\n", formula::expressionDeepRenderStatusName(adaptiveResult.status), formula::expressionDeepRenderStatusName(mpfrResult.status), adaptiveResult.error.c_str(), mpfrResult.error.c_str());
+            ++failures;
+        }
+    }
+
+    auto benchmark = [&](const char* name, const char* source, FormulaParameter pixel, const ExpressionContext& fixed) {
+        ProgramPair pair;
+        if (!compilePair(source, pixel, fixed, pair)) {
+            printf("  adaptive phase1 benchmark compile failed [%s]\n", name);
+            ++failures;
+            return;
+        }
+        std::vector<double> adaptiveTimes;
+        std::vector<double> mpfrTimes;
+        bool okay = true;
+        ExpressionDeepRenderResult telemetry;
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            std::vector<float> adaptive;
+            std::vector<float> mpfr;
+            ExpressionDeepRenderRequest adaptiveRequest = makeRequest(pair, fixed, pixel, "0", "0", "1.01e12", 208, 139, 320, 100.0, adaptive);
+            ExpressionDeepRenderResult adaptiveResult;
+            const Clock::time_point adaptiveStart = Clock::now();
+            const bool adaptiveOkay = formula::renderExpressionDeepFrame(adaptiveRequest, adaptiveResult);
+            adaptiveTimes.push_back(std::chrono::duration<double>(Clock::now() - adaptiveStart).count());
+
+            ExpressionDeepRenderRequest mpfrRequest = makeRequest(pair, fixed, pixel, "0", "0", "1.01e12", 208, 139, 320, 100.0, mpfr);
+            mpfrRequest.forceMpfrFallbackForVerification = true;
+            ExpressionDeepRenderResult mpfrResult;
+            const Clock::time_point mpfrStart = Clock::now();
+            const bool mpfrOkay = formula::renderExpressionDeepFrame(mpfrRequest, mpfrResult);
+            mpfrTimes.push_back(std::chrono::duration<double>(Clock::now() - mpfrStart).count());
+            okay = okay && adaptiveOkay && mpfrOkay && adaptive == mpfr && adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount != 0 && mpfrResult.fastPixelCount == 0 && mpfrResult.fallbackPixelCount == mpfr.size();
+            telemetry = adaptiveResult;
+        }
+        const double adaptiveBest = *std::min_element(adaptiveTimes.begin(), adaptiveTimes.end());
+        const double mpfrBest = *std::min_element(mpfrTimes.begin(), mpfrTimes.end());
+        const double speedup = adaptiveBest > 0.0 ? mpfrBest / adaptiveBest : 0.0;
+        printf("  %-23s 208x139 e12 adaptive/MPFR=%.3f/%.3f s speedup=%.2fx accepted=%d fallback=%llu\n", name, adaptiveBest, mpfrBest, speedup, telemetry.centeredAccepted ? 1 : 0, (unsigned long long)telemetry.fallbackPixelCount);
+        if (!okay || !(adaptiveBest <= mpfrBest * 0.9)) {
+            printf("    adaptive phase1 material speed gate failed\n");
+            ++failures;
+        }
+    };
+    benchmark("z0-entire-benchmark", "sin(z)+c+(n-n)", FormulaParameter::InitialZ, z0Fixed);
+    benchmark("real-smooth-benchmark", "0.2*conj(z)+0.05*complex(real(z),imag(z))+0.01*norm(z)+c+(n-n)", FormulaParameter::C, cFixed);
+
+    {
+        ProgramPair pair;
+        std::vector<float> output;
+        if (!compilePair("sin(z)+c", FormulaParameter::InitialZ, z0Fixed, pair)) {
+            ++failures;
+        } else {
+            ExpressionDeepRenderRequest request = makeRequest(pair, z0Fixed, FormulaParameter::InitialZ, "0", "0", "1.01e12", 128, 96, 2000, 100.0, output);
+            std::atomic<int> polls{0};
+            request.shouldCancel = [&] { return polls.fetch_add(1, std::memory_order_relaxed) > 400; };
+            ExpressionDeepRenderResult result;
+            const bool cancelled = !formula::renderExpressionDeepFrame(request, result) && result.cancelled && result.status == formula::ExpressionDeepRenderStatus::Cancelled && std::count(output.begin(), output.end(), formula::ExpressionDeepEmptyPixel) == static_cast<ptrdiff_t>(output.size());
+            printf("  z0 cancellation polls=%d cancelled/empty=%d/%d\n", polls.load(), result.cancelled ? 1 : 0, std::count(output.begin(), output.end(), formula::ExpressionDeepEmptyPixel) == static_cast<ptrdiff_t>(output.size()) ? 1 : 0);
+            if (!cancelled) ++failures;
+        }
+    }
+
+    printf("=== adaptive phase1 z0/real-smooth\n");
+    printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (adaptive phase1 failure)");
+    return failures == 0 ? 0 : 1;
+}
+
+static int runAdaptivePhase2Case() {
+    using formula::ExpressionContext;
+    using formula::ExpressionDeepRenderRequest;
+    using formula::ExpressionDeepRenderResult;
+    using formula::ExpressionError;
+    using formula::ExpressionProgram;
+    using formula::ExpressionScaledResidualCapability;
+
+    struct ProgramPair {
+        ExpressionProgram canonical;
+        ExpressionProgram runtime;
+    };
+    auto compilePair = [](const char* source, FormulaParameter pixel, const ExpressionContext& fixed, ProgramPair& pair) {
+        ExpressionError error;
+        return pair.canonical.compile(source, &error) && pair.canonical.specialize(fixed, pixel, pair.runtime, &error);
+    };
+    auto makeRequest = [](const ProgramPair& pair, const ExpressionContext& fixed, FormulaParameter pixel, const char* centerReal, const char* centerImaginary, const char* scale, int width, int height, int iterations, double bailout, std::vector<float>& output) {
+        output.assign(static_cast<size_t>(width) * height, formula::ExpressionDeepEmptyPixel);
+        ExpressionDeepRenderRequest request;
+        request.canonicalProgram = &pair.canonical;
+        request.runtimeProgram = &pair.runtime;
+        request.center.realDecimal = centerReal;
+        request.center.imaginaryDecimal = centerImaginary;
+        request.scale.decimal = scale;
+        request.fixed = fixed;
+        request.pixelParameter = pixel;
+        request.width = width;
+        request.height = height;
+        request.maxIterations = iterations;
+        request.bailout = bailout;
+        request.output = output.data();
+        request.outputCount = output.size();
+        request.precision.minimumBits = 128;
+        request.precision.guardBits = 64;
+        request.precision.maximumBits = 4096;
+        request.memory.fallbackGuardBits = 128;
+        request.preflight.enable = false;
+        request.taylor.enableTaylor = false;
+        request.centered.enableAdaptiveCandidate = true;
+        return request;
+    };
+    auto differences = [](const std::vector<float>& actual, const std::vector<float>& expected, size_t& empty, size_t& classification, size_t& floor) {
+        empty = classification = floor = 0;
+        for (size_t index = 0; index < actual.size(); ++index) {
+            empty += actual[index] == formula::ExpressionDeepEmptyPixel;
+            const bool actualInterior = actual[index] < 0.0f;
+            const bool expectedInterior = expected[index] < 0.0f;
+            if (actualInterior != expectedInterior)
+                ++classification;
+            else if (!actualInterior && actual[index] != expected[index])
+                ++floor;
+        }
+    };
+
+    struct DenseCase {
+        const char* name;
+        const char* source;
+        FormulaParameter pixel;
+        ExpressionContext fixed;
+        int width;
+        int height;
+        ExpressionScaledResidualCapability capability;
+        bool expectAdaptive;
+    };
+    ExpressionContext cFixed;
+    cFixed.z0 = {0.125, -0.0625};
+    ExpressionContext z0Fixed;
+    z0Fixed.c = {0.05, 0.02};
+    const DenseCase cases[] = {
+        {"c-divide", "0.5/(z*z+1.5)+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedMeromorphicCandidate, true},
+        {"z0-divide", "0.5/(z*z+1.5)+c", FormulaParameter::InitialZ, z0Fixed, 64, 40, ExpressionScaledResidualCapability::CertifiedMeromorphicCandidate, true},
+        {"c-tan", "0.2*tan(z)+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedMeromorphicCandidate, true},
+        {"z0-tan", "0.2*tan(z)+c", FormulaParameter::InitialZ, z0Fixed, 64, 40, ExpressionScaledResidualCapability::CertifiedMeromorphicCandidate, true},
+        {"c-tanh", "0.2*tanh(z)+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedMeromorphicCandidate, true},
+        {"z0-tanh", "0.2*tanh(z)+c", FormulaParameter::InitialZ, z0Fixed, 64, 40, ExpressionScaledResidualCapability::CertifiedMeromorphicCandidate, true},
+    };
+
+    int failures = 0;
+    for (const DenseCase& test : cases) {
+        ProgramPair pair;
+        std::vector<float> adaptive;
+        std::vector<float> mpfr;
+        if (!compilePair(test.source, test.pixel, test.fixed, pair) || pair.runtime.scaledResidualCapability() != test.capability) {
+            printf("  adaptive phase2 compile/capability failed [%s]\n", test.name);
+            ++failures;
+            continue;
+        }
+        ExpressionDeepRenderRequest adaptiveRequest = makeRequest(pair, test.fixed, test.pixel, "0", "0", "1.01e12", test.width, test.height, 320, 100.0, adaptive);
+        ExpressionDeepRenderResult adaptiveResult;
+        const bool adaptiveOkay = formula::renderExpressionDeepFrame(adaptiveRequest, adaptiveResult);
+        ExpressionDeepRenderRequest mpfrRequest = makeRequest(pair, test.fixed, test.pixel, "0", "0", "1.01e12", test.width, test.height, 320, 100.0, mpfr);
+        mpfrRequest.forceMpfrFallbackForVerification = true;
+        ExpressionDeepRenderResult mpfrResult;
+        const bool mpfrOkay = formula::renderExpressionDeepFrame(mpfrRequest, mpfrResult);
+        size_t empty = 0;
+        size_t classification = 0;
+        size_t floor = 0;
+        if (adaptiveOkay && mpfrOkay) differences(adaptive, mpfr, empty, classification, floor);
+        const uint64_t pixelCount = static_cast<uint64_t>(test.width) * test.height;
+        const bool pathOkay = test.expectAdaptive ? adaptiveResult.centeredAttempted && adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount != 0
+                              : !adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount == pixelCount && adaptiveResult.fallbackPixelCount == 0;
+        const bool okay = adaptiveOkay && mpfrOkay && empty == 0 && classification == 0 && floor == 0 && pathOkay && mpfrResult.fastPixelCount == 0 && mpfrResult.fallbackPixelCount == pixelCount;
+        printf("  %-23s %dx%d %s/%s adaptive=%d/%d/%d refs=%llu fast/fallback=%llu/%llu EMPTY/class/floor=%zu/%zu/%zu\n",
+               test.name, test.width, test.height, test.pixel == FormulaParameter::InitialZ ? "z0" : "c", "meromorphic",
+               adaptiveResult.centeredAttempted ? 1 : 0, adaptiveResult.centeredAccepted ? 1 : 0, adaptiveResult.centeredPreflightRejected ? 1 : 0, (unsigned long long)adaptiveResult.centeredReferenceCount, (unsigned long long)adaptiveResult.fastPixelCount, (unsigned long long)adaptiveResult.fallbackPixelCount, empty, classification, floor);
+        if (!okay) {
+            printf("    status adaptive/MPFR=%s/%s error=%s/%s\n", formula::expressionDeepRenderStatusName(adaptiveResult.status), formula::expressionDeepRenderStatusName(mpfrResult.status), adaptiveResult.error.c_str(), mpfrResult.error.c_str());
+            ++failures;
+        }
+    }
+
+    auto benchmark = [&](const char* name, const char* source, FormulaParameter pixel, const ExpressionContext& fixed) {
+        ProgramPair pair;
+        if (!compilePair(source, pixel, fixed, pair)) {
+            printf("  adaptive phase2 benchmark compile failed [%s]\n", name);
+            ++failures;
+            return;
+        }
+        std::vector<double> adaptiveTimes;
+        std::vector<double> mpfrTimes;
+        bool okay = true;
+        ExpressionDeepRenderResult telemetry;
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            std::vector<float> adaptive;
+            std::vector<float> mpfr;
+            ExpressionDeepRenderRequest adaptiveRequest = makeRequest(pair, fixed, pixel, "0", "0", "1.01e12", 208, 139, 320, 100.0, adaptive);
+            ExpressionDeepRenderResult adaptiveResult;
+            const Clock::time_point adaptiveStart = Clock::now();
+            const bool adaptiveOkay = formula::renderExpressionDeepFrame(adaptiveRequest, adaptiveResult);
+            adaptiveTimes.push_back(std::chrono::duration<double>(Clock::now() - adaptiveStart).count());
+
+            ExpressionDeepRenderRequest mpfrRequest = makeRequest(pair, fixed, pixel, "0", "0", "1.01e12", 208, 139, 320, 100.0, mpfr);
+            mpfrRequest.forceMpfrFallbackForVerification = true;
+            ExpressionDeepRenderResult mpfrResult;
+            const Clock::time_point mpfrStart = Clock::now();
+            const bool mpfrOkay = formula::renderExpressionDeepFrame(mpfrRequest, mpfrResult);
+            mpfrTimes.push_back(std::chrono::duration<double>(Clock::now() - mpfrStart).count());
+            okay = okay && adaptiveOkay && mpfrOkay && adaptive == mpfr && adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount != 0 && mpfrResult.fastPixelCount == 0 && mpfrResult.fallbackPixelCount == mpfr.size();
+            telemetry = adaptiveResult;
+        }
+        const double adaptiveBest = *std::min_element(adaptiveTimes.begin(), adaptiveTimes.end());
+        const double mpfrBest = *std::min_element(mpfrTimes.begin(), mpfrTimes.end());
+        const double speedup = adaptiveBest > 0.0 ? mpfrBest / adaptiveBest : 0.0;
+        printf("  %-23s 208x139 e12 adaptive/MPFR=%.3f/%.3f s speedup=%.2fx accepted=%d fallback=%llu\n", name, adaptiveBest, mpfrBest, speedup, telemetry.centeredAccepted ? 1 : 0, (unsigned long long)telemetry.fallbackPixelCount);
+        if (!okay || !(adaptiveBest <= mpfrBest * 0.9)) {
+            printf("    adaptive phase2 material speed gate failed\n");
+            ++failures;
+        }
+    };
+    benchmark("meromorphic-benchmark", "0.2*tan(z)+0.1/(z*z+2.0)+c", FormulaParameter::C, cFixed);
+
+    printf("=== adaptive phase2 meromorphic (divide, tan, tanh)\n");
+    printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (adaptive phase2 failure)");
+    return failures == 0 ? 0 : 1;
+}
+
+static int runAdaptivePhase3Case() {
+    using formula::ExpressionContext;
+    using formula::ExpressionDeepRenderRequest;
+    using formula::ExpressionDeepRenderResult;
+    using formula::ExpressionError;
+    using formula::ExpressionProgram;
+    using formula::ExpressionScaledResidualCapability;
+
+    struct ProgramPair {
+        ExpressionProgram canonical;
+        ExpressionProgram runtime;
+    };
+    auto compilePair = [](const char* source, FormulaParameter pixel, const ExpressionContext& fixed, ProgramPair& pair) {
+        ExpressionError error;
+        return pair.canonical.compile(source, &error) && pair.canonical.specialize(fixed, pixel, pair.runtime, &error);
+    };
+    auto makeRequest = [](const ProgramPair& pair, const ExpressionContext& fixed, FormulaParameter pixel, const char* centerReal, const char* centerImaginary, const char* scale, int width, int height, int iterations, double bailout, std::vector<float>& output) {
+        output.assign(static_cast<size_t>(width) * height, formula::ExpressionDeepEmptyPixel);
+        ExpressionDeepRenderRequest request;
+        request.canonicalProgram = &pair.canonical;
+        request.runtimeProgram = &pair.runtime;
+        request.center.realDecimal = centerReal;
+        request.center.imaginaryDecimal = centerImaginary;
+        request.scale.decimal = scale;
+        request.fixed = fixed;
+        request.pixelParameter = pixel;
+        request.width = width;
+        request.height = height;
+        request.maxIterations = iterations;
+        request.bailout = bailout;
+        request.output = output.data();
+        request.outputCount = output.size();
+        request.precision.minimumBits = 128;
+        request.precision.guardBits = 64;
+        request.precision.maximumBits = 4096;
+        request.memory.fallbackGuardBits = 128;
+        request.preflight.enable = false;
+        request.taylor.enableTaylor = false;
+        request.centered.enableAdaptiveCandidate = true;
+        return request;
+    };
+    auto differences = [](const std::vector<float>& actual, const std::vector<float>& expected, size_t& empty, size_t& classification, size_t& floor) {
+        empty = classification = floor = 0;
+        for (size_t index = 0; index < actual.size(); ++index) {
+            empty += actual[index] == formula::ExpressionDeepEmptyPixel;
+            const bool actualInterior = actual[index] < 0.0f;
+            const bool expectedInterior = expected[index] < 0.0f;
+            if (actualInterior != expectedInterior)
+                ++classification;
+            else if (!actualInterior && actual[index] != expected[index])
+                ++floor;
+        }
+    };
+
+    struct DenseCase {
+        const char* name;
+        const char* source;
+        FormulaParameter pixel;
+        ExpressionContext fixed;
+        int width;
+        int height;
+        ExpressionScaledResidualCapability capability;
+        bool expectAdaptive;
+    };
+    ExpressionContext cFixed;
+    cFixed.z0 = {0.125, -0.0625};
+    ExpressionContext z0Fixed;
+    z0Fixed.c = {0.05, 0.02};
+    const DenseCase cases[] = {
+        {"c-log", "0.2*log(z+2.0)+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedBranchCandidate, true},
+        {"z0-log", "0.2*log(z+2.0)+c", FormulaParameter::InitialZ, z0Fixed, 64, 40, ExpressionScaledResidualCapability::CertifiedBranchCandidate, true},
+        {"c-log10", "0.2*log10(z+2.0)+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedBranchCandidate, true},
+        {"z0-log10", "0.2*log10(z+2.0)+c", FormulaParameter::InitialZ, z0Fixed, 64, 40, ExpressionScaledResidualCapability::CertifiedBranchCandidate, true},
+        {"c-sqrt", "0.5*sqrt(z*z+1.5)+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedBranchCandidate, true},
+        {"z0-sqrt", "0.5*sqrt(z*z+1.5)+c", FormulaParameter::InitialZ, z0Fixed, 64, 40, ExpressionScaledResidualCapability::CertifiedBranchCandidate, true},
+        {"c-power", "0.2*(z+2.5)^1.5+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedBranchCandidate, true},
+        {"z0-power", "0.2*(z+2.5)^1.5+c", FormulaParameter::InitialZ, z0Fixed, 64, 40, ExpressionScaledResidualCapability::CertifiedBranchCandidate, true},
+    };
+
+    int failures = 0;
+    for (const DenseCase& test : cases) {
+        ProgramPair pair;
+        std::vector<float> adaptive;
+        std::vector<float> mpfr;
+        if (!compilePair(test.source, test.pixel, test.fixed, pair) || pair.runtime.scaledResidualCapability() != test.capability) {
+            printf("  adaptive phase3 compile/capability failed [%s]\n", test.name);
+            ++failures;
+            continue;
+        }
+        ExpressionDeepRenderRequest adaptiveRequest = makeRequest(pair, test.fixed, test.pixel, "0", "0", "1.01e12", test.width, test.height, 320, 100.0, adaptive);
+        ExpressionDeepRenderResult adaptiveResult;
+        const bool adaptiveOkay = formula::renderExpressionDeepFrame(adaptiveRequest, adaptiveResult);
+        ExpressionDeepRenderRequest mpfrRequest = makeRequest(pair, test.fixed, test.pixel, "0", "0", "1.01e12", test.width, test.height, 320, 100.0, mpfr);
+        mpfrRequest.forceMpfrFallbackForVerification = true;
+        ExpressionDeepRenderResult mpfrResult;
+        const bool mpfrOkay = formula::renderExpressionDeepFrame(mpfrRequest, mpfrResult);
+        size_t empty = 0;
+        size_t classification = 0;
+        size_t floor = 0;
+        if (adaptiveOkay && mpfrOkay) differences(adaptive, mpfr, empty, classification, floor);
+        const uint64_t pixelCount = static_cast<uint64_t>(test.width) * test.height;
+        const bool pathOkay = test.expectAdaptive ? adaptiveResult.centeredAttempted && adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount != 0
+                              : !adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount == pixelCount && adaptiveResult.fallbackPixelCount == 0;
+        const bool okay = adaptiveOkay && mpfrOkay && empty == 0 && classification == 0 && floor == 0 && pathOkay && mpfrResult.fastPixelCount == 0 && mpfrResult.fallbackPixelCount == pixelCount;
+        printf("  %-23s %dx%d %s/%s adaptive=%d/%d/%d refs=%llu fast/fallback=%llu/%llu preflightFlags=%llu/%llu EMPTY/class/floor=%zu/%zu/%zu\n",
+               test.name, test.width, test.height, test.pixel == FormulaParameter::InitialZ ? "z0" : "c", "branch",
+               adaptiveResult.centeredAttempted ? 1 : 0, adaptiveResult.centeredAccepted ? 1 : 0, adaptiveResult.centeredPreflightRejected ? 1 : 0, (unsigned long long)adaptiveResult.centeredReferenceCount, (unsigned long long)adaptiveResult.fastPixelCount, (unsigned long long)adaptiveResult.fallbackPixelCount, (unsigned long long)adaptiveResult.centeredPreflightFlagCount, (unsigned long long)adaptiveResult.centeredPreflightSampleCount, empty, classification, floor);
+        if (!okay) {
+            printf("    status adaptive/MPFR=%s/%s error=%s/%s\n", formula::expressionDeepRenderStatusName(adaptiveResult.status), formula::expressionDeepRenderStatusName(mpfrResult.status), adaptiveResult.error.c_str(), mpfrResult.error.c_str());
+            ++failures;
+        }
+    }
+
+    auto benchmark = [&](const char* name, const char* source, FormulaParameter pixel, const ExpressionContext& fixed) {
+        ProgramPair pair;
+        if (!compilePair(source, pixel, fixed, pair)) {
+            printf("  adaptive phase3 benchmark compile failed [%s]\n", name);
+            ++failures;
+            return;
+        }
+        std::vector<double> adaptiveTimes;
+        std::vector<double> mpfrTimes;
+        bool okay = true;
+        ExpressionDeepRenderResult telemetry;
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            std::vector<float> adaptive;
+            std::vector<float> mpfr;
+            ExpressionDeepRenderRequest adaptiveRequest = makeRequest(pair, fixed, pixel, "0", "0", "1.01e12", 208, 139, 320, 100.0, adaptive);
+            ExpressionDeepRenderResult adaptiveResult;
+            const Clock::time_point adaptiveStart = Clock::now();
+            const bool adaptiveOkay = formula::renderExpressionDeepFrame(adaptiveRequest, adaptiveResult);
+            adaptiveTimes.push_back(std::chrono::duration<double>(Clock::now() - adaptiveStart).count());
+
+            ExpressionDeepRenderRequest mpfrRequest = makeRequest(pair, fixed, pixel, "0", "0", "1.01e12", 208, 139, 320, 100.0, mpfr);
+            mpfrRequest.forceMpfrFallbackForVerification = true;
+            ExpressionDeepRenderResult mpfrResult;
+            const Clock::time_point mpfrStart = Clock::now();
+            const bool mpfrOkay = formula::renderExpressionDeepFrame(mpfrRequest, mpfrResult);
+            mpfrTimes.push_back(std::chrono::duration<double>(Clock::now() - mpfrStart).count());
+            okay = okay && adaptiveOkay && mpfrOkay && adaptive == mpfr && adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount != 0 && mpfrResult.fastPixelCount == 0 && mpfrResult.fallbackPixelCount == mpfr.size();
+            telemetry = adaptiveResult;
+        }
+        const double adaptiveBest = *std::min_element(adaptiveTimes.begin(), adaptiveTimes.end());
+        const double mpfrBest = *std::min_element(mpfrTimes.begin(), mpfrTimes.end());
+        const double speedup = adaptiveBest > 0.0 ? mpfrBest / adaptiveBest : 0.0;
+        printf("  %-23s 208x139 e12 adaptive/MPFR=%.3f/%.3f s speedup=%.2fx accepted=%d fallback=%llu\n", name, adaptiveBest, mpfrBest, speedup, telemetry.centeredAccepted ? 1 : 0, (unsigned long long)telemetry.fallbackPixelCount);
+        if (!okay || !(adaptiveBest <= mpfrBest * 0.9)) {
+            printf("    adaptive phase3 material speed gate failed\n");
+            ++failures;
+        }
+    };
+    benchmark("branch-benchmark", "0.2*log(z+2.0)+0.1*sqrt(z*z+1.5)+c", FormulaParameter::C, cFixed);
+
+    printf("=== adaptive phase3 branch (log, log10, sqrt, power)\n");
+    printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (adaptive phase3 failure)");
+    return failures == 0 ? 0 : 1;
+}
+
+static int runAdaptivePhase4Case() {
+    using formula::ExpressionContext;
+    using formula::ExpressionDeepRenderRequest;
+    using formula::ExpressionDeepRenderResult;
+    using formula::ExpressionError;
+    using formula::ExpressionProgram;
+    using formula::ExpressionScaledResidualCapability;
+
+    struct ProgramPair {
+        ExpressionProgram canonical;
+        ExpressionProgram runtime;
+    };
+    auto compilePair = [](const char* source, FormulaParameter pixel, const ExpressionContext& fixed, ProgramPair& pair) {
+        ExpressionError error;
+        return pair.canonical.compile(source, &error) && pair.canonical.specialize(fixed, pixel, pair.runtime, &error);
+    };
+    auto makeRequest = [](const ProgramPair& pair, const ExpressionContext& fixed, FormulaParameter pixel, const char* centerReal, const char* centerImaginary, const char* scale, int width, int height, int iterations, double bailout, std::vector<float>& output) {
+        output.assign(static_cast<size_t>(width) * height, formula::ExpressionDeepEmptyPixel);
+        ExpressionDeepRenderRequest request;
+        request.canonicalProgram = &pair.canonical;
+        request.runtimeProgram = &pair.runtime;
+        request.center.realDecimal = centerReal;
+        request.center.imaginaryDecimal = centerImaginary;
+        request.scale.decimal = scale;
+        request.fixed = fixed;
+        request.pixelParameter = pixel;
+        request.width = width;
+        request.height = height;
+        request.maxIterations = iterations;
+        request.bailout = bailout;
+        request.output = output.data();
+        request.outputCount = output.size();
+        request.precision.minimumBits = 128;
+        request.precision.guardBits = 64;
+        request.precision.maximumBits = 4096;
+        request.memory.fallbackGuardBits = 128;
+        request.preflight.enable = false;
+        request.taylor.enableTaylor = false;
+        request.centered.enableAdaptiveCandidate = true;
+        return request;
+    };
+    auto differences = [](const std::vector<float>& actual, const std::vector<float>& expected, size_t& empty, size_t& classification, size_t& floor) {
+        empty = classification = floor = 0;
+        for (size_t index = 0; index < actual.size(); ++index) {
+            empty += actual[index] == formula::ExpressionDeepEmptyPixel;
+            const bool actualInterior = actual[index] < 0.0f;
+            const bool expectedInterior = expected[index] < 0.0f;
+            if (actualInterior != expectedInterior)
+                ++classification;
+            else if (!actualInterior && actual[index] != expected[index])
+                ++floor;
+        }
+    };
+
+    struct DenseCase {
+        const char* name;
+        const char* source;
+        FormulaParameter pixel;
+        ExpressionContext fixed;
+        int width;
+        int height;
+        ExpressionScaledResidualCapability capability;
+        bool expectAdaptive;
+    };
+    ExpressionContext cFixed;
+    cFixed.z0 = {0.125, -0.0625};
+    ExpressionContext z0Fixed;
+    z0Fixed.c = {0.05, 0.02};
+    const DenseCase cases[] = {
+        {"c-abs", "0.2*abs(real(z+1.5))+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedPiecewiseCandidate, true},
+        {"z0-abs", "0.2*abs(real(z+1.5))+c", FormulaParameter::InitialZ, z0Fixed, 64, 40, ExpressionScaledResidualCapability::CertifiedPiecewiseCandidate, true},
+        {"c-abs-complex", "0.2*abs(z+1.5)+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedPiecewiseCandidate, true},
+        {"z0-abs-complex", "0.2*abs(z+1.5)+c", FormulaParameter::InitialZ, z0Fixed, 64, 40, ExpressionScaledResidualCapability::CertifiedPiecewiseCandidate, true},
+        {"c-mixed-sin-real", "0.2*sin(real(z))+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedRealCandidate, true},
+        {"c-mixed-log-conj", "0.2*log(z+2.0)+0.05*conj(z)+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedBranchCandidate, true},
+        {"c-mixed-tan-norm", "0.2*tan(z)+0.01*norm(z)+c", FormulaParameter::C, cFixed, 64, 40, ExpressionScaledResidualCapability::CertifiedRealCandidate, true},
+    };
+
+    int failures = 0;
+    for (const DenseCase& test : cases) {
+        ProgramPair pair;
+        std::vector<float> adaptive;
+        std::vector<float> mpfr;
+        if (!compilePair(test.source, test.pixel, test.fixed, pair) || pair.runtime.scaledResidualCapability() != test.capability) {
+            printf("  adaptive phase4 compile/capability failed [%s]\n", test.name);
+            ++failures;
+            continue;
+        }
+        ExpressionDeepRenderRequest adaptiveRequest = makeRequest(pair, test.fixed, test.pixel, "0", "0", "1.01e12", test.width, test.height, 320, 100.0, adaptive);
+        ExpressionDeepRenderResult adaptiveResult;
+        const bool adaptiveOkay = formula::renderExpressionDeepFrame(adaptiveRequest, adaptiveResult);
+        ExpressionDeepRenderRequest mpfrRequest = makeRequest(pair, test.fixed, test.pixel, "0", "0", "1.01e12", test.width, test.height, 320, 100.0, mpfr);
+        mpfrRequest.forceMpfrFallbackForVerification = true;
+        ExpressionDeepRenderResult mpfrResult;
+        const bool mpfrOkay = formula::renderExpressionDeepFrame(mpfrRequest, mpfrResult);
+        size_t empty = 0;
+        size_t classification = 0;
+        size_t floor = 0;
+        if (adaptiveOkay && mpfrOkay) differences(adaptive, mpfr, empty, classification, floor);
+        const uint64_t pixelCount = static_cast<uint64_t>(test.width) * test.height;
+        const bool pathOkay = test.expectAdaptive ? adaptiveResult.centeredAttempted && adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount != 0
+                              : !adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount == pixelCount && adaptiveResult.fallbackPixelCount == 0;
+        const bool okay = adaptiveOkay && mpfrOkay && empty == 0 && classification == 0 && floor == 0 && pathOkay && mpfrResult.fastPixelCount == 0 && mpfrResult.fallbackPixelCount == pixelCount;
+        printf("  %-23s %dx%d %s/%s adaptive=%d/%d/%d refs=%llu fast/fallback=%llu/%llu preflightFlags=%llu/%llu EMPTY/class/floor=%zu/%zu/%zu\n",
+               test.name, test.width, test.height, test.pixel == FormulaParameter::InitialZ ? "z0" : "c", "abs",
+               adaptiveResult.centeredAttempted ? 1 : 0, adaptiveResult.centeredAccepted ? 1 : 0, adaptiveResult.centeredPreflightRejected ? 1 : 0, (unsigned long long)adaptiveResult.centeredReferenceCount, (unsigned long long)adaptiveResult.fastPixelCount, (unsigned long long)adaptiveResult.fallbackPixelCount, (unsigned long long)adaptiveResult.centeredPreflightFlagCount, (unsigned long long)adaptiveResult.centeredPreflightSampleCount, empty, classification, floor);
+        if (!okay) {
+            printf("    status adaptive/MPFR=%s/%s error=%s/%s\n", formula::expressionDeepRenderStatusName(adaptiveResult.status), formula::expressionDeepRenderStatusName(mpfrResult.status), adaptiveResult.error.c_str(), mpfrResult.error.c_str());
+            ++failures;
+        }
+    }
+
+    auto benchmark = [&](const char* name, const char* source, FormulaParameter pixel, const ExpressionContext& fixed) {
+        ProgramPair pair;
+        if (!compilePair(source, pixel, fixed, pair)) {
+            printf("  adaptive phase4 benchmark compile failed [%s]\n", name);
+            ++failures;
+            return;
+        }
+        std::vector<double> adaptiveTimes;
+        std::vector<double> mpfrTimes;
+        bool okay = true;
+        ExpressionDeepRenderResult telemetry;
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            std::vector<float> adaptive;
+            std::vector<float> mpfr;
+            ExpressionDeepRenderRequest adaptiveRequest = makeRequest(pair, fixed, pixel, "0", "0", "1.01e12", 208, 139, 320, 100.0, adaptive);
+            ExpressionDeepRenderResult adaptiveResult;
+            const Clock::time_point adaptiveStart = Clock::now();
+            const bool adaptiveOkay = formula::renderExpressionDeepFrame(adaptiveRequest, adaptiveResult);
+            adaptiveTimes.push_back(std::chrono::duration<double>(Clock::now() - adaptiveStart).count());
+
+            ExpressionDeepRenderRequest mpfrRequest = makeRequest(pair, fixed, pixel, "0", "0", "1.01e12", 208, 139, 320, 100.0, mpfr);
+            mpfrRequest.forceMpfrFallbackForVerification = true;
+            ExpressionDeepRenderResult mpfrResult;
+            const Clock::time_point mpfrStart = Clock::now();
+            const bool mpfrOkay = formula::renderExpressionDeepFrame(mpfrRequest, mpfrResult);
+            mpfrTimes.push_back(std::chrono::duration<double>(Clock::now() - mpfrStart).count());
+            okay = okay && adaptiveOkay && mpfrOkay && adaptive == mpfr && adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount != 0 && mpfrResult.fastPixelCount == 0 && mpfrResult.fallbackPixelCount == mpfr.size();
+            telemetry = adaptiveResult;
+        }
+        const double adaptiveBest = *std::min_element(adaptiveTimes.begin(), adaptiveTimes.end());
+        const double mpfrBest = *std::min_element(mpfrTimes.begin(), mpfrTimes.end());
+        const double speedup = adaptiveBest > 0.0 ? mpfrBest / adaptiveBest : 0.0;
+        printf("  %-23s 208x139 e12 adaptive/MPFR=%.3f/%.3f s speedup=%.2fx accepted=%d fallback=%llu\n", name, adaptiveBest, mpfrBest, speedup, telemetry.centeredAccepted ? 1 : 0, (unsigned long long)telemetry.fallbackPixelCount);
+        if (!okay || !(adaptiveBest <= mpfrBest * 0.9)) {
+            printf("    adaptive phase4 material speed gate failed\n");
+            ++failures;
+        }
+    };
+    benchmark("abs-benchmark", "0.2*abs(real(z+1.5))+c", FormulaParameter::C, cFixed);
+
+    printf("=== adaptive phase4 piecewise fold (abs)\n");
+    printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (adaptive phase4 failure)");
+    return failures == 0 ? 0 : 1;
 }
 
 static int runExpressionColoringCase() {
@@ -2489,6 +3499,7 @@ static int runExpressionReferenceCase() {
     using formula::ExpressionProgram;
     using formula::ExpressionReferenceBuildRequest;
     using formula::ExpressionReferenceBuildStatus;
+    using formula::ExpressionReferenceCompaction;
     using formula::ExpressionReferenceOrbitResult;
     using formula::ExpressionReferencePrecisionPolicy;
     using formula::ExpressionReferenceTapeNode;
@@ -3224,6 +4235,249 @@ static int runExpressionReferenceCase() {
         }
     }
 
+    formula::ScaledRealValue expansionRadiusE50Two;
+    formula::ScaledRealValue expansionRadiusE50Four;
+    formula::ScaledRealValue expansionRadiusE100Two;
+    formula::ScaledRealValue expansionRadiusE100Four;
+    {
+        ExpressionProgram expansionCanonical, expansionRuntime;
+        ExpressionContext fixed;
+        const char* source = "z*z+c+(n-n)";
+        const char* centerReal = "-0.122561166876653619975245551820735654052";
+        const char* centerImaginary = "0.74486176661974423659317042860439236724";
+        auto buildExpansion = [&](mpfr_prec_t viewBits, ExpressionReferenceCompaction compaction, int iterations, ExpressionReferenceOrbitResult& reference, std::function<bool()> shouldCancel = {}, size_t memoryLimitBytes = size_t{1} << 30) {
+            if (!expansionCanonical.valid() && (!compile(expansionCanonical, source) || !specialize(expansionCanonical, fixed, FormulaParameter::C, expansionRuntime))) return false;
+            ExpressionReferenceBuildRequest request;
+            request.canonicalProgram = &expansionCanonical;
+            request.runtimeProgram = &expansionRuntime;
+            request.pixelParameter = FormulaParameter::C;
+            request.center.realDecimal = centerReal;
+            request.center.imaginaryDecimal = centerImaginary;
+            request.fixed = fixed;
+            request.bailout = 4.0;
+            request.maxIterations = iterations;
+            request.precision.viewBits = viewBits;
+            request.precision.minimumBits = 53;
+            request.precision.guardBits = 64;
+            request.precision.maximumBits = 4096;
+            request.certificationPrecision = viewBits + 384;
+            request.compaction = compaction;
+            request.shouldCancel = std::move(shouldCancel);
+            request.memoryLimitBytes = memoryLimitBytes;
+            return formula::buildExpressionReferenceOrbit(request, reference);
+        };
+        auto maximumStoredRadius = [](const ExpressionReferenceOrbitResult& reference) {
+            formula::ScaledRealValue maximum;
+            for (const auto& sample : reference.samples)
+                if (formula::compareScaledNonnegative(sample.nextError, maximum) > 0) maximum = sample.nextError;
+            for (const auto& node : reference.tape)
+                if (formula::compareScaledNonnegative(node.outputError, maximum) > 0) maximum = node.outputError;
+            return maximum;
+        };
+        auto nonoverlapReal = [](const std::array<const ScaledRealShadow*, 4>& terms) {
+            mpfr_t previous, next, unit;
+            mpfr_inits2(512, previous, next, unit, (mpfr_ptr)0);
+            bool okay = true;
+            for (size_t index = 1; index < terms.size() && okay; ++index) {
+                const ScaledRealShadow& left = *terms[index - 1];
+                const ScaledRealShadow& right = *terms[index];
+                if (left.isZero()) {
+                    okay = right.isZero();
+                    continue;
+                }
+                if (!left.isFinite() || (!right.isZero() && !right.isFinite()) || !formula::setMpfrFromScaledShadow(previous, left) || !formula::setMpfrFromScaledShadow(next, right)) {
+                    okay = false;
+                    continue;
+                }
+                mpfr_abs(previous, previous, MPFR_RNDU);
+                mpfr_abs(next, next, MPFR_RNDU);
+                mpfr_set_ui_2exp(unit, 1, static_cast<mpfr_exp_t>(left.exponent - 53), MPFR_RNDU);
+                okay = mpfr_cmp(next, previous) <= 0 && mpfr_cmp(next, unit) < 0;
+            }
+            mpfr_clears(previous, next, unit, (mpfr_ptr)0);
+            return okay;
+        };
+        auto nonoverlap = [&](const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, const formula::ScaledComplexExpansionTail& tail) {
+            return nonoverlapReal({&primary.re, &defect.re, &tail.residual2.re, &tail.residual3.re}) && nonoverlapReal({&primary.im, &defect.im, &tail.residual2.im, &tail.residual3.im});
+        };
+        auto containsExpansion = [](const MpfrComplex& exact, const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, const formula::ScaledComplexExpansionTail& tail, const formula::ScaledRealValue& error) {
+            MpfrComplex lower(exact.precision()), upper(exact.precision());
+            mpfr_t radius;
+            mpfr_init2(radius, exact.precision());
+            bool okay = formula::reconstructMpfrFromExpansion(lower, primary, defect, &tail, MPFR_RNDD) && formula::reconstructMpfrFromExpansion(upper, primary, defect, &tail, MPFR_RNDU) && formula::setMpfrFromScaledValue(radius, error, MPFR_RNDU);
+            if (okay) {
+                mpfr_sub(lower.re, lower.re, radius, MPFR_RNDD);
+                mpfr_add(upper.re, upper.re, radius, MPFR_RNDU);
+                mpfr_sub(lower.im, lower.im, radius, MPFR_RNDD);
+                mpfr_add(upper.im, upper.im, radius, MPFR_RNDU);
+                okay = mpfr_cmp(exact.re, lower.re) >= 0 && mpfr_cmp(exact.re, upper.re) <= 0 && mpfr_cmp(exact.im, lower.im) >= 0 && mpfr_cmp(exact.im, upper.im) <= 0;
+            }
+            mpfr_clear(radius);
+            return okay;
+        };
+        auto verifyCertifiedExpansion = [&](const ExpressionReferenceOrbitResult& reference) {
+            if (!reference.fourTerm || reference.fourTerm->samples.size() != reference.samples.size() || reference.fourTerm->tape.size() != reference.tape.size()) return false;
+            ExpressionOracleContext context(reference.certificationPrecision);
+            MpfrComplex center(reference.certificationPrecision);
+            MpfrComplex next(reference.certificationPrecision);
+            if (!center.set(centerReal, centerImaginary)) return false;
+            context.c.set(center);
+            context.z0.set(0.0, 0.0);
+            context.z.set(context.z0);
+            for (size_t iteration = 0; iteration < reference.samples.size(); ++iteration) {
+                context.iteration = static_cast<int>(iteration);
+                ExpressionOracleTrace trace;
+                std::string error;
+                if (!ExpressionOracle::evaluateTrace(expansionRuntime, context, next, trace, &error)) return false;
+                const auto& sample = reference.samples[iteration];
+                const auto& sampleTail = reference.fourTerm->samples[iteration];
+                if (!nonoverlap(sample.z, sample.zDefect, sampleTail.z) || !nonoverlap(sample.next, sample.rootDefect, sampleTail.next) || !containsExpansion(next, sample.next, sample.rootDefect, sampleTail.next, sample.nextError) || trace.nodes.size() != sample.tapeCount) return false;
+                for (size_t nodeIndex = 0; nodeIndex < trace.nodes.size(); ++nodeIndex) {
+                    const size_t tapeIndex = static_cast<size_t>(sample.tapeOffset) + nodeIndex;
+                    const auto& node = reference.tape[tapeIndex];
+                    const auto& nodeTail = reference.fourTerm->tape[tapeIndex];
+                    if (!nonoverlap(node.output, node.outputDefect, nodeTail.output) || !containsExpansion(trace.nodes[nodeIndex].output, node.output, node.outputDefect, nodeTail.output, node.outputError)) return false;
+                }
+                const size_t rootIndex = static_cast<size_t>(sample.tapeOffset) + sample.rootNode;
+                if (std::memcmp(&reference.fourTerm->tape[rootIndex].output, &sampleTail.next, sizeof(sampleTail.next)) != 0) return false;
+                context.z.set(next);
+            }
+            return true;
+        };
+        auto measureReconstructionError = [&](const ExpressionReferenceOrbitResult& reference, formula::ScaledRealValue& measured) {
+            ExpressionOracleContext context(reference.certificationPrecision);
+            MpfrComplex center(reference.certificationPrecision);
+            MpfrComplex next(reference.certificationPrecision);
+            MpfrComplex reconstructed(reference.certificationPrecision);
+            mpfr_t difference, otherDifference, maximum;
+            mpfr_inits2(reference.certificationPrecision, difference, otherDifference, maximum, (mpfr_ptr)0);
+            bool okay = center.set(centerReal, centerImaginary);
+            if (okay) {
+                context.c.set(center);
+                context.z0.set(0.0, 0.0);
+                context.z.set(context.z0);
+                mpfr_set_zero(maximum, 0);
+            }
+            auto include = [&](const MpfrComplex& exact, const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, const formula::ScaledComplexExpansionTail* tail) {
+                if (!(tail ? formula::reconstructMpfrFromExpansion(reconstructed, primary, defect, tail) : formula::reconstructMpfrFromShadows(reconstructed, primary, defect))) return false;
+                auto includeComponent = [&](mpfr_srcptr exactComponent, mpfr_srcptr reconstructedComponent) {
+                    mpfr_sub(difference, exactComponent, reconstructedComponent, MPFR_RNDD);
+                    mpfr_sub(otherDifference, exactComponent, reconstructedComponent, MPFR_RNDU);
+                    mpfr_abs(difference, difference, MPFR_RNDU);
+                    mpfr_abs(otherDifference, otherDifference, MPFR_RNDU);
+                    if (mpfr_cmp(otherDifference, difference) > 0) mpfr_set(difference, otherDifference, MPFR_RNDU);
+                    if (mpfr_cmp(difference, maximum) > 0) mpfr_set(maximum, difference, MPFR_RNDU);
+                };
+                includeComponent(exact.re, reconstructed.re);
+                includeComponent(exact.im, reconstructed.im);
+                return true;
+            };
+            for (size_t iteration = 0; iteration < reference.samples.size() && okay; ++iteration) {
+                context.iteration = static_cast<int>(iteration);
+                ExpressionOracleTrace trace;
+                std::string error;
+                okay = ExpressionOracle::evaluateTrace(expansionRuntime, context, next, trace, &error) && trace.nodes.size() == reference.samples[iteration].tapeCount;
+                const auto& sample = reference.samples[iteration];
+                const formula::ScaledComplexExpansionTail* sampleTail = reference.fourTerm ? &reference.fourTerm->samples[iteration].next : nullptr;
+                if (okay) okay = include(next, sample.next, sample.rootDefect, sampleTail);
+                for (size_t nodeIndex = 0; nodeIndex < trace.nodes.size() && okay; ++nodeIndex) {
+                    const size_t tapeIndex = static_cast<size_t>(sample.tapeOffset) + nodeIndex;
+                    const formula::ScaledComplexExpansionTail* nodeTail = reference.fourTerm ? &reference.fourTerm->tape[tapeIndex].output : nullptr;
+                    okay = include(trace.nodes[nodeIndex].output, reference.tape[tapeIndex].output, reference.tape[tapeIndex].outputDefect, nodeTail);
+                }
+                context.z.set(next);
+            }
+            if (okay) okay = formula::makeScaledNonnegativeUpward(maximum, measured) == formula::ScaledArithmeticStatus::Success;
+            mpfr_clears(difference, otherDifference, maximum, (mpfr_ptr)0);
+            return okay;
+        };
+
+        ExpressionReferenceOrbitResult defaultReference, twoE50, fourE50, twoE100, fourE100;
+        bool okay = buildExpansion(180, ExpressionReferenceCompaction::TwoTerm, 120, defaultReference) && buildExpansion(180, ExpressionReferenceCompaction::TwoTerm, 120, twoE50) && buildExpansion(180, ExpressionReferenceCompaction::FourTermCertifiedTransfer, 120, fourE50) && buildExpansion(360, ExpressionReferenceCompaction::TwoTerm, 120, twoE100) && buildExpansion(360, ExpressionReferenceCompaction::FourTermCertifiedTransfer, 120, fourE100);
+        if (okay) {
+            formula::ScaledRealValue storedFourE50 = maximumStoredRadius(fourE50);
+            formula::ScaledRealValue storedFourE100 = maximumStoredRadius(fourE100);
+            okay = measureReconstructionError(twoE50, expansionRadiusE50Two) && measureReconstructionError(fourE50, expansionRadiusE50Four) && measureReconstructionError(twoE100, expansionRadiusE100Two) && measureReconstructionError(fourE100, expansionRadiusE100Four) && !defaultReference.fourTerm && defaultReference.compaction == ExpressionReferenceCompaction::TwoTerm && fourE50.memoryBytes > twoE50.memoryBytes && fourE100.memoryBytes > twoE100.memoryBytes && formula::compareScaledNonnegative(expansionRadiusE50Four, expansionRadiusE50Two) < 0 && formula::compareScaledNonnegative(expansionRadiusE100Four, expansionRadiusE100Two) < 0 && formula::compareScaledNonnegative(expansionRadiusE50Four, storedFourE50) <= 0 && formula::compareScaledNonnegative(expansionRadiusE100Four, storedFourE100) <= 0 && verifyCertifiedExpansion(fourE50) && verifyCertifiedExpansion(fourE100);
+        }
+
+        if (okay) {
+            ExpressionReferenceOrbitResult retained = fourE50;
+            fourE50 = {};
+            MpfrComplex reconstructed(retained.certificationPrecision);
+            okay = retained.fourTerm && formula::reconstructMpfrFromExpansion(reconstructed, retained.pixel, retained.pixelDefect, &retained.fourTerm->pixel) && mpfr_number_p(reconstructed.re) && mpfr_number_p(reconstructed.im);
+        }
+        if (okay) {
+            ExpressionReferenceOrbitResult constrained;
+            const size_t constrainedLimit = fourE100.memoryBytes > 0 ? fourE100.memoryBytes - 1 : 1;
+            okay = !buildExpansion(360, ExpressionReferenceCompaction::FourTermCertifiedTransfer, 120, constrained, {}, constrainedLimit) && constrained.status == ExpressionReferenceBuildStatus::ResourceLimit && constrained.samples.capacity() == 0 && constrained.tape.capacity() == 0 && !constrained.fourTerm;
+        }
+
+        uint64_t randomState = 0x243f6a8885a308d3ULL;
+        for (int sample = 0; sample < 12 && okay; ++sample) {
+            std::string real = sample == 0 ? "-0" : (sample == 1 ? "1e100" : (sample == 2 ? "1.0000000000000000000000000000000000000000000000000000000000001" : "0."));
+            std::string imaginary = sample == 0 ? "-0" : "0.";
+            if (sample >= 3) {
+                for (int digit = 0; digit < 72; ++digit) {
+                    randomState = randomState * 6364136223846793005ULL + 1442695040888963407ULL;
+                    real.push_back(static_cast<char>('0' + ((randomState >> 32) % 10)));
+                    randomState = randomState * 6364136223846793005ULL + 1442695040888963407ULL;
+                    imaginary.push_back(static_cast<char>('0' + ((randomState >> 32) % 10)));
+                }
+                real += sample & 1 ? "e-40" : "e20";
+                imaginary += sample & 2 ? "e-80" : "e10";
+            }
+            ExpressionReferenceBuildRequest request;
+            request.canonicalProgram = &expansionCanonical;
+            request.runtimeProgram = &expansionRuntime;
+            request.pixelParameter = FormulaParameter::C;
+            request.center.realDecimal = real;
+            request.center.imaginaryDecimal = imaginary;
+            request.maxIterations = 1;
+            request.bailout = 1e100;
+            request.precision.minimumBits = 320;
+            request.precision.guardBits = 64;
+            request.precision.maximumBits = 4096;
+            request.certificationPrecision = 768;
+            request.compaction = ExpressionReferenceCompaction::FourTermCertifiedTransfer;
+            ExpressionReferenceOrbitResult randomReference;
+            okay = formula::buildExpressionReferenceOrbit(request, randomReference) && randomReference.fourTerm && nonoverlap(randomReference.pixel, randomReference.pixelDefect, randomReference.fourTerm->pixel);
+            MpfrComplex exact(768);
+            if (okay) okay = exact.set(real, imaginary) && containsExpansion(exact, randomReference.pixel, randomReference.pixelDefect, randomReference.fourTerm->pixel, randomReference.pixelError);
+            if (okay) {
+                formula::ScaledComplexBall scaled;
+                MpfrComplex full(768), midpoint(768);
+                mpfr_t radius, difference;
+                mpfr_inits2(768, radius, difference, (mpfr_ptr)0);
+                okay = formula::makeScaledComplexExpansionBall(randomReference.pixel, randomReference.pixelDefect, &randomReference.fourTerm->pixel, scaled) == formula::ScaledArithmeticStatus::Success && formula::reconstructMpfrFromExpansion(full, randomReference.pixel, randomReference.pixelDefect, &randomReference.fourTerm->pixel) && formula::setMpfrFromScaledValue(midpoint, scaled.value) && formula::setMpfrFromScaledValue(radius, scaled.radius, MPFR_RNDU);
+                if (okay) {
+                    mpfr_sub(difference, full.re, midpoint.re, MPFR_RNDU);
+                    mpfr_abs(difference, difference, MPFR_RNDU);
+                    okay = mpfr_cmp(difference, radius) <= 0;
+                }
+                if (okay) {
+                    mpfr_sub(difference, full.im, midpoint.im, MPFR_RNDU);
+                    mpfr_abs(difference, difference, MPFR_RNDU);
+                    okay = mpfr_cmp(difference, radius) <= 0;
+                }
+                mpfr_clears(radius, difference, (mpfr_ptr)0);
+            }
+            if (okay && sample == 0) {
+                MpfrComplex signedZero(768);
+                okay = formula::reconstructMpfrFromExpansion(signedZero, randomReference.pixel, randomReference.pixelDefect, &randomReference.fourTerm->pixel) && mpfr_zero_p(signedZero.re) && mpfr_zero_p(signedZero.im) && mpfr_signbit(signedZero.re) && mpfr_signbit(signedZero.im);
+            }
+        }
+
+        ExpressionReferenceOrbitResult cancelled;
+        int cancellationPolls = 0;
+        const bool cancelledBuild = buildExpansion(180, ExpressionReferenceCompaction::FourTermCertifiedTransfer, 120, cancelled, [&] { return ++cancellationPolls > 4; });
+        if (!okay || !cancelledBuild || !cancelled.valid || !cancelled.cancelled) {
+            printf("  four-term expansion verification failed\n");
+            ++failures;
+        } else {
+            ++defectChecks;
+        }
+    }
+
     auto benchmarkReference = [&](const char* source, FormulaParameter pixel, const ExpressionContext& fixed, const char* real, const char* imaginary, double& seconds, double& bytesPerSample) {
         ExpressionProgram canonical, runtime;
         if (!compile(canonical, source) || !specialize(canonical, fixed, pixel, runtime)) return false;
@@ -3256,6 +4510,7 @@ static int runExpressionReferenceCase() {
 
     printf("=== MPFR expression reference orbit/tape\n");
     printf("  root samples=%d companions=%d branches=%d defects=%d\n", orbitSamples, companionChecks, branchChecks, defectChecks);
+    printf("  four-term max radius e50 two/four=(%.6g,e%lld)/(%.6g,e%lld) e100=(%.6g,e%lld)/(%.6g,e%lld)\n", expansionRadiusE50Two.mantissa, (long long)expansionRadiusE50Two.exponent, expansionRadiusE50Four.mantissa, (long long)expansionRadiusE50Four.exponent, expansionRadiusE100Two.mantissa, (long long)expansionRadiusE100Two.exponent, expansionRadiusE100Four.mantissa, (long long)expansionRadiusE100Four.exponent);
     printf("  10k arithmetic: %.3f s %.1f bytes/sample; "
            "transcendental: %.3f s %.1f bytes/sample\n",
            arithmeticSeconds, arithmeticBytes, transcendentalSeconds, transcendentalBytes);
@@ -6886,6 +8141,158 @@ static int runExpressionDeepRenderCase() {
         }
     }
 
+    // Opt-in four-term references feed one opcode-generic certified terminal
+    // transfer segment. Rejection is conservative and restarts exact MPFR.
+    {
+        const char* centerReal = "-0.122561166876653619975245551820735654052";
+        const char* centerImaginary = "0.74486176661974423659317042860439236724";
+        struct TransferCase {
+            const char* name;
+            const char* source;
+            const char* scale;
+        };
+        const TransferCase cases[] = {{"quadratic-e50", "z*z+c", "1e50"}, {"neutral-e50", "z*z+c+(n-n)", "1e50"}, {"asymmetric-e50", "z-z+c+1e-120", "1e50"}, {"quadratic-e100", "z*z+c", "1e100"}, {"neutral-e100", "z*z+c+(n-n)", "1e100"}};
+        for (const TransferCase& test : cases) {
+            ProgramPair pair;
+            std::vector<float> transferred, mpfr, higher;
+            if (!compilePair(test.source, FormulaParameter::C, mandelbrotFixed, pair)) {
+                ++failures;
+                continue;
+            }
+            ExpressionDeepRenderRequest transferRequest = makeRequest(pair, mandelbrotFixed, FormulaParameter::C, centerReal, centerImaginary, 31, 21, 120, transferred);
+            transferRequest.scale.decimal = test.scale;
+            transferRequest.transfer.enableCertifiedSegments = true;
+            transferRequest.taylor.enableTaylor = false;
+            transferRequest.preflight.enable = false;
+            ExpressionDeepRenderResult transferResult;
+            bool okay = formula::renderExpressionDeepFrame(transferRequest, transferResult);
+
+            ExpressionDeepRenderRequest mpfrRequest = makeRequest(pair, mandelbrotFixed, FormulaParameter::C, centerReal, centerImaginary, 31, 21, 120, mpfr);
+            mpfrRequest.scale.decimal = test.scale;
+            mpfrRequest.forceMpfrFallbackForVerification = true;
+            mpfrRequest.taylor.enableTaylor = false;
+            mpfrRequest.preflight.enable = false;
+            ExpressionDeepRenderResult mpfrResult;
+            okay = formula::renderExpressionDeepFrame(mpfrRequest, mpfrResult) && okay;
+            const mpfr_prec_t higherPrecision = std::min<mpfr_prec_t>(4096, mpfrResult.fallbackPrecision + 128);
+            okay = renderOracle(pair.runtime, mandelbrotFixed, FormulaParameter::C, centerReal, centerImaginary, test.scale, 31, 21, 120, 4.0, higherPrecision, higher) && okay;
+            const uint64_t expectedSkipped = static_cast<uint64_t>(transferred.size()) * 120;
+            if (!okay || transferred != mpfr || transferred != higher || !transferResult.transferAttempted || !transferResult.transferAccepted || transferResult.transferAcceptedSegmentCount != 1 || transferResult.transferCoveredIterations != 120 || transferResult.transferSkippedIterationCount != expectedSkipped || transferResult.fallbackPixelCount != 0 || transferResult.fastPixelCount != transferred.size() || transferResult.transferFinalRadius.isZero() || mpfrResult.fallbackPixelCount != mpfr.size()) {
+                printf("  certified transfer parity failed [%s] attempted/accepted=%d/%d covered=%d fallback=%llu radius=(%.6g,e%lld)\n", test.name, transferResult.transferAttempted ? 1 : 0, transferResult.transferAccepted ? 1 : 0, transferResult.transferCoveredIterations, (unsigned long long)transferResult.fallbackPixelCount, transferResult.transferFinalRadius.mantissa, (long long)transferResult.transferFinalRadius.exponent);
+                ++failures;
+            }
+            if (std::strcmp(test.name, "quadratic-e50") == 0 && transferResult.referenceBytes <= std::numeric_limits<size_t>::max() - transferResult.rendererBytes && transferResult.referenceBytes + transferResult.rendererBytes > 0) {
+                std::vector<float> limited;
+                ExpressionDeepRenderRequest limitedRequest = makeRequest(pair, mandelbrotFixed, FormulaParameter::C, centerReal, centerImaginary, 31, 21, 120, limited);
+                limitedRequest.scale.decimal = test.scale;
+                limitedRequest.transfer.enableCertifiedSegments = true;
+                limitedRequest.taylor.enableTaylor = false;
+                limitedRequest.preflight.enable = false;
+                limitedRequest.memory.memoryLimitBytes = transferResult.referenceBytes + transferResult.rendererBytes - 1;
+                ExpressionDeepRenderResult limitedResult;
+                const bool limitedOkay = formula::renderExpressionDeepFrame(limitedRequest, limitedResult);
+                if ((limitedOkay && (limitedResult.transferAccepted || limitedResult.referenceBytes > limitedRequest.memory.memoryLimitBytes || limitedResult.rendererBytes > limitedRequest.memory.memoryLimitBytes - limitedResult.referenceBytes)) || (!limitedOkay && limitedResult.status != ExpressionDeepRenderStatus::ResourceLimit)) {
+                    printf("  certified transfer tight-memory admission failed status=%s accepted=%d ref/renderer/limit=%zu/%zu/%zu\n", formula::expressionDeepRenderStatusName(limitedResult.status), limitedResult.transferAccepted ? 1 : 0, limitedResult.referenceBytes, limitedResult.rendererBytes, limitedRequest.memory.memoryLimitBytes);
+                    ++failures;
+                }
+            }
+        }
+
+        ProgramPair ambiguousPair;
+        std::vector<float> ambiguous, ambiguousMpfr;
+        if (!compilePair("z+c", FormulaParameter::C, mandelbrotFixed, ambiguousPair)) {
+            ++failures;
+        } else {
+            ExpressionDeepRenderRequest request = makeRequest(ambiguousPair, mandelbrotFixed, FormulaParameter::C, "4", "0", 17, 11, 1, ambiguous);
+            request.scale.decimal = "1e50";
+            request.transfer.enableCertifiedSegments = true;
+            request.transfer.minimumIterations = 1;
+            request.transfer.minimumPixelCount = 1;
+            request.taylor.enableTaylor = false;
+            request.preflight.enable = false;
+            ExpressionDeepRenderResult result;
+            bool okay = formula::renderExpressionDeepFrame(request, result);
+            ExpressionDeepRenderRequest baseline = makeRequest(ambiguousPair, mandelbrotFixed, FormulaParameter::C, "4", "0", 17, 11, 1, ambiguousMpfr);
+            baseline.scale.decimal = "1e50";
+            baseline.forceMpfrFallbackForVerification = true;
+            baseline.taylor.enableTaylor = false;
+            baseline.preflight.enable = false;
+            ExpressionDeepRenderResult baselineResult;
+            okay = formula::renderExpressionDeepFrame(baseline, baselineResult) && okay;
+            if (!okay || ambiguous != ambiguousMpfr || !result.transferAttempted || result.transferAccepted || result.fallbackPixelCount != ambiguous.size() || reasonCount(result, ExpressionDeepFallbackReason::CertificationFailure) != ambiguous.size()) {
+                printf("  transfer bailout ambiguity fallback failed\n");
+                ++failures;
+            }
+        }
+
+        ProgramPair cancellationPair;
+        std::vector<float> cancelledOutput;
+        if (!compilePair("z*z+c+(n-n)", FormulaParameter::C, mandelbrotFixed, cancellationPair)) {
+            ++failures;
+        } else {
+            ExpressionDeepRenderRequest request = makeRequest(cancellationPair, mandelbrotFixed, FormulaParameter::C, centerReal, centerImaginary, 64, 40, 500, cancelledOutput);
+            request.scale.decimal = "1e50";
+            request.transfer.enableCertifiedSegments = true;
+            request.taylor.enableTaylor = false;
+            request.preflight.enable = false;
+            std::atomic<int> polls{0};
+            request.shouldCancel = [&] { return polls.fetch_add(1, std::memory_order_relaxed) > 550; };
+            ExpressionDeepRenderResult result;
+            if (formula::renderExpressionDeepFrame(request, result) || result.status != ExpressionDeepRenderStatus::Cancelled || !result.cancelled || std::count(cancelledOutput.begin(), cancelledOutput.end(), formula::ExpressionDeepEmptyPixel) != static_cast<ptrdiff_t>(cancelledOutput.size())) {
+                printf("  transfer cancellation failed polls=%d\n", polls.load());
+                ++failures;
+            }
+        }
+
+        ProgramPair benchmarkPair;
+        if (!compilePair("z*z+c+(n-n)", FormulaParameter::C, mandelbrotFixed, benchmarkPair)) {
+            ++failures;
+        } else {
+            constexpr int Width = 208;
+            constexpr int Height = 139;
+            constexpr int Iterations = 300;
+            std::vector<double> transferTimes;
+            std::vector<double> mpfrTimes;
+            ExpressionDeepRenderResult benchmarkTelemetry;
+            bool benchmarkOkay = true;
+            for (int repeat = 0; repeat < 3; ++repeat) {
+                std::vector<float> transferred, mpfr;
+                ExpressionDeepRenderRequest transferRequest = makeRequest(benchmarkPair, mandelbrotFixed, FormulaParameter::C, centerReal, centerImaginary, Width, Height, Iterations, transferred);
+                transferRequest.scale.decimal = "1e50";
+                transferRequest.transfer.enableCertifiedSegments = true;
+                transferRequest.taylor.enableTaylor = false;
+                transferRequest.preflight.enable = false;
+                ExpressionDeepRenderResult transferResult;
+                const Clock::time_point transferStart = Clock::now();
+                const bool transferOkay = formula::renderExpressionDeepFrame(transferRequest, transferResult);
+                transferTimes.push_back(std::chrono::duration<double>(Clock::now() - transferStart).count());
+
+                ExpressionDeepRenderRequest mpfrRequest = makeRequest(benchmarkPair, mandelbrotFixed, FormulaParameter::C, centerReal, centerImaginary, Width, Height, Iterations, mpfr);
+                mpfrRequest.scale.decimal = "1e50";
+                mpfrRequest.forceMpfrFallbackForVerification = true;
+                mpfrRequest.taylor.enableTaylor = false;
+                mpfrRequest.preflight.enable = false;
+                ExpressionDeepRenderResult mpfrResult;
+                const Clock::time_point mpfrStart = Clock::now();
+                const bool mpfrOkay = formula::renderExpressionDeepFrame(mpfrRequest, mpfrResult);
+                mpfrTimes.push_back(std::chrono::duration<double>(Clock::now() - mpfrStart).count());
+                benchmarkOkay = benchmarkOkay && transferOkay && mpfrOkay && transferred == mpfr && transferResult.transferAccepted && transferResult.transferAcceptedSegmentCount == 1 && transferResult.transferCoveredIterations == Iterations && transferResult.fallbackPixelCount == 0 && mpfrResult.fallbackPixelCount == mpfr.size();
+                benchmarkTelemetry = transferResult;
+            }
+            auto median = [](std::vector<double> values) {
+                std::sort(values.begin(), values.end());
+                return values[values.size() / 2];
+            };
+            const double transferMedian = median(transferTimes);
+            const double mpfrMedian = median(mpfrTimes);
+            printf("  certified transfer 208x139 e50 median total/MPFR %.3f/%.3f s build(ref/segment)=%.3f/%.3f apply/fallback=%.6f/%.3f segments=%llu skipped=%llu radius=(%.6g,e%lld)\n", transferMedian, mpfrMedian, benchmarkTelemetry.referenceSeconds, benchmarkTelemetry.transferBuildSeconds, benchmarkTelemetry.transferApplySeconds, benchmarkTelemetry.fallbackSeconds, (unsigned long long)benchmarkTelemetry.transferAcceptedSegmentCount, (unsigned long long)benchmarkTelemetry.transferSkippedIterationCount, benchmarkTelemetry.transferFinalRadius.mantissa, (long long)benchmarkTelemetry.transferFinalRadius.exponent);
+            if (!benchmarkOkay || !(transferMedian < mpfrMedian)) {
+                printf("  certified transfer repeated-median speed gate failed\n");
+                ++failures;
+            }
+        }
+    }
+
     // A production-sized-enough timing sample: reference is reported
     // separately, and the parallel scaled pass must beat all-pixel MPFR.
     double benchmarkReference = 0.0;
@@ -10123,6 +11530,12 @@ static int runGenericDeepBackendCase() {
     mpf_set_str(scale, "1e500", 10);
     GenericDeepInfo arithmeticInfo;
     GenericDeepInfo fallbackInfo;
+    GenericDeepInfo adaptiveInfo;
+    size_t adaptiveClassMismatch = 0;
+    size_t adaptiveFloorMismatch = 0;
+    bool adaptiveCancellationOkay = false;
+    bool unsupportedFallbackOkay = false;
+    bool unsafeFailureOkay = false;
 
     for (const Case& test : cases) {
         ExpressionProgram canonical;
@@ -10211,6 +11624,356 @@ static int runGenericDeepBackendCase() {
         }
         if (strcmp(test.name, "arithmetic-c") == 0) arithmeticInfo = info;
         if (strcmp(test.name, "branch-cut-fallback") == 0) fallbackInfo = info;
+    }
+
+    {
+        constexpr int AdaptiveWidth = 64;
+        constexpr int AdaptiveHeight = 40;
+        constexpr int AdaptiveIterations = 2000;
+        constexpr double AdaptiveBailout = 100.0;
+        const size_t adaptivePixelCount = static_cast<size_t>(AdaptiveWidth) * AdaptiveHeight;
+        mpf_t adaptiveCenterRe, adaptiveCenterIm, adaptiveScale;
+        mpf_init2(adaptiveCenterRe, 64);
+        mpf_init2(adaptiveCenterIm, 64);
+        mpf_init2(adaptiveScale, 64);
+        mpf_set_str(adaptiveCenterRe, "-1.251552471130320971409943884573286891722", 10);
+        mpf_set_str(adaptiveCenterIm, "-1.229726067217305625607239519911599964807", 10);
+        mpf_set_str(adaptiveScale, "1.01e12", 10);
+
+        ExpressionProgram adaptiveCanonical;
+        ExpressionProgram adaptiveRuntime;
+        ExpressionContext adaptiveFixed;
+        ExpressionError adaptiveError;
+        const bool adaptiveReady = adaptiveCanonical.compile("sin(z)+c", &adaptiveError) && adaptiveCanonical.specialize(adaptiveFixed, FormulaParameter::C, adaptiveRuntime, &adaptiveError);
+        std::vector<float> adaptiveOutput(adaptivePixelCount, EMPTYPIXEL);
+        std::vector<float> adaptiveGroundTruth(adaptivePixelCount, EMPTYPIXEL);
+        Mandel adaptiveEngine(AdaptiveWidth, AdaptiveHeight, AdaptiveIterations, 1, adaptiveOutput.data());
+        adaptiveEngine.setPrecision(64);
+        std::atomic<float> adaptiveProgress{0.0f};
+        std::unique_ptr<IComputeBackend> adaptiveBackend = createComputeBackend("cpu");
+        ComputeRequest adaptiveRequest;
+        adaptiveRequest.mode = ComputeMode::Expression;
+        adaptiveRequest.cpuEngine = &adaptiveEngine;
+        adaptiveRequest.centerRe = adaptiveCenterRe;
+        adaptiveRequest.centerIm = adaptiveCenterIm;
+        adaptiveRequest.scale = adaptiveScale;
+        adaptiveRequest.width = AdaptiveWidth;
+        adaptiveRequest.height = AdaptiveHeight;
+        adaptiveRequest.sub = 1;
+        adaptiveRequest.maxIterations = AdaptiveIterations;
+        adaptiveRequest.iterations = adaptiveOutput.data();
+        adaptiveRequest.progress = &adaptiveProgress;
+        adaptiveRequest.expressionSource = &adaptiveCanonical;
+        adaptiveRequest.expression = &adaptiveRuntime;
+        adaptiveRequest.expressionFixed = &adaptiveFixed;
+        adaptiveRequest.expressionPixel = FormulaParameter::C;
+        adaptiveRequest.expressionBailout = AdaptiveBailout;
+        adaptiveRequest.expressionColoring = formula::ExpressionColoring::Raw;
+        adaptiveBackend->resetCancellation();
+        const bool adaptiveBackendOkay = adaptiveReady && adaptiveBackend->compute(adaptiveRequest);
+        adaptiveInfo = adaptiveBackend->lastGenericDeepInfo();
+
+        ExpressionDeepRenderRequest groundTruthRequest;
+        groundTruthRequest.canonicalProgram = &adaptiveCanonical;
+        groundTruthRequest.runtimeProgram = &adaptiveRuntime;
+        groundTruthRequest.center.realMpf = adaptiveCenterRe;
+        groundTruthRequest.center.imaginaryMpf = adaptiveCenterIm;
+        groundTruthRequest.scale.mpf = adaptiveScale;
+        groundTruthRequest.fixed = adaptiveFixed;
+        groundTruthRequest.pixelParameter = FormulaParameter::C;
+        groundTruthRequest.width = AdaptiveWidth;
+        groundTruthRequest.height = AdaptiveHeight;
+        groundTruthRequest.maxIterations = AdaptiveIterations;
+        groundTruthRequest.bailout = AdaptiveBailout;
+        groundTruthRequest.output = adaptiveGroundTruth.data();
+        groundTruthRequest.outputCount = adaptiveGroundTruth.size();
+        groundTruthRequest.precision.requestedBits = 319;
+        groundTruthRequest.precision.minimumBits = 319;
+        groundTruthRequest.precision.guardBits = 0;
+        groundTruthRequest.precision.maximumBits = 4096;
+        groundTruthRequest.memory.fallbackGuardBits = 128;
+        groundTruthRequest.preflight.enable = false;
+        groundTruthRequest.taylor.enableTaylor = false;
+        groundTruthRequest.forceMpfrFallbackForVerification = true;
+        groundTruthRequest.disableSpecializedPiecewiseMpfrForVerification = true;
+        ExpressionDeepRenderResult groundTruthResult;
+        const bool groundTruthOkay = adaptiveReady && formula::renderExpressionDeepFrame(groundTruthRequest, groundTruthResult);
+        size_t adaptiveEmpty = 0;
+        for (size_t index = 0; adaptiveBackendOkay && groundTruthOkay && index < adaptivePixelCount; ++index) {
+            adaptiveEmpty += adaptiveOutput[index] == EMPTYPIXEL;
+            const bool adaptiveInterior = adaptiveOutput[index] < 0.0f;
+            const bool groundTruthInterior = adaptiveGroundTruth[index] < 0.0f;
+            if (adaptiveInterior != groundTruthInterior) {
+                ++adaptiveClassMismatch;
+            } else if (!adaptiveInterior && adaptiveOutput[index] != adaptiveGroundTruth[index]) {
+                ++adaptiveFloorMismatch;
+            }
+        }
+        const bool adaptiveTelemetryOkay = adaptiveBackend->lastComputeUsedGenericDeepPath() && adaptiveInfo.used && adaptiveInfo.settled && adaptiveInfo.success && adaptiveInfo.adaptiveAttempted && adaptiveInfo.adaptiveAccepted && !adaptiveInfo.adaptiveRejected && adaptiveInfo.adaptiveReferences >= 2 && adaptiveInfo.adaptivePreflightSamples == 256 && adaptiveInfo.adaptivePreflightFlags <= adaptiveInfo.adaptivePreflightSamples && adaptiveInfo.adaptivePrimary == adaptiveInfo.adaptiveSecondary && adaptiveInfo.adaptiveHierarchy >= adaptiveInfo.adaptiveFallback && adaptiveInfo.adaptiveDd != 0 && adaptiveInfo.adaptiveFallback == adaptiveInfo.fallbackPixelCount && adaptiveInfo.adaptiveMandatoryFull + adaptiveInfo.adaptiveLowEligible == adaptiveInfo.adaptiveFallback && adaptiveInfo.adaptiveValidationSamples == std::min<uint64_t>(128, adaptiveInfo.adaptiveLowEligible) && adaptiveInfo.adaptiveCandidatePrecision == 160 && adaptiveInfo.adaptiveFullPrecision == adaptiveInfo.fallbackPrecision && adaptiveInfo.adaptiveValidationMismatches == 0 && !adaptiveInfo.adaptiveUpgraded && adaptiveInfo.adaptiveUpgradedPixels == 0 && adaptiveInfo.adaptiveMandatoryCandidatePrecision == 224 && adaptiveInfo.adaptiveMandatoryCandidatePixels == adaptiveInfo.adaptiveMandatoryFull && adaptiveInfo.adaptiveMandatoryFullPrecisionPixels == std::min<uint64_t>(32, adaptiveInfo.adaptiveMandatoryFull) && adaptiveInfo.adaptiveMandatoryValidationSamples == std::min<uint64_t>(32, adaptiveInfo.adaptiveMandatoryFull) && adaptiveInfo.adaptiveMandatoryValidationMismatches == 0 && !adaptiveInfo.adaptiveMandatoryUpgraded && adaptiveInfo.adaptiveMandatoryUpgradedPixels == 0 && adaptiveProgress.load(std::memory_order_relaxed) == 1.0f;
+        const bool adaptiveTargetOkay = adaptiveBackendOkay && groundTruthOkay && groundTruthResult.fastPixelCount == 0 && groundTruthResult.fallbackPixelCount == adaptivePixelCount && adaptiveEmpty == 0 && adaptiveClassMismatch == 0 && adaptiveFloorMismatch == 0 && adaptiveTelemetryOkay;
+        if (!adaptiveTargetOkay) {
+            ++failures;
+            printf("  adaptive backend target failed ready/backend/GT/telemetry=%d/%d/%d/%d EMPTY/class/floor=%zu/%zu/%zu accepted/rejected=%d/%d refs=%llu pre=%llu/%llu P/S/H/DD/F=%llu/%llu/%llu/%llu/%llu bits=%llu/%llu mandatory/low=%llu/%llu validation/upgrade/pixels=%llu/%d/%llu status=%s error=%s\n",
+                   adaptiveReady ? 1 : 0, adaptiveBackendOkay ? 1 : 0, groundTruthOkay ? 1 : 0, adaptiveTelemetryOkay ? 1 : 0, adaptiveEmpty, adaptiveClassMismatch, adaptiveFloorMismatch, adaptiveInfo.adaptiveAccepted ? 1 : 0, adaptiveInfo.adaptiveRejected ? 1 : 0, (unsigned long long)adaptiveInfo.adaptiveReferences, (unsigned long long)adaptiveInfo.adaptivePreflightFlags, (unsigned long long)adaptiveInfo.adaptivePreflightSamples, (unsigned long long)adaptiveInfo.adaptivePrimary, (unsigned long long)adaptiveInfo.adaptiveSecondary, (unsigned long long)adaptiveInfo.adaptiveHierarchy, (unsigned long long)adaptiveInfo.adaptiveDd, (unsigned long long)adaptiveInfo.adaptiveFallback, (unsigned long long)adaptiveInfo.adaptiveCandidatePrecision, (unsigned long long)adaptiveInfo.adaptiveFullPrecision, (unsigned long long)adaptiveInfo.adaptiveMandatoryFull, (unsigned long long)adaptiveInfo.adaptiveLowEligible, (unsigned long long)adaptiveInfo.adaptiveValidationSamples, adaptiveInfo.adaptiveUpgraded ? 1 : 0, (unsigned long long)adaptiveInfo.adaptiveUpgradedPixels, adaptiveInfo.status.c_str(), adaptiveInfo.error.c_str());
+        }
+
+        std::vector<float> adaptiveCancelled(adaptivePixelCount, EMPTYPIXEL);
+        Mandel adaptiveCancelEngine(AdaptiveWidth, AdaptiveHeight, AdaptiveIterations, 1, adaptiveCancelled.data());
+        adaptiveCancelEngine.setPrecision(64);
+        std::atomic<float> adaptiveCancelProgress{0.0f};
+        ComputeRequest adaptiveCancelRequest = adaptiveRequest;
+        adaptiveCancelRequest.cpuEngine = &adaptiveCancelEngine;
+        adaptiveCancelRequest.iterations = adaptiveCancelled.data();
+        adaptiveCancelRequest.progress = &adaptiveCancelProgress;
+        adaptiveBackend->resetCancellation();
+        std::future<bool> adaptiveFuture = std::async(std::launch::async, [&] { return adaptiveBackend->compute(adaptiveCancelRequest); });
+        bool adaptiveProgressObserved = false;
+        bool adaptiveRenderStarted = false;
+        for (int wait = 0; wait < 2000; ++wait) {
+            const GenericDeepInfo runningInfo = adaptiveBackend->lastGenericDeepInfo();
+            adaptiveRenderStarted = adaptiveRenderStarted || (runningInfo.used && !runningInfo.settled);
+            if (adaptiveRenderStarted && adaptiveCancelProgress.load(std::memory_order_relaxed) > 0.0f) {
+                adaptiveProgressObserved = true;
+                break;
+            }
+            if (adaptiveRenderStarted && runningInfo.settled) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        adaptiveBackend->cancel();
+        const bool adaptiveCancelBounded = adaptiveFuture.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+        const bool adaptiveCancelResult = adaptiveCancelBounded ? adaptiveFuture.get() : true;
+        const GenericDeepInfo adaptiveCancelInfo = adaptiveBackend->lastGenericDeepInfo();
+        adaptiveBackend->resetCancellation();
+        adaptiveCancellationOkay = adaptiveProgressObserved && adaptiveCancelBounded && !adaptiveCancelResult && adaptiveCancelInfo.cancelled && adaptiveCancelInfo.status == "cancelled" && std::count(adaptiveCancelled.begin(), adaptiveCancelled.end(), EMPTYPIXEL) != 0;
+        if (!adaptiveCancellationOkay) {
+            ++failures;
+            printf("  adaptive backend cancellation failed progress/bounded/result/cancelled/status=%d/%d/%d/%d/%s\n",
+                   adaptiveProgressObserved ? 1 : 0, adaptiveCancelBounded ? 1 : 0, adaptiveCancelResult ? 1 : 0, adaptiveCancelInfo.cancelled ? 1 : 0, adaptiveCancelInfo.status.c_str());
+        }
+
+        auto adaptiveBindingBackendCase = [&](const char* name, const char* source, const char* centerReal, const char* centerImaginary, FormulaParameter pixel, const ExpressionContext& fixed, formula::ExpressionScaledResidualCapability capability) {
+            constexpr int BindingIterations = 2000;
+            mpf_set_str(adaptiveCenterRe, centerReal, 10);
+            mpf_set_str(adaptiveCenterIm, centerImaginary, 10);
+            mpf_set_str(adaptiveScale, "1.01e12", 10);
+            ExpressionProgram canonical;
+            ExpressionProgram runtime;
+            ExpressionError error;
+            const bool ready = canonical.compile(source, &error) && canonical.specialize(fixed, pixel, runtime, &error);
+            std::vector<float> output(adaptivePixelCount, EMPTYPIXEL);
+            std::vector<float> groundTruth(adaptivePixelCount, EMPTYPIXEL);
+            Mandel engine(AdaptiveWidth, AdaptiveHeight, BindingIterations, 1, output.data());
+            engine.setPrecision(64);
+            ComputeRequest request = adaptiveRequest;
+            request.cpuEngine = &engine;
+            request.maxIterations = BindingIterations;
+            request.iterations = output.data();
+            request.progress = nullptr;
+            request.expressionSource = &canonical;
+            request.expression = &runtime;
+            request.expressionFixed = &fixed;
+            request.expressionPixel = pixel;
+            adaptiveBackend->resetCancellation();
+            const bool backendOkay = ready && adaptiveBackend->compute(request);
+            const GenericDeepInfo info = adaptiveBackend->lastGenericDeepInfo();
+
+            ExpressionDeepRenderRequest direct = groundTruthRequest;
+            direct.canonicalProgram = &canonical;
+            direct.runtimeProgram = &runtime;
+            direct.center.realMpf = adaptiveCenterRe;
+            direct.center.imaginaryMpf = adaptiveCenterIm;
+            direct.scale.mpf = adaptiveScale;
+            direct.fixed = fixed;
+            direct.pixelParameter = pixel;
+            direct.maxIterations = BindingIterations;
+            direct.output = groundTruth.data();
+            direct.outputCount = groundTruth.size();
+            ExpressionDeepRenderResult directResult;
+            const bool directOkay = ready && formula::renderExpressionDeepFrame(direct, directResult);
+            const bool accelerated = (info.adaptiveAttempted && info.adaptiveAccepted) || info.taylorAccepted;
+            const bool okay = backendOkay && directOkay && output == groundTruth && info.success && accelerated && info.pixelParameter == pixel && info.capability == capability && info.fastPixelCount != 0 && directResult.fastPixelCount == 0 && directResult.fallbackPixelCount == groundTruth.size();
+            printf("  adaptive backend %-11s binding/capability=%s/%s attempted/accepted/rejected=%d/%d/%d fast/fallback=%llu/%llu exact=%d\n", name, info.pixelParameter == FormulaParameter::InitialZ ? "z0" : "c", info.capability == formula::ExpressionScaledResidualCapability::CertifiedRealCandidate ? "real" : (info.capability == formula::ExpressionScaledResidualCapability::CertifiedBranchCandidate ? "branch" : "entire"), info.adaptiveAttempted ? 1 : 0, info.adaptiveAccepted ? 1 : 0, info.adaptiveRejected ? 1 : 0, (unsigned long long)info.fastPixelCount, (unsigned long long)info.fallbackPixelCount, output == groundTruth ? 1 : 0);
+            if (!okay) ++failures;
+        };
+        ExpressionContext adaptiveZ0Fixed;
+        adaptiveBindingBackendCase("z0-entire", "sin(z)+z0+(n-n)", "-1.251552471130320971409943884573286891722", "-1.229726067217305625607239519911599964807", FormulaParameter::InitialZ, adaptiveZ0Fixed, formula::ExpressionScaledResidualCapability::CertifiedEntireCandidate);
+        ExpressionContext adaptiveRealFixed;
+        adaptiveBindingBackendCase("real-smooth", "z*z+0.0000000000000001*conj(z)+c+(n-n)", "-0.743643887037151", "0.13182590420533", FormulaParameter::C, adaptiveRealFixed, formula::ExpressionScaledResidualCapability::CertifiedRealCandidate);
+        ExpressionContext adaptiveBranchFixed;
+        adaptiveBindingBackendCase("branch-smooth", "0.01*log(z+3)+0.01*sqrt(z+4)+c+(n-n)", "-0.743643887037151", "0.13182590420533", FormulaParameter::C, adaptiveBranchFixed, formula::ExpressionScaledResidualCapability::CertifiedBranchCandidate);
+
+        {
+            constexpr int InitialWidth = 17;
+            constexpr int InitialHeight = 16;
+            constexpr int InitialIterations = 320;
+            constexpr double InitialBailout = 2.0;
+            constexpr size_t InitialPreflightSamples = 256;
+            const size_t initialPixelCount = static_cast<size_t>(InitialWidth) * InitialHeight;
+            const size_t sampledTopRight = initialPixelCount - 1;
+            const size_t unsampledTail = initialPixelCount - 2;
+            ExpressionProgram initialCanonical;
+            ExpressionProgram initialRuntime;
+            ExpressionContext initialFixed;
+            initialFixed.c = {0.05, 0.02};
+            ExpressionError initialError;
+            const bool initialReady = initialCanonical.compile("0.1*sin(z)+c+(n-n)", &initialError) && initialCanonical.specialize(initialFixed, FormulaParameter::InitialZ, initialRuntime, &initialError);
+            auto makeInitialRequest = [&](std::vector<float>& output) {
+                output.assign(initialPixelCount, EMPTYPIXEL);
+                ExpressionDeepRenderRequest request;
+                request.canonicalProgram = &initialCanonical;
+                request.runtimeProgram = &initialRuntime;
+                request.center.realDecimal = "0";
+                request.center.imaginaryDecimal = "0";
+                request.scale.decimal = "1";
+                request.fixed = initialFixed;
+                request.pixelParameter = FormulaParameter::InitialZ;
+                request.width = InitialWidth;
+                request.height = InitialHeight;
+                request.maxIterations = InitialIterations;
+                request.bailout = InitialBailout;
+                request.output = output.data();
+                request.outputCount = output.size();
+                request.precision.minimumBits = 128;
+                request.precision.guardBits = 64;
+                request.precision.maximumBits = 4096;
+                request.memory.fallbackGuardBits = 128;
+                request.preflight.enable = false;
+                request.taylor.enableTaylor = false;
+                request.centered.enableAdaptiveCandidate = true;
+                request.centered.preflightSamples = InitialPreflightSamples;
+                return request;
+            };
+            auto isPreflightSample = [&](size_t target) {
+                const int columns = std::max(1, std::min(static_cast<int>(std::ceil(std::sqrt(static_cast<double>(InitialPreflightSamples) * InitialWidth / InitialHeight))), InitialWidth));
+                const int rows = std::max(1, std::min(static_cast<int>((InitialPreflightSamples + static_cast<size_t>(columns) - 1) / static_cast<size_t>(columns)), InitialHeight));
+                const size_t gridCount = static_cast<size_t>(columns) * rows;
+                for (size_t sample = 0; sample < InitialPreflightSamples; ++sample) {
+                    const size_t slot = sample * (gridCount - 1) / (InitialPreflightSamples - 1);
+                    const int row = static_cast<int>(slot / static_cast<size_t>(columns));
+                    const int column = static_cast<int>(slot % static_cast<size_t>(columns));
+                    const int y = static_cast<int>(static_cast<int64_t>(row) * (InitialHeight - 1) / (rows - 1));
+                    const int x = static_cast<int>(static_cast<int64_t>(column) * (InitialWidth - 1) / (columns - 1));
+                    if (static_cast<size_t>(y) * InitialWidth + x == target) return true;
+                }
+                return false;
+            };
+
+            std::vector<float> initialAdaptive;
+            ExpressionDeepRenderRequest initialRequest = makeInitialRequest(initialAdaptive);
+            ExpressionDeepRenderResult initialResult;
+            const bool initialAdaptiveOkay = initialReady && formula::renderExpressionDeepFrame(initialRequest, initialResult);
+            std::vector<float> initialMpfr;
+            ExpressionDeepRenderRequest initialMpfrRequest = makeInitialRequest(initialMpfr);
+            initialMpfrRequest.forceMpfrFallbackForVerification = true;
+            initialMpfrRequest.disableSpecializedPiecewiseMpfrForVerification = true;
+            ExpressionDeepRenderResult initialMpfrResult;
+            const bool initialMpfrOkay = initialReady && formula::renderExpressionDeepFrame(initialMpfrRequest, initialMpfrResult);
+            const bool initialIterationZeroOkay = initialAdaptiveOkay && initialMpfrOkay && isPreflightSample(sampledTopRight) && !isPreflightSample(unsampledTail) && initialAdaptive[sampledTopRight] == 0.0f && initialMpfr[sampledTopRight] == 0.0f && initialAdaptive[unsampledTail] == 0.0f && initialMpfr[unsampledTail] == 0.0f;
+            const bool initialPathOkay = initialAdaptiveOkay && initialResult.centeredAttempted && initialResult.centeredAccepted && !initialResult.centeredPreflightRejected && initialResult.centeredReferenceCount >= 2 && initialResult.centeredPreflightSampleCount == InitialPreflightSamples && initialResult.centeredSecondaryEvaluationCount != 0 && initialResult.centeredAdditionalReferenceEvaluationCount != 0 && initialResult.fastPixelCount == initialPixelCount && initialResult.fallbackPixelCount == 0;
+            const bool initialExact = initialAdaptive == initialMpfr && initialMpfrResult.fastPixelCount == 0 && initialMpfrResult.fallbackPixelCount == initialPixelCount;
+
+            const size_t initialPeak = initialResult.referenceBytes + initialResult.rendererBytes;
+            const size_t initialMemoryLimit = initialPeak > 0 ? initialPeak - 1 : 0;
+            std::vector<float> initialConstrained;
+            ExpressionDeepRenderRequest initialConstrainedRequest = makeInitialRequest(initialConstrained);
+            initialConstrainedRequest.memory.memoryLimitBytes = initialMemoryLimit;
+            ExpressionDeepRenderResult initialConstrainedResult;
+            const bool initialConstrainedRendered = initialMemoryLimit != 0 && formula::renderExpressionDeepFrame(initialConstrainedRequest, initialConstrainedResult);
+            const bool initialMemoryOkay = initialConstrainedRendered && initialConstrained == initialMpfr && !initialConstrainedResult.centeredAccepted && initialConstrainedResult.referenceBytes <= initialMemoryLimit && initialConstrainedResult.rendererBytes <= initialMemoryLimit - initialConstrainedResult.referenceBytes;
+
+            std::vector<float> initialCancelled;
+            ExpressionDeepRenderRequest initialCancelledRequest = makeInitialRequest(initialCancelled);
+            std::atomic_bool initialFastPhase{false};
+            std::atomic<int> initialCancelPolls{0};
+            initialCancelledRequest.progress = [&](formula::ExpressionDeepRenderPhase phase, uint64_t, uint64_t) {
+                if (phase == formula::ExpressionDeepRenderPhase::Fast) initialFastPhase.store(true, std::memory_order_relaxed);
+            };
+            initialCancelledRequest.shouldCancel = [&] { return initialFastPhase.load(std::memory_order_relaxed) && initialCancelPolls.fetch_add(1, std::memory_order_relaxed) > 0; };
+            ExpressionDeepRenderResult initialCancelledResult;
+            const bool initialCancellationOkay = !formula::renderExpressionDeepFrame(initialCancelledRequest, initialCancelledResult) && initialCancelledResult.status == formula::ExpressionDeepRenderStatus::Cancelled && initialCancelledResult.cancelled && std::count(initialCancelled.begin(), initialCancelled.end(), formula::ExpressionDeepEmptyPixel) == static_cast<ptrdiff_t>(initialCancelled.size());
+            const bool initialOkay = initialReady && initialPathOkay && initialExact && initialIterationZeroOkay && initialMemoryOkay && initialCancellationOkay;
+            printf("  adaptive InitialZ 17x16 raw/path/iter0/memory/cancel=%d/%d/%d/%d/%d attempted/accepted/rejected=%d/%d/%d refs=%llu pre=%llu/%llu fast/S/H/F=%llu/%llu/%llu/%llu sampled/unsampled=%zu/%zu output=%.0f/%.0f status=%s error=%s\n",
+                   initialExact ? 1 : 0, initialPathOkay ? 1 : 0, initialIterationZeroOkay ? 1 : 0, initialMemoryOkay ? 1 : 0, initialCancellationOkay ? 1 : 0, initialResult.centeredAttempted ? 1 : 0, initialResult.centeredAccepted ? 1 : 0, initialResult.centeredPreflightRejected ? 1 : 0, (unsigned long long)initialResult.centeredReferenceCount, (unsigned long long)initialResult.centeredPreflightFlagCount, (unsigned long long)initialResult.centeredPreflightSampleCount, (unsigned long long)initialResult.fastPixelCount, (unsigned long long)initialResult.centeredSecondaryEvaluationCount, (unsigned long long)initialResult.centeredAdditionalReferenceEvaluationCount, (unsigned long long)initialResult.fallbackPixelCount, sampledTopRight, unsampledTail, initialAdaptiveOkay ? initialAdaptive[sampledTopRight] : EMPTYPIXEL, initialAdaptiveOkay ? initialAdaptive[unsampledTail] : EMPTYPIXEL, formula::expressionDeepRenderStatusName(initialResult.status), initialResult.error.c_str());
+            if (!initialOkay) ++failures;
+        }
+
+        constexpr int UnsafeWidth = 16;
+        constexpr int UnsafeHeight = 16;
+        constexpr int UnsafeIterations = 256;
+        const size_t unsafePixelCount = static_cast<size_t>(UnsafeWidth) * UnsafeHeight;
+        mpf_set_si(adaptiveCenterRe, -1);
+        mpf_set_ui(adaptiveCenterIm, 0);
+        mpf_set_str(adaptiveScale, "1e500", 10);
+        ExpressionProgram unsupportedCanonical;
+        ExpressionProgram unsupportedRuntime;
+        ExpressionContext unsupportedFixed;
+        const bool unsupportedReady = unsupportedCanonical.compile("0.001*log(c)", &adaptiveError) && unsupportedCanonical.specialize(unsupportedFixed, FormulaParameter::C, unsupportedRuntime, &adaptiveError);
+        std::vector<float> unsupportedOutput(unsafePixelCount, EMPTYPIXEL);
+        std::vector<float> unsupportedGroundTruth(unsafePixelCount, EMPTYPIXEL);
+        Mandel unsupportedAdaptiveEngine(UnsafeWidth, UnsafeHeight, UnsafeIterations, 1, unsupportedOutput.data());
+        unsupportedAdaptiveEngine.setPrecision(64);
+        ComputeRequest unsupportedRequest = adaptiveRequest;
+        unsupportedRequest.cpuEngine = &unsupportedAdaptiveEngine;
+        unsupportedRequest.centerRe = adaptiveCenterRe;
+        unsupportedRequest.centerIm = adaptiveCenterIm;
+        unsupportedRequest.scale = adaptiveScale;
+        unsupportedRequest.width = UnsafeWidth;
+        unsupportedRequest.height = UnsafeHeight;
+        unsupportedRequest.maxIterations = UnsafeIterations;
+        unsupportedRequest.iterations = unsupportedOutput.data();
+        unsupportedRequest.progress = nullptr;
+        unsupportedRequest.expressionSource = &unsupportedCanonical;
+        unsupportedRequest.expression = &unsupportedRuntime;
+        unsupportedRequest.expressionFixed = &unsupportedFixed;
+        unsupportedRequest.expressionBailout = 4.0;
+        adaptiveBackend->resetCancellation();
+        const bool unsupportedBackendOkay = unsupportedReady && adaptiveBackend->compute(unsupportedRequest);
+        const GenericDeepInfo unsupportedInfo = adaptiveBackend->lastGenericDeepInfo();
+        ExpressionDeepRenderRequest unsupportedGtRequest = groundTruthRequest;
+        unsupportedGtRequest.canonicalProgram = &unsupportedCanonical;
+        unsupportedGtRequest.runtimeProgram = &unsupportedRuntime;
+        unsupportedGtRequest.center.realMpf = adaptiveCenterRe;
+        unsupportedGtRequest.center.imaginaryMpf = adaptiveCenterIm;
+        unsupportedGtRequest.scale.mpf = adaptiveScale;
+        unsupportedGtRequest.fixed = unsupportedFixed;
+        unsupportedGtRequest.width = UnsafeWidth;
+        unsupportedGtRequest.height = UnsafeHeight;
+        unsupportedGtRequest.maxIterations = UnsafeIterations;
+        unsupportedGtRequest.bailout = 4.0;
+        unsupportedGtRequest.output = unsupportedGroundTruth.data();
+        unsupportedGtRequest.outputCount = unsupportedGroundTruth.size();
+        ExpressionDeepRenderResult unsupportedGtResult;
+        const bool unsupportedGtOkay = unsupportedReady && formula::renderExpressionDeepFrame(unsupportedGtRequest, unsupportedGtResult);
+        unsupportedFallbackOkay = unsupportedBackendOkay && unsupportedGtOkay && unsupportedOutput == unsupportedGroundTruth && unsupportedInfo.success && !unsupportedInfo.adaptiveAttempted && !unsupportedInfo.adaptiveAccepted && unsupportedInfo.fallbackPixelCount != 0 && std::count(unsupportedOutput.begin(), unsupportedOutput.end(), EMPTYPIXEL) == 0;
+        if (!unsupportedFallbackOkay) {
+            ++failures;
+            printf("  unsupported adaptive fallback failed backend/GT/attempted/accepted/fallback/empty=%d/%d/%d/%d/%llu/%zu status=%s error=%s\n",
+                   unsupportedBackendOkay ? 1 : 0, unsupportedGtOkay ? 1 : 0, unsupportedInfo.adaptiveAttempted ? 1 : 0, unsupportedInfo.adaptiveAccepted ? 1 : 0, (unsigned long long)unsupportedInfo.fallbackPixelCount, std::count(unsupportedOutput.begin(), unsupportedOutput.end(), EMPTYPIXEL), unsupportedInfo.status.c_str(), unsupportedInfo.error.c_str());
+        }
+
+        ExpressionProgram unsafeCanonical;
+        ExpressionProgram unsafeRuntime;
+        ExpressionContext unsafeFixed;
+        const bool unsafeReady = unsafeCanonical.compile("1/(z-z)+c", &adaptiveError) && unsafeCanonical.specialize(unsafeFixed, FormulaParameter::C, unsafeRuntime, &adaptiveError);
+        std::vector<float> unsafeOutput(unsafePixelCount, 0.0f);
+        Mandel unsafeEngine(UnsafeWidth, UnsafeHeight, UnsafeIterations, 1, unsafeOutput.data());
+        unsafeEngine.setPrecision(64);
+        ComputeRequest unsafeRequest = unsupportedRequest;
+        unsafeRequest.cpuEngine = &unsafeEngine;
+        unsafeRequest.iterations = unsafeOutput.data();
+        unsafeRequest.expressionSource = &unsafeCanonical;
+        unsafeRequest.expression = &unsafeRuntime;
+        unsafeRequest.expressionFixed = &unsafeFixed;
+        adaptiveBackend->resetCancellation();
+        const bool unsafeResult = unsafeReady && adaptiveBackend->compute(unsafeRequest);
+        const GenericDeepInfo unsafeInfo = adaptiveBackend->lastGenericDeepInfo();
+        unsafeFailureOkay = unsafeReady && !unsafeResult && unsafeInfo.used && unsafeInfo.settled && !unsafeInfo.success && !unsafeInfo.adaptiveAccepted && unsafeInfo.status == "undefined-pixel" && std::count(unsafeOutput.begin(), unsafeOutput.end(), EMPTYPIXEL) == static_cast<ptrdiff_t>(unsafeOutput.size());
+        if (!unsafeFailureOkay) {
+            ++failures;
+            printf("  unsafe adaptive request was success-shaped ready/result/accepted/empty=%d/%d/%d/%zu status=%s error=%s\n",
+                   unsafeReady ? 1 : 0, unsafeResult ? 1 : 0, unsafeInfo.adaptiveAccepted ? 1 : 0, std::count(unsafeOutput.begin(), unsafeOutput.end(), EMPTYPIXEL), unsafeInfo.status.c_str(), unsafeInfo.error.c_str());
+        }
+        mpf_clears(adaptiveCenterRe, adaptiveCenterIm, adaptiveScale, (mpf_ptr)0);
     }
 
     ExpressionProgram genericCanonical;
@@ -10361,6 +12124,8 @@ static int runGenericDeepBackendCase() {
            "%.6f/%.6f/%.6f/%.6f s; fallback=%llu/%llu (%.2f%%)\n",
            arithmeticInfo.totalSeconds, arithmeticInfo.referenceSeconds, arithmeticInfo.taylorSeconds, arithmeticInfo.fallbackSeconds, (unsigned long long)arithmeticInfo.fallbackPixelCount, (unsigned long long)arithmeticInfo.pixelCount, fallbackRate);
     printf("  branch-cut fallback=%llu/%llu\n", (unsigned long long)fallbackInfo.fallbackPixelCount, (unsigned long long)fallbackInfo.pixelCount);
+    printf("  adaptive 64x40 accepted=%d refs=%llu pre=%llu/%llu P/S/H/DD/F=%llu/%llu/%llu/%llu/%llu bits=%llu/%llu mandatory/low=%llu/%llu class/floor=%zu/%zu cancel/fallback/unsafe=%d/%d/%d\n",
+           adaptiveInfo.adaptiveAccepted ? 1 : 0, (unsigned long long)adaptiveInfo.adaptiveReferences, (unsigned long long)adaptiveInfo.adaptivePreflightFlags, (unsigned long long)adaptiveInfo.adaptivePreflightSamples, (unsigned long long)adaptiveInfo.adaptivePrimary, (unsigned long long)adaptiveInfo.adaptiveSecondary, (unsigned long long)adaptiveInfo.adaptiveHierarchy, (unsigned long long)adaptiveInfo.adaptiveDd, (unsigned long long)adaptiveInfo.adaptiveFallback, (unsigned long long)adaptiveInfo.adaptiveCandidatePrecision, (unsigned long long)adaptiveInfo.adaptiveFullPrecision, (unsigned long long)adaptiveInfo.adaptiveMandatoryFull, (unsigned long long)adaptiveInfo.adaptiveLowEligible, adaptiveClassMismatch, adaptiveFloorMismatch, adaptiveCancellationOkay ? 1 : 0, unsupportedFallbackOkay ? 1 : 0, unsafeFailureOkay ? 1 : 0);
     printf("  cancellation %.3f s empty=%zu/%zu\n", cancelSeconds, empty, cancelled.size());
     printf("  => %s\n\n", failures == 0 ? "PASS" : "CHECK (generic deep integration failure)");
     mpf_clears(centerRe, centerIm, scale, (mpf_ptr)0);
@@ -10761,6 +12526,20 @@ struct CenteredCheckpoint {
     formula::Complex residual;
 };
 
+struct CenteredTelemetry {
+    std::array<formula::Complex, 4> probeStates{};
+    std::array<uint8_t, 4> probeValid{};
+    formula::Complex finalState{};
+    double finalError = 0.0;
+    double maximumError = 0.0;
+    double maximumDerivative = 0.0;
+    double maximumEvaluationGap = 0.0;
+    double maximumAlternateGap = 0.0;
+    double minimumBailoutMargin = std::numeric_limits<double>::infinity();
+    double escapeMargin = std::numeric_limits<double>::infinity();
+    int escapeIteration = 0;
+};
+
 static bool findExpressionCenteredReference(const formula::ExpressionProgram& canonical, const formula::ExpressionProgram& runtime, const formula::ExpressionContext& fixed, const char* centerReal, const char* centerImaginary, const char* scaleText, int width, int height, int maxIterations, double bailout, int& referenceX, int& referenceY, size_t& attemptedCandidates, double& seconds) {
     constexpr mp_bitcnt_t Precision = 512;
     mpf_t centerRe, centerIm, scale, temporary, dxHalf, dyHalf, pixelRe, pixelIm;
@@ -10839,7 +12618,101 @@ static bool findExpressionCenteredReference(const formula::ExpressionProgram& ca
     return referenceX >= 0 && referenceY >= 0;
 }
 
-static bool renderExpressionCentered4(const formula::ExpressionProgram& canonical, const formula::ExpressionProgram& runtime, const formula::ExpressionContext& fixed, const char* centerReal, const char* centerImaginary, const char* scaleText, int width, int height, int referenceX, int referenceY, int maxIterations, double bailout, int checkpointIteration, std::vector<CenteredCheckpoint>* checkpoints, std::vector<double>* errorEstimates, std::vector<float>& output, double& seconds, size_t& failedPixels) {
+static bool findExpressionCenteredReferences(const formula::ExpressionProgram& canonical, const formula::ExpressionProgram& runtime, const formula::ExpressionContext& fixed, const char* centerReal, const char* centerImaginary, const char* scaleText, int width, int height, int maxIterations, double bailout, size_t maximumReferences, std::vector<std::pair<int, int>>& references, size_t& attemptedCandidates, double& seconds) {
+    constexpr mp_bitcnt_t Precision = 512;
+    mpf_t centerRe, centerIm, scale, temporary, dxHalf, dyHalf, pixelRe, pixelIm;
+    mpf_init2(centerRe, Precision);
+    mpf_init2(centerIm, Precision);
+    mpf_init2(scale, Precision);
+    mpf_init2(temporary, Precision);
+    mpf_init2(dxHalf, Precision);
+    mpf_init2(dyHalf, Precision);
+    mpf_init2(pixelRe, Precision);
+    mpf_init2(pixelIm, Precision);
+    bool ready = mpf_set_str(centerRe, centerReal, 10) == 0 && mpf_set_str(centerIm, centerImaginary, 10) == 0 && mpf_set_str(scale, scaleText, 10) == 0 && mpf_sgn(scale) > 0;
+    if (ready) {
+        mpf_mul_ui(temporary, scale, static_cast<unsigned long>(width - 1));
+        mpf_ui_div(dxHalf, 2, temporary);
+        mpf_mul_ui(temporary, scale, static_cast<unsigned long>(width));
+        mpf_mul_ui(temporary, temporary, static_cast<unsigned long>(height - 1));
+        mpf_ui_div(dyHalf, static_cast<unsigned long>(height), temporary);
+        mpf_mul_ui(dyHalf, dyHalf, 2);
+    }
+
+    std::vector<std::pair<int, int>> candidates;
+    constexpr int GridWidth = 9;
+    constexpr int GridHeight = 9;
+    for (int gridY = 0; gridY < GridHeight; ++gridY) {
+        const int y = static_cast<int>(static_cast<long long>(gridY) * (height - 1) / (GridHeight - 1));
+        for (int gridX = 0; gridX < GridWidth; ++gridX) {
+            const int x = static_cast<int>(static_cast<long long>(gridX) * (width - 1) / (GridWidth - 1));
+            candidates.emplace_back(x, y);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+
+    references.clear();
+    attemptedCandidates = 0;
+    const Clock::time_point start = Clock::now();
+    while (ready && !candidates.empty() && references.size() < maximumReferences) {
+        size_t selected = 0;
+        long long selectedScore = std::numeric_limits<long long>::min();
+        for (size_t candidateIndex = 0; candidateIndex < candidates.size(); ++candidateIndex) {
+            const auto [x, y] = candidates[candidateIndex];
+            long long score = 0;
+            if (references.empty()) {
+                const long long dx = 2LL * x - (width - 1LL);
+                const long long dy = 2LL * y - (height - 1LL);
+                score = -(dx * dx + dy * dy);
+            } else {
+                score = std::numeric_limits<long long>::max();
+                for (const auto& reference : references) {
+                    const long long dx = x - reference.first;
+                    const long long dy = y - reference.second;
+                    score = std::min(score, dx * dx + dy * dy);
+                }
+            }
+            if (score > selectedScore) {
+                selectedScore = score;
+                selected = candidateIndex;
+            }
+        }
+        const auto [x, y] = candidates[selected];
+        candidates.erase(candidates.begin() + static_cast<std::ptrdiff_t>(selected));
+
+        const long centeredX = static_cast<long>(2LL * x - (width - 1LL));
+        const long centeredY = static_cast<long>(2LL * y - (height - 1LL));
+        mpf_mul_ui(temporary, dxHalf, static_cast<unsigned long>(std::labs(centeredX)));
+        if (centeredX < 0) mpf_neg(temporary, temporary);
+        mpf_add(pixelRe, centerRe, temporary);
+        mpf_mul_ui(temporary, dyHalf, static_cast<unsigned long>(std::labs(centeredY)));
+        if (centeredY < 0) mpf_neg(temporary, temporary);
+        mpf_add(pixelIm, centerIm, temporary);
+
+        formula::ExpressionReferenceBuildRequest request;
+        request.canonicalProgram = &canonical;
+        request.runtimeProgram = &runtime;
+        request.pixelParameter = FormulaParameter::C;
+        request.center.realMpf = pixelRe;
+        request.center.imaginaryMpf = pixelIm;
+        request.fixed = fixed;
+        request.maxIterations = maxIterations;
+        request.bailout = bailout;
+        request.precision.requestedBits = 512;
+        request.precision.minimumBits = 53;
+        request.precision.guardBits = 0;
+        request.precision.maximumBits = 4096;
+        formula::ExpressionReferenceOrbitResult result;
+        ++attemptedCandidates;
+        if (formula::buildExpressionReferenceOrbit(request, result) && result.valid && !result.escaped && !result.undefined && result.samples.size() == static_cast<size_t>(maxIterations)) references.emplace_back(x, y);
+    }
+    seconds = since(start);
+    mpf_clears(centerRe, centerIm, scale, temporary, dxHalf, dyHalf, pixelRe, pixelIm, (mpf_ptr)0);
+    return !references.empty();
+}
+
+static bool renderExpressionCentered4(const formula::ExpressionProgram& canonical, const formula::ExpressionProgram& runtime, const formula::ExpressionContext& fixed, const char* centerReal, const char* centerImaginary, const char* scaleText, int width, int height, int referenceX, int referenceY, int maxIterations, double bailout, int checkpointIteration, std::vector<CenteredCheckpoint>* checkpoints, std::vector<double>* errorEstimates, std::vector<CenteredTelemetry>* telemetry, std::vector<float>& output, double& seconds, size_t& failedPixels) {
     const Clock::time_point start = Clock::now();
     formula::ExpressionReferenceBuildRequest referenceRequest;
     referenceRequest.canonicalProgram = &canonical;
@@ -10936,6 +12809,7 @@ static bool renderExpressionCentered4(const formula::ExpressionProgram& canonica
         checkpoints->assign(output.size(), {{nan, nan}, {nan, nan}});
     }
     if (errorEstimates) errorEstimates->assign(output.size(), 0.0);
+    if (telemetry) telemetry->assign(output.size(), {});
     std::atomic<size_t> failures{0};
 #pragma omp parallel for schedule(dynamic, 1)
     for (int y = 0; y < height; ++y) {
@@ -10988,7 +12862,8 @@ static bool renderExpressionCentered4(const formula::ExpressionProgram& canonica
                     const formula::Complex outputDelta = evaluated[lane].delta;
                     const formula::Complex actual = nextReference + outputDelta;
                     stateDelta[lane] = iteration + 1 < maxIterations ? outputDelta + (nextReference - referenceZ[static_cast<size_t>(iteration + 1)]) : outputDelta;
-                    if (errorEstimates) {
+                    CenteredTelemetry* pixelTelemetry = telemetry ? &(*telemetry)[static_cast<size_t>(pixelIndices[lane])] : nullptr;
+                    if (errorEstimates || pixelTelemetry) {
                         formula::ExpressionContext actualContext = fixed;
                         actualContext.z = currentActual;
                         actualContext.c = referenceC + deltas[lane].c;
@@ -10999,13 +12874,43 @@ static bool renderExpressionCentered4(const formula::ExpressionProgram& canonica
                         formula::Complex derivative;
                         if (runtime.evaluateWithDerivative(actualContext, seed, value, derivative) && std::isfinite(derivative.real()) && std::isfinite(derivative.imag())) {
                             stateError[lane] = std::abs(derivative) * stateError[lane] + 64.0 * std::numeric_limits<double>::epsilon() * std::max(1.0, std::abs(actual));
+                            if (pixelTelemetry) {
+                                pixelTelemetry->maximumDerivative = std::max(pixelTelemetry->maximumDerivative, std::abs(derivative));
+                                const double evaluationScale = 1.0 + std::max(std::abs(value), std::abs(actual));
+                                pixelTelemetry->maximumEvaluationGap = std::max(pixelTelemetry->maximumEvaluationGap, std::abs(value - actual) / evaluationScale);
+                            }
                         } else {
                             stateError[lane] = std::numeric_limits<double>::infinity();
                         }
-                        (*errorEstimates)[static_cast<size_t>(pixelIndices[lane])] = stateError[lane];
+                        if (errorEstimates) (*errorEstimates)[static_cast<size_t>(pixelIndices[lane])] = stateError[lane];
+                        if (pixelTelemetry) {
+                            pixelTelemetry->finalError = stateError[lane];
+                            pixelTelemetry->maximumError = std::max(pixelTelemetry->maximumError, stateError[lane]);
+                        }
+                    }
+                    if (pixelTelemetry) {
+                        pixelTelemetry->finalState = actual;
+                        const double magnitude = std::abs(actual);
+                        pixelTelemetry->minimumBailoutMargin = std::min(pixelTelemetry->minimumBailoutMargin, std::fabs(magnitude - bailout) / (1.0 + bailout));
+                        if (iteration + 1 < maxIterations) {
+                            const formula::Complex alternateDelta = actual - referenceZ[static_cast<size_t>(iteration + 1)];
+                            const double alternateScale = 1.0 + std::max(std::abs(alternateDelta), std::abs(stateDelta[lane]));
+                            pixelTelemetry->maximumAlternateGap = std::max(pixelTelemetry->maximumAlternateGap, std::abs(alternateDelta - stateDelta[lane]) / alternateScale);
+                        }
+                        for (size_t probe = 0; probe < pixelTelemetry->probeStates.size(); ++probe) {
+                            const int probeIteration = std::max(1, static_cast<int>((static_cast<long long>(probe + 1) * maxIterations) / pixelTelemetry->probeStates.size()));
+                            if (iteration + 1 == probeIteration) {
+                                pixelTelemetry->probeStates[probe] = actual;
+                                pixelTelemetry->probeValid[probe] = 1;
+                            }
+                        }
                     }
                     if (!std::isfinite(actual.real()) || !std::isfinite(actual.imag()) || std::hypot(actual.real(), actual.imag()) > bailout) {
                         output[static_cast<size_t>(pixelIndices[lane])] = static_cast<float>(iteration + 1);
+                        if (pixelTelemetry) {
+                            pixelTelemetry->escapeIteration = iteration + 1;
+                            pixelTelemetry->escapeMargin = (std::abs(actual) - bailout) / (1.0 + bailout);
+                        }
                         active[lane] = false;
                         --activeCount;
                     } else if (checkpoints && iteration + 1 == checkpointIteration) {
@@ -11359,7 +13264,7 @@ static int runCustomSlowdownCase(int width, int height) {
         size_t failedPixels = 0;
         if (sparseReferenceX < 0 || sparseReferenceY < 0) {
             printf("  centered VM4 SKIP: frame has no bounded reference candidate\n");
-        } else if (!renderExpressionCentered4(canonical, runtime, fixed, centerReal, centerImaginary, scaleText, width, height, sparseReferenceX, sparseReferenceY, maxIterations, bailout, centeredCheckpointIteration, &centeredCheckpoints, &centeredErrors, centered, centeredSeconds, failedPixels)) {
+        } else if (!renderExpressionCentered4(canonical, runtime, fixed, centerReal, centerImaginary, scaleText, width, height, sparseReferenceX, sparseReferenceY, maxIterations, bailout, centeredCheckpointIteration, &centeredCheckpoints, &centeredErrors, nullptr, centered, centeredSeconds, failedPixels)) {
             printf("  centered VM4 render failed\n");
             okay = false;
         } else {
@@ -11501,7 +13406,7 @@ static int runCustomSlowdownCase(int width, int height) {
                     std::vector<float> comparison;
                     double localSeconds = 0.0;
                     size_t localFailedPixels = 0;
-                    if (renderExpressionCentered4(canonical, runtime, fixed, centerReal, centerImaginary, scaleText, width, height, static_cast<int>(referenceIndex % static_cast<size_t>(width)), static_cast<int>(referenceIndex / static_cast<size_t>(width)), maxIterations, bailout, centeredCheckpointIteration, nullptr, nullptr, comparison, localSeconds, localFailedPixels)) {
+                    if (renderExpressionCentered4(canonical, runtime, fixed, centerReal, centerImaginary, scaleText, width, height, static_cast<int>(referenceIndex % static_cast<size_t>(width)), static_cast<int>(referenceIndex / static_cast<size_t>(width)), maxIterations, bailout, centeredCheckpointIteration, nullptr, nullptr, nullptr, comparison, localSeconds, localFailedPixels)) {
                         comparisonSeconds += localSeconds;
                         comparisonOutputs.push_back(std::move(comparison));
                     }
@@ -11779,6 +13684,1306 @@ static int runCustomSlowdownCase(int width, int height) {
     return okay && preflightOkay ? 0 : 1;
 }
 
+static int runCenteredSelectorSweepCase() {
+    using formula::ExpressionContext;
+    using formula::ExpressionDeepRenderRequest;
+    using formula::ExpressionDeepRenderResult;
+    using formula::ExpressionError;
+    using formula::ExpressionProgram;
+
+    struct SweepCase {
+        const char* name;
+        const char* source;
+        const char* centerReal;
+        const char* centerImaginary;
+        const char* scale;
+        int width;
+        int height;
+        int maxIterations;
+        double bailout;
+        bool expectPreflightRejection;
+    };
+    constexpr const char* TargetReal = "-1.251552471130320971409943884573286891722";
+    constexpr const char* TargetImaginary = "-1.229726067217305625607239519911599964807";
+    const std::array<SweepCase, 11> cases = {{
+        {"target-64x40", "sin(z)+c", TargetReal, TargetImaginary, "1.01e12", 64, 40, 2000, 100.0, false},
+        {"reviewer-120x80", "sin(z)+c", TargetReal, TargetImaginary, "1.01e12", 120, 80, 2000, 100.0, false},
+        {"target-208x139", "sin(z)+c", TargetReal, TargetImaginary, "1.01e12", 208, 139, 2000, 100.0, false},
+        {"odd-neighbor", "sin(z)+c", "-1.251552471130070971409943884573286891722", "-1.229726067217455625607239519911599964807", "1.01e12", 63, 41, 2000, 100.0, false},
+        {"even-neighbor", "sin(z)+c", "-1.251552471130620971409943884573286891722", "-1.229726067217105625607239519911599964807", "1.07e12", 66, 42, 2000, 100.0, false},
+        {"lower-zoom-risk", "sin(z)+c", TargetReal, TargetImaginary, "1.01e11", 64, 40, 2000, 100.0, false},
+        {"bailout-256", "sin(z)+c", TargetReal, TargetImaginary, "1.01e12", 64, 40, 2000, 256.0, false},
+        {"neutral-entire", "sin(z)*1e-6+c*0.1", TargetReal, TargetImaginary, "1.01e12", 64, 40, 512, 100.0, false},
+        {"nested-entire", "sin(sin(z)*1e-6)+c*0.1", TargetReal, TargetImaginary, "1.01e12", 64, 40, 512, 100.0, false},
+        {"unsafe-preflight", "sin(sin(z)+c)+c", TargetReal, TargetImaginary, "1.01e12", 64, 40, 512, 100.0, true},
+        {"dd-coordinate-collapse", "sin(z)+c", TargetReal, TargetImaginary, "1e40", 32, 20, 256, 100.0, true},
+    }};
+    struct Combination {
+        double errorThreshold = 0.0;
+        double stateThreshold = 0.0;
+    };
+    std::vector<Combination> combinations;
+    for (double errorThreshold : {1e8, 3e8, 1e9, 3e9, 1e10})
+        for (double stateThreshold : {0x1p-12, 0x1.6a09e667f3bcdp-12, 0x1p-11}) combinations.push_back({errorThreshold, stateThreshold});
+
+    struct Aggregate {
+        bool passed = true;
+        uint64_t secondaryEvaluations = 0;
+        uint64_t hierarchyEvaluations = 0;
+        uint64_t fallbackPixels = 0;
+        uint64_t fallbackIterations = 0;
+        uint64_t totalIterations = 0;
+        double seconds = 0.0;
+    };
+    std::vector<Aggregate> aggregates(combinations.size());
+    constexpr std::array<mpfr_prec_t, 6> fallbackCandidates = {80, 96, 112, 128, 144, 160};
+    std::array<bool, fallbackCandidates.size()> fallbackCandidatePassed;
+    fallbackCandidatePassed.fill(true);
+
+    auto configureRequest = [](const SweepCase& test, const ExpressionProgram& canonical, const ExpressionProgram& runtime, const ExpressionContext& fixed, std::vector<float>& output) {
+        ExpressionDeepRenderRequest request;
+        request.canonicalProgram = &canonical;
+        request.runtimeProgram = &runtime;
+        request.center.realDecimal = test.centerReal;
+        request.center.imaginaryDecimal = test.centerImaginary;
+        request.scale.decimal = test.scale;
+        request.fixed = fixed;
+        request.pixelParameter = FormulaParameter::C;
+        request.width = test.width;
+        request.height = test.height;
+        request.maxIterations = test.maxIterations;
+        request.bailout = test.bailout;
+        request.output = output.data();
+        request.outputCount = output.size();
+        request.precision.minimumBits = 128;
+        request.precision.guardBits = 64;
+        request.precision.maximumBits = 4096;
+        request.memory.fallbackGuardBits = 128;
+        request.preflight.enable = false;
+        request.taylor.enableTaylor = false;
+        return request;
+    };
+
+    printf("=== centered selector dense sweep cases=%zu combinations=%zu preflight=256\n", cases.size(), combinations.size());
+    bool groundTruthPassed = true;
+    for (const SweepCase& test : cases) {
+        ExpressionProgram canonical;
+        ExpressionProgram runtime;
+        ExpressionError error;
+        ExpressionContext fixed;
+        if (!canonical.compile(test.source, &error) || !canonical.specialize(fixed, FormulaParameter::C, runtime, &error)) {
+            printf("  %-18s compile failed: %s\n", test.name, error.message.c_str());
+            groundTruthPassed = false;
+            continue;
+        }
+        const size_t pixelCount = static_cast<size_t>(test.width) * test.height;
+        std::vector<float> groundTruth(pixelCount, formula::ExpressionDeepEmptyPixel);
+        ExpressionDeepRenderRequest groundTruthRequest = configureRequest(test, canonical, runtime, fixed, groundTruth);
+        groundTruthRequest.precision.requestedBits = 319;
+        groundTruthRequest.precision.minimumBits = 319;
+        groundTruthRequest.precision.guardBits = 0;
+        groundTruthRequest.forceMpfrFallbackForVerification = true;
+        groundTruthRequest.disableSpecializedPiecewiseMpfrForVerification = true;
+        ExpressionDeepRenderResult groundTruthResult;
+        const Clock::time_point groundTruthStart = Clock::now();
+        const bool groundTruthOkay = formula::renderExpressionDeepFrame(groundTruthRequest, groundTruthResult);
+        const double groundTruthSeconds = since(groundTruthStart);
+        const bool denseGroundTruth = groundTruthOkay && groundTruthResult.fastPixelCount == 0 && groundTruthResult.fallbackPixelCount == pixelCount && std::count(groundTruth.begin(), groundTruth.end(), formula::ExpressionDeepEmptyPixel) == 0;
+        printf("  %-18s GT=%d precision=%lld time=%.3f s\n", test.name, denseGroundTruth ? 1 : 0, (long long)groundTruthResult.fallbackPrecision, groundTruthSeconds);
+        if (!denseGroundTruth) {
+            groundTruthPassed = false;
+            for (Aggregate& aggregate : aggregates) aggregate.passed = false;
+            fallbackCandidatePassed.fill(false);
+            continue;
+        }
+
+        for (size_t candidateIndex = 0; candidateIndex < fallbackCandidates.size(); ++candidateIndex) {
+            std::vector<float> output(pixelCount, formula::ExpressionDeepEmptyPixel);
+            ExpressionDeepRenderRequest request = configureRequest(test, canonical, runtime, fixed, output);
+            request.centered.enableAdaptiveCandidate = true;
+            request.verificationCenteredFallbackCandidatePrecision = fallbackCandidates[candidateIndex];
+            request.verificationCenteredFallbackValidationSamples = pixelCount;
+            ExpressionDeepRenderResult result;
+            const Clock::time_point start = Clock::now();
+            const bool rendered = formula::renderExpressionDeepFrame(request, result);
+            const double seconds = since(start);
+            size_t empty = 0;
+            size_t classMismatch = 0;
+            size_t floorMismatch = 0;
+            size_t reviewer1300Mismatch = 0;
+            size_t maskFallback = 0;
+            size_t mandatoryMaskCount = 0;
+            size_t lowEligibleMaskCount = 0;
+            size_t invalidLowMaskCount = 0;
+            size_t mandatoryOutputMismatch = 0;
+            for (size_t index = 0; rendered && index < pixelCount; ++index) {
+                empty += output[index] == formula::ExpressionDeepEmptyPixel;
+                reviewer1300Mismatch += std::strcmp(test.name, "reviewer-120x80") == 0 && output[index] == 1300.0f && groundTruth[index] == 1301.0f;
+                const bool candidateInterior = output[index] < 0.0f;
+                const bool oracleInterior = groundTruth[index] < 0.0f;
+                if (candidateInterior != oracleInterior) {
+                    ++classMismatch;
+                } else if (!candidateInterior && output[index] != groundTruth[index]) {
+                    ++floorMismatch;
+                }
+                if (result.centeredFallbackPrecisionReasonMask.size() != pixelCount) continue;
+                const uint8_t reasonMask = result.centeredFallbackPrecisionReasonMask[index];
+                if (reasonMask == 0) continue;
+                ++maskFallback;
+                if (isMandatoryCenteredFallback(reasonMask)) {
+                    ++mandatoryMaskCount;
+                    mandatoryOutputMismatch += output[index] != groundTruth[index];
+                } else {
+                    ++lowEligibleMaskCount;
+                    invalidLowMaskCount += reasonMask != lowEligibleCenteredFallbackMask();
+                }
+            }
+            const bool rejectedOkay = test.expectPreflightRejection && result.centeredPreflightRejected && !result.centeredAccepted && result.fallbackPixelCount == pixelCount;
+            const bool classificationOkay = result.centeredFallbackPrecisionReasonMask.size() == pixelCount && maskFallback == result.fallbackPixelCount && mandatoryMaskCount == result.centeredFallbackMandatoryFullPixelCount && lowEligibleMaskCount == result.centeredFallbackLowEligiblePixelCount && mandatoryMaskCount + lowEligibleMaskCount == result.fallbackPixelCount && invalidLowMaskCount == 0 && mandatoryOutputMismatch == 0;
+            const bool validatedOkay = !test.expectPreflightRejection && result.centeredAccepted && classificationOkay && result.centeredFallbackCandidatePrecision == fallbackCandidates[candidateIndex] && result.centeredFallbackFullPrecision == result.fallbackPrecision && result.centeredFallbackValidationSampleCount == result.centeredFallbackLowEligiblePixelCount && result.centeredFallbackValidationMismatchCount == 0 && !result.centeredFallbackUpgraded && result.centeredFallbackUpgradedPixelCount == 0 && result.centeredFallbackLowPrecisionPixelCount == result.centeredFallbackLowEligiblePixelCount && result.centeredFallbackFullPrecisionPixelCount == result.centeredFallbackMandatoryValidationSampleCount + result.centeredFallbackValidationSampleCount && result.centeredFallbackMandatoryCandidatePrecision == 224 && result.centeredFallbackMandatoryCandidatePixelCount == result.centeredFallbackMandatoryFullPixelCount && result.centeredFallbackMandatoryFullPrecisionPixelCount == result.centeredFallbackMandatoryValidationSampleCount && result.centeredFallbackMandatoryValidationSampleCount == std::min<uint64_t>(32, result.centeredFallbackMandatoryFullPixelCount) && result.centeredFallbackMandatoryValidationMismatchCount == 0 && !result.centeredFallbackMandatoryUpgraded;
+            const bool doubleDoubleTelemetryOkay = result.centeredDoubleDoubleVerifiedPixelCount == result.centeredDoubleDoubleAgreementCount + result.centeredDoubleDoubleRejectedCount;
+            const bool passed = rendered && empty == 0 && classMismatch == 0 && floorMismatch == 0 && reviewer1300Mismatch == 0 && doubleDoubleTelemetryOkay && (rejectedOkay || validatedOkay);
+            fallbackCandidatePassed[candidateIndex] = fallbackCandidatePassed[candidateIndex] && passed;
+            printf("    fallback bits=%lld/%lld %-18s gate=%d EMPTY/class/floor/reviewer1300=%zu/%zu/%zu/%zu DD=%llu/%llu/%llu mandatory/low=%llu/%llu mask-invalid/mandatory-mismatch=%zu/%zu empirical samples/mismatch/upgrade=%llu/%llu/%d upgraded=%llu low/full pixels=%llu/%llu iters=%llu/%llu mandatory-iters=%llu time=%.3f/%.3f/%.3f/%.3f s%s\n", (long long)result.centeredFallbackCandidatePrecision, (long long)result.centeredFallbackFullPrecision, test.name, passed ? 1 : 0, empty, classMismatch, floorMismatch, reviewer1300Mismatch, (unsigned long long)result.centeredDoubleDoubleVerifiedPixelCount, (unsigned long long)result.centeredDoubleDoubleAgreementCount, (unsigned long long)result.centeredDoubleDoubleRejectedCount, (unsigned long long)result.centeredFallbackMandatoryFullPixelCount, (unsigned long long)result.centeredFallbackLowEligiblePixelCount, invalidLowMaskCount, mandatoryOutputMismatch, (unsigned long long)result.centeredFallbackValidationSampleCount, (unsigned long long)result.centeredFallbackValidationMismatchCount, result.centeredFallbackUpgraded ? 1 : 0, (unsigned long long)result.centeredFallbackUpgradedPixelCount, (unsigned long long)result.centeredFallbackLowPrecisionPixelCount, (unsigned long long)result.centeredFallbackFullPrecisionPixelCount, (unsigned long long)result.centeredFallbackLowPrecisionIterationCount, (unsigned long long)result.centeredFallbackFullPrecisionIterationCount, (unsigned long long)result.centeredFallbackMandatoryFullIterationCount, result.centeredFallbackLowPrecisionSeconds, result.centeredFallbackFullPrecisionSeconds, result.centeredFallbackMandatoryFullSeconds, seconds, rejectedOkay ? " preflight-rejected" : "");
+        }
+
+        for (size_t combinationIndex = 0; combinationIndex < combinations.size(); ++combinationIndex) {
+            const Combination combination = combinations[combinationIndex];
+            std::vector<float> output(pixelCount, formula::ExpressionDeepEmptyPixel);
+            ExpressionDeepRenderRequest request = configureRequest(test, canonical, runtime, fixed, output);
+            request.centered.enableAdaptiveCandidate = true;
+            request.verificationCenteredPrimaryErrorThreshold = combination.errorThreshold;
+            request.verificationCenteredStateDisagreementThreshold = combination.stateThreshold;
+            ExpressionDeepRenderResult result;
+            const Clock::time_point start = Clock::now();
+            const bool rendered = formula::renderExpressionDeepFrame(request, result);
+            const double seconds = since(start);
+
+            size_t empty = 0;
+            size_t classMismatch = 0;
+            size_t floorMismatch = 0;
+            size_t reviewer1300Mismatch = 0;
+            for (size_t index = 0; rendered && index < pixelCount; ++index) {
+                empty += output[index] == formula::ExpressionDeepEmptyPixel;
+                reviewer1300Mismatch += std::strcmp(test.name, "reviewer-120x80") == 0 && output[index] == 1300.0f && groundTruth[index] == 1301.0f;
+                const bool candidateInterior = output[index] < 0.0f;
+                const bool oracleInterior = groundTruth[index] < 0.0f;
+                if (candidateInterior != oracleInterior) {
+                    ++classMismatch;
+                } else if (!candidateInterior && output[index] != groundTruth[index]) {
+                    ++floorMismatch;
+                }
+            }
+
+            const uint64_t additionalReferencesPerFlag = result.centeredReferenceCount > 2 ? result.centeredReferenceCount - 2 : 0;
+            const bool preflightTelemetryOkay = result.centeredPreflightPrimaryRiskFlagCount == result.centeredPreflightSecondaryEvaluationCount && result.centeredPreflightAdditionalReferenceEvaluationCount <= result.centeredPreflightInitialFlagCount * additionalReferencesPerFlag;
+            const bool doubleDoubleTelemetryOkay = result.centeredDoubleDoubleVerifiedPixelCount == result.centeredDoubleDoubleAgreementCount + result.centeredDoubleDoubleRejectedCount;
+            const bool acceptedTelemetryOkay = doubleDoubleTelemetryOkay && result.centeredPrimaryRiskFlagCount == result.centeredSecondaryEvaluationCount && result.centeredSelectorFlagCount >= result.centeredFinalFallbackFlagCount && result.centeredFinalFallbackFlagCount == result.fallbackPixelCount && result.centeredAdditionalReferenceEvaluationCount == result.centeredSelectorFlagCount * additionalReferencesPerFlag && result.centeredHierarchyEvaluationCount == result.centeredAdditionalReferenceEvaluationCount;
+            const bool pathOkay = test.expectPreflightRejection ? result.centeredPreflightRejected && !result.centeredAccepted && result.fastPixelCount == 0 && result.fallbackPixelCount == pixelCount && preflightTelemetryOkay : result.centeredAccepted && !result.centeredPreflightRejected && result.fastPixelCount + result.fallbackPixelCount == pixelCount && preflightTelemetryOkay && acceptedTelemetryOkay;
+            const bool passed = rendered && empty == 0 && classMismatch == 0 && floorMismatch == 0 && reviewer1300Mismatch == 0 && doubleDoubleTelemetryOkay && pathOkay;
+            Aggregate& aggregate = aggregates[combinationIndex];
+            aggregate.passed = aggregate.passed && passed;
+            aggregate.secondaryEvaluations += result.centeredSecondaryEvaluationCount;
+            aggregate.hierarchyEvaluations += result.centeredHierarchyEvaluationCount;
+            aggregate.fallbackPixels += result.fallbackPixelCount;
+            aggregate.fallbackIterations += result.totalIterations >= result.fastIterationCount ? result.totalIterations - result.fastIterationCount : 0;
+            aggregate.totalIterations += result.totalIterations;
+            aggregate.seconds += seconds;
+            printf("    e=%-4.0e state=%-10.6g %-18s gate=%d EMPTY/class/floor/reviewer1300=%zu/%zu/%zu/%zu accepted/rejected=%d/%d secondary/hierarchy/fallback=%llu/%llu/%llu DD=%llu/%llu/%llu time=%.3f\n", combination.errorThreshold, combination.stateThreshold, test.name, passed ? 1 : 0, empty, classMismatch, floorMismatch, reviewer1300Mismatch, result.centeredAccepted ? 1 : 0, result.centeredPreflightRejected ? 1 : 0, (unsigned long long)result.centeredSecondaryEvaluationCount, (unsigned long long)result.centeredHierarchyEvaluationCount, (unsigned long long)result.fallbackPixelCount, (unsigned long long)result.centeredDoubleDoubleVerifiedPixelCount, (unsigned long long)result.centeredDoubleDoubleAgreementCount, (unsigned long long)result.centeredDoubleDoubleRejectedCount, seconds);
+        }
+    }
+
+    size_t baselineIndex = combinations.size();
+    size_t winnerIndex = combinations.size();
+    for (size_t index = 0; index < combinations.size(); ++index) {
+        const Combination combination = combinations[index];
+        const Aggregate& aggregate = aggregates[index];
+        const uint64_t selectorWork = aggregate.secondaryEvaluations + aggregate.hierarchyEvaluations + aggregate.fallbackPixels;
+        printf("  summary e=%-4.0e state=%-10.6g pass=%d secondary/hierarchy/fallback=%llu/%llu/%llu fallback-iters=%llu total-iters=%llu selector-work=%llu time=%.3f\n", combination.errorThreshold, combination.stateThreshold, aggregate.passed ? 1 : 0, (unsigned long long)aggregate.secondaryEvaluations, (unsigned long long)aggregate.hierarchyEvaluations, (unsigned long long)aggregate.fallbackPixels, (unsigned long long)aggregate.fallbackIterations, (unsigned long long)aggregate.totalIterations, (unsigned long long)selectorWork, aggregate.seconds);
+        if (combination.errorThreshold == 1e8 && combination.stateThreshold == 0x1p-12) baselineIndex = index;
+        if (!aggregate.passed) continue;
+        if (winnerIndex == combinations.size()) {
+            winnerIndex = index;
+            continue;
+        }
+        const Aggregate& winner = aggregates[winnerIndex];
+        const uint64_t winnerWork = winner.secondaryEvaluations + winner.hierarchyEvaluations + winner.fallbackPixels;
+        if (std::tie(aggregate.fallbackIterations, selectorWork, aggregate.totalIterations) < std::tie(winner.fallbackIterations, winnerWork, winner.totalIterations)) winnerIndex = index;
+    }
+    if (!groundTruthPassed || baselineIndex == combinations.size() || !aggregates[baselineIndex].passed || winnerIndex == combinations.size()) {
+        printf("  => FAIL: no safe calibrated selector combination\n\n");
+        return 1;
+    }
+    const Aggregate& baseline = aggregates[baselineIndex];
+    const Aggregate& winner = aggregates[winnerIndex];
+    const uint64_t baselineWork = baseline.secondaryEvaluations + baseline.hierarchyEvaluations + baseline.fallbackPixels;
+    const uint64_t winnerWork = winner.secondaryEvaluations + winner.hierarchyEvaluations + winner.fallbackPixels;
+    size_t lowestFallbackCandidate = fallbackCandidates.size();
+    for (size_t index = 0; index < fallbackCandidates.size(); ++index) {
+        printf("  fallback summary bits=%lld pass=%d\n", (long long)fallbackCandidates[index], fallbackCandidatePassed[index] ? 1 : 0);
+        if (lowestFallbackCandidate == fallbackCandidates.size() && fallbackCandidatePassed[index]) lowestFallbackCandidate = index;
+    }
+    if (lowestFallbackCandidate == fallbackCandidates.size()) {
+        printf("  => FAIL: no adaptive fallback candidate passed every dense gate\n\n");
+        return 1;
+    }
+    printf("  => winner e=%.0e state=%.9g selector-work=%llu/%llu fallback-iters=%llu/%llu\n\n", combinations[winnerIndex].errorThreshold, combinations[winnerIndex].stateThreshold, (unsigned long long)winnerWork, (unsigned long long)baselineWork, (unsigned long long)winner.fallbackIterations, (unsigned long long)baseline.fallbackIterations);
+    return 0;
+}
+
+static int runCenteredMandatoryPrecisionSweepCase() {
+    using formula::ExpressionContext;
+    using formula::ExpressionDeepRenderRequest;
+    using formula::ExpressionDeepRenderResult;
+    using formula::ExpressionError;
+    using formula::ExpressionProgram;
+
+    constexpr const char* Source = "sin(z)+c";
+    constexpr const char* CenterReal = "-1.251552471130320971409943884573286891722";
+    constexpr const char* CenterImaginary = "-1.229726067217305625607239519911599964807";
+    constexpr const char* Scale = "1.01e12";
+    constexpr int MaxIterations = 2000;
+    constexpr double Bailout = 100.0;
+    constexpr std::array<mpfr_prec_t, 4> CandidatePrecisions = {224, 256, 288, 327};
+    constexpr std::array<std::pair<int, int>, 3> DenseSizes = {{{64, 40}, {120, 80}, {208, 139}}};
+
+    ExpressionProgram canonical;
+    ExpressionProgram runtime;
+    ExpressionError error;
+    ExpressionContext fixed;
+    if (!canonical.compile(Source, &error) || !canonical.specialize(fixed, FormulaParameter::C, runtime, &error)) {
+        printf("centered mandatory precision sweep compile failed: %s\n", error.message.c_str());
+        return 1;
+    }
+
+    auto configure = [&](int width, int height, std::vector<float>& output) {
+        ExpressionDeepRenderRequest request;
+        request.canonicalProgram = &canonical;
+        request.runtimeProgram = &runtime;
+        request.center.realDecimal = CenterReal;
+        request.center.imaginaryDecimal = CenterImaginary;
+        request.scale.decimal = Scale;
+        request.fixed = fixed;
+        request.pixelParameter = FormulaParameter::C;
+        request.width = width;
+        request.height = height;
+        request.maxIterations = MaxIterations;
+        request.bailout = Bailout;
+        request.output = output.data();
+        request.outputCount = output.size();
+        request.precision.minimumBits = 128;
+        request.precision.guardBits = 64;
+        request.precision.maximumBits = 4096;
+        request.memory.fallbackGuardBits = 128;
+        request.preflight.enable = false;
+        request.taylor.enableTaylor = false;
+        return request;
+    };
+
+    struct SweepResult {
+        bool passed = true;
+        double seconds = 0.0;
+        double fullSeconds = 0.0;
+        double fullMandatorySeconds = 0.0;
+        size_t fullRuns = 0;
+    };
+    std::array<SweepResult, CandidatePrecisions.size()> results;
+    auto runCandidates = [&](const char* name, int width, int height, const std::vector<float>& groundTruth, bool reverseOrder = false) {
+        const size_t pixelCount = static_cast<size_t>(width) * height;
+        for (size_t orderIndex = 0; orderIndex < CandidatePrecisions.size(); ++orderIndex) {
+            const size_t precisionIndex = reverseOrder ? CandidatePrecisions.size() - 1 - orderIndex : orderIndex;
+            std::vector<float> output(pixelCount, formula::ExpressionDeepEmptyPixel);
+            ExpressionDeepRenderRequest request = configure(width, height, output);
+            request.centered.enableAdaptiveCandidate = true;
+            request.verificationCenteredMandatoryFallbackCandidatePrecision = CandidatePrecisions[precisionIndex];
+            ExpressionDeepRenderResult result;
+            const Clock::time_point start = Clock::now();
+            const bool rendered = formula::renderExpressionDeepFrame(request, result);
+            const double seconds = since(start);
+            size_t empty = 0;
+            size_t classMismatch = 0;
+            size_t floorMismatch = 0;
+            for (size_t index = 0; rendered && index < pixelCount; ++index) {
+                empty += output[index] == formula::ExpressionDeepEmptyPixel;
+                const bool candidateInterior = output[index] < 0.0f;
+                const bool oracleInterior = groundTruth[index] < 0.0f;
+                if (candidateInterior != oracleInterior) {
+                    ++classMismatch;
+                } else if (!candidateInterior && output[index] != groundTruth[index]) {
+                    ++floorMismatch;
+                }
+            }
+            const bool candidateTier = CandidatePrecisions[precisionIndex] < result.centeredFallbackFullPrecision;
+            const bool telemetryOkay = result.centeredAccepted && result.centeredFallbackMandatoryCandidatePrecision == (candidateTier ? CandidatePrecisions[precisionIndex] : result.centeredFallbackFullPrecision) && (candidateTier ? result.centeredFallbackMandatoryCandidatePixelCount == result.centeredFallbackMandatoryFullPixelCount && result.centeredFallbackMandatoryFullPrecisionPixelCount == 0 : result.centeredFallbackMandatoryCandidatePixelCount == 0 && result.centeredFallbackMandatoryFullPrecisionPixelCount == result.centeredFallbackMandatoryFullPixelCount);
+            const bool passed = rendered && empty == 0 && classMismatch == 0 && floorMismatch == 0 && telemetryOkay;
+            results[precisionIndex].passed = results[precisionIndex].passed && passed;
+            results[precisionIndex].seconds += seconds;
+            if (width == 832 && height == 555) {
+                results[precisionIndex].fullSeconds += seconds;
+                results[precisionIndex].fullMandatorySeconds += candidateTier ? result.centeredFallbackMandatoryCandidateSeconds : result.centeredFallbackMandatoryFullPrecisionSeconds;
+                ++results[precisionIndex].fullRuns;
+            }
+            const size_t run = width == 832 && height == 555 ? results[precisionIndex].fullRuns : 1;
+            printf("  bits=%lld %-12s run=%zu gate=%d EMPTY/class/floor=%zu/%zu/%zu mandatory=%llu candidate/full=%llu/%llu time=%.3f s\n", (long long)CandidatePrecisions[precisionIndex], name, run, passed ? 1 : 0, empty, classMismatch, floorMismatch, (unsigned long long)result.centeredFallbackMandatoryFullPixelCount, (unsigned long long)result.centeredFallbackMandatoryCandidatePixelCount, (unsigned long long)result.centeredFallbackMandatoryFullPrecisionPixelCount, seconds);
+        }
+    };
+
+    printf("=== centered mandatory precision sweep\n");
+    std::vector<float> precisionSensitiveGroundTruth;
+    for (const auto [width, height] : DenseSizes) {
+        const size_t pixelCount = static_cast<size_t>(width) * height;
+        std::vector<float> groundTruth(pixelCount, formula::ExpressionDeepEmptyPixel);
+        ExpressionDeepRenderRequest request = configure(width, height, groundTruth);
+        request.precision.requestedBits = 319;
+        request.precision.minimumBits = 319;
+        request.precision.guardBits = 0;
+        request.forceMpfrFallbackForVerification = true;
+        request.disableSpecializedPiecewiseMpfrForVerification = true;
+        ExpressionDeepRenderResult result;
+        const bool rendered = formula::renderExpressionDeepFrame(request, result);
+        if (!rendered || result.fastPixelCount != 0 || result.fallbackPixelCount != pixelCount || std::count(groundTruth.begin(), groundTruth.end(), formula::ExpressionDeepEmptyPixel) != 0) {
+            printf("  dense GT %dx%d failed: %s\n", width, height, result.error.c_str());
+            return 1;
+        }
+        char name[32];
+        snprintf(name, sizeof(name), "dense-%dx%d", width, height);
+        runCandidates(name, width, height, groundTruth);
+        if (width == 64 && height == 40) precisionSensitiveGroundTruth = groundTruth;
+    }
+
+    const char* fullPath = getenv("MANDEL_CENTERED_FULL_GT_FILE");
+    if (!fullPath || !*fullPath) {
+        printf("  persisted full GT path is required via MANDEL_CENTERED_FULL_GT_FILE\n");
+        return 1;
+    }
+    constexpr int FullWidth = 832;
+    constexpr int FullHeight = 555;
+    std::vector<float> fullGroundTruth(static_cast<size_t>(FullWidth) * FullHeight, formula::ExpressionDeepEmptyPixel);
+    FILE* file = nullptr;
+    const bool fullLoaded = fopen_s(&file, fullPath, "rb") == 0 && file && fread(fullGroundTruth.data(), sizeof(float), fullGroundTruth.size(), file) == fullGroundTruth.size() && fgetc(file) == EOF;
+    if (file) fclose(file);
+    if (!fullLoaded) {
+        printf("  persisted full GT load failed: %s\n", fullPath);
+        return 1;
+    }
+    runCandidates("full-832x555", FullWidth, FullHeight, fullGroundTruth);
+    runCandidates("full-832x555", FullWidth, FullHeight, fullGroundTruth, true);
+
+    std::vector<float> upgraded(precisionSensitiveGroundTruth.size(), formula::ExpressionDeepEmptyPixel);
+    ExpressionDeepRenderRequest upgradeRequest = configure(64, 40, upgraded);
+    upgradeRequest.centered.enableAdaptiveCandidate = true;
+    upgradeRequest.verificationCenteredMandatoryFallbackCandidatePrecision = 64;
+    upgradeRequest.verificationCenteredMandatoryFallbackValidationSamples = upgraded.size();
+    ExpressionDeepRenderResult upgradeResult;
+    const bool upgradeRendered = formula::renderExpressionDeepFrame(upgradeRequest, upgradeResult);
+    const bool upgradePassed = upgradeRendered && upgraded == precisionSensitiveGroundTruth && upgradeResult.centeredFallbackMandatoryValidationSampleCount == upgradeResult.centeredFallbackMandatoryFullPixelCount && upgradeResult.centeredFallbackMandatoryValidationMismatchCount != 0 && upgradeResult.centeredFallbackMandatoryUpgraded && upgradeResult.centeredFallbackMandatoryUpgradedPixelCount == upgradeResult.centeredFallbackMandatoryFullPixelCount && upgradeResult.centeredFallbackMandatoryCandidatePixelCount == upgradeResult.centeredFallbackMandatoryFullPixelCount && upgradeResult.centeredFallbackMandatoryFullPrecisionPixelCount == upgradeResult.centeredFallbackMandatoryFullPixelCount && upgradeResult.centeredFallbackValidationSampleCount == upgradeResult.centeredFallbackLowEligiblePixelCount && upgradeResult.centeredFallbackValidationMismatchCount == 0 && !upgradeResult.centeredFallbackUpgraded;
+    printf("  precision-sensitive upgrade gate=%d mandatory samples/mismatch/upgrade/pixels=%llu/%llu/%d/%llu low samples/mismatch/upgrade=%llu/%llu/%d\n", upgradePassed ? 1 : 0, (unsigned long long)upgradeResult.centeredFallbackMandatoryValidationSampleCount, (unsigned long long)upgradeResult.centeredFallbackMandatoryValidationMismatchCount, upgradeResult.centeredFallbackMandatoryUpgraded ? 1 : 0, (unsigned long long)upgradeResult.centeredFallbackMandatoryUpgradedPixelCount, (unsigned long long)upgradeResult.centeredFallbackValidationSampleCount, (unsigned long long)upgradeResult.centeredFallbackValidationMismatchCount, upgradeResult.centeredFallbackUpgraded ? 1 : 0);
+    if (!upgradePassed) return 1;
+
+    size_t lowestPassing = CandidatePrecisions.size();
+    for (size_t index = 0; index < CandidatePrecisions.size(); ++index) {
+        const double fullAverage = results[index].fullRuns == 0 ? 0.0 : results[index].fullSeconds / results[index].fullRuns;
+        const double mandatoryAverage = results[index].fullRuns == 0 ? 0.0 : results[index].fullMandatorySeconds / results[index].fullRuns;
+        printf("  summary bits=%lld pass=%d aggregate/full-average/mandatory-average=%.3f/%.3f/%.3f s\n", (long long)CandidatePrecisions[index], results[index].passed ? 1 : 0, results[index].seconds, fullAverage, mandatoryAverage);
+        if (lowestPassing == CandidatePrecisions.size() && results[index].passed) lowestPassing = index;
+    }
+    if (lowestPassing == CandidatePrecisions.size()) {
+        printf("  => FAIL: no mandatory precision passed dense and persisted full GT\n\n");
+        return 1;
+    }
+    const double lowestFullAverage = results[lowestPassing].fullSeconds / results[lowestPassing].fullRuns;
+    const double baselineFullAverage = results.back().fullSeconds / results.back().fullRuns;
+    const double lowestMandatoryAverage = results[lowestPassing].fullMandatorySeconds / results[lowestPassing].fullRuns;
+    const double baselineMandatoryAverage = results.back().fullMandatorySeconds / results.back().fullRuns;
+    const bool lowerHelps = CandidatePrecisions[lowestPassing] < CandidatePrecisions.back() && lowestFullAverage < baselineFullAverage;
+    printf("  => lowest passing mandatory precision=%lld helps-vs-327=%d full-average=%.3f/%.3f s mandatory-average=%.3f/%.3f s\n\n", (long long)CandidatePrecisions[lowestPassing], lowerHelps ? 1 : 0, lowestFullAverage, baselineFullAverage, lowestMandatoryAverage, baselineMandatoryAverage);
+    return 0;
+}
+
+static int runCenteredSelectorCase(int width, int height) {
+    using formula::ExpressionContext;
+    using formula::ExpressionDeepRenderRequest;
+    using formula::ExpressionDeepRenderResult;
+    using formula::ExpressionError;
+    using formula::ExpressionProgram;
+
+    const char* source = getenv("MANDEL_SELECTOR_SOURCE");
+    if (!source) source = "sin(z)+c";
+    const char* centerReal = getenv("MANDEL_SELECTOR_CX");
+    if (!centerReal) centerReal = "-1.251552471130320971409943884573286891722";
+    const char* centerImaginary = getenv("MANDEL_SELECTOR_CY");
+    if (!centerImaginary) centerImaginary = "-1.229726067217305625607239519911599964807";
+    const char* scaleText = getenv("MANDEL_SELECTOR_ZOOM");
+    if (!scaleText) scaleText = "1.01e12";
+    const int maxIterations = [] {
+        const char* value = getenv("MANDEL_SELECTOR_MXIT");
+        return value ? std::clamp(atoi(value), 1, 5000000) : 2000;
+    }();
+    const double bailout = [] {
+        const char* value = getenv("MANDEL_SELECTOR_BAILOUT");
+        const double parsed = value ? std::strtod(value, nullptr) : 100.0;
+        return std::isfinite(parsed) && parsed > 0.0 ? parsed : 100.0;
+    }();
+    const size_t referenceLimit = [] {
+        const char* value = getenv("MANDEL_SELECTOR_REFS");
+        return value ? static_cast<size_t>(std::clamp(atoi(value), 1, 9)) : size_t{5};
+    }();
+
+    ExpressionProgram canonical;
+    ExpressionProgram runtime;
+    ExpressionError error;
+    ExpressionContext fixed;
+    if (!canonical.compile(source, &error) || !canonical.specialize(fixed, FormulaParameter::C, runtime, &error)) {
+        printf("centered selector compile failed: %s\n", error.message.c_str());
+        return 1;
+    }
+    printf("=== centered selector %dx%d source=%s center=(%s,%s) zoom=%s mxit=%d bailout=%.9g\n", width, height, source, centerReal, centerImaginary, scaleText, maxIterations, bailout);
+
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    auto renderGt = [&](mpfr_prec_t minimumBits, mpfr_prec_t fallbackGuardBits, std::vector<float>& output, ExpressionDeepRenderResult& result, double& seconds) {
+        output.assign(pixelCount, formula::ExpressionDeepEmptyPixel);
+        ExpressionDeepRenderRequest request;
+        request.canonicalProgram = &canonical;
+        request.runtimeProgram = &runtime;
+        request.center.realDecimal = centerReal;
+        request.center.imaginaryDecimal = centerImaginary;
+        request.scale.decimal = scaleText;
+        request.fixed = fixed;
+        request.pixelParameter = FormulaParameter::C;
+        request.width = width;
+        request.height = height;
+        request.maxIterations = maxIterations;
+        request.bailout = bailout;
+        request.output = output.data();
+        request.outputCount = output.size();
+        request.precision.requestedBits = minimumBits;
+        request.precision.minimumBits = minimumBits;
+        request.precision.guardBits = 0;
+        request.precision.maximumBits = 4096;
+        request.memory.fallbackGuardBits = fallbackGuardBits;
+        request.preflight.enable = false;
+        request.taylor.enableTaylor = false;
+        request.forceMpfrFallbackForVerification = true;
+        request.disableSpecializedPiecewiseMpfrForVerification = true;
+        const Clock::time_point start = Clock::now();
+        const bool okay = formula::renderExpressionDeepFrame(request, result);
+        seconds = since(start);
+        return okay;
+    };
+
+    std::vector<float> groundTruth;
+    ExpressionDeepRenderResult groundTruthResult;
+    double groundTruthSeconds = 0.0;
+    bool groundTruthLoaded = false;
+    if (const char* path = getenv("MANDEL_SELECTOR_GT_FILE")) {
+        groundTruth.assign(pixelCount, formula::ExpressionDeepEmptyPixel);
+        FILE* file = nullptr;
+        if (fopen_s(&file, path, "rb") == 0 && file) {
+            groundTruthLoaded = fread(groundTruth.data(), sizeof(float), groundTruth.size(), file) == groundTruth.size() && fgetc(file) == EOF;
+            fclose(file);
+        }
+        if (groundTruthLoaded) {
+            groundTruthResult.selectedPrecision = 319;
+            groundTruthResult.fallbackPrecision = 447;
+            groundTruthResult.fallbackPixelCount = pixelCount;
+        }
+    }
+    if (!groundTruthLoaded && !renderGt(319, 128, groundTruth, groundTruthResult, groundTruthSeconds)) {
+        printf("  447-bit GT failed: %s\n", groundTruthResult.error.c_str());
+        return 1;
+    }
+    if (groundTruthResult.fastPixelCount != 0 || groundTruthResult.fallbackPixelCount != pixelCount) {
+        printf("  447-bit GT did not use full MPFR fallback fast/fallback=%llu/%llu\n", (unsigned long long)groundTruthResult.fastPixelCount, (unsigned long long)groundTruthResult.fallbackPixelCount);
+        return 1;
+    }
+    printf("  GT %s precision=%lld/%lld time=%.3f s iterations=%llu\n", groundTruthLoaded ? "loaded" : "rendered", (long long)groundTruthResult.selectedPrecision, (long long)groundTruthResult.fallbackPrecision, groundTruthSeconds, (unsigned long long)groundTruthResult.totalIterations);
+
+    if (getenv("MANDEL_SELECTOR_DUAL_GT")) {
+        std::vector<float> lowerGroundTruth;
+        ExpressionDeepRenderResult lowerGroundTruthResult;
+        double lowerGroundTruthSeconds = 0.0;
+        if (!renderGt(256, 128, lowerGroundTruth, lowerGroundTruthResult, lowerGroundTruthSeconds)) {
+            printf("  384-bit GT failed: %s\n", lowerGroundTruthResult.error.c_str());
+            return 1;
+        }
+        size_t mismatch = 0;
+        for (size_t index = 0; index < pixelCount; ++index) mismatch += lowerGroundTruth[index] != groundTruth[index];
+        printf("  independent GT precision=%lld/%lld time=%.3f s mismatch-vs-447=%zu\n", (long long)lowerGroundTruthResult.selectedPrecision, (long long)lowerGroundTruthResult.fallbackPrecision, lowerGroundTruthSeconds, mismatch);
+        if (mismatch != 0) return 1;
+    }
+
+    std::vector<float> adaptive(pixelCount, formula::ExpressionDeepEmptyPixel);
+    ExpressionDeepRenderRequest adaptiveRequest;
+    adaptiveRequest.canonicalProgram = &canonical;
+    adaptiveRequest.runtimeProgram = &runtime;
+    adaptiveRequest.center.realDecimal = centerReal;
+    adaptiveRequest.center.imaginaryDecimal = centerImaginary;
+    adaptiveRequest.scale.decimal = scaleText;
+    adaptiveRequest.fixed = fixed;
+    adaptiveRequest.pixelParameter = FormulaParameter::C;
+    adaptiveRequest.width = width;
+    adaptiveRequest.height = height;
+    adaptiveRequest.maxIterations = maxIterations;
+    adaptiveRequest.bailout = bailout;
+    adaptiveRequest.output = adaptive.data();
+    adaptiveRequest.outputCount = adaptive.size();
+    adaptiveRequest.precision.minimumBits = 128;
+    adaptiveRequest.precision.guardBits = 64;
+    adaptiveRequest.precision.maximumBits = 4096;
+    adaptiveRequest.memory.fallbackGuardBits = 128;
+    adaptiveRequest.preflight.enable = false;
+    adaptiveRequest.taylor.enableTaylor = false;
+    adaptiveRequest.centered.enableAdaptiveCandidate = true;
+    adaptiveRequest.centered.maximumReferences = referenceLimit;
+    if (const char* value = getenv("MANDEL_SELECTOR_ERROR_THRESHOLD")) adaptiveRequest.verificationCenteredPrimaryErrorThreshold = std::strtod(value, nullptr);
+    if (const char* value = getenv("MANDEL_SELECTOR_STATE_THRESHOLD")) adaptiveRequest.verificationCenteredStateDisagreementThreshold = std::strtod(value, nullptr);
+    if (const char* value = getenv("MANDEL_SELECTOR_PREFLIGHT_SAMPLES")) adaptiveRequest.centered.preflightSamples = static_cast<size_t>(std::max(1, atoi(value)));
+    if (const char* value = getenv("MANDEL_SELECTOR_FALLBACK_BITS")) adaptiveRequest.verificationCenteredFallbackCandidatePrecision = static_cast<mpfr_prec_t>(std::max(1, atoi(value)));
+    if (const char* value = getenv("MANDEL_SELECTOR_FALLBACK_VALIDATION")) adaptiveRequest.verificationCenteredFallbackValidationSamples = static_cast<size_t>(std::max(1, atoi(value)));
+    if (const char* value = getenv("MANDEL_SELECTOR_MANDATORY_FALLBACK_BITS")) adaptiveRequest.verificationCenteredMandatoryFallbackCandidatePrecision = static_cast<mpfr_prec_t>(std::max(1, atoi(value)));
+    if (const char* value = getenv("MANDEL_SELECTOR_MANDATORY_FALLBACK_VALIDATION")) adaptiveRequest.verificationCenteredMandatoryFallbackValidationSamples = static_cast<size_t>(std::max(1, atoi(value)));
+    ExpressionDeepRenderResult adaptiveResult;
+    const Clock::time_point adaptiveStart = Clock::now();
+    const bool adaptiveOkay = formula::renderExpressionDeepFrame(adaptiveRequest, adaptiveResult);
+    const double adaptiveSeconds = since(adaptiveStart);
+    size_t adaptiveEmpty = 0;
+    size_t adaptiveClassMismatch = 0;
+    size_t adaptiveFloorMismatch = 0;
+    size_t adaptiveMaskFallback = 0;
+    size_t adaptiveMandatoryMaskCount = 0;
+    size_t adaptiveLowEligibleMaskCount = 0;
+    size_t adaptiveInvalidLowMaskCount = 0;
+    size_t adaptiveMandatoryMismatch = 0;
+    for (size_t index = 0; adaptiveOkay && index < pixelCount; ++index) {
+        adaptiveEmpty += adaptive[index] == formula::ExpressionDeepEmptyPixel;
+        const bool candidateInterior = adaptive[index] < 0.0f;
+        const bool oracleInterior = groundTruth[index] < 0.0f;
+        if (candidateInterior != oracleInterior) {
+            ++adaptiveClassMismatch;
+        } else if (!candidateInterior && adaptive[index] != groundTruth[index]) {
+            ++adaptiveFloorMismatch;
+        }
+        if (adaptiveResult.centeredFallbackPrecisionReasonMask.size() != pixelCount) continue;
+        const uint8_t reasonMask = adaptiveResult.centeredFallbackPrecisionReasonMask[index];
+        if (reasonMask == 0) continue;
+        ++adaptiveMaskFallback;
+        if (isMandatoryCenteredFallback(reasonMask)) {
+            ++adaptiveMandatoryMaskCount;
+            adaptiveMandatoryMismatch += adaptive[index] != groundTruth[index];
+        } else {
+            ++adaptiveLowEligibleMaskCount;
+            adaptiveInvalidLowMaskCount += reasonMask != lowEligibleCenteredFallbackMask();
+        }
+    }
+    const double vectorLaneUtilization = adaptiveResult.centeredVectorStepCount == 0 ? 0.0 : static_cast<double>(adaptiveResult.centeredVectorActiveLaneCount) / (4.0 * adaptiveResult.centeredVectorStepCount);
+    printf("  adaptive production EMPTY/class/floor=%zu/%zu/%zu accepted/rejected=%d/%d refs/attempts=%llu/%llu preflight samples/risk/secondary/hierarchy/final=%llu/%llu/%llu/%llu/%llu selector risk/secondary/hierarchy-flags/hierarchy-evals/final=%llu/%llu/%llu/%llu/%llu fast/fallback=%llu/%llu time ref/preflight/primary/select/secondary/hierarchy/final/fallback/total=%.3f/%.3f/%.3f/%.6f/%.3f/%.3f/%.6f/%.3f/%.3f s iterations fast/total=%llu/%llu vector steps/active/util=%llu/%llu/%.2f%%\n", adaptiveEmpty, adaptiveClassMismatch, adaptiveFloorMismatch, adaptiveResult.centeredAccepted ? 1 : 0, adaptiveResult.centeredPreflightRejected ? 1 : 0, (unsigned long long)adaptiveResult.centeredReferenceCount, (unsigned long long)adaptiveResult.centeredReferenceAttemptCount, (unsigned long long)adaptiveResult.centeredPreflightSampleCount, (unsigned long long)adaptiveResult.centeredPreflightPrimaryRiskFlagCount, (unsigned long long)adaptiveResult.centeredPreflightSecondaryEvaluationCount, (unsigned long long)adaptiveResult.centeredPreflightAdditionalReferenceEvaluationCount, (unsigned long long)adaptiveResult.centeredPreflightFlagCount, (unsigned long long)adaptiveResult.centeredPrimaryRiskFlagCount, (unsigned long long)adaptiveResult.centeredSecondaryEvaluationCount, (unsigned long long)adaptiveResult.centeredSelectorFlagCount, (unsigned long long)adaptiveResult.centeredHierarchyEvaluationCount, (unsigned long long)adaptiveResult.centeredFinalFallbackFlagCount, (unsigned long long)adaptiveResult.fastPixelCount, (unsigned long long)adaptiveResult.fallbackPixelCount, adaptiveResult.referenceSeconds, adaptiveResult.centeredPreflightSeconds, adaptiveResult.centeredPrimarySeconds, adaptiveResult.centeredSelectorSeconds, adaptiveResult.centeredSecondarySeconds, adaptiveResult.centeredAdditionalReferenceSeconds, adaptiveResult.centeredFinalSelectorSeconds, adaptiveResult.fallbackSeconds, adaptiveSeconds, (unsigned long long)adaptiveResult.fastIterationCount, (unsigned long long)adaptiveResult.totalIterations, (unsigned long long)adaptiveResult.centeredVectorStepCount, (unsigned long long)adaptiveResult.centeredVectorActiveLaneCount, 100.0 * vectorLaneUtilization);
+    printf("    DD verified/agreed/rejected=%llu/%llu/%llu iterations/time=%llu/%.3f s\n", (unsigned long long)adaptiveResult.centeredDoubleDoubleVerifiedPixelCount, (unsigned long long)adaptiveResult.centeredDoubleDoubleAgreementCount, (unsigned long long)adaptiveResult.centeredDoubleDoubleRejectedCount, (unsigned long long)adaptiveResult.centeredDoubleDoubleIterationCount, adaptiveResult.centeredDoubleDoubleSeconds);
+    printf("    fallback empirical=%d precision selected/candidate/full=%lld/%lld/%lld mandatory bits/count=%lld/%llu candidate pixels/iterations/time=%llu/%llu/%.3f full pixels/iterations/time=%llu/%llu/%.3f sample/mismatch/upgrade/pixels=%llu/%llu/%d/%llu low=%llu validation samples/mismatch/upgrade=%llu/%llu/%d upgraded=%llu low pixels/iterations/time=%llu/%llu/%.3f aggregate-full=%llu/%llu/%.3f mask fallback/invalid/mandatory-mismatch=%zu/%zu/%zu reasons=", adaptiveResult.centeredFallbackValidationIsEmpirical ? 1 : 0, (long long)adaptiveResult.selectedPrecision, (long long)adaptiveResult.centeredFallbackCandidatePrecision, (long long)adaptiveResult.centeredFallbackFullPrecision, (long long)adaptiveResult.centeredFallbackMandatoryCandidatePrecision, (unsigned long long)adaptiveResult.centeredFallbackMandatoryFullPixelCount, (unsigned long long)adaptiveResult.centeredFallbackMandatoryCandidatePixelCount, (unsigned long long)adaptiveResult.centeredFallbackMandatoryCandidateIterationCount, adaptiveResult.centeredFallbackMandatoryCandidateSeconds, (unsigned long long)adaptiveResult.centeredFallbackMandatoryFullPrecisionPixelCount, (unsigned long long)adaptiveResult.centeredFallbackMandatoryFullPrecisionIterationCount, adaptiveResult.centeredFallbackMandatoryFullPrecisionSeconds, (unsigned long long)adaptiveResult.centeredFallbackMandatoryValidationSampleCount, (unsigned long long)adaptiveResult.centeredFallbackMandatoryValidationMismatchCount, adaptiveResult.centeredFallbackMandatoryUpgraded ? 1 : 0, (unsigned long long)adaptiveResult.centeredFallbackMandatoryUpgradedPixelCount, (unsigned long long)adaptiveResult.centeredFallbackLowEligiblePixelCount, (unsigned long long)adaptiveResult.centeredFallbackValidationSampleCount, (unsigned long long)adaptiveResult.centeredFallbackValidationMismatchCount, adaptiveResult.centeredFallbackUpgraded ? 1 : 0, (unsigned long long)adaptiveResult.centeredFallbackUpgradedPixelCount, (unsigned long long)adaptiveResult.centeredFallbackLowPrecisionPixelCount, (unsigned long long)adaptiveResult.centeredFallbackLowPrecisionIterationCount, adaptiveResult.centeredFallbackLowPrecisionSeconds, (unsigned long long)adaptiveResult.centeredFallbackFullPrecisionPixelCount, (unsigned long long)adaptiveResult.centeredFallbackFullPrecisionIterationCount, adaptiveResult.centeredFallbackFullPrecisionSeconds, adaptiveMaskFallback, adaptiveInvalidLowMaskCount, adaptiveMandatoryMismatch);
+    for (size_t reason = 0; reason < adaptiveResult.centeredFallbackPrecisionReasonCounts.size(); ++reason)
+        if (adaptiveResult.centeredFallbackPrecisionReasonCounts[reason] != 0) printf(" %s=%llu", formula::expressionDeepCenteredFallbackReasonName(static_cast<formula::ExpressionDeepCenteredFallbackReason>(reason)), (unsigned long long)adaptiveResult.centeredFallbackPrecisionReasonCounts[reason]);
+    printf("\n");
+    const uint64_t additionalReferencesPerFlag = adaptiveResult.centeredReferenceCount > 2 ? adaptiveResult.centeredReferenceCount - 2 : 0;
+    const bool preflightTelemetryOkay = adaptiveResult.centeredPreflightAdditionalReferenceEvaluationCount <= adaptiveResult.centeredPreflightInitialFlagCount * additionalReferencesPerFlag;
+    const bool doubleDoubleTelemetryOkay = adaptiveResult.centeredDoubleDoubleVerifiedPixelCount == adaptiveResult.centeredDoubleDoubleAgreementCount + adaptiveResult.centeredDoubleDoubleRejectedCount;
+    const bool hierarchyTelemetryOkay = preflightTelemetryOkay && doubleDoubleTelemetryOkay && adaptiveResult.centeredPreflightPrimaryRiskFlagCount == adaptiveResult.centeredPreflightSecondaryEvaluationCount && adaptiveResult.centeredPrimaryRiskFlagCount == adaptiveResult.centeredSecondaryEvaluationCount && adaptiveResult.centeredSelectorFlagCount >= adaptiveResult.centeredFinalFallbackFlagCount && adaptiveResult.centeredFinalFallbackFlagCount == adaptiveResult.fallbackPixelCount && adaptiveResult.centeredAdditionalReferenceEvaluationCount <= adaptiveResult.centeredSelectorFlagCount * additionalReferencesPerFlag && adaptiveResult.centeredHierarchyEvaluationCount == adaptiveResult.centeredAdditionalReferenceEvaluationCount;
+    const bool defaultGeometry = std::strcmp(source, "sin(z)+c") == 0 && std::strcmp(centerReal, "-1.251552471130320971409943884573286891722") == 0 && std::strcmp(centerImaginary, "-1.229726067217305625607239519911599964807") == 0 && std::strcmp(scaleText, "1.01e12") == 0 && maxIterations == 2000 && bailout == 100.0;
+    const bool defaultAcceptanceTarget = defaultGeometry && ((width == 64 && height == 40) || (width == 120 && height == 80) || (width == 208 && height == 139));
+    const double secondaryRate = pixelCount == 0 ? 1.0 : static_cast<double>(adaptiveResult.centeredSecondaryEvaluationCount) / pixelCount;
+    const double hierarchyFlagRate = pixelCount == 0 ? 1.0 : static_cast<double>(adaptiveResult.centeredSelectorFlagCount) / pixelCount;
+    const double fallbackRate = pixelCount == 0 ? 1.0 : static_cast<double>(adaptiveResult.fallbackPixelCount) / pixelCount;
+    const bool selectorRegressionOkay = !defaultAcceptanceTarget || (adaptiveResult.centeredPreflightSampleCount == std::min<size_t>(256, pixelCount) && secondaryRate >= 0.25 && secondaryRate <= 0.45 && hierarchyFlagRate >= 0.05 && hierarchyFlagRate <= 0.25 && fallbackRate >= 0.005 && fallbackRate <= 0.04);
+    const bool fallbackClassificationOkay = adaptiveResult.centeredFallbackPrecisionReasonMask.size() == pixelCount && adaptiveMaskFallback == adaptiveResult.fallbackPixelCount && adaptiveMandatoryMaskCount == adaptiveResult.centeredFallbackMandatoryFullPixelCount && adaptiveLowEligibleMaskCount == adaptiveResult.centeredFallbackLowEligiblePixelCount && adaptiveMandatoryMaskCount + adaptiveLowEligibleMaskCount == adaptiveResult.fallbackPixelCount && adaptiveInvalidLowMaskCount == 0 && adaptiveMandatoryMismatch == 0;
+    const bool fallbackTelemetryOkay = adaptiveResult.fallbackPixelCount == 0 || (fallbackClassificationOkay && adaptiveResult.centeredFallbackValidationIsEmpirical && adaptiveResult.centeredFallbackCandidatePrecision < adaptiveResult.centeredFallbackFullPrecision && adaptiveResult.centeredFallbackValidationSampleCount == std::min<uint64_t>(128, adaptiveResult.centeredFallbackLowEligiblePixelCount) && adaptiveResult.centeredFallbackValidationMismatchCount == 0 && !adaptiveResult.centeredFallbackUpgraded && adaptiveResult.centeredFallbackUpgradedPixelCount == 0 && adaptiveResult.centeredFallbackLowPrecisionPixelCount == adaptiveResult.centeredFallbackLowEligiblePixelCount && adaptiveResult.centeredFallbackFullPrecisionPixelCount == adaptiveResult.centeredFallbackMandatoryValidationSampleCount + adaptiveResult.centeredFallbackValidationSampleCount && adaptiveResult.centeredFallbackMandatoryCandidatePrecision == 224 && adaptiveResult.centeredFallbackMandatoryCandidatePixelCount == adaptiveResult.centeredFallbackMandatoryFullPixelCount && adaptiveResult.centeredFallbackMandatoryFullPrecisionPixelCount == adaptiveResult.centeredFallbackMandatoryValidationSampleCount && adaptiveResult.centeredFallbackMandatoryValidationSampleCount == std::min<uint64_t>(32, adaptiveResult.centeredFallbackMandatoryFullPixelCount) && adaptiveResult.centeredFallbackMandatoryValidationMismatchCount == 0 && !adaptiveResult.centeredFallbackMandatoryUpgraded && adaptiveResult.centeredFallbackMandatoryUpgradedPixelCount == 0);
+    const bool acceptedPathOkay = adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount != 0 && hierarchyTelemetryOkay && selectorRegressionOkay && fallbackTelemetryOkay;
+    const bool rejectedPathOkay = !defaultAcceptanceTarget && adaptiveResult.centeredPreflightRejected && !adaptiveResult.centeredAccepted && adaptiveResult.fastPixelCount == 0 && adaptiveResult.fallbackPixelCount == pixelCount && preflightTelemetryOkay;
+    bool adaptivePassed = adaptiveOkay && adaptiveEmpty == 0 && adaptiveClassMismatch == 0 && adaptiveFloorMismatch == 0 && (acceptedPathOkay || rejectedPathOkay);
+    if (!adaptivePassed) {
+        printf("    adaptive status=%s error=%s\n", formula::expressionDeepRenderStatusName(adaptiveResult.status), adaptiveResult.error.c_str());
+    }
+    if (adaptiveResult.centeredPreflightRejected) return adaptivePassed ? 0 : 1;
+    const bool runDefaultSelectorCoverage = defaultGeometry && width == 120 && height == 80;
+    if (adaptivePassed && (pixelCount <= 2560 || runDefaultSelectorCoverage) && adaptiveResult.referenceBytes <= std::numeric_limits<size_t>::max() - adaptiveResult.rendererBytes) {
+        std::vector<float> singleThread(pixelCount, formula::ExpressionDeepEmptyPixel);
+        ExpressionDeepRenderRequest singleThreadRequest = adaptiveRequest;
+        singleThreadRequest.output = singleThread.data();
+        singleThreadRequest.outputCount = singleThread.size();
+        singleThreadRequest.threading.threads = 1;
+        ExpressionDeepRenderResult singleThreadResult;
+        const bool singleThreadRendered = formula::renderExpressionDeepFrame(singleThreadRequest, singleThreadResult);
+        const bool deterministic = singleThreadRendered && singleThread == adaptive && singleThreadResult.centeredDoubleDoubleVerifiedPixelCount == adaptiveResult.centeredDoubleDoubleVerifiedPixelCount && singleThreadResult.centeredDoubleDoubleAgreementCount == adaptiveResult.centeredDoubleDoubleAgreementCount && singleThreadResult.centeredDoubleDoubleRejectedCount == adaptiveResult.centeredDoubleDoubleRejectedCount && singleThreadResult.centeredFallbackCandidatePrecision == adaptiveResult.centeredFallbackCandidatePrecision && singleThreadResult.centeredFallbackFullPrecision == adaptiveResult.centeredFallbackFullPrecision && singleThreadResult.centeredFallbackValidationSampleCount == adaptiveResult.centeredFallbackValidationSampleCount && singleThreadResult.centeredFallbackValidationMismatchCount == adaptiveResult.centeredFallbackValidationMismatchCount && singleThreadResult.centeredFallbackUpgraded == adaptiveResult.centeredFallbackUpgraded && singleThreadResult.centeredFallbackMandatoryFullPixelCount == adaptiveResult.centeredFallbackMandatoryFullPixelCount && singleThreadResult.centeredFallbackMandatoryCandidatePrecision == adaptiveResult.centeredFallbackMandatoryCandidatePrecision && singleThreadResult.centeredFallbackMandatoryCandidatePixelCount == adaptiveResult.centeredFallbackMandatoryCandidatePixelCount && singleThreadResult.centeredFallbackMandatoryFullPrecisionPixelCount == adaptiveResult.centeredFallbackMandatoryFullPrecisionPixelCount && singleThreadResult.centeredFallbackMandatoryValidationSampleCount == adaptiveResult.centeredFallbackMandatoryValidationSampleCount && singleThreadResult.centeredFallbackMandatoryValidationMismatchCount == adaptiveResult.centeredFallbackMandatoryValidationMismatchCount && singleThreadResult.centeredFallbackMandatoryUpgraded == adaptiveResult.centeredFallbackMandatoryUpgraded && singleThreadResult.centeredFallbackMandatoryUpgradedPixelCount == adaptiveResult.centeredFallbackMandatoryUpgradedPixelCount && singleThreadResult.centeredFallbackLowEligiblePixelCount == adaptiveResult.centeredFallbackLowEligiblePixelCount && singleThreadResult.centeredFallbackUpgradedPixelCount == adaptiveResult.centeredFallbackUpgradedPixelCount && singleThreadResult.centeredFallbackPrecisionReasonCounts == adaptiveResult.centeredFallbackPrecisionReasonCounts && singleThreadResult.centeredFallbackPrecisionReasonMask == adaptiveResult.centeredFallbackPrecisionReasonMask && singleThreadResult.centeredFallbackLowPrecisionPixelCount == adaptiveResult.centeredFallbackLowPrecisionPixelCount && singleThreadResult.centeredFallbackLowPrecisionIterationCount == adaptiveResult.centeredFallbackLowPrecisionIterationCount && singleThreadResult.centeredFallbackFullPrecisionPixelCount == adaptiveResult.centeredFallbackFullPrecisionPixelCount && singleThreadResult.centeredFallbackFullPrecisionIterationCount == adaptiveResult.centeredFallbackFullPrecisionIterationCount && singleThreadResult.centeredFallbackMandatoryFullIterationCount == adaptiveResult.centeredFallbackMandatoryFullIterationCount;
+
+        bool upgradeOkay = true;
+        bool mandatoryPrecisionIndependent = true;
+        bool fallbackCancellationOkay = true;
+        uint64_t upgradeMismatches = 0;
+        if (defaultAcceptanceTarget) {
+            std::vector<float> upgraded(pixelCount, formula::ExpressionDeepEmptyPixel);
+            ExpressionDeepRenderRequest upgradeRequest = adaptiveRequest;
+            upgradeRequest.output = upgraded.data();
+            upgradeRequest.outputCount = upgraded.size();
+            upgradeRequest.verificationCenteredFallbackCandidatePrecision = 64;
+            ExpressionDeepRenderResult upgradeResult;
+            const bool upgradeRendered = formula::renderExpressionDeepFrame(upgradeRequest, upgradeResult);
+            upgradeMismatches = upgradeResult.centeredFallbackValidationMismatchCount;
+            mandatoryPrecisionIndependent = upgradeRendered && upgradeResult.centeredFallbackPrecisionReasonMask == adaptiveResult.centeredFallbackPrecisionReasonMask;
+            for (size_t index = 0; mandatoryPrecisionIndependent && index < pixelCount; ++index) {
+                if (!isMandatoryCenteredFallback(adaptiveResult.centeredFallbackPrecisionReasonMask[index])) continue;
+                mandatoryPrecisionIndependent = upgraded[index] == adaptive[index] && upgraded[index] == groundTruth[index];
+            }
+            upgradeOkay = upgradeRendered && upgraded == groundTruth && mandatoryPrecisionIndependent && upgradeResult.centeredFallbackValidationIsEmpirical && upgradeResult.centeredFallbackCandidatePrecision == 64 && upgradeResult.centeredFallbackUpgraded && upgradeResult.centeredFallbackValidationMismatchCount != 0 && upgradeResult.centeredFallbackUpgradedPixelCount == upgradeResult.centeredFallbackLowEligiblePixelCount && upgradeResult.centeredFallbackFullPrecisionPixelCount == upgradeResult.centeredFallbackLowEligiblePixelCount + upgradeResult.centeredFallbackMandatoryValidationSampleCount && upgradeResult.centeredFallbackMandatoryCandidatePixelCount == upgradeResult.centeredFallbackMandatoryFullPixelCount && upgradeResult.centeredFallbackMandatoryValidationMismatchCount == 0 && !upgradeResult.centeredFallbackMandatoryUpgraded;
+
+            std::vector<float> fallbackCancelled(pixelCount, 0.0f);
+            ExpressionDeepRenderRequest fallbackCancelledRequest = adaptiveRequest;
+            fallbackCancelledRequest.output = fallbackCancelled.data();
+            fallbackCancelledRequest.outputCount = fallbackCancelled.size();
+            std::atomic_bool fallbackPhase{false};
+            std::atomic<int> fallbackPolls{0};
+            fallbackCancelledRequest.progress = [&](formula::ExpressionDeepRenderPhase phase, uint64_t, uint64_t) {
+                if (phase == formula::ExpressionDeepRenderPhase::Fallback) fallbackPhase.store(true, std::memory_order_relaxed);
+            };
+            fallbackCancelledRequest.shouldCancel = [&] { return fallbackPhase.load(std::memory_order_relaxed) && fallbackPolls.fetch_add(1, std::memory_order_relaxed) > 8; };
+            ExpressionDeepRenderResult fallbackCancelledResult;
+            fallbackCancellationOkay = !formula::renderExpressionDeepFrame(fallbackCancelledRequest, fallbackCancelledResult) && fallbackCancelledResult.status == formula::ExpressionDeepRenderStatus::Cancelled && fallbackCancelledResult.cancelled && std::count(fallbackCancelled.begin(), fallbackCancelled.end(), formula::ExpressionDeepEmptyPixel) == static_cast<ptrdiff_t>(fallbackCancelled.size());
+        }
+        printf("  fallback determinism/upgrade/mandatory-invariant/cancel=%d/%d/%d/%d upgrade-mismatches=%llu\n", deterministic ? 1 : 0, upgradeOkay ? 1 : 0, mandatoryPrecisionIndependent ? 1 : 0, fallbackCancellationOkay ? 1 : 0, (unsigned long long)upgradeMismatches);
+        adaptivePassed = adaptivePassed && deterministic && upgradeOkay && fallbackCancellationOkay;
+
+        const size_t adaptivePeak = adaptiveResult.referenceBytes + adaptiveResult.rendererBytes;
+        const size_t constrainedLimit = size_t{8} << 20;
+        bool memoryOkay = true;
+        if (adaptivePeak > constrainedLimit) {
+            std::vector<float> constrained(pixelCount, formula::ExpressionDeepEmptyPixel);
+            ExpressionDeepRenderRequest constrainedRequest = adaptiveRequest;
+            constrainedRequest.output = constrained.data();
+            constrainedRequest.outputCount = constrained.size();
+            constrainedRequest.memory.memoryLimitBytes = constrainedLimit;
+            ExpressionDeepRenderResult constrainedResult;
+            memoryOkay = formula::renderExpressionDeepFrame(constrainedRequest, constrainedResult) && constrained == groundTruth && !constrainedResult.centeredAccepted && constrainedResult.referenceBytes <= constrainedLimit && constrainedResult.rendererBytes <= constrainedLimit - constrainedResult.referenceBytes;
+        }
+
+        std::vector<float> cancelled(pixelCount, 0.0f);
+        ExpressionDeepRenderRequest cancelledRequest = adaptiveRequest;
+        cancelledRequest.output = cancelled.data();
+        cancelledRequest.outputCount = cancelled.size();
+        std::atomic_bool fastPhase{false};
+        std::atomic<int> fastPolls{0};
+        cancelledRequest.progress = [&](formula::ExpressionDeepRenderPhase phase, uint64_t, uint64_t) {
+            if (phase == formula::ExpressionDeepRenderPhase::Fast) fastPhase.store(true, std::memory_order_relaxed);
+        };
+        cancelledRequest.shouldCancel = [&] { return fastPhase.load(std::memory_order_relaxed) && fastPolls.fetch_add(1, std::memory_order_relaxed) > 64; };
+        ExpressionDeepRenderResult cancelledResult;
+        const bool cancellationOkay = !formula::renderExpressionDeepFrame(cancelledRequest, cancelledResult) && cancelledResult.status == formula::ExpressionDeepRenderStatus::Cancelled && cancelledResult.cancelled && std::count(cancelled.begin(), cancelled.end(), formula::ExpressionDeepEmptyPixel) == static_cast<ptrdiff_t>(cancelled.size());
+        printf("  hierarchy memory/cancel=%d/%d limit/peak=%zu/%zu polls=%d\n", memoryOkay ? 1 : 0, cancellationOkay ? 1 : 0, constrainedLimit, adaptivePeak, fastPolls.load(std::memory_order_relaxed));
+        adaptivePassed = adaptivePassed && memoryOkay && cancellationOkay;
+    }
+
+    std::vector<float> direct(pixelCount, formula::ExpressionDeepEmptyPixel);
+    mpf_t directCenterReal, directCenterImaginary, directScale;
+    mpf_init2(directCenterReal, 512);
+    mpf_init2(directCenterImaginary, 512);
+    mpf_init2(directScale, 512);
+    const bool directParsed = mpf_set_str(directCenterReal, centerReal, 10) == 0 && mpf_set_str(directCenterImaginary, centerImaginary, 10) == 0 && mpf_set_str(directScale, scaleText, 10) == 0;
+    formula::ExpressionOrbitPlan directPlan;
+    formula::ExpressionJit4 directJit;
+    const bool haveDirectPlan = directPlan.build(runtime, &error) && directPlan.profitable();
+    const bool haveDirectJit = VERIFY_JIT && (haveDirectPlan ? directJit.compile(directPlan) : directJit.compile(runtime));
+    Mandel directRenderer(width, height, maxIterations, 1, direct.data());
+    const Clock::time_point directStart = Clock::now();
+    const bool directOkay = directParsed && directRenderer.ComputeExpression(directCenterReal, directCenterImaginary, directScale, runtime, fixed, FormulaParameter::C, maxIterations, bailout, formula::ExpressionColoring::Raw, haveDirectJit ? &directJit : nullptr, haveDirectPlan ? &directPlan : nullptr);
+    const double directSeconds = since(directStart);
+    mpf_clears(directCenterReal, directCenterImaginary, directScale, (mpf_ptr)0);
+    if (!directOkay) {
+        printf("  direct binary64 candidate failed\n");
+        return 1;
+    }
+    size_t directClassMismatch = 0;
+    size_t directFloorMismatch = 0;
+    for (size_t index = 0; index < pixelCount; ++index) {
+        const bool directInterior = direct[index] < 0.0f;
+        const bool oracleInterior = groundTruth[index] < 0.0f;
+        if (directInterior != oracleInterior) {
+            ++directClassMismatch;
+        } else if (!directInterior && direct[index] != groundTruth[index]) {
+            ++directFloorMismatch;
+        }
+    }
+    printf("  direct binary64 class/floor=%zu/%zu time=%.3f s\n", directClassMismatch, directFloorMismatch, directSeconds);
+
+    std::vector<std::pair<int, int>> references;
+    size_t referenceAttempts = 0;
+    double referenceSearchSeconds = 0.0;
+    if (!findExpressionCenteredReferences(canonical, runtime, fixed, centerReal, centerImaginary, scaleText, width, height, maxIterations, bailout, referenceLimit, references, referenceAttempts, referenceSearchSeconds)) {
+        printf("  no bounded centered reference found\n");
+        return 1;
+    }
+    printf("  references=%zu attempts=%zu search=%.3f s:", references.size(), referenceAttempts, referenceSearchSeconds);
+    for (const auto& reference : references) printf(" (%d,%d)", reference.first, reference.second);
+    printf("\n");
+
+    std::vector<std::vector<float>> candidates(references.size());
+    std::vector<std::vector<CenteredTelemetry>> telemetry(references.size());
+    std::vector<double> candidateSeconds(references.size());
+    double totalCandidateSeconds = 0.0;
+    for (size_t referenceIndex = 0; referenceIndex < references.size(); ++referenceIndex) {
+        size_t failedPixels = 0;
+        const auto [referenceX, referenceY] = references[referenceIndex];
+        if (!renderExpressionCentered4(canonical, runtime, fixed, centerReal, centerImaginary, scaleText, width, height, referenceX, referenceY, maxIterations, bailout, maxIterations, nullptr, nullptr, &telemetry[referenceIndex], candidates[referenceIndex], candidateSeconds[referenceIndex], failedPixels)) {
+            printf("  centered reference %zu failed\n", referenceIndex);
+            return 1;
+        }
+        totalCandidateSeconds += candidateSeconds[referenceIndex];
+        size_t empty = 0;
+        size_t classMismatch = 0;
+        size_t floorMismatch = 0;
+        for (size_t index = 0; index < pixelCount; ++index) {
+            empty += candidates[referenceIndex][index] == formula::ExpressionDeepEmptyPixel;
+            const bool candidateInterior = candidates[referenceIndex][index] < 0.0f;
+            const bool oracleInterior = groundTruth[index] < 0.0f;
+            if (candidateInterior != oracleInterior) {
+                ++classMismatch;
+            } else if (!candidateInterior && candidates[referenceIndex][index] != groundTruth[index]) {
+                ++floorMismatch;
+            }
+        }
+        printf("  candidate ref=%zu pixel=(%d,%d) EMPTY/class/floor=%zu/%zu/%zu failed=%zu time=%.3f s\n", referenceIndex, referenceX, referenceY, empty, classMismatch, floorMismatch, failedPixels, candidateSeconds[referenceIndex]);
+    }
+
+    std::vector<size_t> selectedReference(pixelCount, 0);
+    std::vector<size_t> secondReference(pixelCount, 0);
+    std::vector<uint8_t> mismatch(pixelCount, 0);
+    size_t mismatchCount = 0;
+    for (size_t index = 0; index < pixelCount; ++index) {
+        const int x = static_cast<int>(index % static_cast<size_t>(width));
+        const int y = static_cast<int>(index / static_cast<size_t>(width));
+        std::vector<std::pair<long long, size_t>> distances;
+        distances.reserve(references.size());
+        for (size_t referenceIndex = 0; referenceIndex < references.size(); ++referenceIndex) {
+            const long long dx = x - references[referenceIndex].first;
+            const long long dy = y - references[referenceIndex].second;
+            distances.emplace_back(dx * dx + dy * dy, referenceIndex);
+        }
+        std::sort(distances.begin(), distances.end());
+        selectedReference[index] = distances[0].second;
+        secondReference[index] = distances.size() > 1 ? distances[1].second : distances[0].second;
+        mismatch[index] = candidates[selectedReference[index]][index] != groundTruth[index];
+        mismatchCount += mismatch[index];
+    }
+    std::vector<double> anyOutputDisagreement(pixelCount, 0.0);
+    std::vector<double> secondOutputDisagreement(pixelCount, 0.0);
+    std::vector<double> anyStateDisagreement(pixelCount, 0.0);
+    std::vector<double> secondStateDisagreement(pixelCount, 0.0);
+    std::vector<double> maximumEvaluationGap(pixelCount, 0.0);
+    std::vector<double> maximumAlternateGap(pixelCount, 0.0);
+    std::vector<double> maximumError(pixelCount, 0.0);
+    std::vector<double> maximumDerivative(pixelCount, 0.0);
+    std::vector<double> inverseMargin(pixelCount, 0.0);
+    std::vector<double> referenceTie(pixelCount, 0.0);
+    std::vector<double> primaryReferenceDistance(pixelCount, 0.0);
+    std::vector<double> directDisagreement(pixelCount, 0.0);
+    std::vector<double> outputOrDirectDisagreement(pixelCount, 0.0);
+    std::vector<double> interiorStateDisagreement(pixelCount, 0.0);
+    std::vector<double> interiorError(pixelCount, 0.0);
+    for (size_t index = 0; index < pixelCount; ++index) {
+        const size_t primaryIndex = selectedReference[index];
+        const size_t secondaryIndex = secondReference[index];
+        const CenteredTelemetry& primary = telemetry[primaryIndex][index];
+        maximumEvaluationGap[index] = primary.maximumEvaluationGap;
+        maximumAlternateGap[index] = primary.maximumAlternateGap;
+        maximumError[index] = primary.maximumError;
+        maximumDerivative[index] = primary.maximumDerivative;
+        inverseMargin[index] = 1.0 / std::max(primary.minimumBailoutMargin, std::numeric_limits<double>::min());
+        directDisagreement[index] = direct[index] != candidates[primaryIndex][index] ? 1.0 : 0.0;
+        const int x = static_cast<int>(index % static_cast<size_t>(width));
+        const int y = static_cast<int>(index / static_cast<size_t>(width));
+        std::vector<long long> distances;
+        distances.reserve(references.size());
+        for (const auto& reference : references) {
+            const long long dx = x - reference.first;
+            const long long dy = y - reference.second;
+            distances.push_back(dx * dx + dy * dy);
+        }
+        std::sort(distances.begin(), distances.end());
+        primaryReferenceDistance[index] = static_cast<double>(distances[0]);
+        if (distances.size() > 1) referenceTie[index] = static_cast<double>(distances[0] + 1) / static_cast<double>(distances[1] + 1);
+        for (size_t referenceIndex = 0; referenceIndex < references.size(); ++referenceIndex) {
+            if (referenceIndex == primaryIndex) continue;
+            const bool outputDiffers = candidates[referenceIndex][index] != candidates[primaryIndex][index];
+            anyOutputDisagreement[index] = std::max(anyOutputDisagreement[index], outputDiffers ? 1.0 : 0.0);
+            if (referenceIndex == secondaryIndex) secondOutputDisagreement[index] = outputDiffers ? 1.0 : 0.0;
+            const CenteredTelemetry& comparison = telemetry[referenceIndex][index];
+            double stateGap = std::abs(comparison.finalState - primary.finalState) / (1.0 + std::max(std::abs(comparison.finalState), std::abs(primary.finalState)));
+            for (size_t probe = 0; probe < primary.probeStates.size(); ++probe) {
+                if (!primary.probeValid[probe] || !comparison.probeValid[probe]) continue;
+                stateGap = std::max(stateGap, std::abs(comparison.probeStates[probe] - primary.probeStates[probe]) / (1.0 + std::max(std::abs(comparison.probeStates[probe]), std::abs(primary.probeStates[probe]))));
+            }
+            anyStateDisagreement[index] = std::max(anyStateDisagreement[index], stateGap);
+            if (referenceIndex == secondaryIndex) secondStateDisagreement[index] = stateGap;
+        }
+        outputOrDirectDisagreement[index] = std::max(anyOutputDisagreement[index], directDisagreement[index]);
+        if (candidates[primaryIndex][index] < 0.0f) {
+            interiorStateDisagreement[index] = anyStateDisagreement[index];
+            interiorError[index] = maximumError[index];
+        }
+    }
+    size_t selectedEmpty = 0;
+    size_t selectedClassMismatch = 0;
+    size_t selectedFloorMismatch = 0;
+    for (size_t index = 0; index < pixelCount; ++index) {
+        const float candidate = candidates[selectedReference[index]][index];
+        selectedEmpty += candidate == formula::ExpressionDeepEmptyPixel;
+        const bool candidateInterior = candidate < 0.0f;
+        const bool oracleInterior = groundTruth[index] < 0.0f;
+        if (candidateInterior != oracleInterior) {
+            ++selectedClassMismatch;
+        } else if (!candidateInterior && candidate != groundTruth[index]) {
+            ++selectedFloorMismatch;
+        }
+    }
+    printf("  nearest-reference candidate EMPTY/class/floor=%zu/%zu/%zu\n", selectedEmpty, selectedClassMismatch, selectedFloorMismatch);
+    for (double threshold : {1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e18, 1e20, 1e24, 1e28, 1e32, 1e40, 1e60, 1e100}) {
+        size_t primaryFallback = 0;
+        size_t primaryResidualMismatch = 0;
+        size_t nearestFallback = 0;
+        size_t nearestResidualMismatch = 0;
+        size_t combinedFallback = 0;
+        size_t combinedResidualMismatch = 0;
+        for (size_t index = 0; index < pixelCount; ++index) {
+            const bool primarySelected = std::isfinite(telemetry[0][index].maximumError) && telemetry[0][index].maximumError <= threshold;
+            primaryFallback += !primarySelected;
+            primaryResidualMismatch += primarySelected && candidates[0][index] != groundTruth[index];
+            const bool nearestSelected = std::isfinite(maximumError[index]) && maximumError[index] <= threshold;
+            nearestFallback += !nearestSelected;
+            nearestResidualMismatch += nearestSelected && mismatch[index];
+            const bool combinedSelected = nearestSelected && anyOutputDisagreement[index] == 0.0;
+            combinedFallback += !combinedSelected;
+            combinedResidualMismatch += combinedSelected && mismatch[index];
+        }
+        printf("    error<=%.0e primary fallback/mismatch=%zu/%zu nearest=%zu/%zu +five-output=%zu/%zu\n", threshold, primaryFallback, primaryResidualMismatch, nearestFallback, nearestResidualMismatch, combinedFallback, combinedResidualMismatch);
+    }
+
+    auto printRoc = [&](const char* name, const std::vector<double>& risk, const std::vector<double>* mandatory = nullptr) {
+        if (mismatchCount == 0) {
+            printf("    ROC %-24s no mismatches\n", name);
+            return;
+        }
+        double threshold = std::numeric_limits<double>::infinity();
+        bool haveUnforcedMismatch = false;
+        for (size_t index = 0; index < pixelCount; ++index) {
+            if (!mismatch[index] || (mandatory && (*mandatory)[index] > 0.0)) continue;
+            threshold = std::min(threshold, risk[index]);
+            haveUnforcedMismatch = true;
+        }
+        size_t flagged = 0;
+        size_t caught = 0;
+        for (size_t index = 0; index < pixelCount; ++index) {
+            const bool selected = (mandatory && (*mandatory)[index] > 0.0) || (haveUnforcedMismatch && risk[index] >= threshold);
+            flagged += selected;
+            caught += selected && mismatch[index];
+        }
+        const size_t falsePositive = flagged >= caught ? flagged - caught : 0;
+        const size_t negatives = pixelCount - mismatchCount;
+        printf("    ROC %-24s caught=%zu/%zu flagged=%zu/%zu false-positive=%.3f%% threshold=%.6g\n", name, caught, mismatchCount, flagged, pixelCount, negatives ? 100.0 * falsePositive / negatives : 0.0, haveUnforcedMismatch ? threshold : std::numeric_limits<double>::infinity());
+    };
+
+    auto printBinary = [&](const char* name, const std::vector<double>& risk) {
+        size_t flagged = 0;
+        size_t caught = 0;
+        for (size_t index = 0; index < pixelCount; ++index) {
+            const bool selected = risk[index] > 0.0;
+            flagged += selected;
+            caught += selected && mismatch[index];
+        }
+        const size_t negatives = pixelCount - mismatchCount;
+        const size_t falsePositive = flagged >= caught ? flagged - caught : 0;
+        printf("    BIN %-24s caught=%zu/%zu flagged=%zu/%zu false-positive=%.3f%%\n", name, caught, mismatchCount, flagged, pixelCount, negatives ? 100.0 * falsePositive / negatives : 0.0);
+    };
+
+    printBinary("two-ref output", secondOutputDisagreement);
+    printBinary("five-ref output", anyOutputDisagreement);
+    printBinary("direct output", directDisagreement);
+    printBinary("five-output + direct", outputOrDirectDisagreement);
+    printRoc("two-ref output", secondOutputDisagreement);
+    printRoc("five-ref output", anyOutputDisagreement);
+    printRoc("primary evaluation gap", maximumEvaluationGap);
+    printRoc("primary alternate gap", maximumAlternateGap);
+    printRoc("primary error", maximumError);
+    printRoc("primary derivative", maximumDerivative);
+    printRoc("inverse bailout margin", inverseMargin);
+    printRoc("primary ref distance", primaryReferenceDistance);
+    printRoc("reference distance tie", referenceTie);
+    printRoc("two-ref state gap", secondStateDisagreement);
+    printRoc("five-ref state gap", anyStateDisagreement);
+    printRoc("two-output + state", secondStateDisagreement, &secondOutputDisagreement);
+    printRoc("five-output + interior state", interiorStateDisagreement, &anyOutputDisagreement);
+    printRoc("five-output + interior error", interiorError, &anyOutputDisagreement);
+    printRoc("five-output + primary eval", maximumEvaluationGap, &anyOutputDisagreement);
+    printRoc("five-output + state", anyStateDisagreement, &anyOutputDisagreement);
+    printRoc("five-output + direct", directDisagreement, &anyOutputDisagreement);
+
+    constexpr double FixedStateDisagreementThreshold = 0x1p-12;
+    std::vector<double> fixedSelectorScores(pixelCount, 0.0);
+    std::vector<float> nearestCandidate(pixelCount, formula::ExpressionDeepEmptyPixel);
+    size_t fixedFlags = 0;
+    size_t fixedCaught = 0;
+    for (size_t index = 0; index < pixelCount; ++index) {
+        nearestCandidate[index] = candidates[selectedReference[index]][index];
+        const bool selected = secondOutputDisagreement[index] > 0.0 || !std::isfinite(secondStateDisagreement[index]) || secondStateDisagreement[index] >= FixedStateDisagreementThreshold;
+        if (selected) fixedSelectorScores[index] = std::numeric_limits<double>::infinity();
+        fixedFlags += selected;
+        fixedCaught += selected && mismatch[index];
+    }
+    const size_t fixedFalsePositive = fixedFlags >= fixedCaught ? fixedFlags - fixedCaught : 0;
+    const size_t fixedNegatives = pixelCount - mismatchCount;
+    printf("    FIXED two-ref output/state>=2^-12 caught=%zu/%zu flagged=%zu/%zu false-positive=%.3f%%\n", fixedCaught, mismatchCount, fixedFlags, pixelCount, fixedNegatives ? 100.0 * fixedFalsePositive / fixedNegatives : 0.0);
+
+    size_t productionDiagnostics = 0;
+    for (size_t index = 0; index < pixelCount && productionDiagnostics < 32; ++index) {
+        if (adaptive[index] == groundTruth[index]) continue;
+        const size_t primaryIndex = selectedReference[index];
+        const CenteredTelemetry& primary = telemetry[primaryIndex][index];
+        printf("    production mismatch (%zu,%zu) adaptive/GT=%.9g/%.9g ref=%zu outputs=", index % static_cast<size_t>(width), index / static_cast<size_t>(width), adaptive[index], groundTruth[index], primaryIndex);
+        for (const auto& candidate : candidates) printf("%.0f,", candidate[index]);
+        printf(" state2/5=%.6g/%.6g eval=%.6g alt=%.6g err=%.6g deriv=%.6g margin=%.6g escapeMargin=%.6g tie=%.6g distance=%.0f direct=%.0f\n", secondStateDisagreement[index], anyStateDisagreement[index], primary.maximumEvaluationGap, primary.maximumAlternateGap, primary.maximumError, primary.maximumDerivative, primary.minimumBailoutMargin, primary.escapeMargin, referenceTie[index], primaryReferenceDistance[index], direct[index]);
+        ++productionDiagnostics;
+    }
+    if (getenv("MANDEL_SELECTOR_DIAGNOSTICS_ONLY")) return adaptivePassed ? 0 : 1;
+
+    std::vector<float> fixedOutput;
+    double fixedFallbackSeconds = 0.0;
+    size_t fixedFallbackPixels = 0;
+    uint64_t fixedFallbackIterations = 0;
+    if (!renderExpressionSelectedMpfr(runtime, fixed, centerReal, centerImaginary, scaleText, width, height, maxIterations, bailout, 384, fixedSelectorScores, 0.0, nearestCandidate, fixedOutput, fixedFallbackSeconds, fixedFallbackPixels, fixedFallbackIterations)) {
+        printf("    FIXED selective MPFR failed\n");
+        return 1;
+    }
+    size_t fixedEmpty = 0;
+    size_t fixedClassMismatch = 0;
+    size_t fixedFloorMismatch = 0;
+    for (size_t index = 0; index < pixelCount; ++index) {
+        fixedEmpty += fixedOutput[index] == formula::ExpressionDeepEmptyPixel;
+        const bool candidateInterior = fixedOutput[index] < 0.0f;
+        const bool oracleInterior = groundTruth[index] < 0.0f;
+        if (candidateInterior != oracleInterior) {
+            ++fixedClassMismatch;
+        } else if (!candidateInterior && fixedOutput[index] != groundTruth[index]) {
+            ++fixedFloorMismatch;
+        }
+    }
+    printf("    FIXED selective EMPTY/class/floor=%zu/%zu/%zu fallback=%zu iterations=%llu time=%.3f s\n", fixedEmpty, fixedClassMismatch, fixedFloorMismatch, fixedFallbackPixels, (unsigned long long)fixedFallbackIterations, fixedFallbackSeconds);
+    if (fixedEmpty != 0 || fixedClassMismatch != 0 || fixedFloorMismatch != 0) return 1;
+
+    size_t reviewerPixels = 0;
+    size_t reviewerFailures = 0;
+    for (size_t index = 0; index < pixelCount; ++index) {
+        const float centered = candidates[selectedReference[index]][index];
+        if (defaultGeometry && width == 120 && height == 80 && centered == 1300.0f && groundTruth[index] == 1301.0f) {
+            bool unanimous = true;
+            for (const std::vector<float>& candidate : candidates) unanimous = unanimous && candidate[index] == centered;
+            if (!unanimous) continue;
+            ++reviewerPixels;
+            reviewerFailures += adaptive[index] != groundTruth[index];
+        }
+    }
+    const bool reviewerGate = !defaultGeometry || width != 120 || height != 80 || (reviewerPixels != 0 && reviewerFailures == 0 && adaptiveResult.centeredDoubleDoubleRejectedCount != 0);
+    printf("    reviewer centered+DD 1300/1301 pixels/failures=%zu/%zu DD-rejected=%llu gate=%d\n", reviewerPixels, reviewerFailures, (unsigned long long)adaptiveResult.centeredDoubleDoubleRejectedCount, reviewerGate ? 1 : 0);
+    adaptivePassed = adaptivePassed && reviewerGate;
+
+    for (size_t index = 0; index < pixelCount; ++index) {
+        if (!mismatch[index] || anyOutputDisagreement[index] > 0.0 || directDisagreement[index] > 0.0) continue;
+        const size_t primaryIndex = selectedReference[index];
+        const CenteredTelemetry& primary = telemetry[primaryIndex][index];
+        printf("    unanimous mismatch (%zu,%zu) ref=%zu candidate/GT=%.9g/%.9g state2/5=%.6g/%.6g eval=%.6g alt=%.6g err=%.6g deriv=%.6g margin=%.6g escapeMargin=%.6g tie=%.6g distance=%.0f\n", index % static_cast<size_t>(width), index / static_cast<size_t>(width), primaryIndex, candidates[primaryIndex][index], groundTruth[index], secondStateDisagreement[index], anyStateDisagreement[index], primary.maximumEvaluationGap, primary.maximumAlternateGap, primary.maximumError, primary.maximumDerivative, primary.minimumBailoutMargin, primary.escapeMargin, referenceTie[index], primaryReferenceDistance[index]);
+    }
+
+    size_t diagnostics = 0;
+    for (size_t index = 0; index < pixelCount && diagnostics < 64; ++index) {
+        if (!mismatch[index]) continue;
+        const size_t primaryIndex = selectedReference[index];
+        const CenteredTelemetry& primary = telemetry[primaryIndex][index];
+        printf("    mismatch (%zu,%zu) ref=%zu candidate/GT=%.9g/%.9g outputs=", index % static_cast<size_t>(width), index / static_cast<size_t>(width), primaryIndex, candidates[primaryIndex][index], groundTruth[index]);
+        for (const auto& candidate : candidates) printf("%.0f,", candidate[index]);
+        printf(" state2/5=%.3g/%.3g eval=%.3g alt=%.3g err=%.3g deriv=%.3g margin=%.3g escapeMargin=%.3g tie=%.3g distance=%.0f\n", secondStateDisagreement[index], anyStateDisagreement[index], primary.maximumEvaluationGap, primary.maximumAlternateGap, primary.maximumError, primary.maximumDerivative, primary.minimumBailoutMargin, primary.escapeMargin, referenceTie[index], primaryReferenceDistance[index]);
+        ++diagnostics;
+    }
+    printf("  total reference/candidate=%.3f/%.3f s primary-total=%.3f s five-total=%.3f s\n\n", referenceSearchSeconds, totalCandidateSeconds, referenceSearchSeconds + candidateSeconds[0], referenceSearchSeconds + totalCandidateSeconds);
+    return adaptivePassed ? 0 : 1;
+}
+
+static int runCenteredFullAuditCase(int width, int height) {
+    using formula::ExpressionContext;
+    using formula::ExpressionDeepRenderRequest;
+    using formula::ExpressionDeepRenderResult;
+    using formula::ExpressionError;
+    using formula::ExpressionProgram;
+
+    const char* source = getenv("MANDEL_SELECTOR_SOURCE");
+    if (!source) source = "sin(z)+c";
+    const char* centerReal = getenv("MANDEL_SELECTOR_CX");
+    if (!centerReal) centerReal = "-1.251552471130320971409943884573286891722";
+    const char* centerImaginary = getenv("MANDEL_SELECTOR_CY");
+    if (!centerImaginary) centerImaginary = "-1.229726067217305625607239519911599964807";
+    const char* scaleText = getenv("MANDEL_SELECTOR_ZOOM");
+    if (!scaleText) scaleText = "1.01e12";
+    const int maxIterations = [] {
+        const char* value = getenv("MANDEL_SELECTOR_MXIT");
+        return value ? std::clamp(atoi(value), 1, 5000000) : 2000;
+    }();
+    const double bailout = [] {
+        const char* value = getenv("MANDEL_SELECTOR_BAILOUT");
+        const double parsed = value ? std::strtod(value, nullptr) : 100.0;
+        return std::isfinite(parsed) && parsed > 0.0 ? parsed : 100.0;
+    }();
+
+    ExpressionProgram canonical;
+    ExpressionProgram runtime;
+    ExpressionError error;
+    ExpressionContext fixed;
+    if (!canonical.compile(source, &error) || !canonical.specialize(fixed, FormulaParameter::C, runtime, &error)) {
+        printf("centered full audit compile failed: %s\n", error.message.c_str());
+        return 1;
+    }
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    std::vector<float> output(pixelCount, formula::ExpressionDeepEmptyPixel);
+    ExpressionDeepRenderRequest request;
+    request.canonicalProgram = &canonical;
+    request.runtimeProgram = &runtime;
+    request.center.realDecimal = centerReal;
+    request.center.imaginaryDecimal = centerImaginary;
+    request.scale.decimal = scaleText;
+    request.fixed = fixed;
+    request.pixelParameter = FormulaParameter::C;
+    request.width = width;
+    request.height = height;
+    request.maxIterations = maxIterations;
+    request.bailout = bailout;
+    request.output = output.data();
+    request.outputCount = output.size();
+    request.precision.minimumBits = 128;
+    request.precision.guardBits = 64;
+    request.precision.maximumBits = 4096;
+    request.memory.fallbackGuardBits = 128;
+    request.preflight.enable = false;
+    request.taylor.enableTaylor = false;
+    request.centered.enableAdaptiveCandidate = true;
+    if (const char* value = getenv("MANDEL_SELECTOR_ERROR_THRESHOLD")) request.verificationCenteredPrimaryErrorThreshold = std::strtod(value, nullptr);
+    if (const char* value = getenv("MANDEL_SELECTOR_STATE_THRESHOLD")) request.verificationCenteredStateDisagreementThreshold = std::strtod(value, nullptr);
+    if (const char* value = getenv("MANDEL_SELECTOR_PREFLIGHT_SAMPLES")) request.centered.preflightSamples = static_cast<size_t>(std::max(1, atoi(value)));
+    if (const char* value = getenv("MANDEL_SELECTOR_FALLBACK_BITS")) request.verificationCenteredFallbackCandidatePrecision = static_cast<mpfr_prec_t>(std::max(1, atoi(value)));
+    if (const char* value = getenv("MANDEL_SELECTOR_FALLBACK_VALIDATION")) request.verificationCenteredFallbackValidationSamples = static_cast<size_t>(std::max(1, atoi(value)));
+    if (const char* value = getenv("MANDEL_SELECTOR_MANDATORY_FALLBACK_BITS")) request.verificationCenteredMandatoryFallbackCandidatePrecision = static_cast<mpfr_prec_t>(std::max(1, atoi(value)));
+    if (const char* value = getenv("MANDEL_SELECTOR_MANDATORY_FALLBACK_VALIDATION")) request.verificationCenteredMandatoryFallbackValidationSamples = static_cast<size_t>(std::max(1, atoi(value)));
+    ExpressionDeepRenderResult result;
+    const Clock::time_point start = Clock::now();
+    const bool okay = formula::renderExpressionDeepFrame(request, result);
+    const double totalSeconds = since(start);
+    if (!okay) {
+        printf("centered full render failed: %s\n", result.error.c_str());
+        return 1;
+    }
+    size_t fallbackMaskCount = 0;
+    size_t mandatoryMaskCount = 0;
+    size_t lowEligibleMaskCount = 0;
+    size_t invalidLowMaskCount = 0;
+    if (result.centeredFallbackPrecisionReasonMask.size() == pixelCount) {
+        for (uint8_t reasonMask : result.centeredFallbackPrecisionReasonMask) {
+            if (reasonMask == 0) continue;
+            ++fallbackMaskCount;
+            if (isMandatoryCenteredFallback(reasonMask)) {
+                ++mandatoryMaskCount;
+            } else {
+                ++lowEligibleMaskCount;
+                invalidLowMaskCount += reasonMask != lowEligibleCenteredFallbackMask();
+            }
+        }
+    }
+    const bool fallbackClassificationOkay = result.centeredFallbackPrecisionReasonMask.size() == pixelCount && fallbackMaskCount == result.fallbackPixelCount && mandatoryMaskCount == result.centeredFallbackMandatoryFullPixelCount && lowEligibleMaskCount == result.centeredFallbackLowEligiblePixelCount && mandatoryMaskCount + lowEligibleMaskCount == result.fallbackPixelCount && invalidLowMaskCount == 0;
+    printf("=== centered full %dx%d source=%s\n", width, height, source);
+    const double vectorLaneUtilization = result.centeredVectorStepCount == 0 ? 0.0 : static_cast<double>(result.centeredVectorActiveLaneCount) / (4.0 * result.centeredVectorStepCount);
+    printf("  accepted/rejected=%d/%d refs/attempts=%llu/%llu preflight samples/risk/secondary/hierarchy/final=%llu/%llu/%llu/%llu/%llu selector risk/secondary/hierarchy-flags/hierarchy-evals/final=%llu/%llu/%llu/%llu/%llu fast/fallback=%llu/%llu time ref/preflight/primary/select/secondary/hierarchy/final/fallback/total=%.3f/%.3f/%.3f/%.6f/%.3f/%.3f/%.6f/%.3f/%.3f s iterations fast/total=%llu/%llu vector steps/active/util=%llu/%llu/%.2f%%\n", result.centeredAccepted ? 1 : 0, result.centeredPreflightRejected ? 1 : 0, (unsigned long long)result.centeredReferenceCount, (unsigned long long)result.centeredReferenceAttemptCount, (unsigned long long)result.centeredPreflightSampleCount, (unsigned long long)result.centeredPreflightPrimaryRiskFlagCount, (unsigned long long)result.centeredPreflightSecondaryEvaluationCount, (unsigned long long)result.centeredPreflightAdditionalReferenceEvaluationCount, (unsigned long long)result.centeredPreflightFlagCount, (unsigned long long)result.centeredPrimaryRiskFlagCount, (unsigned long long)result.centeredSecondaryEvaluationCount, (unsigned long long)result.centeredSelectorFlagCount, (unsigned long long)result.centeredHierarchyEvaluationCount, (unsigned long long)result.centeredFinalFallbackFlagCount, (unsigned long long)result.fastPixelCount, (unsigned long long)result.fallbackPixelCount, result.referenceSeconds, result.centeredPreflightSeconds, result.centeredPrimarySeconds, result.centeredSelectorSeconds, result.centeredSecondarySeconds, result.centeredAdditionalReferenceSeconds, result.centeredFinalSelectorSeconds, result.fallbackSeconds, totalSeconds, (unsigned long long)result.fastIterationCount, (unsigned long long)result.totalIterations, (unsigned long long)result.centeredVectorStepCount, (unsigned long long)result.centeredVectorActiveLaneCount, 100.0 * vectorLaneUtilization);
+    printf("  DD verified/agreed/rejected=%llu/%llu/%llu iterations/time=%llu/%.3f s\n", (unsigned long long)result.centeredDoubleDoubleVerifiedPixelCount, (unsigned long long)result.centeredDoubleDoubleAgreementCount, (unsigned long long)result.centeredDoubleDoubleRejectedCount, (unsigned long long)result.centeredDoubleDoubleIterationCount, result.centeredDoubleDoubleSeconds);
+    printf("  fallback empirical=%d precision selected/candidate/full=%lld/%lld/%lld mandatory bits/count=%lld/%llu candidate pixels/iterations/time=%llu/%llu/%.3f full pixels/iterations/time=%llu/%llu/%.3f sample/mismatch/upgrade/pixels=%llu/%llu/%d/%llu low=%llu validation samples/mismatch/upgrade=%llu/%llu/%d upgraded=%llu low pixels/iterations/time=%llu/%llu/%.3f aggregate-full=%llu/%llu/%.3f mask fallback/invalid=%zu/%zu reasons=", result.centeredFallbackValidationIsEmpirical ? 1 : 0, (long long)result.selectedPrecision, (long long)result.centeredFallbackCandidatePrecision, (long long)result.centeredFallbackFullPrecision, (long long)result.centeredFallbackMandatoryCandidatePrecision, (unsigned long long)result.centeredFallbackMandatoryFullPixelCount, (unsigned long long)result.centeredFallbackMandatoryCandidatePixelCount, (unsigned long long)result.centeredFallbackMandatoryCandidateIterationCount, result.centeredFallbackMandatoryCandidateSeconds, (unsigned long long)result.centeredFallbackMandatoryFullPrecisionPixelCount, (unsigned long long)result.centeredFallbackMandatoryFullPrecisionIterationCount, result.centeredFallbackMandatoryFullPrecisionSeconds, (unsigned long long)result.centeredFallbackMandatoryValidationSampleCount, (unsigned long long)result.centeredFallbackMandatoryValidationMismatchCount, result.centeredFallbackMandatoryUpgraded ? 1 : 0, (unsigned long long)result.centeredFallbackMandatoryUpgradedPixelCount, (unsigned long long)result.centeredFallbackLowEligiblePixelCount, (unsigned long long)result.centeredFallbackValidationSampleCount, (unsigned long long)result.centeredFallbackValidationMismatchCount, result.centeredFallbackUpgraded ? 1 : 0, (unsigned long long)result.centeredFallbackUpgradedPixelCount, (unsigned long long)result.centeredFallbackLowPrecisionPixelCount, (unsigned long long)result.centeredFallbackLowPrecisionIterationCount, result.centeredFallbackLowPrecisionSeconds, (unsigned long long)result.centeredFallbackFullPrecisionPixelCount, (unsigned long long)result.centeredFallbackFullPrecisionIterationCount, result.centeredFallbackFullPrecisionSeconds, fallbackMaskCount, invalidLowMaskCount);
+    for (size_t reason = 0; reason < result.centeredFallbackPrecisionReasonCounts.size(); ++reason)
+        if (result.centeredFallbackPrecisionReasonCounts[reason] != 0) printf(" %s=%llu", formula::expressionDeepCenteredFallbackReasonName(static_cast<formula::ExpressionDeepCenteredFallbackReason>(reason)), (unsigned long long)result.centeredFallbackPrecisionReasonCounts[reason]);
+    printf("\n");
+
+    bool fullDenseOkay = true;
+    bool mandatoryCoverageOkay = fallbackClassificationOkay;
+    if (getenv("MANDEL_CENTERED_FULL_DENSE_GT")) {
+        std::vector<float> dense(pixelCount, formula::ExpressionDeepEmptyPixel);
+        ExpressionDeepRenderResult denseResult;
+        bool denseLoaded = false;
+        double denseSeconds = 0.0;
+        if (const char* path = getenv("MANDEL_CENTERED_FULL_GT_FILE")) {
+            FILE* file = nullptr;
+            if (fopen_s(&file, path, "rb") == 0 && file) {
+                denseLoaded = fread(dense.data(), sizeof(float), dense.size(), file) == dense.size() && fgetc(file) == EOF;
+                fclose(file);
+            }
+        }
+        bool denseRendered = denseLoaded;
+        if (!denseLoaded) {
+            ExpressionDeepRenderRequest denseRequest = request;
+            denseRequest.output = dense.data();
+            denseRequest.outputCount = dense.size();
+            denseRequest.precision.requestedBits = 319;
+            denseRequest.precision.minimumBits = 319;
+            denseRequest.precision.guardBits = 0;
+            denseRequest.memory.fallbackGuardBits = 128;
+            denseRequest.centered.enableAdaptiveCandidate = false;
+            denseRequest.forceMpfrFallbackForVerification = true;
+            denseRequest.disableSpecializedPiecewiseMpfrForVerification = true;
+            const Clock::time_point denseStart = Clock::now();
+            denseRendered = formula::renderExpressionDeepFrame(denseRequest, denseResult);
+            denseSeconds = since(denseStart);
+        }
+        size_t denseEmpty = 0;
+        size_t denseClassMismatch = 0;
+        size_t denseFloorMismatch = 0;
+        size_t denseDiagnostics = 0;
+        for (size_t index = 0; denseRendered && index < pixelCount; ++index) {
+            denseEmpty += dense[index] == formula::ExpressionDeepEmptyPixel;
+            const bool candidateInterior = output[index] < 0.0f;
+            const bool oracleInterior = dense[index] < 0.0f;
+            if (candidateInterior != oracleInterior) {
+                ++denseClassMismatch;
+                if (denseDiagnostics++ < 32) printf("    full dense class mismatch=(%zu,%zu) candidate/oracle=%.9g/%.9g fallback-mask=0x%02x\n", index % static_cast<size_t>(width), index / static_cast<size_t>(width), output[index], dense[index], result.centeredFallbackPrecisionReasonMask.size() == pixelCount ? result.centeredFallbackPrecisionReasonMask[index] : 0);
+            } else if (!candidateInterior && output[index] != dense[index]) {
+                ++denseFloorMismatch;
+                if (denseDiagnostics++ < 32) printf("    full dense floor mismatch=(%zu,%zu) candidate/oracle=%.9g/%.9g fallback-mask=0x%02x\n", index % static_cast<size_t>(width), index / static_cast<size_t>(width), output[index], dense[index], result.centeredFallbackPrecisionReasonMask.size() == pixelCount ? result.centeredFallbackPrecisionReasonMask[index] : 0);
+            }
+        }
+        std::vector<double> fallbackAuditMask(pixelCount, 0.0);
+        for (size_t index = 0; index < pixelCount; ++index)
+            if (result.centeredFallbackPrecisionReasonMask.size() == pixelCount && result.centeredFallbackPrecisionReasonMask[index] != 0) fallbackAuditMask[index] = std::numeric_limits<double>::infinity();
+        std::vector<float> lowFallback;
+        double lowDenseSeconds = 0.0;
+        size_t lowDensePixels = 0;
+        uint64_t lowDenseIterations = 0;
+        const bool lowDenseRendered = denseRendered && renderExpressionSelectedMpfr(runtime, fixed, centerReal, centerImaginary, scaleText, width, height, maxIterations, bailout, 160, fallbackAuditMask, 0.0, output, lowFallback, lowDenseSeconds, lowDensePixels, lowDenseIterations);
+        size_t lowVsFullMismatch = 0;
+        size_t lowVsFullNotMandatory = 0;
+        for (size_t index = 0; lowDenseRendered && index < pixelCount; ++index) {
+            if (!std::isinf(fallbackAuditMask[index]) || lowFallback[index] == dense[index]) continue;
+            ++lowVsFullMismatch;
+            if (result.centeredFallbackPrecisionReasonMask.size() != pixelCount || !isMandatoryCenteredFallback(result.centeredFallbackPrecisionReasonMask[index])) ++lowVsFullNotMandatory;
+        }
+        const bool lowDenseAuditOkay = lowDenseRendered && lowDensePixels == result.fallbackPixelCount && lowVsFullNotMandatory == 0;
+        mandatoryCoverageOkay = mandatoryCoverageOkay && lowDenseAuditOkay;
+        printf("  160-vs-full fallback audit pixels=%zu mismatches/not-mandatory=%zu/%zu iterations/time=%llu/%.3f s gate=%d\n", lowDensePixels, lowVsFullMismatch, lowVsFullNotMandatory, (unsigned long long)lowDenseIterations, lowDenseSeconds, lowDenseAuditOkay ? 1 : 0);
+        if (denseRendered) {
+            const char* dumpPath = getenv("MANDEL_CENTERED_DUMP_GT");
+            if (dumpPath && *dumpPath) {
+                FILE* file = nullptr;
+                if (fopen_s(&file, dumpPath, "wb") == 0 && file) {
+                    const size_t written = fwrite(dense.data(), sizeof(float), dense.size(), file);
+                    fclose(file);
+                    if (written != dense.size()) fullDenseOkay = false;
+                } else {
+                    fullDenseOkay = false;
+                }
+            }
+        }
+        fullDenseOkay = fullDenseOkay && mandatoryCoverageOkay && denseRendered && (denseLoaded || (denseResult.fastPixelCount == 0 && denseResult.fallbackPixelCount == pixelCount)) && denseEmpty == 0 && denseClassMismatch == 0 && denseFloorMismatch == 0;
+        printf("  full dense GT %s precision=%lld pixels=%zu EMPTY/class/floor=%zu/%zu/%zu iterations/time=%llu/%.3f s gate=%d\n", denseLoaded ? "loaded" : "rendered", (long long)(denseLoaded ? 447 : denseResult.fallbackPrecision), pixelCount, denseEmpty, denseClassMismatch, denseFloorMismatch, (unsigned long long)denseResult.totalIterations, denseSeconds, fullDenseOkay ? 1 : 0);
+    }
+
+    constexpr int TileWidth = 16;
+    constexpr int TileHeight = 16;
+    const int tilesX = (width + TileWidth - 1) / TileWidth;
+    const int tilesY = (height + TileHeight - 1) / TileHeight;
+    struct TileScore {
+        uint64_t score = 0;
+        int tile = 0;
+    };
+    std::vector<TileScore> tiles(static_cast<size_t>(tilesX) * tilesY);
+    for (size_t tile = 0; tile < tiles.size(); ++tile) tiles[tile].tile = static_cast<int>(tile);
+    auto addBoundary = [&](int x0, int y0, int x1, int y1) {
+        const size_t first = static_cast<size_t>(y0) * width + x0;
+        const size_t second = static_cast<size_t>(y1) * width + x1;
+        if (output[first] == output[second]) return;
+        ++tiles[static_cast<size_t>(y0 / TileHeight) * tilesX + x0 / TileWidth].score;
+        ++tiles[static_cast<size_t>(y1 / TileHeight) * tilesX + x1 / TileWidth].score;
+    };
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            if (x + 1 < width) addBoundary(x, y, x + 1, y);
+            if (y + 1 < height) addBoundary(x, y, x, y + 1);
+        }
+    }
+    std::sort(tiles.begin(), tiles.end(), [](const TileScore& left, const TileScore& right) { return left.score > right.score || (left.score == right.score && left.tile < right.tile); });
+    const size_t selectedTileCount = std::min<size_t>(32, tiles.size());
+    std::vector<double> auditMask(pixelCount, 0.0);
+    size_t auditPixels = 0;
+    std::vector<uint8_t> auditedTiles(tiles.size(), 0);
+    auto selectAuditTile = [&](int tile) {
+        if (tile < 0 || static_cast<size_t>(tile) >= auditedTiles.size() || auditedTiles[static_cast<size_t>(tile)]) return;
+        auditedTiles[static_cast<size_t>(tile)] = 1;
+        const int tileX = tile % tilesX;
+        const int tileY = tile / tilesX;
+        const int xBegin = tileX * TileWidth;
+        const int yBegin = tileY * TileHeight;
+        const int xEnd = std::min(width, xBegin + TileWidth);
+        const int yEnd = std::min(height, yBegin + TileHeight);
+        for (int y = yBegin; y < yEnd; ++y) {
+            for (int x = xBegin; x < xEnd; ++x) {
+                const size_t index = static_cast<size_t>(y) * width + x;
+                if (!std::isfinite(auditMask[index])) continue;
+                auditMask[index] = std::numeric_limits<double>::infinity();
+                ++auditPixels;
+            }
+        }
+    };
+    for (size_t rank = 0; rank < selectedTileCount; ++rank) selectAuditTile(tiles[rank].tile);
+    constexpr size_t UniformTileSamples = 16;
+    for (size_t sample = 0; sample < UniformTileSamples && !tiles.empty(); ++sample) {
+        const size_t tile = UniformTileSamples == 1 ? 0 : sample * (tiles.size() - 1) / (UniformTileSamples - 1);
+        selectAuditTile(static_cast<int>(tile));
+    }
+    mpfr_t auditScale;
+    mpfr_init2(auditScale, 128);
+    const bool auditScaleReady = mpfr_set_str(auditScale, scaleText, 10, MPFR_RNDU) == 0 && mpfr_number_p(auditScale) && mpfr_sgn(auditScale) > 0;
+    const mpfr_exp_t auditScaleBits = auditScaleReady ? std::max<mpfr_exp_t>(0, mpfr_get_exp(auditScale)) : 0;
+    mpfr_clear(auditScale);
+    if (!auditScaleReady || auditScaleBits > 4096 - 128) {
+        printf("  dense MPFR audit precision is outside policy\n");
+        return 1;
+    }
+    const mpfr_prec_t auditPrecision = std::max<mpfr_prec_t>(447, static_cast<mpfr_prec_t>(auditScaleBits + 128));
+    std::vector<float> audited;
+    double auditSeconds = 0.0;
+    size_t auditedFallbackPixels = 0;
+    uint64_t auditedIterations = 0;
+    if (!renderExpressionSelectedMpfr(runtime, fixed, centerReal, centerImaginary, scaleText, width, height, maxIterations, bailout, auditPrecision, auditMask, 0.0, output, audited, auditSeconds, auditedFallbackPixels, auditedIterations)) {
+        printf("  dense MPFR audit failed\n");
+        return 1;
+    }
+    size_t auditEmpty = 0;
+    size_t auditClassMismatch = 0;
+    size_t auditFloorMismatch = 0;
+    size_t firstAuditMismatch = pixelCount;
+    for (size_t index = 0; index < pixelCount; ++index) {
+        if (std::isfinite(auditMask[index])) continue;
+        auditEmpty += audited[index] == formula::ExpressionDeepEmptyPixel;
+        const bool candidateInterior = output[index] < 0.0f;
+        const bool oracleInterior = audited[index] < 0.0f;
+        if (candidateInterior != oracleInterior) {
+            ++auditClassMismatch;
+            if (firstAuditMismatch == pixelCount) firstAuditMismatch = index;
+        } else if (!candidateInterior && output[index] != audited[index]) {
+            ++auditFloorMismatch;
+            if (firstAuditMismatch == pixelCount) firstAuditMismatch = index;
+        }
+    }
+    const size_t auditedTileCount = static_cast<size_t>(std::count(auditedTiles.begin(), auditedTiles.end(), uint8_t{1}));
+    const bool doubleDoubleTelemetryOkay = result.centeredDoubleDoubleVerifiedPixelCount == result.centeredDoubleDoubleAgreementCount + result.centeredDoubleDoubleRejectedCount;
+    const bool fallbackGoal = result.fallbackPixelCount < 12000;
+    const bool performanceGoal = result.fallbackPixelCount < 12000 && totalSeconds < 32.0;
+    const bool doubleDoubleCostOkay = result.centeredDoubleDoubleVerifiedPixelCount == 0 || result.centeredDoubleDoubleSeconds < result.fallbackSeconds;
+    printf("  dense boundary+uniform audit tiles/pixels=%zu/%zu precision=%lld EMPTY/class/floor=%zu/%zu/%zu MPFR iterations/time=%llu/%.3f s goal fallback<12000,total<32=%d DD-cost<MPFR=%d\n\n", auditedTileCount, auditPixels, (long long)auditPrecision, auditEmpty, auditClassMismatch, auditFloorMismatch, (unsigned long long)auditedIterations, auditSeconds, performanceGoal ? 1 : 0, doubleDoubleCostOkay ? 1 : 0);
+    if (firstAuditMismatch != pixelCount) printf("  first dense mismatch=(%zu,%zu) candidate/oracle=%.9g/%.9g\n", firstAuditMismatch % static_cast<size_t>(width), firstAuditMismatch / static_cast<size_t>(width), output[firstAuditMismatch], audited[firstAuditMismatch]);
+    return fallbackClassificationOkay && fullDenseOkay && auditEmpty == 0 && auditClassMismatch == 0 && auditFloorMismatch == 0 && doubleDoubleTelemetryOkay && fallbackGoal && doubleDoubleCostOkay ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     std::string which = (argc > 1) ? argv[1] : "all";
     const int W = (argc > 2) ? atoi(argv[2]) : 120;
@@ -11934,8 +15139,16 @@ int main(int argc, char** argv) {
     if (which == "formula-periodic") rc |= runGenericPeriodicityCase();
     if (which == "multibrot") rc |= runMultibrotCase();
     if (which == "backend") rc |= runBackendCase();
-    if (which == "generic-deep") rc |= runGenericDeepBackendCase();
+    if (which == "generic-deep" || which == "all") rc |= runGenericDeepBackendCase();
     if (which == "custom-slowdown") rc |= runCustomSlowdownCase(W, H);
+    if (which == "adaptive-phase1") rc |= runAdaptivePhase1Case();
+    if (which == "adaptive-phase2") rc |= runAdaptivePhase2Case();
+    if (which == "adaptive-phase3") rc |= runAdaptivePhase3Case();
+    if (which == "adaptive-phase4") rc |= runAdaptivePhase4Case();
+    if (which == "centered-sweep") rc |= runCenteredSelectorSweepCase();
+    if (which == "centered-mandatory") rc |= runCenteredMandatoryPrecisionSweepCase();
+    if (which == "centered-selector") rc |= runCenteredSelectorCase(W, H);
+    if (which == "centered-full") rc |= runCenteredFullAuditCase(argc > 2 ? W : 832, argc > 3 ? H : 555);
     if (which == "gpu") rc |= runGpuBenchmarkCase(argc > 2 ? W : 1920, argc > 3 ? H : 1080);
     return rc;
 }

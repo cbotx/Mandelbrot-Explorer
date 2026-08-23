@@ -86,7 +86,7 @@ $vcpkgCommit | Set-Content (Join-Path $stage 'third-party-source\vcpkg-commit.tx
 $manifestLines = Get-ChildItem -Path $stage -File -Recurse |
     Sort-Object FullName |
     ForEach-Object {
-        $relative = [IO.Path]::GetRelativePath($stage, $_.FullName).Replace('\', '/')
+        $relative = $_.FullName.Substring($stage.Length).TrimStart('\').Replace('\', '/')
         "$(Get-FileHash $_.FullName -Algorithm SHA256 | Select-Object -ExpandProperty Hash)  $relative"
     }
 $manifestLines | Set-Content (Join-Path $stage 'RELEASE-MANIFEST.sha256') -Encoding ascii

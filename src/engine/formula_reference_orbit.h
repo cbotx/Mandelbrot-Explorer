@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,12 @@ struct ScaledComplexShadow {
     ScaledRealShadow im;
 };
 
+struct ScaledComplexExpansionTail {
+    // Third and fourth terms. The existing defect is the second term.
+    ScaledComplexShadow residual2;
+    ScaledComplexShadow residual3;
+};
+
 // A finite arithmetic value is mantissa*2^exponent with
 // 0.5 <= abs(mantissa) < 1. Error radii use the same representation and are
 // always finite and nonnegative.
@@ -57,6 +64,7 @@ bool makeScaledComplexShadow(const MpfrComplex& value, ScaledComplexShadow& outp
 bool setMpfrFromScaledShadow(mpfr_ptr output, const ScaledRealShadow& shadow, mpfr_rnd_t rounding = MPFR_RNDN);
 bool setMpfrFromScaledShadow(MpfrComplex& output, const ScaledComplexShadow& shadow, mpfr_rnd_t rounding = MPFR_RNDN);
 bool reconstructMpfrFromShadows(MpfrComplex& output, const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, mpfr_rnd_t rounding = MPFR_RNDN);
+bool reconstructMpfrFromExpansion(MpfrComplex& output, const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, const ScaledComplexExpansionTail* tail, mpfr_rnd_t rounding = MPFR_RNDN);
 
 struct ExpressionReferenceExactInput {
     // Select exactly one representation. Both mpf pointers must be non-null,
@@ -92,6 +100,11 @@ enum class ExpressionReferenceBuildStatus : uint8_t { Success,
                                                       CompactionOutOfRange,
                                                       ResourceLimit };
 
+enum class ExpressionReferenceCompaction : uint8_t {
+    TwoTerm,
+    FourTermCertifiedTransfer
+};
+
 struct ExpressionReferenceBuildRequest {
     // canonicalProgram is the user formula before specialization.
     // runtimeProgram is the fixed-parameter specialization used by the
@@ -109,6 +122,10 @@ struct ExpressionReferenceBuildRequest {
     // independently iterated oracle at this higher precision. The resulting
     // radii certify the compact data relative to that finite-precision oracle.
     mpfr_prec_t certificationPrecision = 0;
+    // Four terms are opt-in and reserved for consumers that explicitly prove
+    // they consume every retained residual. Existing reference users retain
+    // the two-term representation and behavior.
+    ExpressionReferenceCompaction compaction = ExpressionReferenceCompaction::TwoTerm;
     size_t memoryLimitBytes = size_t{1} << 30;
     std::function<bool()> shouldCancel;
 };
@@ -151,6 +168,25 @@ struct ExpressionReferenceSample {
     uint16_t rootNode = UINT16_MAX;
 };
 
+struct ExpressionReferenceTapeNodeFourTerm {
+    ScaledComplexExpansionTail output;
+    ScaledComplexExpansionTail auxiliary;
+};
+
+struct ExpressionReferenceSampleFourTerm {
+    ScaledComplexExpansionTail z;
+    ScaledComplexExpansionTail next;
+};
+
+struct ExpressionReferenceFourTermData {
+    ScaledComplexExpansionTail c;
+    ScaledComplexExpansionTail z0;
+    ScaledComplexExpansionTail pixel;
+    ScaledComplexExpansionTail initialZ;
+    std::vector<ExpressionReferenceSampleFourTerm> samples;
+    std::vector<ExpressionReferenceTapeNodeFourTerm> tape;
+};
+
 struct ExpressionReferenceOrbitResult {
     ExpressionReferenceBuildStatus status = ExpressionReferenceBuildStatus::InvalidRequest;
     std::string error;
@@ -172,6 +208,7 @@ struct ExpressionReferenceOrbitResult {
     size_t sampleCount = 0;
     size_t memoryBytes = 0;
     ExpressionOracleCertification branchCertification = ExpressionOracleCertification::PointOnlyNotCertified;
+    ExpressionReferenceCompaction compaction = ExpressionReferenceCompaction::TwoTerm;
 
     ScaledComplexShadow c;
     ScaledComplexShadow cDefect;
@@ -187,6 +224,9 @@ struct ExpressionReferenceOrbitResult {
     ScaledRealValue initialZError;
     std::vector<ExpressionReferenceSample> samples;
     std::vector<ExpressionReferenceTapeNode> tape;
+    // Immutable sidecar keeps default sample/tape layouts unchanged. It is
+    // present exactly when compaction is FourTermCertifiedTransfer.
+    std::shared_ptr<const ExpressionReferenceFourTermData> fourTerm;
 };
 
 // This builds reference/tape data only. It is intentionally not connected to

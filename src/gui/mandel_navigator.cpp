@@ -861,11 +861,13 @@ std::string MandelNavigator::GetExpressionAccelerationText() const {
         const GenericDeepInfo info = _backend->lastGenericDeepInfo();
         if (!info.used || !info.settled) {
             if (info.phase == "certified fallback preflight") return "generic deep certified MPFR preflight";
-            return "generic deep Taylor";
+            return "generic deep adaptive / Taylor";
         }
         if (!info.success) { return "generic deep failed (" + (info.status.empty() ? std::string("unknown") : info.status) + ")"; }
         std::string path;
-        if (info.preflightRejectedFast) {
+        if (info.adaptiveAccepted) {
+            path = info.fallbackPixelCount != 0 ? "generic deep adaptive centered + selective MPFR" : "generic deep adaptive centered";
+        } else if (info.preflightRejectedFast) {
             path = info.specializedPiecewiseMpfr ? "generic deep specialized MPFR (preflight)" : "generic deep MPFR (preflight)";
         } else if (info.pixelCount != 0 && info.fallbackPixelCount == info.pixelCount && info.fastPixelCount == 0) {
             path = "generic deep MPFR";
@@ -877,7 +879,16 @@ std::string MandelNavigator::GetExpressionAccelerationText() const {
         const double fallbackRate = info.pixelCount ? 100.0 * info.fallbackPixelCount / info.pixelCount : 0.0;
         const double taylorCoverage = info.pixelCount ? 100.0 * info.taylorPixelCoverage / info.pixelCount : 0.0;
         std::ostringstream text;
-        text << path << "  fallback " << info.fallbackPixelCount << "/" << info.pixelCount << " (" << std::fixed << std::setprecision(1) << fallbackRate << "%), Taylor coverage " << taylorCoverage << "%";
+        text << path << "  fallback " << info.fallbackPixelCount << "/" << info.pixelCount << " (" << std::fixed << std::setprecision(1) << fallbackRate << "%)";
+        if (info.adaptiveAccepted) {
+            const char* capability = info.capability == formula::ExpressionScaledResidualCapability::ExactCenteredArithmetic ? "arithmetic" : info.capability == formula::ExpressionScaledResidualCapability::CertifiedEntireCandidate ? "entire"
+                                                                                                                                          : info.capability == formula::ExpressionScaledResidualCapability::CertifiedMeromorphicCandidate ? "meromorphic"
+                                                                                                                                          : info.capability == formula::ExpressionScaledResidualCapability::CertifiedRealCandidate     ? "real-smooth"
+                                                                                                                                                                                                                                       : "other";
+            text << ", " << (info.pixelParameter == FormulaParameter::InitialZ ? "z0" : "c") << "/" << capability << ", refs " << info.adaptiveReferences << ", pre " << info.adaptivePreflightFlags << "/" << info.adaptivePreflightSamples << ", P/S/H/DD " << info.adaptivePrimary << "/" << info.adaptiveSecondary << "/" << info.adaptiveHierarchy << "/" << info.adaptiveDd;
+        } else {
+            text << ", Taylor coverage " << taylorCoverage << "%";
+        }
         if (info.preflightAttempted) {
             const double preflightFallbackRate = info.preflightSampleCount ? 100.0 * static_cast<double>(info.preflightFallbackCount) / static_cast<double>(info.preflightSampleCount) : 0.0;
             text << ", preflight " << info.preflightFallbackCount << "/" << info.preflightSampleCount << " (" << preflightFallbackRate << "%) -> " << info.predictedPath;

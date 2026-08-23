@@ -1,4 +1,5 @@
 #include "formula_expression.h"
+#include "formula_expression_vector_math.h"
 
 #include <algorithm>
 #include <atomic>
@@ -60,11 +61,18 @@ void vectorRealSinCos(__m256d value, __m256d& sine, __m256d& cosine, int (&quadr
         4.11031762331216484407e-19,
     };
 
-    const __m256d multiple = _mm256_round_pd(_mm256_mul_pd(value, _mm256_set1_pd(InverseHalfPi)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-    const __m128i integerMultiple = _mm256_cvttpd_epi32(multiple);
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(quadrants), integerMultiple);
-    __m256d reduced = _mm256_sub_pd(value, _mm256_mul_pd(multiple, _mm256_set1_pd(HalfPiHigh)));
-    reduced = _mm256_sub_pd(reduced, _mm256_mul_pd(multiple, _mm256_set1_pd(HalfPiLow)));
+    const __m256d absolute = _mm256_andnot_pd(_mm256_set1_pd(-0.0), value);
+    __m256d reduced;
+    if (_mm256_movemask_pd(_mm256_cmp_pd(absolute, _mm256_set1_pd(0.78539816339744830962), _CMP_LE_OQ)) == 15) {
+        quadrants[0] = quadrants[1] = quadrants[2] = quadrants[3] = 0;
+        reduced = value;
+    } else {
+        const __m256d multiple = _mm256_round_pd(_mm256_mul_pd(value, _mm256_set1_pd(InverseHalfPi)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        const __m128i integerMultiple = _mm256_cvttpd_epi32(multiple);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(quadrants), integerMultiple);
+        reduced = _mm256_sub_pd(value, _mm256_mul_pd(multiple, _mm256_set1_pd(HalfPiHigh)));
+        reduced = _mm256_sub_pd(reduced, _mm256_mul_pd(multiple, _mm256_set1_pd(HalfPiLow)));
+    }
     const __m256d squared = _mm256_mul_pd(reduced, reduced);
     sine = _mm256_add_pd(reduced, _mm256_mul_pd(_mm256_mul_pd(reduced, squared), evaluatePolynomial(squared, SineCoefficients)));
     cosine = _mm256_add_pd(_mm256_set1_pd(1.0), _mm256_mul_pd(squared, evaluatePolynomial(squared, CosineCoefficients)));
@@ -129,6 +137,12 @@ void vectorRealSinhCosh(__m256d value, __m256d& hyperbolicSine, __m256d& hyperbo
     const __m256d squared = _mm256_mul_pd(value, value);
     const __m256d smallSine = _mm256_add_pd(value, _mm256_mul_pd(_mm256_mul_pd(value, squared), evaluatePolynomial(squared, SinhCoefficients)));
     const __m256d smallCosine = _mm256_add_pd(_mm256_set1_pd(1.0), _mm256_mul_pd(squared, evaluatePolynomial(squared, CoshCoefficients)));
+    const __m256d small = _mm256_cmp_pd(absolute, _mm256_set1_pd(0.5), _CMP_LE_OQ);
+    if (_mm256_movemask_pd(small) == 15) {
+        hyperbolicSine = smallSine;
+        hyperbolicCosine = smallCosine;
+        return;
+    }
 
     const __m256d exponential = vectorPositiveExp(absolute);
     const __m256d reciprocal = _mm256_div_pd(_mm256_set1_pd(1.0), exponential);
@@ -136,65 +150,19 @@ void vectorRealSinhCosh(__m256d value, __m256d& hyperbolicSine, __m256d& hyperbo
     __m256d largeSine = _mm256_mul_pd(half, _mm256_sub_pd(exponential, reciprocal));
     largeSine = _mm256_xor_pd(largeSine, _mm256_and_pd(value, signMask));
     const __m256d largeCosine = _mm256_mul_pd(half, _mm256_add_pd(exponential, reciprocal));
-    const __m256d small = _mm256_cmp_pd(absolute, _mm256_set1_pd(0.5), _CMP_LE_OQ);
     hyperbolicSine = _mm256_blendv_pd(largeSine, smallSine, small);
     hyperbolicCosine = _mm256_blendv_pd(largeCosine, smallCosine, small);
 }
 
 void evaluateVectorComplexSinCos(__m256d inputReal, __m256d inputImaginary, bool cosineOperation, __m256d& outputReal, __m256d& outputImaginary) {
-    alignas(32) double real[4], imaginary[4];
+    const uint8_t safeMask = detail::evaluateVectorComplexSinCosFast(inputReal, inputImaginary, cosineOperation, outputReal, outputImaginary);
+    alignas(32) double real[4], imaginary[4], resultReal[4], resultImaginary[4];
     _mm256_store_pd(real, inputReal);
     _mm256_store_pd(imaginary, inputImaginary);
-    alignas(32) double evaluationReal[4], evaluationImaginary[4];
-    bool safe[4];
-    bool haveSafeLane = false;
+    _mm256_store_pd(resultReal, outputReal);
+    _mm256_store_pd(resultImaginary, outputImaginary);
     for (int lane = 0; lane < 4; ++lane) {
-        safe[lane] = std::isfinite(real[lane]) && std::isfinite(imaginary[lane]) && real[lane] != 0.0 && imaginary[lane] != 0.0 && std::fabs(real[lane]) <= 128.0 && std::fabs(imaginary[lane]) <= 20.0;
-        haveSafeLane = haveSafeLane || safe[lane];
-        evaluationReal[lane] = safe[lane] ? real[lane] : 0.0;
-        evaluationImaginary[lane] = safe[lane] ? imaginary[lane] : 0.0;
-    }
-
-    alignas(32) double resultReal[4], resultImaginary[4];
-    if (haveSafeLane) {
-        __m256d realSine, realCosine, imaginarySine, imaginaryCosine;
-        int quadrants[4];
-        alignas(32) double reducedSine[4], reducedCosine[4], hyperbolicSine[4], hyperbolicCosine[4];
-        vectorRealSinCos(_mm256_load_pd(evaluationReal), realSine, realCosine, quadrants);
-        _mm256_store_pd(reducedSine, realSine);
-        _mm256_store_pd(reducedCosine, realCosine);
-        vectorRealSinhCosh(_mm256_load_pd(evaluationImaginary), imaginarySine, imaginaryCosine);
-        _mm256_store_pd(hyperbolicSine, imaginarySine);
-        _mm256_store_pd(hyperbolicCosine, imaginaryCosine);
-        for (int lane = 0; lane < 4; ++lane) {
-            double sine = reducedSine[lane];
-            double cosine = reducedCosine[lane];
-            switch (quadrants[lane] & 3) {
-            case 1:
-                std::swap(sine, cosine);
-                cosine = -cosine;
-                break;
-            case 2:
-                sine = -sine;
-                cosine = -cosine;
-                break;
-            case 3:
-                std::swap(sine, cosine);
-                sine = -sine;
-                break;
-            }
-            if (cosineOperation) {
-                resultReal[lane] = cosine * hyperbolicCosine[lane];
-                resultImaginary[lane] = -sine * hyperbolicSine[lane];
-            } else {
-                resultReal[lane] = sine * hyperbolicCosine[lane];
-                resultImaginary[lane] = cosine * hyperbolicSine[lane];
-            }
-        }
-    }
-
-    for (int lane = 0; lane < 4; ++lane) {
-        if (safe[lane]) continue;
+        if ((safeMask & (uint8_t{1} << lane)) != 0) continue;
         const Complex input{real[lane], imaginary[lane]};
         const Complex result = cosineOperation ? std::cos(input) : std::sin(input);
         resultReal[lane] = result.real();
@@ -267,6 +235,59 @@ void evaluateVectorComplexTan(__m256d inputReal, __m256d inputImaginary, __m256d
 }
 
 } // namespace
+
+namespace detail {
+
+uint8_t evaluateVectorComplexExpFast(__m256d inputReal, __m256d inputImaginary, __m256d& outputReal, __m256d& outputImaginary) {
+    alignas(32) double real[4], imaginary[4], evaluationReal[4], evaluationImaginary[4];
+    _mm256_store_pd(real, inputReal);
+    _mm256_store_pd(imaginary, inputImaginary);
+    uint8_t safeMask = 0;
+    for (int lane = 0; lane < 4; ++lane) {
+        const bool safe = std::isfinite(real[lane]) && std::isfinite(imaginary[lane]) && real[lane] != 0.0 && imaginary[lane] != 0.0 && std::fabs(real[lane]) <= 20.0 && std::fabs(imaginary[lane]) <= 128.0;
+        if (safe) safeMask |= uint8_t{1} << lane;
+        evaluationReal[lane] = safe ? real[lane] : 0.0;
+        evaluationImaginary[lane] = safe ? imaginary[lane] : 0.0;
+    }
+    if (safeMask == 0) {
+        outputReal = _mm256_setzero_pd();
+        outputImaginary = _mm256_setzero_pd();
+        return 0;
+    }
+
+    __m256d sine, cosine;
+    int quadrants[4];
+    vectorRealSinCos(_mm256_load_pd(evaluationImaginary), sine, cosine, quadrants);
+    alignas(32) double reducedSine[4], reducedCosine[4];
+    _mm256_store_pd(reducedSine, sine);
+    _mm256_store_pd(reducedCosine, cosine);
+    for (int lane = 0; lane < 4; ++lane) {
+        double laneSine = reducedSine[lane];
+        double laneCosine = reducedCosine[lane];
+        switch (quadrants[lane] & 3) {
+        case 1:
+            std::swap(laneSine, laneCosine);
+            laneCosine = -laneCosine;
+            break;
+        case 2:
+            laneSine = -laneSine;
+            laneCosine = -laneCosine;
+            break;
+        case 3:
+            std::swap(laneSine, laneCosine);
+            laneSine = -laneSine;
+            break;
+        }
+        reducedSine[lane] = laneSine;
+        reducedCosine[lane] = laneCosine;
+    }
+    const __m256d exponential = vectorPositiveExp(_mm256_load_pd(evaluationReal));
+    outputReal = _mm256_mul_pd(exponential, _mm256_load_pd(reducedCosine));
+    outputImaginary = _mm256_mul_pd(exponential, _mm256_load_pd(reducedSine));
+    return safeMask;
+}
+
+} // namespace detail
 
 class ExpressionParser {
   public:
@@ -817,10 +838,7 @@ ExpressionScaledResidualCapability ExpressionProgram::scaledResidualCapability()
             kind.real = true;
             kind.zero = kinds[left].zero;
             hasBranchIncompatible = true;
-            if (kinds[left].real)
-                hasPiecewise = true;
-            else
-                hasUnsupported = true;
+            hasPiecewise = true;
             break;
         case Op::Polar:
             if (!kinds[left].real || !kinds[right].real)
@@ -834,20 +852,16 @@ ExpressionScaledResidualCapability ExpressionProgram::scaledResidualCapability()
         kinds[index] = kind;
         stack.push_back(index);
     }
-    if (hasCertifiedBranch && (hasBranchIncompatible || hasPiecewise || hasBivariateBranch || hasPolar)) return ExpressionScaledResidualCapability::BranchSensitive;
     if (hasCertifiedBranch) return ExpressionScaledResidualCapability::CertifiedBranchCandidate;
     if (hasUnsupported) return ExpressionScaledResidualCapability::Unsupported;
     if (hasBivariateBranch || hasPolar) {
-        if (hasSeries || hasMeromorphic) return ExpressionScaledResidualCapability::Unsupported;
         if (hasPiecewise) return ExpressionScaledResidualCapability::CertifiedPiecewiseCandidate;
         return ExpressionScaledResidualCapability::CertifiedRealCandidate;
     }
     if (hasPiecewise) {
-        if (hasSeries || hasMeromorphic) return ExpressionScaledResidualCapability::Unsupported;
         return ExpressionScaledResidualCapability::CertifiedPiecewiseCandidate;
     }
     if (hasRealSmooth) {
-        if (hasSeries || hasMeromorphic) return ExpressionScaledResidualCapability::Unsupported;
         return ExpressionScaledResidualCapability::CertifiedRealCandidate;
     }
     if (hasMeromorphic) return ExpressionScaledResidualCapability::CertifiedMeromorphicCandidate;

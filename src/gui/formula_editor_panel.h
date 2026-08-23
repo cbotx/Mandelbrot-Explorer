@@ -13,6 +13,7 @@
 
 struct FormulaEditorCallbacks {
     std::function<bool(const FormulaDialogConfig&)> apply;
+    std::function<void(const FormulaDialogConfig&)> stagePreview;
     std::function<void()> useMandelbrot;
     std::function<void()> close;
 };

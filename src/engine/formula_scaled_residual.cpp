@@ -468,6 +468,26 @@ ScaledArithmeticStatus makeScaledComplexValue(const ScaledComplexShadow& primary
     return scaledAdd(left, right, output);
 }
 
+ScaledArithmeticStatus makeScaledComplexExpansionBall(const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, const ScaledComplexExpansionTail* tail, ScaledComplexBall& output) {
+    output = {};
+    ScaledComplexBall term;
+    ScaledArithmeticStatus status = makeScaledComplexValue(primary, output.value);
+    if (status != ScaledArithmeticStatus::Success) return status;
+    status = makeScaledComplexValue(defect, term.value);
+    if (status != ScaledArithmeticStatus::Success) return status;
+    status = certifiedScaledAdd(output, term, output);
+    if (status != ScaledArithmeticStatus::Success || !tail) return status;
+    term = {};
+    status = makeScaledComplexValue(tail->residual2, term.value);
+    if (status != ScaledArithmeticStatus::Success) return status;
+    status = certifiedScaledAdd(output, term, output);
+    if (status != ScaledArithmeticStatus::Success) return status;
+    term = {};
+    status = makeScaledComplexValue(tail->residual3, term.value);
+    if (status != ScaledArithmeticStatus::Success) return status;
+    return certifiedScaledAdd(output, term, output);
+}
+
 bool setMpfrFromScaledValue(mpfr_ptr output, const ScaledRealValue& value, mpfr_rnd_t rounding) {
     if (validate(value) != ScaledArithmeticStatus::Success) return false;
     ScaledRealShadow shadow;
@@ -912,6 +932,7 @@ bool ExpressionScaledResidualEvaluator::prepare(const ExpressionProgram& program
         return false;
     };
     if (!program.valid() || !reference.valid || reference.status != ExpressionReferenceBuildStatus::Success) return fail("program or reference is invalid");
+    if (reference.compaction != ExpressionReferenceCompaction::TwoTerm || reference.fourTerm) return fail("four-term references require an expansion-aware certified consumer");
     if (reference.programSemanticHash != program.semanticHash() || reference.programSource != program.source()) return fail("reference semantic identity mismatch");
     if (reference.sampleCount != reference.samples.size()) return fail("reference sample count mismatch");
     if (program.instructionCount() == 0 || program.instructionCount() > std::numeric_limits<uint16_t>::max()) return fail("program cannot be represented by the tape");

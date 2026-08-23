@@ -17,6 +17,7 @@ class ExpressionOracle;
 class ExpressionJit4;
 class ExpressionOrbitPlan;
 class ExpressionCenteredEvaluator;
+class ExpressionDoubleDoubleEvaluator;
 class ExpressionScaledResidualEvaluator;
 class ExpressionTaylorJetBuilder;
 class ExpressionRealTaylorJetBuilder;
@@ -169,6 +170,7 @@ class ExpressionProgram {
     friend class ExpressionJit4;
     friend class ExpressionOrbitPlan;
     friend class ExpressionCenteredEvaluator;
+    friend class ExpressionDoubleDoubleEvaluator;
     friend class ExpressionScaledResidualEvaluator;
     friend class ExpressionTaylorJetBuilder;
     friend class ExpressionRealTaylorJetBuilder;

@@ -89,19 +89,49 @@ void setDoubleContext(const ExpressionContext& input, ExpressionOracleContext& o
     output.iteration = input.iteration;
 }
 
-bool quantizationDefect(const MpfrComplex& value, const ScaledComplexShadow& shadow, MpfrComplex& reconstructed, MpfrComplex& difference, ScaledComplexShadow& defect) {
-    defect = {};
-    if (!mpfr_number_p(value.re) || !mpfr_number_p(value.im)) return true;
-    if (!setMpfrFromScaledShadow(reconstructed, shadow)) return false;
+bool reconstructExpansion(MpfrComplex& output, MpfrComplex& term, const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, const ScaledComplexExpansionTail* tail, size_t termCount, mpfr_rnd_t rounding) {
+    if (termCount < 1 || termCount > 4 || !setMpfrFromScaledShadow(output, primary, rounding)) return false;
+    const ScaledComplexShadow* residuals[] = {&defect, tail ? &tail->residual2 : nullptr, tail ? &tail->residual3 : nullptr};
+    for (size_t index = 1; index < termCount; ++index) {
+        if (!residuals[index - 1] || !setMpfrFromScaledShadow(term, *residuals[index - 1], rounding)) return false;
+        if (!mpfr_zero_p(term.re)) mpfr_add(output.re, output.re, term.re, rounding);
+        if (!mpfr_zero_p(term.im)) mpfr_add(output.im, output.im, term.im, rounding);
+    }
+    return true;
+}
 
+bool compactExpansion(const MpfrComplex& value, size_t termCount, ScaledComplexShadow& primary, ScaledComplexShadow& defect, ScaledComplexExpansionTail* tail, MpfrComplex& reconstructed, MpfrComplex& term, MpfrComplex& difference) {
+    primary = {};
+    defect = {};
+    if (tail) *tail = {};
+    if (!makeScaledComplexShadow(value, primary)) return false;
+    if (!mpfr_number_p(value.re) || !mpfr_number_p(value.im)) return true;
+    ScaledComplexShadow* residuals[] = {&defect, tail ? &tail->residual2 : nullptr, tail ? &tail->residual3 : nullptr};
+    for (size_t index = 1; index < termCount; ++index) {
+        if (!residuals[index - 1] || !reconstructExpansion(reconstructed, term, primary, defect, tail, index, RND)) return false;
+        const mpfr_flags_t saved = mpfr_flags_save();
+        mpfr_flags_clear(MPFR_FLAGS_ALL);
+        mpfr_sub(difference.re, value.re, reconstructed.re, RND);
+        mpfr_sub(difference.im, value.im, reconstructed.im, RND);
+        const mpfr_flags_t rangeFlags = mpfr_flags_test(MPFR_FLAGS_UNDERFLOW | MPFR_FLAGS_OVERFLOW | MPFR_FLAGS_ERANGE);
+        mpfr_flags_restore(saved, MPFR_FLAGS_ALL);
+        if (rangeFlags != 0 || !mpfr_number_p(difference.re) || !mpfr_number_p(difference.im) || !makeScaledComplexShadow(difference, *residuals[index - 1])) return false;
+    }
+    return true;
+}
+
+bool subtractOutward(mpfr_srcptr exactComponent, mpfr_srcptr reconstructedComponent, mpfr_ptr lower, mpfr_ptr upper, mpfr_ptr output) {
     const mpfr_flags_t saved = mpfr_flags_save();
     mpfr_flags_clear(MPFR_FLAGS_ALL);
-    mpfr_sub(difference.re, value.re, reconstructed.re, RND);
-    mpfr_sub(difference.im, value.im, reconstructed.im, RND);
+    mpfr_sub(lower, exactComponent, reconstructedComponent, MPFR_RNDD);
+    mpfr_sub(upper, exactComponent, reconstructedComponent, MPFR_RNDU);
+    mpfr_abs(lower, lower, MPFR_RNDU);
+    mpfr_abs(upper, upper, MPFR_RNDU);
     const mpfr_flags_t rangeFlags = mpfr_flags_test(MPFR_FLAGS_UNDERFLOW | MPFR_FLAGS_OVERFLOW | MPFR_FLAGS_ERANGE);
     mpfr_flags_restore(saved, MPFR_FLAGS_ALL);
-    if (rangeFlags != 0 || !mpfr_number_p(difference.re) || !mpfr_number_p(difference.im)) return false;
-    return makeScaledComplexShadow(difference, defect);
+    if (rangeFlags != 0 || !mpfr_number_p(lower) || !mpfr_number_p(upper)) return false;
+    mpfr_set(output, mpfr_cmp(lower, upper) >= 0 ? lower : upper, MPFR_RNDU);
+    return true;
 }
 
 bool makeUpwardScaledRadius(mpfr_srcptr value, ScaledRealValue& output) {
@@ -119,21 +149,14 @@ bool makeUpwardScaledRadius(mpfr_srcptr value, ScaledRealValue& output) {
     return output.isNormalized();
 }
 
-bool compactError(const MpfrComplex& exact, const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, MpfrComplex& reconstructedValue, MpfrComplex& differenceLower, MpfrComplex& differenceUpper, mpfr_ptr componentMaximum, mpfr_ptr maximum, ScaledRealValue& output) {
-    ScaledComplexValue reconstructed;
-    if (makeScaledComplexValue(primary, defect, reconstructed) != ScaledArithmeticStatus::Success || !setMpfrFromScaledValue(reconstructedValue, reconstructed)) return false;
-    auto componentError = [&](mpfr_srcptr exactComponent, mpfr_srcptr reconstructedComponent, mpfr_ptr componentOutput) {
-        mpfr_sub(differenceLower.re, exactComponent, reconstructedComponent, MPFR_RNDD);
-        mpfr_sub(differenceUpper.re, exactComponent, reconstructedComponent, MPFR_RNDU);
-        mpfr_abs(differenceLower.re, differenceLower.re, MPFR_RNDU);
-        mpfr_abs(differenceUpper.re, differenceUpper.re, MPFR_RNDU);
-        if (mpfr_cmp(differenceLower.re, differenceUpper.re) >= 0)
-            mpfr_set(componentOutput, differenceLower.re, MPFR_RNDU);
-        else
-            mpfr_set(componentOutput, differenceUpper.re, MPFR_RNDU);
-    };
-    componentError(exact.re, reconstructedValue.re, maximum);
-    componentError(exact.im, reconstructedValue.im, componentMaximum);
+bool compactError(const MpfrComplex& exact, const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, const ScaledComplexExpansionTail* tail, MpfrComplex& reconstructedValue, MpfrComplex& reconstructionTerm, MpfrComplex& differenceLower, MpfrComplex& differenceUpper, mpfr_ptr componentMaximum, mpfr_ptr maximum, ScaledRealValue& output) {
+    if (tail) {
+        if (!reconstructExpansion(reconstructedValue, reconstructionTerm, primary, defect, tail, 4, RND)) return false;
+    } else {
+        ScaledComplexValue reconstructed;
+        if (makeScaledComplexValue(primary, defect, reconstructed) != ScaledArithmeticStatus::Success || !setMpfrFromScaledValue(reconstructedValue, reconstructed)) return false;
+    }
+    if (!subtractOutward(exact.re, reconstructedValue.re, differenceLower.re, differenceUpper.re, maximum) || !subtractOutward(exact.im, reconstructedValue.im, differenceLower.im, differenceUpper.im, componentMaximum)) return false;
     if (mpfr_cmp(componentMaximum, maximum) > 0) mpfr_set(maximum, componentMaximum, MPFR_RNDU);
     return makeUpwardScaledRadius(maximum, output);
 }
@@ -145,7 +168,9 @@ bool outsideBailout(const MpfrComplex& value, double bailout, mpfr_ptr magnitude
 }
 
 size_t retainedBytes(const ExpressionReferenceOrbitResult& result) {
-    return sizeof(result) + result.samples.capacity() * sizeof(ExpressionReferenceSample) + result.tape.capacity() * sizeof(ExpressionReferenceTapeNode) + result.error.capacity() + result.programSource.capacity();
+    size_t bytes = sizeof(result) + result.samples.capacity() * sizeof(ExpressionReferenceSample) + result.tape.capacity() * sizeof(ExpressionReferenceTapeNode) + result.error.capacity() + result.programSource.capacity();
+    if (result.fourTerm) bytes += sizeof(ExpressionReferenceFourTermData) + result.fourTerm->samples.capacity() * sizeof(ExpressionReferenceSampleFourTerm) + result.fourTerm->tape.capacity() * sizeof(ExpressionReferenceTapeNodeFourTerm);
+    return bytes;
 }
 
 bool addEstimate(uint64_t& total, uint64_t count, uint64_t bytes) {
@@ -154,13 +179,14 @@ bool addEstimate(uint64_t& total, uint64_t count, uint64_t bytes) {
     return true;
 }
 
-bool estimatePeakBytes(const ExpressionProgram& program, uint64_t iterations, uint64_t tapeNodes, mpfr_prec_t precision, uint64_t& peakBytes) {
+bool estimatePeakBytes(const ExpressionProgram& program, uint64_t iterations, uint64_t tapeNodes, mpfr_prec_t precision, ExpressionReferenceCompaction compaction, uint64_t& peakBytes) {
     uint64_t persistent = sizeof(ExpressionReferenceOrbitResult) + 512;
     if (!addEstimate(persistent, iterations, sizeof(ExpressionReferenceSample)) || !addEstimate(persistent, tapeNodes, sizeof(ExpressionReferenceTapeNode)) || !addEstimate(persistent, static_cast<uint64_t>(program.source().size()) + 1, sizeof(char))) return false;
+    if (compaction == ExpressionReferenceCompaction::FourTermCertifiedTransfer && (!addEstimate(persistent, 1, sizeof(ExpressionReferenceFourTermData)) || !addEstimate(persistent, iterations, sizeof(ExpressionReferenceSampleFourTerm)) || !addEstimate(persistent, tapeNodes, sizeof(ExpressionReferenceTapeNodeFourTerm)))) return false;
 
     const uint64_t instructionCount = static_cast<uint64_t>(program.instructionCount());
     const uint64_t stackDepth = static_cast<uint64_t>(program.stackDepth());
-    uint64_t transient = sizeof(ExpressionOracleContext) + sizeof(ExpressionOracleTrace) + 5 * sizeof(MpfrComplex);
+    uint64_t transient = sizeof(ExpressionOracleContext) + sizeof(ExpressionOracleTrace) + 6 * sizeof(MpfrComplex);
     if (!addEstimate(transient, stackDepth, sizeof(MpfrComplex)) || !addEstimate(transient, stackDepth, sizeof(uint16_t)) || !addEstimate(transient, instructionCount, sizeof(ExpressionOracleTraceNode))) return false;
 
     const uint64_t bits = static_cast<uint64_t>(precision);
@@ -240,15 +266,17 @@ bool setMpfrFromScaledShadow(MpfrComplex& output, const ScaledComplexShadow& sha
 }
 
 bool reconstructMpfrFromShadows(MpfrComplex& output, const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, mpfr_rnd_t rounding) {
-    MpfrComplex remainder(output.precision());
-    if (!setMpfrFromScaledShadow(output, primary, rounding) || !setMpfrFromScaledShadow(remainder, defect, rounding)) return false;
-    mpfr_add(output.re, output.re, remainder.re, rounding);
-    mpfr_add(output.im, output.im, remainder.im, rounding);
-    return true;
+    return reconstructMpfrFromExpansion(output, primary, defect, nullptr, rounding);
+}
+
+bool reconstructMpfrFromExpansion(MpfrComplex& output, const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, const ScaledComplexExpansionTail* tail, mpfr_rnd_t rounding) {
+    MpfrComplex term(output.precision());
+    return reconstructExpansion(output, term, primary, defect, tail, tail ? 4 : 2, rounding);
 }
 
 static bool buildExpressionReferenceOrbitImpl(const ExpressionReferenceBuildRequest& request, ExpressionReferenceOrbitResult& result) {
     result = {};
+    result.compaction = request.compaction;
     auto fail = [&](ExpressionReferenceBuildStatus status, const char* message) {
         result.status = status;
         result.error = message;
@@ -263,7 +291,7 @@ static bool buildExpressionReferenceOrbitImpl(const ExpressionReferenceBuildRequ
         return true;
     };
 
-    if ((!request.canonicalProgram && !request.runtimeProgram) || (request.pixelParameter != FormulaParameter::C && request.pixelParameter != FormulaParameter::InitialZ) || request.maxIterations < 0 || !(request.bailout > 0.0) || !std::isfinite(request.bailout) || (request.center.usesMpf() == request.center.usesDecimal()) || (request.center.usesDecimal() && request.center.realDecimal.empty())) { return fail(ExpressionReferenceBuildStatus::InvalidRequest, "invalid expression reference request"); }
+    if ((!request.canonicalProgram && !request.runtimeProgram) || (request.pixelParameter != FormulaParameter::C && request.pixelParameter != FormulaParameter::InitialZ) || request.maxIterations < 0 || !(request.bailout > 0.0) || !std::isfinite(request.bailout) || (request.center.usesMpf() == request.center.usesDecimal()) || (request.center.usesDecimal() && request.center.realDecimal.empty()) || (request.compaction != ExpressionReferenceCompaction::TwoTerm && request.compaction != ExpressionReferenceCompaction::FourTermCertifiedTransfer) || (request.compaction == ExpressionReferenceCompaction::FourTermCertifiedTransfer && request.certificationPrecision == 0)) { return fail(ExpressionReferenceBuildStatus::InvalidRequest, "invalid expression reference request"); }
     if ((request.center.usesMpf() && (!request.center.realMpf || !request.center.imaginaryMpf)) || !finiteComplex(request.fixed.z0) || !finiteComplex(request.fixed.c) || !std::all_of(request.fixed.parameters.begin(), request.fixed.parameters.end(), finiteComplex)) { return fail(ExpressionReferenceBuildStatus::InvalidRequest, "reference inputs must be finite and complete"); }
 
     ExpressionProgram specialized;
@@ -312,11 +340,11 @@ static bool buildExpressionReferenceOrbitImpl(const ExpressionReferenceBuildRequ
     if (iterations > static_cast<uint64_t>(result.samples.max_size()) || tapeNodes > static_cast<uint64_t>(result.tape.max_size())) { return fail(ExpressionReferenceBuildStatus::ResourceLimit, "reference orbit exceeds vector capacity"); }
     if (precision > ExpressionReferencePrecisionPolicy::ApplicationMaximumBits) { return fail(ExpressionReferenceBuildStatus::ResourceLimit, "selected precision exceeds application resource cap"); }
     uint64_t estimatedPeak = 0;
-    if (!estimatePeakBytes(*runtime, iterations, tapeNodes, precision, estimatedPeak) || (request.memoryLimitBytes != 0 && estimatedPeak > static_cast<uint64_t>(request.memoryLimitBytes))) { return fail(ExpressionReferenceBuildStatus::ResourceLimit, "reference orbit exceeds peak memory limit"); }
+    if (!estimatePeakBytes(*runtime, iterations, tapeNodes, precision, request.compaction, estimatedPeak) || (request.memoryLimitBytes != 0 && estimatedPeak > static_cast<uint64_t>(request.memoryLimitBytes))) { return fail(ExpressionReferenceBuildStatus::ResourceLimit, "reference orbit exceeds peak memory limit"); }
     if (request.certificationPrecision != 0) {
         if (request.certificationPrecision <= precision || request.certificationPrecision > request.precision.maximumBits || request.certificationPrecision > ExpressionReferencePrecisionPolicy::ApplicationMaximumBits) { return fail(ExpressionReferenceBuildStatus::PrecisionOutOfRange, "higher reference certification precision is invalid"); }
         uint64_t certificationPeak = 0;
-        if (!estimatePeakBytes(*runtime, iterations, tapeNodes, request.certificationPrecision, certificationPeak) || estimatedPeak > std::numeric_limits<uint64_t>::max() - certificationPeak || (request.memoryLimitBytes != 0 && estimatedPeak + certificationPeak > static_cast<uint64_t>(request.memoryLimitBytes))) { return fail(ExpressionReferenceBuildStatus::ResourceLimit, "certified reference exceeds peak memory limit"); }
+        if (!estimatePeakBytes(*runtime, iterations, tapeNodes, request.certificationPrecision, request.compaction, certificationPeak) || estimatedPeak > std::numeric_limits<uint64_t>::max() - certificationPeak || (request.memoryLimitBytes != 0 && estimatedPeak + certificationPeak > static_cast<uint64_t>(request.memoryLimitBytes))) { return fail(ExpressionReferenceBuildStatus::ResourceLimit, "certified reference exceeds peak memory limit"); }
         result.certificationPrecision = request.certificationPrecision;
     }
 
@@ -342,28 +370,43 @@ static bool buildExpressionReferenceOrbitImpl(const ExpressionReferenceBuildRequ
         certificationContext.z0.set(certificationCenter);
     certificationContext.z.set(certificationContext.z0);
 
+    std::shared_ptr<ExpressionReferenceFourTermData> fourTerm;
+    if (request.compaction == ExpressionReferenceCompaction::FourTermCertifiedTransfer) {
+        fourTerm = std::make_shared<ExpressionReferenceFourTermData>();
+        result.fourTerm = fourTerm;
+    }
+
     MpfrComplex reconstructed(precision);
+    MpfrComplex reconstructionTerm(precision);
     MpfrComplex difference(precision);
     MpfrComplex radiusReconstructed(certificationPrecision);
+    MpfrComplex radiusReconstructionTerm(certificationPrecision);
     MpfrComplex radiusDifferenceLower(certificationPrecision);
     MpfrComplex radiusDifferenceUpper(certificationPrecision);
     MpfrComplex radiusMaximumStorage(certificationPrecision);
     mpfr_ptr radiusComponentMaximum = radiusMaximumStorage.re;
     mpfr_ptr radiusMaximum = radiusMaximumStorage.im;
-    auto compact = [&](const MpfrComplex& value, const MpfrComplex& exact, ScaledComplexShadow& shadow, ScaledComplexShadow& defect, ScaledRealValue& error) {
+    auto compact = [&](const MpfrComplex& value, const MpfrComplex& exact, ScaledComplexShadow& shadow, ScaledComplexShadow& defect, ScaledComplexExpansionTail* tail, ScaledRealValue& error) {
         shadow = {};
         defect = {};
+        if (tail) *tail = {};
         error = {};
-        if (!makeScaledComplexShadow(value, shadow) || !quantizationDefect(value, shadow, reconstructed, difference, defect)) return false;
-        return !certify || compactError(exact, shadow, defect, radiusReconstructed, radiusDifferenceLower, radiusDifferenceUpper, radiusComponentMaximum, radiusMaximum, error);
+        const size_t termCount = tail ? 4 : 2;
+        if (!compactExpansion(value, termCount, shadow, defect, tail, reconstructed, reconstructionTerm, difference)) return false;
+        return !certify || compactError(exact, shadow, defect, tail, radiusReconstructed, radiusReconstructionTerm, radiusDifferenceLower, radiusDifferenceUpper, radiusComponentMaximum, radiusMaximum, error);
     };
-    if (!compact(context.c, certificationContext.c, result.c, result.cDefect, result.cError) || !compact(context.z0, certificationContext.z0, result.z0, result.z0Defect, result.z0Error) || !compact(center, certificationCenter, result.pixel, result.pixelDefect, result.pixelError)) { return fail(ExpressionReferenceBuildStatus::CompactionOutOfRange, "reference input cannot be represented by compact shadows"); }
+    if (!compact(context.c, certificationContext.c, result.c, result.cDefect, fourTerm ? &fourTerm->c : nullptr, result.cError) || !compact(context.z0, certificationContext.z0, result.z0, result.z0Defect, fourTerm ? &fourTerm->z0 : nullptr, result.z0Error) || !compact(center, certificationCenter, result.pixel, result.pixelDefect, fourTerm ? &fourTerm->pixel : nullptr, result.pixelError)) { return fail(ExpressionReferenceBuildStatus::CompactionOutOfRange, "reference input cannot be represented by compact shadows"); }
     result.initialZ = result.z0;
     result.initialZDefect = result.z0Defect;
     result.initialZError = result.z0Error;
+    if (fourTerm) fourTerm->initialZ = fourTerm->z0;
 
     result.samples.reserve(static_cast<size_t>(iterations));
     result.tape.reserve(static_cast<size_t>(tapeNodes));
+    if (fourTerm) {
+        fourTerm->samples.reserve(static_cast<size_t>(iterations));
+        fourTerm->tape.reserve(static_cast<size_t>(tapeNodes));
+    }
 
     MpfrComplex magnitudeStorage(precision);
     mpfr_ptr magnitude = magnitudeStorage.re;
@@ -396,8 +439,9 @@ static bool buildExpressionReferenceOrbitImpl(const ExpressionReferenceBuildRequ
             if (certify && (certificationTrace.nodes.size() != trace.nodes.size() || certificationDefined != defined)) { return fail(ExpressionReferenceBuildStatus::CompactionOutOfRange, "higher-precision reference did not converge to the same finite trace"); }
 
             ExpressionReferenceSample sample;
+            ExpressionReferenceSampleFourTerm sampleFourTerm;
             sample.iteration = iteration;
-            if (!compact(context.z, certificationContext.z, sample.z, sample.zDefect, sample.zError) || !compact(next, certificationNext, sample.next, sample.rootDefect, sample.nextError)) { return fail(ExpressionReferenceBuildStatus::CompactionOutOfRange, "reference sample cannot be represented by compact shadows"); }
+            if (!compact(context.z, certificationContext.z, sample.z, sample.zDefect, fourTerm ? &sampleFourTerm.z : nullptr, sample.zError) || !compact(next, certificationNext, sample.next, sample.rootDefect, fourTerm ? &sampleFourTerm.next : nullptr, sample.nextError)) { return fail(ExpressionReferenceBuildStatus::CompactionOutOfRange, "reference sample cannot be represented by compact shadows"); }
             sample.tapeOffset = result.tape.size();
             sample.tapeCount = static_cast<uint16_t>(trace.nodes.size());
             sample.rootNode = static_cast<uint16_t>(trace.nodes.size() - 1);
@@ -406,9 +450,10 @@ static bool buildExpressionReferenceOrbitImpl(const ExpressionReferenceBuildRequ
                 const ExpressionOracleTraceNode& exact = certify ? certificationTrace.nodes[traceIndex] : traced;
                 if (certify && (traced.operation != exact.operation || traced.argument != exact.argument || traced.leftNode != exact.leftNode || traced.rightNode != exact.rightNode)) { return fail(ExpressionReferenceBuildStatus::CompactionOutOfRange, "higher-precision reference tape layout mismatch"); }
                 ExpressionReferenceTapeNode node;
-                if (!compact(traced.output, exact.output, node.output, node.outputDefect, node.outputError)) { return fail(ExpressionReferenceBuildStatus::CompactionOutOfRange, "reference tape output cannot be represented by compact shadows"); }
+                ExpressionReferenceTapeNodeFourTerm nodeFourTerm;
+                if (!compact(traced.output, exact.output, node.output, node.outputDefect, fourTerm ? &nodeFourTerm.output : nullptr, node.outputError)) { return fail(ExpressionReferenceBuildStatus::CompactionOutOfRange, "reference tape output cannot be represented by compact shadows"); }
                 if (traced.flags & (OracleTraceHasCompanion | OracleTraceHasDenominator | OracleTraceHasLogarithmBase)) {
-                    if (!compact(traced.auxiliary, exact.auxiliary, node.auxiliary, node.auxiliaryDefect, node.auxiliaryError)) { return fail(ExpressionReferenceBuildStatus::CompactionOutOfRange, "reference tape auxiliary cannot be represented by compact shadows"); }
+                    if (!compact(traced.auxiliary, exact.auxiliary, node.auxiliary, node.auxiliaryDefect, fourTerm ? &nodeFourTerm.auxiliary : nullptr, node.auxiliaryError)) { return fail(ExpressionReferenceBuildStatus::CompactionOutOfRange, "reference tape auxiliary cannot be represented by compact shadows"); }
                 }
                 node.leftNode = traced.leftNode;
                 node.rightNode = traced.rightNode;
@@ -419,9 +464,11 @@ static bool buildExpressionReferenceOrbitImpl(const ExpressionReferenceBuildRequ
                 node.clearance = traced.clearance;
                 node.certification = traced.certification;
                 result.tape.push_back(node);
+                if (fourTerm) fourTerm->tape.push_back(nodeFourTerm);
             }
             sample.rootError = result.tape[static_cast<size_t>(sample.tapeOffset) + sample.rootNode].outputError;
             result.samples.push_back(sample);
+            if (fourTerm) fourTerm->samples.push_back(sampleFourTerm);
 
             if (!defined) {
                 result.undefined = true;
@@ -448,6 +495,7 @@ bool buildExpressionReferenceOrbit(const ExpressionReferenceBuildRequest& reques
     } catch (const std::bad_alloc&) {
         std::vector<ExpressionReferenceSample>().swap(result.samples);
         std::vector<ExpressionReferenceTapeNode>().swap(result.tape);
+        result.fourTerm.reset();
         result.status = ExpressionReferenceBuildStatus::ResourceLimit;
         result.error.clear();
         result.valid = false;
@@ -457,6 +505,7 @@ bool buildExpressionReferenceOrbit(const ExpressionReferenceBuildRequest& reques
     } catch (const std::length_error&) {
         std::vector<ExpressionReferenceSample>().swap(result.samples);
         std::vector<ExpressionReferenceTapeNode>().swap(result.tape);
+        result.fourTerm.reset();
         result.status = ExpressionReferenceBuildStatus::ResourceLimit;
         result.error.clear();
         result.valid = false;

@@ -3085,7 +3085,7 @@ bool ExpressionTaylorJetBuilder::build(const ExpressionTaylorJetRequest& request
                         ScaledComplexBall referenceOutput;
                         if (arithmetic == ScaledArithmeticStatus::Success) arithmetic = makeScaledComplexValue(node.output, node.outputDefect, referenceOutput.value);
                         if (arithmetic != ScaledArithmeticStatus::Success) break;
-                        if (!dividePolynomials(meromorphicNumerator.data(), remainders[node.leftNode], meromorphicDenominator.data(), remainders[node.rightNode], referenceOutput, &coefficient(local, 0), remainders[local])) arithmetic = ScaledArithmeticStatus::Success;
+                        if (!dividePolynomials(meromorphicNumerator.data(), remainders[node.leftNode], meromorphicDenominator.data(), remainders[node.rightNode], referenceOutput, &coefficient(local, 0), remainders[local])) arithmetic = ScaledArithmeticStatus::ExponentRange;
                         break;
                     }
                     case Op::Exp:
@@ -3093,14 +3093,14 @@ bool ExpressionTaylorJetBuilder::build(const ExpressionTaylorJetRequest& request
                     case Op::Cos:
                     case Op::Sinh:
                     case Op::Cosh:
-                        if (!composeEntire(local, node, remainders[local])) arithmetic = ScaledArithmeticStatus::Success;
+                        if (!composeEntire(local, node, remainders[local])) arithmetic = ScaledArithmeticStatus::ExponentRange;
                         break;
                     case Op::Log:
                     case Op::Log10: {
                         const uint64_t operationsBefore = candidate.operations;
                         ScaledComplexBall baseFunction;
                         if (!composePrincipalLogVariation(node, sampleOffset, node.leftNode, op == Op::Log10, &coefficient(local, 0), remainders[local], baseFunction)) {
-                            arithmetic = ScaledArithmeticStatus::Success;
+                            arithmetic = ScaledArithmeticStatus::ExponentRange;
                             break;
                         }
                         ScaledComplexBall referenceOutput;
@@ -3117,7 +3117,7 @@ bool ExpressionTaylorJetBuilder::build(const ExpressionTaylorJetRequest& request
                         ScaledComplexValue inputCenter;
                         ScaledRealValue logRemainder;
                         if (!composePrincipalLogVariation(node, sampleOffset, node.leftNode, false, meromorphicNumerator.data(), logRemainder, logBase, &inputCenter)) {
-                            arithmetic = ScaledArithmeticStatus::Success;
+                            arithmetic = ScaledArithmeticStatus::ExponentRange;
                             break;
                         }
                         ScaledComplexBall oneHalf;
@@ -3128,7 +3128,7 @@ bool ExpressionTaylorJetBuilder::build(const ExpressionTaylorJetRequest& request
                         if (arithmetic == ScaledArithmeticStatus::Success) arithmetic = makePrincipalFunctionBall(inputCenter, PrincipalFunction::Sqrt, request.reference->certificationPrecision, sqrtBase);
                         if (arithmetic != ScaledArithmeticStatus::Success) break;
                         if (!composeEntire(local, node, remainders[local], &coefficient(local, 0), ExpressionOracleOperation::Exp, &sqrtBase, nullptr, meromorphicDenominator.data(), &halfLogRemainder)) {
-                            arithmetic = ScaledArithmeticStatus::Success;
+                            arithmetic = ScaledArithmeticStatus::ExponentRange;
                             break;
                         }
                         ScaledComplexBall referenceOutput;
@@ -3149,7 +3149,7 @@ bool ExpressionTaylorJetBuilder::build(const ExpressionTaylorJetRequest& request
                         ScaledComplexBall logBase;
                         ScaledRealValue logRemainder;
                         if (!composePrincipalLogVariation(node, sampleOffset, node.leftNode, false, meromorphicNumerator.data(), logRemainder, logBase)) {
-                            arithmetic = ScaledArithmeticStatus::Success;
+                            arithmetic = ScaledArithmeticStatus::ExponentRange;
                             break;
                         }
 
@@ -3184,7 +3184,7 @@ bool ExpressionTaylorJetBuilder::build(const ExpressionTaylorJetRequest& request
                         if (arithmetic == ScaledArithmeticStatus::Success) arithmetic = makePrincipalFunctionBall(productCenter, PrincipalFunction::Exp, request.reference->certificationPrecision, exponentialBase);
                         if (arithmetic != ScaledArithmeticStatus::Success) break;
                         if (!composeEntire(local, node, remainders[local], &coefficient(local, 0), ExpressionOracleOperation::Exp, &exponentialBase, nullptr, quotientCoefficients.data(), &productRemainder)) {
-                            arithmetic = ScaledArithmeticStatus::Success;
+                            arithmetic = ScaledArithmeticStatus::ExponentRange;
                             break;
                         }
                         ScaledComplexBall referenceOutput;
@@ -3264,7 +3264,7 @@ bool ExpressionTaylorJetBuilder::build(const ExpressionTaylorJetRequest& request
                         ScaledRealValue cosineRemainder;
                         const bool hyperbolic = op == Op::Tanh;
                         if (!composeEntire(local, node, sineRemainder, meromorphicNumerator.data(), hyperbolic ? ExpressionOracleOperation::Sinh : ExpressionOracleOperation::Sin, &zero, &one) || !composeEntire(local, node, cosineRemainder, meromorphicDenominator.data(), hyperbolic ? ExpressionOracleOperation::Cosh : ExpressionOracleOperation::Cos, &one, &zero)) {
-                            arithmetic = ScaledArithmeticStatus::Success;
+                            arithmetic = ScaledArithmeticStatus::ExponentRange;
                             break;
                         }
                         arithmetic = addBall(one, meromorphicDenominator[0], meromorphicDenominator[0]);
@@ -3277,7 +3277,7 @@ bool ExpressionTaylorJetBuilder::build(const ExpressionTaylorJetRequest& request
                         ScaledRealValue denominatorRemainder = cosineRemainder;
                         if (arithmetic == ScaledArithmeticStatus::Success) arithmetic = addPolynomialTerm(functionTerm, denominatorRemainder, functionFirst, scaledSineRemainder, !hyperbolic);
                         if (arithmetic != ScaledArithmeticStatus::Success) break;
-                        if (!dividePolynomials(functionScratch.data(), numeratorRemainder, functionTerm.data(), denominatorRemainder, referenceOutput, &coefficient(local, 0), remainders[local], &conservativePoint)) arithmetic = ScaledArithmeticStatus::Success;
+                        if (!dividePolynomials(functionScratch.data(), numeratorRemainder, functionTerm.data(), denominatorRemainder, referenceOutput, &coefficient(local, 0), remainders[local], &conservativePoint)) arithmetic = ScaledArithmeticStatus::ExponentRange;
                         break;
                     }
                     default: arithmetic = ScaledArithmeticStatus::Singular; break;

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "formula_reference_orbit.h"
 #include "formula_scaled_residual.h"
@@ -72,6 +73,29 @@ struct ExpressionDeepPreflightPolicy {
     uint32_t earlyRejectMinimumFirstUncertainIteration = 8;
 };
 
+struct ExpressionDeepTransferPolicy {
+    // Opt-in prototype for ExactCenteredArithmetic. It builds one certified
+    // terminal segment over the full frame and otherwise routes directly to
+    // the existing exact MPFR fallback.
+    bool enableCertifiedSegments = false;
+    bool requirePredictedBenefit = true;
+    size_t minimumPixelCount = 256;
+    int minimumIterations = 32;
+};
+
+struct ExpressionDeepCenteredPolicy {
+    // Default-off exact/entire/real-smooth c- or z0-plane candidate. It is
+    // never exposed as a render mode: failed admission or sparse verification
+    // continues through exact MPFR.
+    bool enableAdaptiveCandidate = false;
+    bool requirePredictedBenefit = true;
+    size_t minimumPixelCount = 256;
+    int minimumIterations = 256;
+    size_t maximumReferences = 5;
+    size_t preflightSamples = 256;
+    double maximumPredictedFallbackRate = 0.125;
+};
+
 enum class ExpressionDeepRenderPhase : uint8_t { Reference,
                                                  Preflight,
                                                  Fast,
@@ -96,6 +120,22 @@ enum class ExpressionDeepFallbackReason : uint8_t { UncertifiedSeries,
                                                     BailoutUncertain,
                                                     ReconstructionFailure,
                                                     Count };
+
+enum class ExpressionDeepCenteredFallbackReason : uint8_t { CandidateFailure,
+                                                            Nonfinite,
+                                                            ReferenceOutputDisagreement,
+                                                            StateDisagreement,
+                                                            InteriorConservatism,
+                                                            DoubleDoubleRejected,
+                                                            StructuralInconsistency,
+                                                            DenominatorInstability,
+                                                            Count };
+
+constexpr uint8_t expressionDeepCenteredFallbackReasonMask(ExpressionDeepCenteredFallbackReason reason) {
+    return uint8_t{1} << static_cast<uint8_t>(reason);
+}
+
+constexpr uint8_t ExpressionDeepCenteredFallbackMandatoryMask = expressionDeepCenteredFallbackReasonMask(ExpressionDeepCenteredFallbackReason::CandidateFailure) | expressionDeepCenteredFallbackReasonMask(ExpressionDeepCenteredFallbackReason::Nonfinite) | expressionDeepCenteredFallbackReasonMask(ExpressionDeepCenteredFallbackReason::ReferenceOutputDisagreement) | expressionDeepCenteredFallbackReasonMask(ExpressionDeepCenteredFallbackReason::DoubleDoubleRejected) | expressionDeepCenteredFallbackReasonMask(ExpressionDeepCenteredFallbackReason::StructuralInconsistency) | expressionDeepCenteredFallbackReasonMask(ExpressionDeepCenteredFallbackReason::DenominatorInstability);
 
 enum class ExpressionDeepRenderStatus : uint8_t { Success,
                                                   Cancelled,
@@ -133,6 +173,8 @@ struct ExpressionDeepRenderRequest {
     ExpressionDeepMemoryPolicy memory;
     ExpressionDeepTaylorPolicy taylor;
     ExpressionDeepPreflightPolicy preflight;
+    ExpressionDeepTransferPolicy transfer;
+    ExpressionDeepCenteredPolicy centered;
     // This is a verification/benchmark switch. Production callers must leave
     // it false because local transcendental series are not interval-certified.
     bool allowUncertifiedForBenchmark = false;
@@ -144,6 +186,15 @@ struct ExpressionDeepRenderRequest {
     bool disablePiecewiseBigFixedForVerification = false;
     // Verification-only outward inflation of every certification radius.
     int verificationErrorInflationBits = 0;
+    // Verification-only selector calibration overrides. Production callers
+    // must leave these at zero to use the fixed production thresholds.
+    double verificationCenteredPrimaryErrorThreshold = 0.0;
+    double verificationCenteredStateDisagreementThreshold = 0.0;
+    // Verification-only adaptive-fallback precision/sample overrides.
+    mpfr_prec_t verificationCenteredFallbackCandidatePrecision = 0;
+    size_t verificationCenteredFallbackValidationSamples = 0;
+    mpfr_prec_t verificationCenteredMandatoryFallbackCandidatePrecision = 0;
+    size_t verificationCenteredMandatoryFallbackValidationSamples = 0;
     // Verification-only deterministic exception injection. Production callers
     // must leave this at None.
     ExpressionDeepVerificationFault verificationFault = ExpressionDeepVerificationFault::None;
@@ -199,6 +250,76 @@ struct ExpressionDeepRenderResult {
     uint64_t fastFoldOperationCount = 0;
     uint64_t fastUncertainFoldCount = 0;
     std::array<uint64_t, ExpressionDeepUncertaintyHistogramBins> fallbackFirstUncertainHistogram{};
+    bool transferAttempted = false;
+    bool transferAccepted = false;
+    uint64_t transferAcceptedSegmentCount = 0;
+    int transferCoveredIterations = 0;
+    uint64_t transferSkippedIterationCount = 0;
+    double transferBuildSeconds = 0.0;
+    double transferApplySeconds = 0.0;
+    size_t transferMemoryBytes = 0;
+    ScaledRealValue transferFinalRadius;
+    bool centeredAttempted = false;
+    bool centeredAccepted = false;
+    bool centeredPreflightRejected = false;
+    uint64_t centeredReferenceCount = 0;
+    uint64_t centeredReferenceAttemptCount = 0;
+    uint64_t centeredPreflightSampleCount = 0;
+    uint64_t centeredPreflightPrimaryRiskFlagCount = 0;
+    uint64_t centeredPreflightSecondaryEvaluationCount = 0;
+    uint64_t centeredPreflightInitialFlagCount = 0;
+    uint64_t centeredPreflightAdditionalReferenceEvaluationCount = 0;
+    uint64_t centeredPreflightFlagCount = 0;
+    uint64_t centeredPrimaryRiskFlagCount = 0;
+    uint64_t centeredSecondaryEvaluationCount = 0;
+    uint64_t centeredSelectorFlagCount = 0;
+    uint64_t centeredAdditionalReferenceEvaluationCount = 0;
+    uint64_t centeredHierarchyEvaluationCount = 0;
+    uint64_t centeredFinalFallbackFlagCount = 0;
+    uint64_t centeredDoubleDoubleVerifiedPixelCount = 0;
+    uint64_t centeredDoubleDoubleAgreementCount = 0;
+    uint64_t centeredDoubleDoubleRejectedCount = 0;
+    uint64_t centeredDoubleDoubleIterationCount = 0;
+    uint64_t centeredVectorStepCount = 0;
+    uint64_t centeredVectorActiveLaneCount = 0;
+    double centeredPreflightSeconds = 0.0;
+    double centeredPrimarySeconds = 0.0;
+    double centeredSecondarySeconds = 0.0;
+    double centeredCandidateSeconds = 0.0;
+    double centeredSelectorSeconds = 0.0;
+    double centeredAdditionalReferenceSeconds = 0.0;
+    double centeredFinalSelectorSeconds = 0.0;
+    double centeredDoubleDoubleSeconds = 0.0;
+    mpfr_prec_t centeredFallbackCandidatePrecision = 0;
+    mpfr_prec_t centeredFallbackFullPrecision = 0;
+    bool centeredFallbackValidationIsEmpirical = false;
+    uint64_t centeredFallbackValidationSampleCount = 0;
+    uint64_t centeredFallbackValidationMismatchCount = 0;
+    bool centeredFallbackUpgraded = false;
+    uint64_t centeredFallbackMandatoryFullPixelCount = 0;
+    mpfr_prec_t centeredFallbackMandatoryCandidatePrecision = 0;
+    uint64_t centeredFallbackMandatoryCandidatePixelCount = 0;
+    uint64_t centeredFallbackMandatoryCandidateIterationCount = 0;
+    double centeredFallbackMandatoryCandidateSeconds = 0.0;
+    uint64_t centeredFallbackMandatoryFullPrecisionPixelCount = 0;
+    uint64_t centeredFallbackMandatoryFullPrecisionIterationCount = 0;
+    double centeredFallbackMandatoryFullPrecisionSeconds = 0.0;
+    uint64_t centeredFallbackMandatoryValidationSampleCount = 0;
+    uint64_t centeredFallbackMandatoryValidationMismatchCount = 0;
+    bool centeredFallbackMandatoryUpgraded = false;
+    uint64_t centeredFallbackMandatoryUpgradedPixelCount = 0;
+    uint64_t centeredFallbackLowEligiblePixelCount = 0;
+    uint64_t centeredFallbackUpgradedPixelCount = 0;
+    std::array<uint64_t, static_cast<size_t>(ExpressionDeepCenteredFallbackReason::Count)> centeredFallbackPrecisionReasonCounts{};
+    std::vector<uint8_t> centeredFallbackPrecisionReasonMask;
+    uint64_t centeredFallbackLowPrecisionPixelCount = 0;
+    uint64_t centeredFallbackLowPrecisionIterationCount = 0;
+    double centeredFallbackLowPrecisionSeconds = 0.0;
+    uint64_t centeredFallbackFullPrecisionPixelCount = 0;
+    uint64_t centeredFallbackFullPrecisionIterationCount = 0;
+    double centeredFallbackFullPrecisionSeconds = 0.0;
+    uint64_t centeredFallbackMandatoryFullIterationCount = 0;
+    double centeredFallbackMandatoryFullSeconds = 0.0;
     bool usedSpecializedPiecewiseMpfr = false;
     uint64_t specializedPiecewiseMpfrPixelCount = 0;
     uint64_t specializedPiecewiseMpfrIterationCount = 0;
@@ -272,6 +393,7 @@ struct ExpressionDeepRenderResult {
 
 const char* expressionDeepRenderStatusName(ExpressionDeepRenderStatus status);
 const char* expressionDeepFallbackReasonName(ExpressionDeepFallbackReason reason);
+const char* expressionDeepCenteredFallbackReasonName(ExpressionDeepCenteredFallbackReason reason);
 const char* expressionDeepPreflightDecisionName(ExpressionDeepPreflightDecision decision);
 
 // Renders finite-iteration escape classifications. The arithmetic fast path is

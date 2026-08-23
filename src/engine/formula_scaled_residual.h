@@ -45,6 +45,10 @@ ScaledArithmeticStatus makeScaledComplexValue(const MpfrComplex& value, ScaledCo
 ScaledArithmeticStatus makeScaledRealValue(const ScaledRealShadow& shadow, ScaledRealValue& output);
 ScaledArithmeticStatus makeScaledComplexValue(const ScaledComplexShadow& shadow, ScaledComplexValue& output);
 ScaledArithmeticStatus makeScaledComplexValue(const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, ScaledComplexValue& output);
+// Reconstructs every retained term through certified scaled additions. The
+// midpoint is a ScaledComplexValue and radius encloses all binary64 summation
+// loss, so tails can never be silently discarded by a certified consumer.
+ScaledArithmeticStatus makeScaledComplexExpansionBall(const ScaledComplexShadow& primary, const ScaledComplexShadow& defect, const ScaledComplexExpansionTail* tail, ScaledComplexBall& output);
 
 bool setMpfrFromScaledValue(mpfr_ptr output, const ScaledRealValue& value, mpfr_rnd_t rounding = MPFR_RNDN);
 bool setMpfrFromScaledValue(MpfrComplex& output, const ScaledComplexValue& value, mpfr_rnd_t rounding = MPFR_RNDN);

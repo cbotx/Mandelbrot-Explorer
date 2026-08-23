@@ -103,14 +103,70 @@ landing bounds, renderer parity, memory fallback, and the acceleration gate.
 `expression-deep-render` verifies the production-shaped tiled frame API,
 higher-precision-MPFR-relative arithmetic certification, rigorous bailout
 intervals, automatic per-pixel MPFR fallback, cancellation, determinism,
-adversarial views, and e500 timing. Certified paths also fall back
+adversarial views, and e500 timing. It also exercises the default-off
+`enableCertifiedSegments` prototype: ExactCenteredArithmetic C-plane requests
+retain four nonoverlapping reference terms and may accept one full-frame
+terminal transfer segment only after every intermediate state is certified
+inside bailout; rejection restarts the existing exact MPFR path. The
+direct renderer keeps `enableAdaptiveCandidate` default-off. For
+exact-arithmetic, certified-entire, and supported real-smooth formulas on the
+`c` or `z0` pixel plane, the candidate compares two fused full-frame reference
+evaluations and evaluates the remaining
+retained references only for flagged pixels. Failures, output disagreement,
+and unresolved interior-state
+disagreement use exact MPFR. Unanimous exterior pixels with high state
+disagreement first pass through a bounded opcode-generic AVX2 double-double
+direct-orbit verifier using exact high/low coordinate transfer and the selected
+pixel binding; only an exact
+raw escape-iteration agreement is accepted. This verifier is an independent
+disagreement detector, not a proof, and unsupported or nonfinite evaluation
+also uses MPFR. Low-risk interiors are accepted directly. A 256-sample exact
+preflight checks those samples against MPFR, applies double-double only to
+high-state-disagreement exterior samples, and rejects the candidate if any
+accepted sample differs from its high-precision oracle.
+The primary selector propagates a real 2x2 state Jacobian and uses its operator
+norm; nonholomorphic component operations never reuse a holomorphic derivative.
+Its four-lane AVX2 batches refill completed lanes independently
+across reference iterations and report active-lane utilization in the
+verifier. Its selected fallback queue uses an automatic
+160/192/224/256-bit precision ladder only for pixels whose centered references
+produce identical raw outputs and fall back solely for state disagreement or
+interior conservatism. Candidate failures, nonfinite state, reference-output disagreement,
+double-double rejection, and other structural inconsistencies use a validated
+224-bit candidate with a separate deterministic risk-biased 32-pixel 327-bit sample;
+any mismatch or undefined candidate upgrades the whole structural subset.
+This sample is isolated from the 160-bit low-eligible validator. Sparse
+low/full validation is limited to the low-eligible subset; a mismatch upgrades
+that entire subset, and full validation outputs are reused. Interior candidates
+are compared
+across every retained centered reference when structural risk requires the
+reference hierarchy; low-risk interiors take the direct path guarded by the
+exact preflight.
+Certified paths also
+fall back
 conservatively near poles, branch cuts/zero, and MPFR's runtime exponent
 limits. Scalar-real component absolute values use certified per-pixel branch
 selection (and fixed-cell Taylor only when the entire cell stays on one side
 of the fold); general complex-modulus `abs(z)`, mixed real/transcendental
 formulas, argument, polar, and other unsupported operations default to MPFR.
-The CPU GUI backend dispatches eligible deep custom formulas through this
-certified renderer and falls back to exact per-pixel MPFR where required.
+The adaptive real-smooth subset is `conj`, `real`, `imag`, `norm`, and
+`complex`; the adaptive meromorphic subset includes `divide`, `tan`, and `tanh`
+with exact real-axis pole-distance guards; `abs`, `arg`, and `polar` remain outside this candidate.
+`build\verify.exe centered-sweep` densely checks the fixed, formula-generic
+selector thresholds across target, neighboring, bailout, neutral, nested, and
+unsafe-preflight frames before reporting the lowest-work passing combination.
+`build\verify.exe centered-mandatory` scans 224/256/288/327-bit structural
+fallback over dense 64/120/208 gates and the persisted full GT supplied by
+`MANDEL_CENTERED_FULL_GT_FILE`, including a forced precision-sensitive upgrade.
+The CPU generic-deep backend automatically opts eligible production requests
+into the adaptive centered candidate after the existing certified path has
+selected full-frame fallback. Direct renderer callers remain default-off for
+controlled verification. Rejection retains the existing Taylor/MPFR path.
+`build\verify.exe adaptive-phase1` runs dense z0-plane and real-smooth MPFR
+parity, odd-tail, unsupported-`abs`, cancellation, backend telemetry, and
+208x139 e12 speed gates.
+`build\verify.exe adaptive-phase2` runs dense meromorphic (`divide`, `tan`, `tanh`)
+c-plane and z0-plane MPFR parity and 208x139 e12 speed gates (~23x-27x speedup).
 
 ### Compute backend
 

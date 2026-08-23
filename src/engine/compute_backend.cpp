@@ -182,6 +182,8 @@ class CpuComputeBackend final : public IComputeBackend {
             _genericInfo.phase = "reference/Taylor planning";
             _genericInfo.progress = 0.0f;
             _genericInfo.pixelCount = pixelCount;
+            _genericInfo.pixelParameter = request.expressionPixel;
+            _genericInfo.capability = request.expression->scaledResidualCapability();
         }
         if (request.progress) request.progress->store(0.0f, std::memory_order_relaxed);
 
@@ -202,6 +204,7 @@ class CpuComputeBackend final : public IComputeBackend {
         deepRequest.output = request.iterations;
         deepRequest.outputCount = static_cast<size_t>(pixelCount);
         deepRequest.precision.viewBits = static_cast<mpfr_prec_t>(std::max({mpf_get_prec(request.centerRe), mpf_get_prec(request.centerIm), mpf_get_prec(request.scale)}));
+        deepRequest.centered.enableAdaptiveCandidate = true;
         deepRequest.shouldCancel = [this, engine = request.cpuEngine] { return _cancelRequested.load(std::memory_order_acquire) || engine->HaltRequested(); };
         deepRequest.progress = [this, progress = request.progress](formula::ExpressionDeepRenderPhase phase, uint64_t completed, uint64_t total) {
             const float value = phaseProgress(phase, completed, total);
@@ -225,6 +228,13 @@ class CpuComputeBackend final : public IComputeBackend {
             _genericInfo.preflightRejectedFast = deepResult.preflightRejectedFast;
             _genericInfo.specializedPiecewiseMpfr = deepResult.usedSpecializedPiecewiseMpfr;
             _genericInfo.piecewiseBigFixed = deepResult.usedPiecewiseBigFixed;
+            _genericInfo.adaptiveAttempted = deepResult.centeredAttempted;
+            _genericInfo.adaptiveAccepted = deepResult.centeredAccepted;
+            _genericInfo.adaptiveRejected = deepResult.centeredPreflightRejected;
+            _genericInfo.adaptiveUpgraded = deepResult.centeredFallbackUpgraded;
+            _genericInfo.adaptiveMandatoryUpgraded = deepResult.centeredFallbackMandatoryUpgraded;
+            _genericInfo.pixelParameter = request.expressionPixel;
+            _genericInfo.capability = deepResult.capability;
             _genericInfo.status = formula::expressionDeepRenderStatusName(deepResult.status);
             _genericInfo.predictedPath = formula::expressionDeepPreflightDecisionName(deepResult.preflightDecision);
             _genericInfo.error = deepResult.error;
@@ -247,6 +257,32 @@ class CpuComputeBackend final : public IComputeBackend {
             _genericInfo.genericMpfrPeriodicPixelCount = deepResult.genericMpfrPeriodicPixelCount;
             _genericInfo.piecewiseBigFixedPixelCount = deepResult.piecewiseBigFixedPixelCount;
             _genericInfo.piecewiseBigFixedIterationCount = deepResult.piecewiseBigFixedIterationCount;
+            _genericInfo.adaptiveReferences = deepResult.centeredReferenceCount;
+            _genericInfo.adaptivePreflightSamples = deepResult.centeredPreflightSampleCount;
+            _genericInfo.adaptivePreflightFlags = deepResult.centeredPreflightFlagCount;
+            _genericInfo.adaptivePrimary = deepResult.centeredPrimaryRiskFlagCount;
+            _genericInfo.adaptiveSecondary = deepResult.centeredSecondaryEvaluationCount;
+            _genericInfo.adaptiveHierarchy = deepResult.centeredHierarchyEvaluationCount;
+            _genericInfo.adaptiveDd = deepResult.centeredDoubleDoubleVerifiedPixelCount;
+            _genericInfo.adaptiveFallback = deepResult.centeredFinalFallbackFlagCount;
+            _genericInfo.adaptiveCandidatePrecision = static_cast<uint64_t>(deepResult.centeredFallbackCandidatePrecision);
+            _genericInfo.adaptiveFullPrecision = static_cast<uint64_t>(deepResult.centeredFallbackFullPrecision);
+            _genericInfo.adaptiveValidationSamples = deepResult.centeredFallbackValidationSampleCount;
+            _genericInfo.adaptiveValidationMismatches = deepResult.centeredFallbackValidationMismatchCount;
+            _genericInfo.adaptiveMandatoryFull = deepResult.centeredFallbackMandatoryFullPixelCount;
+            _genericInfo.adaptiveMandatoryCandidatePrecision = static_cast<uint64_t>(deepResult.centeredFallbackMandatoryCandidatePrecision);
+            _genericInfo.adaptiveMandatoryCandidatePixels = deepResult.centeredFallbackMandatoryCandidatePixelCount;
+            _genericInfo.adaptiveMandatoryFullPrecisionPixels = deepResult.centeredFallbackMandatoryFullPrecisionPixelCount;
+            _genericInfo.adaptiveMandatoryValidationSamples = deepResult.centeredFallbackMandatoryValidationSampleCount;
+            _genericInfo.adaptiveMandatoryValidationMismatches = deepResult.centeredFallbackMandatoryValidationMismatchCount;
+            _genericInfo.adaptiveMandatoryUpgradedPixels = deepResult.centeredFallbackMandatoryUpgradedPixelCount;
+            _genericInfo.adaptiveLowEligible = deepResult.centeredFallbackLowEligiblePixelCount;
+            _genericInfo.adaptiveUpgradedPixels = deepResult.centeredFallbackUpgradedPixelCount;
+            _genericInfo.adaptiveLowIterations = deepResult.centeredFallbackLowPrecisionIterationCount;
+            _genericInfo.adaptiveFullIterations = deepResult.centeredFallbackFullPrecisionIterationCount;
+            _genericInfo.adaptiveMandatoryFullIterations = deepResult.centeredFallbackMandatoryFullIterationCount;
+            _genericInfo.adaptiveMandatoryCandidateIterations = deepResult.centeredFallbackMandatoryCandidateIterationCount;
+            _genericInfo.adaptiveMandatoryFullPrecisionIterations = deepResult.centeredFallbackMandatoryFullPrecisionIterationCount;
             _genericInfo.selectedPrecision = static_cast<uint64_t>(deepResult.selectedPrecision);
             _genericInfo.fallbackPrecision = static_cast<uint64_t>(deepResult.fallbackPrecision);
             _genericInfo.totalSeconds = totalSeconds;
@@ -255,6 +291,18 @@ class CpuComputeBackend final : public IComputeBackend {
             _genericInfo.taylorSeconds = deepResult.taylorBuildSeconds + deepResult.fastSeconds;
             _genericInfo.fastSeconds = deepResult.fastSeconds;
             _genericInfo.fallbackSeconds = deepResult.fallbackSeconds;
+            _genericInfo.adaptivePreflightSeconds = deepResult.centeredPreflightSeconds;
+            _genericInfo.adaptivePrimarySeconds = deepResult.centeredPrimarySeconds;
+            _genericInfo.adaptiveSelectSeconds = deepResult.centeredSelectorSeconds + deepResult.centeredFinalSelectorSeconds;
+            _genericInfo.adaptiveSecondarySeconds = deepResult.centeredSecondarySeconds;
+            _genericInfo.adaptiveHierarchySeconds = deepResult.centeredAdditionalReferenceSeconds;
+            _genericInfo.adaptiveDdSeconds = deepResult.centeredDoubleDoubleSeconds;
+            _genericInfo.adaptiveFallbackSeconds = deepResult.centeredFallbackLowPrecisionSeconds + deepResult.centeredFallbackFullPrecisionSeconds;
+            _genericInfo.adaptiveLowSeconds = deepResult.centeredFallbackLowPrecisionSeconds;
+            _genericInfo.adaptiveFullSeconds = deepResult.centeredFallbackFullPrecisionSeconds;
+            _genericInfo.adaptiveMandatoryFullSeconds = deepResult.centeredFallbackMandatoryFullSeconds;
+            _genericInfo.adaptiveMandatoryCandidateSeconds = deepResult.centeredFallbackMandatoryCandidateSeconds;
+            _genericInfo.adaptiveMandatoryFullPrecisionSeconds = deepResult.centeredFallbackMandatoryFullPrecisionSeconds;
         }
         if (success && request.progress) request.progress->store(1.0f, std::memory_order_relaxed);
         return success;

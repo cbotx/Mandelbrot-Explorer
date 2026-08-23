@@ -923,6 +923,17 @@ class App {
         return true;
     }
 
+    void previewFormulaConfig(const FormulaDialogConfig& candidate) {
+        formula::ExpressionError error;
+        if (!nav->SetExpressionFormula(candidate.source, candidate.pixelParameter, candidate.fixedZ0, candidate.fixedC, candidate.parameters, candidate.bailout, &error)) {
+            return;
+        }
+        formulaConfig = candidate;
+        nav->JumpReset();
+        needFull = true;
+        startRender();
+    }
+
     void expandWindowForFormulaEditor() {
         if (formulaEditorExpansionDip > 0 || IsZoomed(hwnd)) return;
         RECT wr{};
@@ -2241,6 +2252,14 @@ class App {
                     fprintf(f, "%llu", (unsigned long long)deep.preflightFirstUncertainHistogram[bin]);
                 }
                 fputc('\n', f);
+                if (deep.adaptiveAttempted) {
+                    fprintf(f,
+                            "adaptive attempted/accepted/rejected=%d/%d/%d refs=%llu preflight=%llu/%llu P/S/H/DD/fallback=%llu/%llu/%llu/%llu/%llu bits=%llu/%llu mandatory/low=%llu/%llu validation/mismatch=%llu/%llu upgrade/pixels=%d/%llu iterations low/full/mandatory=%llu/%llu/%llu time pre/P/select/S/H/DD/fallback/low/full/mandatory=%.6f/%.6f/%.6f/%.6f/%.6f/%.6f/%.6f/%.6f/%.6f/%.6f\n",
+                            deep.adaptiveAttempted ? 1 : 0, deep.adaptiveAccepted ? 1 : 0, deep.adaptiveRejected ? 1 : 0, (unsigned long long)deep.adaptiveReferences, (unsigned long long)deep.adaptivePreflightFlags, (unsigned long long)deep.adaptivePreflightSamples, (unsigned long long)deep.adaptivePrimary, (unsigned long long)deep.adaptiveSecondary, (unsigned long long)deep.adaptiveHierarchy, (unsigned long long)deep.adaptiveDd, (unsigned long long)deep.adaptiveFallback, (unsigned long long)deep.adaptiveCandidatePrecision, (unsigned long long)deep.adaptiveFullPrecision, (unsigned long long)deep.adaptiveMandatoryFull, (unsigned long long)deep.adaptiveLowEligible, (unsigned long long)deep.adaptiveValidationSamples, (unsigned long long)deep.adaptiveValidationMismatches, deep.adaptiveUpgraded ? 1 : 0, (unsigned long long)deep.adaptiveUpgradedPixels, (unsigned long long)deep.adaptiveLowIterations, (unsigned long long)deep.adaptiveFullIterations, (unsigned long long)deep.adaptiveMandatoryFullIterations, deep.adaptivePreflightSeconds, deep.adaptivePrimarySeconds, deep.adaptiveSelectSeconds, deep.adaptiveSecondarySeconds, deep.adaptiveHierarchySeconds, deep.adaptiveDdSeconds, deep.adaptiveFallbackSeconds, deep.adaptiveLowSeconds, deep.adaptiveFullSeconds, deep.adaptiveMandatoryFullSeconds);
+                    fprintf(f,
+                            "adaptive mandatory bits=%llu candidate/full pixels=%llu/%llu samples/mismatch=%llu/%llu upgrade/pixels=%d/%llu iterations candidate/full=%llu/%llu time candidate/full=%.6f/%.6f\n",
+                            (unsigned long long)deep.adaptiveMandatoryCandidatePrecision, (unsigned long long)deep.adaptiveMandatoryCandidatePixels, (unsigned long long)deep.adaptiveMandatoryFullPrecisionPixels, (unsigned long long)deep.adaptiveMandatoryValidationSamples, (unsigned long long)deep.adaptiveMandatoryValidationMismatches, deep.adaptiveMandatoryUpgraded ? 1 : 0, (unsigned long long)deep.adaptiveMandatoryUpgradedPixels, (unsigned long long)deep.adaptiveMandatoryCandidateIterations, (unsigned long long)deep.adaptiveMandatoryFullPrecisionIterations, deep.adaptiveMandatoryCandidateSeconds, deep.adaptiveMandatoryFullPrecisionSeconds);
+                }
             }
             fclose(f);
         }
@@ -2416,6 +2435,7 @@ class App {
             formulaEditor = std::make_unique<FormulaEditorPanel>();
             FormulaEditorCallbacks editorCallbacks;
             editorCallbacks.apply = [this](const FormulaDialogConfig& config) { return applyFormulaConfig(config); };
+            editorCallbacks.stagePreview = [this](const FormulaDialogConfig& config) { previewFormulaConfig(config); };
             editorCallbacks.useMandelbrot = [this]() { restoreMandelbrotUi(); };
             editorCallbacks.close = [this]() { closeFormulaEditor(); };
             if (!formulaEditor->create(hwnd, dpi, std::move(editorCallbacks))) formulaEditor.reset();
@@ -2987,10 +3007,13 @@ class App {
             }
             if (inRect(viewRect(), q.x, q.y)) {
                 POINT p = mapToRender(q.x, q.y);
-                if (wd > 0)
-                    nav->ZoomIn(p.x, p.y);
-                else
-                    nav->ZoomOut(p.x, p.y);
+                int notches = std::max(1, std::abs(wd) / WHEEL_DELTA);
+                for (int n = 0; n < notches; ++n) {
+                    if (wd > 0)
+                        nav->ZoomIn(p.x, p.y);
+                    else
+                        nav->ZoomOut(p.x, p.y);
+                }
                 keepLive();
                 return 0;
             }

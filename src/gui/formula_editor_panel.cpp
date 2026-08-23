@@ -1643,6 +1643,7 @@ struct FormulaEditorPanel::Impl {
         notifyAccessibility(EVENT_OBJECT_VALUECHANGE, FORMULA_ACC_PRESET);
         notifyAccessibility(EVENT_OBJECT_VALUECHANGE, FORMULA_ACC_EXPRESSION);
         setFocused(FOCUS_FORMULA);
+        triggerPreview();
     }
 
     void copyCompleteFormula() {
@@ -1684,6 +1685,7 @@ struct FormulaEditorPanel::Impl {
         notifyAccessibility(EVENT_OBJECT_VALUECHANGE, FORMULA_ACC_REAL);
         notifyAccessibility(EVENT_OBJECT_VALUECHANGE, FORMULA_ACC_IMAGINARY);
         notifyAccessibility(EVENT_OBJECT_STATECHANGE, FORMULA_ACC_PICKER);
+        triggerPreview();
     }
 
     void changeRange(double factor) {
@@ -1716,6 +1718,7 @@ struct FormulaEditorPanel::Impl {
         notifyAccessibility(EVENT_OBJECT_VALUECHANGE, FORMULA_ACC_REAL);
         notifyAccessibility(EVENT_OBJECT_VALUECHANGE, FORMULA_ACC_IMAGINARY);
         InvalidateRect(hwnd, nullptr, FALSE);
+        triggerPreview();
     }
 
     bool validateComplexes(FormulaDialogConfig& candidate) {
@@ -1781,6 +1784,14 @@ struct FormulaEditorPanel::Impl {
             return false;
         }
         return true;
+    }
+
+    void triggerPreview() {
+        FormulaDialogConfig candidate;
+        if (!readCandidate(candidate)) return;
+        if (callbacks.stagePreview) {
+            callbacks.stagePreview(candidate);
+        }
     }
 
     void applyChanges() {
@@ -3055,6 +3066,7 @@ struct FormulaEditorPanel::Impl {
             notifyAccessibility(EVENT_OBJECT_VALUECHANGE, FORMULA_ACC_PICKER);
             notifyAccessibility(EVENT_OBJECT_VALUECHANGE, FORMULA_ACC_REAL);
             notifyAccessibility(EVENT_OBJECT_VALUECHANGE, FORMULA_ACC_IMAGINARY);
+            triggerPreview();
             return true;
         }
         if (key == VK_RETURN || key == VK_SPACE) {
