@@ -1,0 +1,24 @@
+name: GPU Benchmark (Self-Hosted Home Runner)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  gpu-benchmark:
+    if: github.actor == github.repository_owner
+    runs-on: [ self-hosted, windows, gpu ]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build verify.exe
+        shell: cmd
+        run: |
+          scripts\build_verify.bat
+
+      - name: Run GPU Benchmark
+        shell: cmd
+        run: |
+          build\verify.exe gpu
