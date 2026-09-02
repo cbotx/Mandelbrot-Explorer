@@ -16,6 +16,11 @@ jobs:
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Install vcpkg dependencies
+        shell: cmd
+        run: |
+          "%VCPKG_INSTALLATION_ROOT%\vcpkg.exe" install gmp:x64-windows-static mpfr:x64-windows-static asmjit:x64-windows-static
+
       - name: Build verify.exe
         shell: cmd
         run: |
