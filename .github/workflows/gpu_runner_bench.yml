@@ -1,4 +1,4 @@
-name: GPU Benchmark (Self-Hosted Home Runner)
+name: GPU Benchmark (Cloud Build + Home Self-Hosted Run)
 
 on:
   workflow_dispatch:
@@ -6,17 +6,38 @@ on:
     branches: [ main, master ]
 
 jobs:
-  gpu-benchmark:
-    if: github.actor == github.repository_owner
-    runs-on: [ self-hosted, windows, gpu ]
+  build:
+    name: Build verify.exe on GitHub Cloud
+    runs-on: windows-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build verify.exe
         shell: cmd
         run: |
           scripts\build_verify.bat
+
+      - name: Upload verify.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-exe
+          path: build/verify.exe
+
+  gpu-benchmark:
+    name: Run GPU Benchmark on Home Machine
+    needs: build
+    if: github.actor == github.repository_owner
+    runs-on: [ self-hosted, windows, gpu ]
+    steps:
+      - name: Download verify.exe artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: verify-exe
+          path: build
 
       - name: Run GPU Benchmark
         shell: cmd
