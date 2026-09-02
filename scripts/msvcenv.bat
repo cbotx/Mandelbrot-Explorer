@@ -1,16 +1,16 @@
 @echo off
 REM Set up an MSVC x64 build environment and locate vcpkg + the OpenMP redist
 
-if defined VCINSTALLDIR if defined WindowsSDKVersion goto :findvcpkg
+if defined VCINSTALLDIR goto :findvcpkg
 
 if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" (
   for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath 2^>nul`) do (
     if exist "%%i\VC\Auxiliary\Build\vcvars64.bat" (
       call "%%i\VC\Auxiliary\Build\vcvars64.bat" >nul
-      if defined VCINSTALLDIR goto :findvcpkg
     )
   )
 )
+if defined VCINSTALLDIR goto :findvcpkg
 
 REM ---- fallback: manual search ---------------------------------------------
 set "VSROOT="
