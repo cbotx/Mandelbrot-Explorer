@@ -2531,25 +2531,35 @@ void Mandel::stepParallel(std::set<std::array<int, 4>>& s, int mx_ref_it, int mx
                                 ++conf_giveup; // not a sustained attracting cycle
                             }
                         }
-                    } else if ((j & 15) == 0 && conf_giveup < 3) {
-                        // Search for a candidate cycle only every 16 iterations, and give up
-                        // after a few failed confirmations, so escaping (exterior) pixels pay
-                        // almost nothing. A close (relative) return starts a confirmation.
-                        Float pr = zr - zsr, pi = zi - zsi;
-                        if (pr * pr + pi * pi < _interior_eps2 * zrad) {
-                            conf_P = j - save_j;
-                            if (conf_P < 1) conf_P = 1;
-                            conf_zr = zr;
-                            conf_zi = zi;
-                            conf_D2 = 1;
-                            conf_next = j + conf_P;
-                            conf_count = 0;
-                        }
-                        if (j - save_j >= period_win) {
-                            zsr = zr;
-                            zsi = zi;
-                            save_j = j;
-                            period_win += period_win;
+                    } else if ((j & 15) == 0) {
+                        if (conf_giveup >= 3) {
+                            if ((j & 511) == 0) {
+                                conf_giveup = 0;
+                                save_j = j;
+                                zsr = zr;
+                                zsi = zi;
+                                period_win = 1;
+                            }
+                        } else {
+                            // Search for a candidate cycle only every 16 iterations, and give up
+                            // after a few failed confirmations, so escaping (exterior) pixels pay
+                            // almost nothing. A close (relative) return starts a confirmation.
+                            Float pr = zr - zsr, pi = zi - zsi;
+                            if (pr * pr + pi * pi < _interior_eps2 * zrad) {
+                                conf_P = j - save_j;
+                                if (conf_P < 1) conf_P = 1;
+                                conf_zr = zr;
+                                conf_zi = zi;
+                                conf_D2 = 1;
+                                conf_next = j + conf_P;
+                                conf_count = 0;
+                            }
+                            if (j - save_j >= period_win) {
+                                zsr = zr;
+                                zsi = zi;
+                                save_j = j;
+                                period_win += period_win;
+                            }
                         }
                     }
                 }
@@ -3547,22 +3557,32 @@ float Mandel::pixelRescaled(FloatExp dcr, FloatExp dci, double customSeedRe, dou
                         ++conf_giveup;
                     }
                 }
-            } else if ((iter & 15) == 0 && conf_giveup < 3) {
-                double pr = zr - zsr, pi = zi - zsi;
-                if (pr * pr + pi * pi < _interior_eps2 * zrad) {
-                    conf_P = iter - save_iter;
-                    if (conf_P < 1) conf_P = 1;
-                    conf_zr = zr;
-                    conf_zi = zi;
-                    conf_D2 = 1;
-                    conf_next = iter + conf_P;
-                    conf_count = 0;
-                }
-                if (iter - save_iter >= period_win) {
-                    zsr = zr;
-                    zsi = zi;
-                    save_iter = iter;
-                    period_win += period_win;
+            } else if ((iter & 15) == 0) {
+                if (conf_giveup >= 3) {
+                    if ((iter & 511) == 0) {
+                        conf_giveup = 0;
+                        save_iter = iter;
+                        zsr = zr;
+                        zsi = zi;
+                        period_win = 1;
+                    }
+                } else {
+                    double pr = zr - zsr, pi = zi - zsi;
+                    if (pr * pr + pi * pi < _interior_eps2 * zrad) {
+                        conf_P = iter - save_iter;
+                        if (conf_P < 1) conf_P = 1;
+                        conf_zr = zr;
+                        conf_zi = zi;
+                        conf_D2 = 1;
+                        conf_next = iter + conf_P;
+                        conf_count = 0;
+                    }
+                    if (iter - save_iter >= period_win) {
+                        zsr = zr;
+                        zsi = zi;
+                        save_iter = iter;
+                        period_win += period_win;
+                    }
                 }
             }
         }

@@ -41,110 +41,86 @@ constexpr float kCpuRefineIteration = 64.0f;
 
 const char kShaderSource[] = R"(
 cbuffer Params : register(b0) {
-    float2 c0Re;
-    float2 c0Im;
-    float2 dx;
-    float2 dy;
+    double c0Re;
+    double c0Im;
+    double dx;
+    double dy;
+    double escapeSquared;
     uint width;
     uint height;
     uint maxIterations;
     uint basePixel;
     uint pixelCount;
-    float2 escapeSquared;
-    uint padding;
+    uint padding0;
+    uint padding1;
+    uint padding2;
 };
 
 RWStructuredBuffer<float> Output : register(u0);
 
-float2 dsAdd(float2 a, float2 b) {
-    precise float s = a.x + b.x;
-    precise float v = s - a.x;
-    precise float e = (a.x - (s - v)) + (b.x - v);
-    e = e + a.y + b.y;
-    precise float hi = s + e;
-    precise float lo = e - (hi - s);
-    return float2(hi, lo);
-}
-
-float2 dsSub(float2 a, float2 b) {
-    return dsAdd(a, float2(-b.x, -b.y));
-}
-
-float2 dsMul(float2 a, float2 b) {
-    const float splitter = 8193.0f;
-    precise float p = a.x * b.x;
-
-    precise float ca = splitter * a.x;
-    precise float ah = ca - (ca - a.x);
-    precise float al = a.x - ah;
-    precise float cb = splitter * b.x;
-    precise float bh = cb - (cb - b.x);
-    precise float bl = b.x - bh;
-
-    precise float e = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
-    e = e + a.x * b.y + a.y * b.x + a.y * b.y;
-    precise float hi = p + e;
-    precise float lo = e - (hi - p);
-    return float2(hi, lo);
-}
-
-float2 dsScale(float2 a, float b) {
-    return dsMul(a, float2(b, 0.0f));
-}
-
-bool dsGreater(float2 a, float2 b) {
-    return a.x > b.x || (a.x == b.x && a.y > b.y);
-}
-
-bool inMainCardioidOrBulb(float2 x, float2 y) {
-    float2 y2 = dsMul(y, y);
-    float2 xm = dsAdd(x, float2(-0.25f, 0.0f));
-    float2 q = dsAdd(dsMul(xm, xm), y2);
-    float2 cardioidLeft = dsMul(q, dsAdd(q, xm));
-    float2 cardioidRight = dsScale(y2, 0.25f);
-    bool cardioid = dsGreater(cardioidRight, cardioidLeft);
-
-    float2 xp = dsAdd(x, float2(1.0f, 0.0f));
-    float2 bulbRadius = dsAdd(dsMul(xp, xp), y2);
-    bool bulb = dsGreater(float2(0.0625f, 0.0f), bulbRadius);
+bool inMainCardioidOrBulb(double x, double y) {
+    double y2 = y * y;
+    double xm = x - 0.25;
+    double q = xm * xm + y2;
+    bool cardioid = q * (q + xm) < 0.25 * y2;
+    bool bulb = (x + 1.0) * (x + 1.0) + y2 < 0.0625;
     return cardioid || bulb;
 }
 
 float solvePixel(uint pixel) {
     uint y = pixel / width;
     uint x = pixel - y * width;
-    float2 cr = dsAdd(c0Re, dsScale(dx, (float)x));
-    float2 ci = dsAdd(c0Im, dsScale(dy, (float)y));
-    if (inMainCardioidOrBulb(cr, ci)) return -3.0f;
+    double cr = c0Re + dx * (double)x;
+    double ci = c0Im + dy * (double)y;
+    if (inMainCardioidOrBulb(cr, ci)) return -2.0f;
 
-    float2 zr = cr;
-    float2 zi = ci;
-    float dr = 2.0f;
-    float di = 0.0f;
+    double zr = cr;
+    double zi = ci;
+    double dr = 2.0;
+    double di = 0.0;
+
+    double zsr = zr;
+    double zsi = zi;
+    uint save_i = 1;
+    uint period_win = 1;
+
     uint i = 1;
-    uint iterationLimit = min(maxIterations, 64u);
+    uint iterationLimit = maxIterations;
     while (i < iterationLimit) {
-        precise float nextDr = 2.0f * (dr * zr.x - di * zi.x);
-        precise float nextDi = 2.0f * (dr * zi.x + di * zr.x);
-        float2 zr2 = dsMul(zr, zr);
-        float2 zi2 = dsMul(zi, zi);
-        float2 zri = dsMul(zr, zi);
-        zr = dsAdd(dsSub(zr2, zi2), cr);
-        zi = dsAdd(dsScale(zri, 2.0f), ci);
+        double nextDr = 2.0 * (dr * zr - di * zi);
+        double nextDi = 2.0 * (dr * zi + di * zr);
+        double zr2 = zr * zr;
+        double zi2 = zi * zi;
+        double zri = zr * zi;
+        zr = zr2 - zi2 + cr;
+        zi = 2.0 * zri + ci;
         dr = nextDr;
         di = nextDi;
 
-        float2 radiusSquared = dsAdd(dsMul(zr, zr), dsMul(zi, zi));
-        if (dsGreater(radiusSquared, escapeSquared)) {
-            float radius = radiusSquared.x + radiusSquared.y;
-            const float invLog2 = 1.4426950408889634f;
-            return (float)(i + 1) -
-                   log(log(radius) * (0.5f * invLog2)) * invLog2;
+        double radiusSquared = zr * zr + zi * zi;
+        if (radiusSquared > escapeSquared) {
+            const double invLog2 = 1.4426950408889634;
+            return (float)((double)(i + 1) - log(log(max(radiusSquared, 4.0)) * (0.5 * invLog2)) * invLog2);
         }
-        if (dr * dr + di * di < 1.0e-9f) return -4.0f;
+
+        if (dr * dr + di * di < 1.0e-9) return -2.0f;
+
+        if ((i & 15) == 0) {
+            double dzr = zr - zsr;
+            double dzi = zi - zsi;
+            double d2 = dzr * dzr + dzi * dzi;
+            if (d2 < 1.0e-12) return -2.0f;
+            if (i - save_i >= period_win) {
+                zsr = zr;
+                zsi = zi;
+                save_i = i;
+                period_win += period_win;
+            }
+        }
+
         ++i;
     }
-    return -5.0f;
+    return -2.0f;
 }
 
 [numthreads(64, 1, 1)]
@@ -172,18 +148,6 @@ std::string narrow(const wchar_t* text) {
     return result;
 }
 
-struct FloatPair {
-    float hi;
-    float lo;
-};
-
-FloatPair splitDouble(double value) {
-    FloatPair result{};
-    result.hi = static_cast<float>(value);
-    result.lo = static_cast<float>(value - static_cast<double>(result.hi));
-    return result;
-}
-
 bool inMainCardioidOrBulb(double x, double y) {
     const double y2 = y * y;
     const double xm = x - 0.25;
@@ -192,19 +156,21 @@ bool inMainCardioidOrBulb(double x, double y) {
 }
 
 struct alignas(16) ShaderParams {
-    FloatPair c0Re;
-    FloatPair c0Im;
-    FloatPair dx;
-    FloatPair dy;
+    double c0Re;
+    double c0Im;
+    double dx;
+    double dy;
+    double escapeSquared;
     UINT width;
     UINT height;
     UINT maxIterations;
     UINT basePixel;
     UINT pixelCount;
-    FloatPair escapeSquared;
-    UINT padding;
+    UINT padding0;
+    UINT padding1;
+    UINT padding2;
 };
-static_assert(sizeof(ShaderParams) == 64, "HLSL constant layout mismatch");
+static_assert(sizeof(ShaderParams) == 80, "HLSL constant layout mismatch");
 
 class D3D11ComputeBackend final : public IComputeBackend {
   public:
@@ -462,13 +428,10 @@ class D3D11ComputeBackend final : public IComputeBackend {
         if (!std::isfinite(lastRe) || !std::isfinite(lastIm) || std::fabs(lastRe) > 1.0e8 || std::fabs(lastIm) > 1.0e8) return false;
 
         ShaderParams params{};
-        params.c0Re = splitDouble(values[0]);
-        params.c0Im = splitDouble(values[1]);
-        params.dx = splitDouble(values[2]);
-        params.dy = splitDouble(values[3]);
-        const FloatPair coordinatePairs[] = {params.c0Re, params.c0Im, params.dx, params.dy};
-        for (const FloatPair pair : coordinatePairs)
-            if (!std::isfinite(pair.hi) || !std::isfinite(pair.lo)) return false;
+        params.c0Re = values[0];
+        params.c0Im = values[1];
+        params.dx = values[2];
+        params.dy = values[3];
         params.width = static_cast<UINT>(request.width);
         params.height = static_cast<UINT>(request.height);
         params.maxIterations = static_cast<UINT>(request.maxIterations);
@@ -476,8 +439,7 @@ class D3D11ComputeBackend final : public IComputeBackend {
         if (!std::isfinite(escapeRadius) || escapeRadius < 2.0 || escapeRadius > 1.0e8) return false;
         double escapeSquared = request.cpuEngine->escapeRadiusSquared();
         if (!std::isfinite(escapeSquared)) return false;
-        params.escapeSquared = splitDouble(escapeSquared);
-        if (!std::isfinite(params.escapeSquared.hi) || !std::isfinite(params.escapeSquared.lo)) return false;
+        params.escapeSquared = escapeSquared;
 
         ID3D11Buffer* constantBuffers[] = {_constantBuffer.Get()};
         ID3D11UnorderedAccessView* uavs[] = {_outputUav.Get()};
@@ -550,14 +512,15 @@ class D3D11ComputeBackend final : public IComputeBackend {
             int x = pixel - y * request.width;
             double cr = values[0] + values[2] * x;
             double ci = values[1] + values[3] * y;
+            if (value >= 0.0f || value == -2.0f) {
+                continue;
+            }
             if (value == kAnalyticInterior) {
                 if (inMainCardioidOrBulb(cr, ci)) {
                     _readback[pixel] = -2.0f;
                     ++analytic;
                     continue;
                 }
-            } else if (value >= 0.0f && value < kCpuRefineIteration) {
-                continue;
             }
             int slot = refineCount.fetch_add(1, std::memory_order_relaxed);
             _refinePixels[slot] = pixel;

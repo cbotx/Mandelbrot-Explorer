@@ -17,7 +17,7 @@
 //          oracle | custom-deep | expression-suite | suite |
 //          expression-residual | formula-bench | multibrot | backend |
 //          adaptive-phase1 | centered-sweep | centered-mandatory | centered-selector |
-//          centered-full | gpu | all
+//          centered-full | slow-matrix | gpu | all
 //   The 1e1000 cases are excluded from "all" because their 3400-bit GMP oracles
 //   are intentionally much more expensive than the regular regression set.
 
@@ -12134,8 +12134,11 @@ static int runGenericDeepBackendCase() {
 
 static int runGpuBenchmarkCase(int width, int height) {
     std::unique_ptr<IComputeBackend> gpu = createComputeBackend("gpu");
-    printf("=== D3D11 hardware GPU benchmark\n");
     if (!gpu || gpu->info().fallback || !gpu->info().hardwareAccelerated) {
+        gpu = createComputeBackend("d3d11-warp");
+    }
+    printf("=== D3D11 GPU compute benchmark (%s)\n", gpu ? gpu->info().name.c_str() : "none");
+    if (!gpu || gpu->info().fallback) {
         printf("  SKIP: %s\n\n", gpu ? gpu->info().detail.c_str() : "backend creation failed");
         return 0;
     }
@@ -14984,6 +14987,131 @@ static int runCenteredFullAuditCase(int width, int height) {
     return fallbackClassificationOkay && fullDenseOkay && auditEmpty == 0 && auditClassMismatch == 0 && auditFloorMismatch == 0 && doubleDoubleTelemetryOkay && fallbackGoal && doubleDoubleCostOkay ? 0 : 1;
 }
 
+static int runSlowMatrixCase(int targetW = 800, int targetH = 600) {
+    struct SearchSpec {
+        const char* category;
+        int default_mxit;
+        const char* cx_str;
+        const char* cy_str;
+        const char* scale_str;
+    };
+    const std::string deep51_scale = [] {
+        std::string s = "3831277";
+        s.append(45, '0');
+        return s;
+    }();
+    const SearchSpec g_specs[] = {
+        {"1. Interior Centered", 100000, "0.0", "0.0", "1"},
+        {"2. Interior Non-Centered", 100000, "-0.745", "0.1", "20"},
+        {"3. Slowpoint 7.8e8", 500000, "-1.1758621450236620370", "-0.2447677973532398022", "782679600"},
+        {"4. Seahorse Valley Spiral", 200000, "-0.743643887037158704752191506114774", "0.131825904205311970493132056385139", "100000"},
+        {"5. Elephant Valley Filigree", 150000, "0.275", "0.006", "10000"},
+        {"6. Left Pup Buttock", 200000, "-1.2500047", "0.000123", "300000"},
+        {"7. Shallow High Iteration", 500000, "-0.743643887037158704752191506114774", "0.131825904205311970493132056385139", "10000"},
+        {"8. Point31 (7.35e31)", 500000, "-0.749139567333446841955467474699747367338762518832278501811", "0.040823298514634751035521346975478853963578400940553676068", "7354177000000000000000000000000"},
+        {"9. Deep51 (3.83e51)", 2000000, testcases::deep51_x, testcases::deep51_y, deep51_scale.c_str()},
+        {"10. Deep Minibrot (1e876)", 500000, testcases::deep1_x, testcases::deep1_y, testcases::deep1_z.c_str()}
+    };
+
+    printf("=======================================================================\n");
+    printf("  Mandelbrot Explorer -- Comprehensive Slow Benchmark Matrix Probe (%dx%d)\n", targetW, targetH);
+    printf("=======================================================================\n");
+
+    const int total_pix = targetW * targetH;
+    struct Result {
+        const char* category;
+        double calc_time_sec;
+        double interior_pct;
+        double avg_iter;
+        int mxit;
+        uint32_t chksum;
+    };
+    std::vector<Result> results;
+
+    for (const auto& spec : g_specs) {
+        printf("\nEvaluating category: %s (mxit=%d)...\n", spec.category, spec.default_mxit);
+
+        int precision = static_cast<int>((strlen(spec.cx_str) + strlen(spec.scale_str)) * 3.321928) + 128;
+        if (precision < 256) precision = 256;
+        mpf_set_default_prec(precision);
+
+        mpf_t cre, cim, scale;
+        mpf_init2(cre, precision);
+        mpf_init2(cim, precision);
+        mpf_init2(scale, precision);
+        mpf_set_str(cre, spec.cx_str, 10);
+        mpf_set_str(cim, spec.cy_str, 10);
+        mpf_set_str(scale, spec.scale_str, 10);
+
+        std::vector<float> iter(total_pix, EMPTYPIXEL);
+        Mandel mandel(targetW, targetH, spec.default_mxit, 1, iter.data());
+        mandel.setPrecision(precision);
+
+        auto t0 = Clock::now();
+        mandel.Compute(cre, cim, scale, spec.default_mxit, 1);
+        double elapsed = since(t0);
+
+        int interior_cnt = 0;
+        int empty_cnt = 0;
+        int escaped_cnt = 0;
+        double sum_iter = 0.0;
+        float min_v = 1e30f, max_v = -1e30f;
+
+        for (int i = 0; i < total_pix; ++i) {
+            float v = iter[i];
+            if (v < min_v) min_v = v;
+            if (v > max_v) max_v = v;
+
+            if (v == -2.0f) {
+                interior_cnt++;
+            } else if (v < -1.5f) {
+                empty_cnt++;
+            } else if (v >= 0.0f) {
+                escaped_cnt++;
+                sum_iter += (double)v;
+            }
+        }
+
+        uint32_t h = 2166136261u;
+        for (int i = 0; i < total_pix; ++i) {
+            uint32_t b;
+            std::memcpy(&b, &iter[i], 4);
+            h = (h ^ b) * 16777619u;
+        }
+
+        double int_pct = 100.0 * interior_cnt / total_pix;
+        double empty_pct = 100.0 * empty_cnt / total_pix;
+        double avg_it = sum_iter / std::max(1, escaped_cnt);
+
+        printf("  Done in %.3f s | Int: %.1f%% | Empty: %.1f%% | Escaped: %d | Min/Max: [%.1f, %.1f] | AvgEscIter: %.1f | Checksum: 0x%08x\n",
+               elapsed, int_pct, empty_pct, escaped_cnt, min_v, max_v, avg_it, h);
+
+        Result res;
+        res.category = spec.category;
+        res.calc_time_sec = elapsed;
+        res.interior_pct = int_pct;
+        res.avg_iter = avg_it;
+        res.mxit = spec.default_mxit;
+        res.chksum = h;
+        results.push_back(res);
+
+        mpf_clears(cre, cim, scale, (mpf_ptr)0);
+    }
+
+    printf("\n=======================================================================================\n");
+    printf("  SUMMARY BENCHMARK SLOW MATRIX TABLE (%dx%d)\n", targetW, targetH);
+    printf("=======================================================================================\n");
+    printf("%-30s | %-8s | %-10s | %-12s | %-8s | %-10s\n",
+           "Category", "Time(s)", "Interior%", "AvgIter", "MaxIt", "Checksum");
+    printf("---------------------------------------------------------------------------------------\n");
+    for (const auto& r : results) {
+        printf("%-30s | %-8.3f | %-10.1f | %-12.1f | %-8d | 0x%08x\n",
+               r.category, r.calc_time_sec, r.interior_pct, r.avg_iter, r.mxit, r.chksum);
+    }
+
+    return 0;
+}
+
 int main(int argc, char** argv) {
     std::string which = (argc > 1) ? argv[1] : "all";
     const int W = (argc > 2) ? atoi(argv[2]) : 120;
@@ -15149,6 +15277,7 @@ int main(int argc, char** argv) {
     if (which == "centered-mandatory") rc |= runCenteredMandatoryPrecisionSweepCase();
     if (which == "centered-selector") rc |= runCenteredSelectorCase(W, H);
     if (which == "centered-full") rc |= runCenteredFullAuditCase(argc > 2 ? W : 832, argc > 3 ? H : 555);
+    if (which == "slow-matrix" || which == "slowmatrix") rc |= runSlowMatrixCase(argc > 2 ? W : 800, argc > 3 ? H : 600);
     if (which == "gpu") rc |= runGpuBenchmarkCase(argc > 2 ? W : 1920, argc > 3 ? H : 1080);
     return rc;
 }
