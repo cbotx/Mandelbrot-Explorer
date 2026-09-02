@@ -1,6 +1,7 @@
 @echo off
 REM Set up an MSVC x64 build environment and locate vcpkg + the OpenMP redist
 
+if defined INCLUDE goto :findvcpkg
 if defined WindowsSdkDir goto :findvcpkg
 if defined VCINSTALLDIR goto :findvcpkg
 
@@ -13,6 +14,7 @@ if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" (
     )
   )
 )
+if defined INCLUDE goto :findvcpkg
 if defined WindowsSdkDir goto :findvcpkg
 if defined VCINSTALLDIR goto :findvcpkg
 
